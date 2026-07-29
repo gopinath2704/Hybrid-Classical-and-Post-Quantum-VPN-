@@ -19,7 +19,7 @@
 
 ---
 
-## 👤 Member 2 – Cryptography
+## 👤 Karthik – Cryptography
 
 ### Responsibilities
 - Implement Hybrid Cryptography
@@ -37,7 +37,7 @@
 
 ---
 
-## 👤 Member 3 – Secure Handshake & Performance
+## 👤 Nandha – Secure Handshake & Performance
 
 ### Responsibilities
 - Implement Signature-Free Handshake (KEMTLS-inspired)
