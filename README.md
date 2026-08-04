@@ -74,33 +74,40 @@
 
 ---
 
-# Revised Project Architecture
+# Revised Project Architecture & Application Flow
 
 ```text
-                Client
-                   │
-        Hybrid Key Exchange
-         (ECC + ML-KEM)
-                   │
-     Signature-Free Handshake
-       (KEMTLS Inspired)
-                   │
-     Dynamic Network Agility
- (MTU & Network Quality Monitor)
-                   │
-           OpenVPN Tunnel
-                   │
-                Server
+ ┌─────────────────────────────────────────────────────────────┐
+ │                  Desktop GUI / Web App UI                  │
+ │  (Connection Toggle, Real-Time MTU/Latency Graphs, Logs)   │
+ └──────────────────────────────┬──────────────────────────────┘
+                                │ API / IPC Socket
+ ┌──────────────────────────────▼──────────────────────────────┐
+ │                    VPN Controller Daemon                    │
+ │                                                             │
+ │  ┌──────────────────┐  ┌──────────────────┐  ┌───────────┐  │
+ │  │ Hybrid Key Exch. │  │ Signature-Free   │  │  Dynamic  │  │
+ │  │  (ECC + ML-KEM)  │  │ Handshake Engine │  │ Network   │  │
+ │  └─────────┬────────┘  └─────────┬────────┘  │  Agility  │  │
+ │            └─────────────────────┤           └─────┬─────┘  │
+ └──────────────────────────────────┼─────────────────┼────────┘
+                                    │ Derived Keys    │ MTU/Route
+ ┌──────────────────────────────────▼─────────────────▼────────┐
+ │                      VPN Tunnel Layer                       │
+ │    Option A: Modified OpenVPN Engine (via Plugin/Mgmt)      │
+ │    Option B: Native Standalone Hybrid TUN/TAP Engine        │
+ └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Data Flow
 
-1. **Client** initiates the connection.
-2. **Hybrid Key Exchange** combines ECC and ML-KEM for secure key establishment.
-3. **Signature-Free Handshake** establishes a secure session using a KEMTLS-inspired approach.
-4. **Dynamic Network Agility** continuously monitors MTU and network quality to optimize performance.
-5. **OpenVPN Tunnel** encrypts and transports data securely.
-6. **Server** receives and processes the secure communication.
+1. **User / Client** interacts with the Desktop GUI / Web Application interface.
+2. **GUI Application** sends control commands (Connect/Disconnect/Benchmark) via REST/WebSocket API to the **VPN Controller Daemon**.
+3. **Hybrid Key Exchange** combines classical ECC (X25519) and Post-Quantum Cryptography (ML-KEM / Kyber-768 via `liboqs`) for quantum-safe key establishment.
+4. **Signature-Free Handshake** establishes an authenticated secure session using a zero-signature KEMTLS-inspired protocol.
+5. **Dynamic Network Agility** continuously monitors PMTU, fragmentation, RTT latency, and jitter to adjust network parameters on the fly.
+6. **VPN Tunnel Layer** encrypts and routes data traffic through a native TUN/TAP interface or modified OpenVPN tunnel.
+7. **Server Node** processes the secure communication and routes decrypted traffic.
 
 ---
 

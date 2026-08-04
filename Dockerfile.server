@@ -1,0 +1,27 @@
+# Dockerfile for Hybrid VPN Server Node
+FROM ubuntu:22.04
+
+# Environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    openvpn \
+    net-tools \
+    iproute2 \
+    iptables \
+    iputils-ping \
+    liboqs-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy requirements and install Python libraries
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+EXPOSE 8000 1194/udp
+
+CMD ["python3", "-m", "vpn.engine.tunnel_daemon"]

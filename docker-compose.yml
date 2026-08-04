@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  vpn-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: hybrid_vpn_server
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+    ports:
+      - "8000:8000"   # Web Dashboard / REST API
+      - "1194:1194/udp" # OpenVPN / Hybrid VPN UDP port
+    volumes:
+      - .:/app
+    environment:
+      - MODE=server
+
+  vpn-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: hybrid_vpn_client
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+    depends_on:
+      - vpn-server
+    volumes:
+      - .:/app
+    environment:
+      - MODE=client
