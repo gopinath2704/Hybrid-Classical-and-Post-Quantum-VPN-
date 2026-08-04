@@ -1,6 +1,6 @@
 # Team Roles & Responsibilities
 
-## 👤 Member 1 – Networking & VPN
+## 👤 Gowtham supported by Shadow – Networking & VPN
 
 ### Responsibilities
 - Set up OpenVPN or strongSwan
@@ -19,7 +19,7 @@
 
 ---
 
-## 👤 Karthik – Cryptography
+## 👤 Karthik supported by Shadow – Cryptography
 
 ### Responsibilities
 - Implement Hybrid Cryptography
@@ -37,7 +37,7 @@
 
 ---
 
-## 👤 Nandha – Secure Handshake & Performance
+## 👤 Nandha supported by Shadow – Secure Handshake & Performance
 
 ### Responsibilities
 - Implement Signature-Free Handshake (KEMTLS-inspired)
@@ -54,7 +54,7 @@
 
 ---
 
-## 👤 Member 4 – Integration, Testing & Documentation
+## 👤 Shadow – Integration, Testing & Documentation
 
 ### Responsibilities
 - Integrate all project components
