@@ -111,6 +111,56 @@
 
 ---
 
+## 🔐 Cryptographic Specifications & Key Architecture
+
+The system uses a hybrid classical and post-quantum key encapsulation mechanism (`crypto/hybrid_crypto.py`).
+
+### 1. Classical Cryptography (ECC)
+* **Algorithm**: **X25519** (Elliptic Curve Diffie-Hellman over Curve25519)
+* **Classical Security**: 128-bit security level
+* **Private Key**: 32 bytes (`X25519PrivateKey`)
+* **Public Key**: 32 bytes (Raw uncompressed bytes for wire transport)
+* **Shared Secret**: 32 bytes
+
+### 2. Post-Quantum Cryptography (PQC)
+* **Algorithm**: **ML-KEM** (NIST FIPS 203 standardized Module-Lattice-Based KEM, formerly *CRYSTALS-Kyber*)
+* **Default Variant**: **Kyber768** (NIST Security Category 3 $\approx$ AES-192 equivalent)
+* **Supported Variants**:
+
+| Variant | NIST Level | Public Key | Secret Key | Ciphertext | PQ Shared Secret |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Kyber512** | Level 1 | 800 B | 1,632 B | 768 B | 32 bytes |
+| **Kyber768** *(Default)* | Level 3 | **1,184 B** | **2,400 B** | **1,088 B** | **32 bytes** |
+| **Kyber1024** | Level 5 | 1,568 B | 3,168 B | 1,568 B | 32 bytes |
+
+### 3. Hybrid Combination & Key Derivation (KDF)
+```text
+  [ ECC Shared Secret (32B) ] + [ PQC Shared Secret (32B) ]
+                              │
+                              ▼
+                 [ Combined Secret (64 Bytes) ]
+                              │
+                              ▼
+                        HKDF-SHA256
+                              │
+         ┌────────────────────┴────────────────────┐
+         ▼                                         ▼
+[ Encryption Key (32B) ]                 [ MAC Key (32B) ]
+(b"hybrid-vpn-encryption-key")         (b"hybrid-vpn-mac-key")
+```
+* **Master Secret**: Concatenation of ECC (32B) + PQC (32B) = **64 bytes**.
+* **KDF Algorithm**: **HKDF-SHA256** (RFC 5869).
+* **Salt**: **32-byte** cryptographically secure random salt (`os.urandom(32)`).
+* **Derived Session Keys**:
+  * **Encryption Key**: 32 bytes (256-bit AES-GCM key) derived with info `b"hybrid-vpn-encryption-key"`.
+  * **MAC / Integrity Key**: 32 bytes (256-bit HMAC key) derived with info `b"hybrid-vpn-mac-key"`.
+
+### 4. Memory Security & Key Revocation
+* **Storage**: In-memory `SessionKeyStore` using mutable `bytearray` buffers.
+* **Zeroization**: Instant secure overwrite of memory via `ctypes.memset` zero-fill on session revocation to eliminate RAM residue.
+
+---
+
 ## Technology Stack
 
 | Component | Technologies |

@@ -2,7 +2,7 @@
 
 # Cryptography & PQC
 cryptography>=41.0.0
-oqs>=0.8.0
+liboqs-python>=0.16.0
 
 # Networking & Packet Analysis
 scapy>=2.5.0
