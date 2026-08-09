@@ -161,6 +161,50 @@ The system uses a hybrid classical and post-quantum key encapsulation mechanism 
 
 ---
 
+## 🤝 Signature-Free Handshake Architecture (KEMTLS-Inspired)
+
+The system implements a signature-free post-quantum hybrid handshake (`handshake/kemtls.py`) based on KEMTLS principles, replacing expensive post-quantum digital signatures with key encapsulation mechanisms.
+
+### 1. Wire Protocol Specification
+All wire messages start with a fixed 6-byte header formatted in big-endian network byte order:
+* **Header Format**: `Magic (2B: 0x4856 "HV") | Version (1B: 0x10) | Type (1B) | PayloadLength (2B)`
+
+| Message Type | Type Code | Payload Components & Exact Sizes | Total Wire Size |
+| :--- | :---: | :--- | :---: |
+| **ClientHello** | `0x01` | Client Random (32B) + Session ID (32B) + Client ECC Public Key (32B) + Client Kyber768 Public Key (1,184B) | **1,286 B** |
+| **ServerHello** | `0x02` | Server Random (32B) + Session ID (32B) + Server ECC Public Key (32B) + Server Kyber768 Public Key (1,184B) + Kyber768 Ciphertext to Client (1,088B) | **2,374 B** |
+| **ClientKeyExchange** | `0x03` | Kyber768 Ciphertext to Server (1,088B) + Client Finished MAC (32B) | **1,126 B** |
+| **ServerFinished** | `0x04` | Server Finished MAC (32B) | **38 B** |
+| **HandshakeError** | `0xFF` | Error Code + UTF-8 Description | Variable |
+
+### 2. Handshake Protocol Sequence & Data Flow
+
+```text
+ Client (Initiator)                                                Server (Responder)
+   │                                                                    │
+   │ ─── 1. ClientHello (1,286 Bytes) ───────────────────────────────> │
+   │       (Ephemeral X25519 PK + Ephemeral Kyber768 PK)                │
+   │                                                                    │
+   │ <── 2. ServerHello (2,374 Bytes) ─────────────────────────────── │
+   │       (Ephemeral X25519 PK + Kyber768 PK + Kyber768 CT to Client)   │
+   │                                                                    │
+   │ ─── 3. ClientKeyExchange (1,126 Bytes) ─────────────────────────> │
+   │       (Kyber768 CT to Server + Client Finished HMAC over Transcript)│
+   │                                                                    │
+   │ <── 4. ServerFinished (38 Bytes) ───────────────────────────────── │
+   │       (Server Finished HMAC over Transcript)                       │
+   │                                                                    │
+   │ ================================================================== │
+   │                AES-256-GCM Secure Data Channel                     │
+```
+
+### 3. Transcript Integrity & Security Guarantees
+* **Transcript Binding**: `TranscriptHasher` maintains an incremental SHA-256 digest of all handshake bytes exchanged.
+* **Handshake Authentication**: Finished MACs (`HMAC-SHA256`) bind derived keys to the complete, un-tampered transcript, eliminating signature generation/verification overhead while guaranteeing anti-tampering and key authentication.
+* **Transport Encryption**: Successful handshake establishes a `HandshakeSession` using **AES-256-GCM** authenticated encryption with 12-byte nonces (`8-byte sequence counter + 4-byte random salt`) for data tunnel frames.
+
+---
+
 ## Technology Stack
 
 | Component | Technologies |
