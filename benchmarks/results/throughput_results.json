@@ -1,0 +1,74 @@
+{
+  "64B": {
+    "payload_size_bytes": 64,
+    "frame_size_bytes": 92,
+    "overhead_bytes": 28,
+    "overhead_percentage": 43.75,
+    "iterations": 200,
+    "avg_enc_time_us": 1.7,
+    "avg_dec_time_us": 1.18,
+    "total_time_seconds": 0.0006,
+    "throughput_mbps": 323.74,
+    "packets_per_second": 632311.1
+  },
+  "128B": {
+    "payload_size_bytes": 128,
+    "frame_size_bytes": 156,
+    "overhead_bytes": 28,
+    "overhead_percentage": 21.88,
+    "iterations": 200,
+    "avg_enc_time_us": 1.57,
+    "avg_dec_time_us": 1.12,
+    "total_time_seconds": 0.0006,
+    "throughput_mbps": 684.03,
+    "packets_per_second": 668002.7
+  },
+  "512B": {
+    "payload_size_bytes": 512,
+    "frame_size_bytes": 540,
+    "overhead_bytes": 28,
+    "overhead_percentage": 5.47,
+    "iterations": 200,
+    "avg_enc_time_us": 1.78,
+    "avg_dec_time_us": 1.31,
+    "total_time_seconds": 0.0007,
+    "throughput_mbps": 2464.87,
+    "packets_per_second": 601775.2
+  },
+  "1024B": {
+    "payload_size_bytes": 1024,
+    "frame_size_bytes": 1052,
+    "overhead_bytes": 28,
+    "overhead_percentage": 2.73,
+    "iterations": 200,
+    "avg_enc_time_us": 2.06,
+    "avg_dec_time_us": 1.36,
+    "total_time_seconds": 0.0007,
+    "throughput_mbps": 4491.84,
+    "packets_per_second": 548320.8
+  },
+  "1400B": {
+    "payload_size_bytes": 1400,
+    "frame_size_bytes": 1428,
+    "overhead_bytes": 28,
+    "overhead_percentage": 2.0,
+    "iterations": 200,
+    "avg_enc_time_us": 2.42,
+    "avg_dec_time_us": 1.47,
+    "total_time_seconds": 0.0008,
+    "throughput_mbps": 5440.85,
+    "packets_per_second": 485790.6
+  },
+  "8192B": {
+    "payload_size_bytes": 8192,
+    "frame_size_bytes": 8220,
+    "overhead_bytes": 28,
+    "overhead_percentage": 0.34,
+    "iterations": 200,
+    "avg_enc_time_us": 5.34,
+    "avg_dec_time_us": 3.55,
+    "total_time_seconds": 0.0019,
+    "throughput_mbps": 14126.42,
+    "packets_per_second": 215552.1
+  }
+}

@@ -3,14 +3,380 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hybrid Classical & Post-Quantum VPN</title>
+    <title>PQ-VPN — Post-Quantum Secure VPN</title>
+    <meta name="description" content="Hybrid Classical & Post-Quantum VPN Desktop Application with real-time telemetry, KEMTLS handshake, and X25519 + Kyber768 encryption.">
     <link rel="stylesheet" href="css/style.css">
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 </head>
 <body>
     <div id="app">
-        <!-- Dashboard Shell Placeholder -->
-        <h1>Hybrid Classical & Post-Quantum VPN Dashboard</h1>
+
+        <!-- ═══════════════════════════════════════════════════════════
+             SIDEBAR NAVIGATION
+             ═══════════════════════════════════════════════════════════ -->
+        <aside class="sidebar">
+            <!-- Brand -->
+            <div class="sidebar-brand">
+                <div class="brand-icon">🛡</div>
+                <div class="brand-text">
+                    <h2>PQ-VPN</h2>
+                    <span>Post-Quantum Secure</span>
+                </div>
+            </div>
+
+            <!-- Navigation Links -->
+            <nav class="sidebar-nav">
+                <a href="#" class="nav-link active" id="nav-dashboard">
+                    <span class="nav-icon">📊</span>
+                    <span>Dashboard</span>
+                </a>
+                <a href="#" class="nav-link" id="nav-connections">
+                    <span class="nav-icon">🌐</span>
+                    <span>Connections</span>
+                </a>
+                <a href="#" class="nav-link" id="nav-servers">
+                    <span class="nav-icon">🖥</span>
+                    <span>Servers</span>
+                </a>
+                <a href="#" class="nav-link" id="nav-telemetry">
+                    <span class="nav-icon">📈</span>
+                    <span>Telemetry</span>
+                </a>
+                <a href="#" class="nav-link" id="nav-security">
+                    <span class="nav-icon">🛡</span>
+                    <span>Security</span>
+                </a>
+                <a href="#" class="nav-link" id="nav-settings">
+                    <span class="nav-icon">⚙️</span>
+                    <span>Settings</span>
+                </a>
+                <a href="#" class="nav-link" id="nav-logs">
+                    <span class="nav-icon">📄</span>
+                    <span>Logs</span>
+                </a>
+
+                <div class="nav-divider"></div>
+
+                <a href="#" class="nav-link" id="nav-about">
+                    <span class="nav-icon">ℹ️</span>
+                    <span>About</span>
+                </a>
+            </nav>
+
+            <!-- Sidebar Footer -->
+            <div class="sidebar-footer">
+                <div class="system-status">
+                    <span class="status-dot"></span>
+                    <div class="status-info">
+                        <h4>System Status</h4>
+                        <span>All Systems Operational</span>
+                    </div>
+                </div>
+                <div class="sidebar-version">
+                    <strong>PQ-VPN</strong> v1.0.0<br>
+                    Hybrid Classical & Post-Quantum
+                </div>
+            </div>
+        </aside>
+
+
+        <!-- ═══════════════════════════════════════════════════════════
+             TOP BAR
+             ═══════════════════════════════════════════════════════════ -->
+        <header class="topbar">
+            <div class="topbar-title">
+                <h1>Dashboard</h1>
+                <p>Secure. Private. <span>Post-Quantum.</span></p>
+            </div>
+            <div class="topbar-actions">
+                <div class="server-selector">
+                    <span>📍</span>
+                    <select id="server-select">
+                        <option value="fra-01">🇩🇪 Frankfurt, Germany</option>
+                    </select>
+                </div>
+                <button class="topbar-btn" title="Telemetry">📊</button>
+                <button class="topbar-btn" title="Settings">⚙️</button>
+            </div>
+        </header>
+
+
+        <!-- ═══════════════════════════════════════════════════════════
+             MAIN CONTENT
+             ═══════════════════════════════════════════════════════════ -->
+        <main class="main-content">
+
+            <!-- ─── TOP ROW: Connection Status + Live Telemetry ─── -->
+            <section class="dashboard-top">
+
+                <!-- Connection Status Card -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>Connection Status</h3>
+                    </div>
+                    <div class="connection-card">
+                        <!-- Left: Info -->
+                        <div class="connection-info">
+                            <div id="connection-state" class="connection-state disconnected">Disconnected</div>
+                            <div id="connection-subtitle" class="connection-subtitle">Not connected to any server</div>
+
+                            <div class="pq-badge" id="pq-badge" style="display: none;">
+                                🛡 Post-Quantum Secure
+                            </div>
+
+                            <div class="connection-details">
+                                <div class="detail-row">
+                                    <span class="detail-icon">⏱</span>
+                                    <span class="detail-label">Duration</span>
+                                    <span class="detail-value" id="detail-duration">00:00:00</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="detail-icon">🌐</span>
+                                    <span class="detail-label">VPN IP Address</span>
+                                    <span class="detail-value" id="detail-ip">—</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="detail-icon">📍</span>
+                                    <span class="detail-label">Server Location</span>
+                                    <span class="detail-value" id="detail-location">Frankfurt, Germany 🇩🇪</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="detail-icon">🔒</span>
+                                    <span class="detail-label">Protocol</span>
+                                    <span class="detail-value">KEMTLS 1.0</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="detail-icon">🌐</span>
+                                    <span class="detail-label">Network</span>
+                                    <span class="detail-value">Secure Tunnel</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="detail-icon">🔑</span>
+                                    <span class="detail-label">Next Key Rotation</span>
+                                    <span class="detail-value" id="detail-key-rotation">05:00</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Right: Hero Power Button -->
+                        <div class="hero-button-area">
+                            <div class="power-ring" id="power-ring" title="Click to connect/disconnect">
+                                <div class="power-ring-bg"></div>
+                                <div class="power-ring-glow"></div>
+                                <span class="power-icon">⏻</span>
+                            </div>
+                            <div id="hero-status-text" class="hero-status-text disconnected">DISCONNECTED</div>
+                            <div id="hero-status-sub" class="hero-status-sub">Click to connect</div>
+                            <button id="connect-btn" class="connect-btn connect">Connect</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Live Telemetry Card -->
+                <div class="card telemetry-card">
+                    <div class="card-header">
+                        <h3>Live Telemetry</h3>
+                        <div class="card-badge">
+                            Real-time <span class="live-dot" id="ws-indicator"></span>
+                        </div>
+                    </div>
+
+                    <!-- Bandwidth Section -->
+                    <div class="bandwidth-header">
+                        <h3>Bandwidth</h3>
+                        <span class="bandwidth-value" id="bandwidth-value">0 Mbps</span>
+                    </div>
+                    <div class="bandwidth-legend">
+                        <div class="legend-item">
+                            <span class="legend-dot download"></span>
+                            <span>Download</span>
+                        </div>
+                        <div class="legend-item">
+                            <span class="legend-dot upload"></span>
+                            <span>Upload</span>
+                        </div>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="bandwidth-chart"></canvas>
+                    </div>
+
+                    <!-- Latency & Packet Loss Mini Stats -->
+                    <div class="telemetry-mini-row">
+                        <div class="mini-stat">
+                            <div class="mini-stat-header">
+                                <h4>Latency</h4>
+                                <span class="mini-value" id="latency-value">0.0 ms</span>
+                            </div>
+                            <div class="mini-chart-container">
+                                <canvas id="latency-chart"></canvas>
+                            </div>
+                        </div>
+                        <div class="mini-stat">
+                            <div class="mini-stat-header">
+                                <h4>Packet Loss</h4>
+                                <span class="mini-value" id="loss-value" style="color: #F59E0B;">0.00%</span>
+                            </div>
+                            <div class="mini-chart-container">
+                                <canvas id="loss-chart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+
+            <!-- ─── BOTTOM ROW: Security + Crypto Stack + Activity ─── -->
+            <section class="dashboard-bottom">
+
+                <!-- Security Overview Card -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>Security Overview</h3>
+                    </div>
+                    <div class="security-list">
+                        <div class="security-item">
+                            <div class="security-icon encryption">🔐</div>
+                            <div class="security-info">
+                                <h4>Encryption</h4>
+                                <span>AES-256-GCM</span>
+                            </div>
+                            <span class="security-status active">ACTIVE</span>
+                        </div>
+                        <div class="security-item">
+                            <div class="security-icon key-exchange">🔑</div>
+                            <div class="security-info">
+                                <h4>Key Exchange</h4>
+                                <span>Hybrid (X25519 + Kyber768)</span>
+                            </div>
+                            <span class="security-status active">ACTIVE</span>
+                        </div>
+                        <div class="security-item">
+                            <div class="security-icon handshake">🤝</div>
+                            <div class="security-info">
+                                <h4>Handshake</h4>
+                                <span>Signature-Free KEMTLS</span>
+                            </div>
+                            <span class="security-status active">ACTIVE</span>
+                        </div>
+                        <div class="security-item">
+                            <div class="security-icon integrity">#</div>
+                            <div class="security-info">
+                                <h4>Integrity</h4>
+                                <span>HMAC-SHA256</span>
+                            </div>
+                            <span class="security-status active">ACTIVE</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Cryptographic Stack Card -->
+                <div class="card crypto-stack-card">
+                    <div class="card-header" style="width: 100%; align-self: flex-start;">
+                        <h3>Cryptographic Stack</h3>
+                        <span style="font-size: 1rem;">🛡</span>
+                    </div>
+
+                    <div class="crypto-columns">
+                        <!-- Classical Column -->
+                        <div class="crypto-column">
+                            <span class="crypto-column-title">Classical (X25519)</span>
+                            <div class="crypto-visual classical">🔐</div>
+                            <span class="crypto-name">Curves</span>
+                            <span class="crypto-sub">X25519 ECDH</span>
+                            <span class="crypto-status-badge active">ACTIVE</span>
+                        </div>
+
+                        <span class="crypto-plus">+</span>
+
+                        <!-- Post-Quantum Column -->
+                        <div class="crypto-column">
+                            <span class="crypto-column-title">Post-Quantum (Kyber768)</span>
+                            <div class="crypto-visual quantum">🔮</div>
+                            <span class="crypto-name">ML-KEM</span>
+                            <span class="crypto-sub">Kyber768 (NIST)</span>
+                            <span class="crypto-status-badge active">ACTIVE</span>
+                        </div>
+                    </div>
+
+                    <!-- Hybrid Security Level -->
+                    <div class="security-level">
+                        <div class="security-level-header">
+                            <span>Hybrid Security Level</span>
+                            <strong>MAXIMUM</strong>
+                        </div>
+                        <div class="security-bar">
+                            <div class="security-bar-fill" style="width: 100%;"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Recent Activity Card -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>Recent Activity</h3>
+                    </div>
+                    <div class="activity-list" id="activity-list">
+                        <!-- Dynamic content rendered by app.js -->
+                        <div class="activity-item">
+                            <span class="activity-time">—</span>
+                            <span class="activity-dot info"></span>
+                            <span class="activity-message">Waiting for connection...</span>
+                        </div>
+                    </div>
+                    <a href="#" class="view-logs-link" id="view-logs-link">
+                        View full logs →
+                    </a>
+                </div>
+            </section>
+        </main>
+
+
+        <!-- ═══════════════════════════════════════════════════════════
+             FOOTER STATUS BAR
+             ═══════════════════════════════════════════════════════════ -->
+        <footer class="footer">
+            <div class="footer-item">
+                <span class="footer-icon">🛡</span>
+                <span class="footer-label">Post-Quantum Protection</span>
+                <span class="footer-value enabled">Enabled</span>
+            </div>
+            <div class="footer-item">
+                <span class="footer-icon">🔑</span>
+                <span class="footer-label">Key Rotation</span>
+                <span class="footer-value" id="footer-key-rotation">Every 5 Minutes</span>
+            </div>
+            <div class="footer-item">
+                <span class="footer-icon">🔒</span>
+                <span class="footer-label">Protocol</span>
+                <span class="footer-value">KEMTLS 1.0</span>
+            </div>
+            <div class="footer-item">
+                <span class="footer-icon">⏱</span>
+                <span class="footer-label">Uptime</span>
+                <span class="footer-value" id="footer-uptime">00:00:00</span>
+            </div>
+            <div class="footer-item">
+                <span class="footer-icon">📡</span>
+                <span class="footer-label">Data Transferred</span>
+                <span class="footer-value" id="footer-data-sent">↑ 0 B</span>
+                <span class="footer-value" id="footer-data-recv">↓ 0 B</span>
+                <div class="footer-data-bars">
+                    <span style="height: 6px;"></span>
+                    <span style="height: 10px;"></span>
+                    <span style="height: 8px;"></span>
+                    <span style="height: 14px;"></span>
+                    <span style="height: 12px;"></span>
+                    <span style="height: 16px;"></span>
+                    <span style="height: 10px;"></span>
+                    <span style="height: 14px;"></span>
+                </div>
+            </div>
+        </footer>
+
     </div>
+
+    <!-- Application Logic -->
     <script src="js/app.js"></script>
 </body>
 </html>

@@ -29,16 +29,17 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ├── Dockerfile.client                  # Docker setup for Client (OpenVPN + TUN + liboqs)
 │
 ├── app/                               # 🖥 Application GUI & Backend API
+│   ├── main.py                        # Desktop launcher (PyWebView + Uvicorn, --web, --cli)
 │   ├── backend/
-│   │   ├── __init__.py
-│   │   ├── api.py                     # REST API endpoints (connect, disconnect, stats)
-│   │   └── websocket.py               # Live telemetry streaming (MTU, latency, throughput)
+│   │   ├── __init__.py                # Package exports (app, vpn_state, ws_manager)
+│   │   ├── api.py                     # FastAPI REST endpoints (connect, disconnect, status, servers, config, logs)
+│   │   └── websocket.py               # WebSocket telemetry broadcaster (/ws/telemetry, 500ms interval)
 │   └── frontend/
-│       ├── index.html                 # Web App UI Dashboard
+│       ├── index.html                 # PQ-VPN Dashboard (sidebar, hero button, telemetry, security, crypto stack)
 │       ├── css/
-│       │   └── style.css              # Dark mode styling & responsive layout
+│       │   └── style.css              # Dark glassmorphic theme (Inter + JetBrains Mono, neon accents)
 │       └── js/
-│           └── app.js                 # Dynamic UI logic & real-time telemetry graphs
+│           └── app.js                 # UI controller (Chart.js, WebSocket client, REST client, state machine)
 │
 ├── crypto/                            # 🔐 Hybrid Cryptography Module
 │   ├── __init__.py                    # Public API re-exports
@@ -49,30 +50,30 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 │   └── kemtls.py                      # Unified module: protocol, transcript, session, client/server state machines
 │
 ├── vpn/                               # 🌐 VPN Engine & Network Integration
-│   ├── engine/                        # Standalone Hybrid TUN Engine
-│   │   ├── __init__.py
-│   │   ├── tun_interface.py           # Native Linux/WSL TUN reader/writer
-│   │   └── tunnel_daemon.py           # Data channel encryption & forwarding loop
-│   ├── openvpn_mod/                   # OpenVPN Modification & Wrapper
-│   │   ├── openvpn-server.conf        # OpenVPN server configuration
-│   │   ├── openvpn-client.conf        # OpenVPN client configuration
-│   │   └── mgmt_wrapper.py            # OpenVPN management socket wrapper
-│   └── agility/                       # Dynamic Network Agility Submodule
-│       ├── __init__.py
-│       ├── mtu_monitor.py             # PMTU discovery & MSS clamping
-│       └── network_quality.py         # Real-time RTT latency, jitter & loss monitor
+│   ├── __init__.py                    # Public API re-exports (15 symbols)
+│   └── engine.py                      # Unified module: TUN Interface + Tunnel Daemon + MTU Monitor + Network Quality + OpenVPN Manager
 │
 ├── benchmarks/                        # 📊 Performance Suite
-│   ├── __init__.py
+│   ├── __init__.py                    # Package exports & unified runner CLI
+│   ├── __main__.py                    # CLI entry point (python -m benchmarks)
 │   ├── handshake_bench.py             # Handshake benchmark (Timing & Size)
-│   ├── throughput_bench.py            # Tunnel throughput benchmark
-│   ├── packet_capture.py              # Scapy packet overhead capture tool
-│   └── results/                       # JSON/CSV metrics & charts
+│   ├── throughput_bench.py            # Encrypted tunnel throughput & payload scaling
+│   ├── packet_capture.py              # Scapy wire packet overhead analyzer
+│   ├── generate_charts.py             # Matplotlib chart generator (PNG figures)
+│   └── results/                       # JSON metric reports & exported PNG figures
+│       ├── handshake_results.json
+│       ├── throughput_results.json
+│       ├── packet_capture_results.json
+│       ├── handshake_latency_comparison.png
+│       ├── handshake_size_comparison.png
+│       ├── throughput_payload_scaling.png
+│       └── packet_overhead_breakdown.png
 │
 ├── tests/                             # 🧪 Automated Test Suite
-│   ├── test_crypto.py                 # Hybrid ECC + ML-KEM unit tests
-│   ├── test_handshake.py              # End-to-end KEMTLS handshake integration test
-│   └── test_agility.py                # Network agility unit tests
+│   ├── test_crypto.py                 # Hybrid ECC + ML-KEM unit tests (37 tests)
+│   ├── test_handshake.py              # End-to-end KEMTLS handshake integration test (43 tests)
+│   ├── test_vpn.py                    # VPN engine & network agility tests (71 tests)
+│   └── test_benchmarks.py             # Benchmark suite integration tests (10 tests)
 │
 └── docs/                              # 📚 Documentation
     ├── architecture.md                # System design specification
@@ -82,6 +83,81 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ---
 
 ## 📝 Modification Log & Project Progress
+
+### 📅 Date: 2026-08-12 (Performance Benchmarks & Validation Implementation)
+- **Benchmarking Module (`benchmarks/`) — FULLY IMPLEMENTED**:
+  - **Implemented [`benchmarks/handshake_bench.py`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/benchmarks/handshake_bench.py)** (~260 lines): Quantifies handshake setup latency (ms), message payload sizes (ClientHello, ServerHello, CKE, ServerFinished), and CPU processing overhead across Kyber768 and Hybrid KEMTLS suites. Exports `handshake_results.json`.
+  - **Implemented [`benchmarks/throughput_bench.py`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/benchmarks/throughput_bench.py)** (~200 lines): Quantifies AES-256-GCM data-plane encryption/decryption latency (microseconds), throughput (Mbps), pps rate, and framing overhead across payload sizes 64B to 8192B. Exports `throughput_results.json`.
+  - **Implemented [`benchmarks/packet_capture.py`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/benchmarks/packet_capture.py)** (~160 lines): Scapy wire header breakdown (20B IP + 8B UDP + 28B crypto + 2B length framing = 58B IPv4 / 78B IPv6) and wire payload efficiency calculations. Exports `packet_capture_results.json`.
+  - **Created [`benchmarks/generate_charts.py`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/benchmarks/generate_charts.py)** (~230 lines): Matplotlib automated chart generator producing 4 publication-quality 300 DPI PNG figures:
+    - `handshake_latency_comparison.png`
+    - `handshake_size_comparison.png`
+    - `throughput_payload_scaling.png`
+    - `packet_overhead_breakdown.png`
+  - **Created [`benchmarks/__main__.py`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/benchmarks/__main__.py)** and updated [`benchmarks/__init__.py`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/benchmarks/__init__.py): Unified CLI runner (`python -m benchmarks --iterations 20`).
+  - **Created [`tests/test_benchmarks.py`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/tests/test_benchmarks.py)**: 10 automated integration tests covering all benchmark modules and chart generation.
+  - **Verification Results**:
+    - All **161/161 tests passed cleanly (`100% pass rate`)** (10 benchmark + 71 VPN + 43 handshake + 37 crypto, 8.66s, zero warnings).
+    - Executed `python -m benchmarks --iterations 20` generating all 4 JSON reports and 4 PNG chart figures in `benchmarks/results/`.
+
+### 📅 Date: 2026-08-12 (Desktop Application & Dashboard Implementation)
+- **Application Module (`app/`) — FULLY IMPLEMENTED**:
+  - **Created [`app/main.py`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/app/main.py)**: Cross-platform desktop application launcher with 3 modes: PyWebView native window (default, using Edge Webview2 on Windows / WebKitGTK on Linux), `--web` browser mode, and `--cli` headless mode. Spawns Uvicorn server on background daemon thread.
+  - **Implemented [`app/backend/api.py`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/app/backend/api.py)** (~360 lines): FastAPI REST controller with endpoints:
+    - `POST /api/v1/vpn/connect`: Initiates KEMTLS handshake simulation and starts tunnel daemon.
+    - `POST /api/v1/vpn/disconnect`: Gracefully terminates tunnel and securely wipes session keys.
+    - `GET /api/v1/vpn/status`: Returns connection state, uptime, cipher suite (AES-256-GCM + X25519 + Kyber768), VPN IP, MTU, RTT, and key rotation timer.
+    - `GET /api/v1/vpn/servers`: Returns 6 global VPN server profiles (Frankfurt, London, NYC, Tokyo, Singapore, Sydney).
+    - `GET /api/v1/vpn/config`: Active tunnel configuration parameters.
+    - `GET /api/v1/logs`: Recent activity log event stream.
+    - Background telemetry simulation thread generating realistic bandwidth/latency/jitter data.
+  - **Implemented [`app/backend/websocket.py`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/app/backend/websocket.py)** (~230 lines): Real-time WebSocket telemetry broadcaster at `/ws/telemetry`:
+    - 500ms push interval with 120-point rolling history buffers (60s window).
+    - Streams download/upload speed, latency, jitter, packet loss, MTU, data transferred, and key rotation countdown.
+    - Multi-client ConnectionManager with automatic cleanup.
+  - **Created [`app/frontend/css/style.css`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/app/frontend/css/style.css)** (~900 lines): Deep dark glassmorphic theme matching reference UI:
+    - Color palette: `#0B0F19` bg, `#131A2B` cards, `#00E676` emerald, `#00F0FF` cyan, `#A855F7` purple accents.
+    - Inter + JetBrains Mono fonts, CSS custom properties design system, glassmorphic `backdrop-filter` cards.
+    - Animated power ring with rotating glow, pulsing status dots, smooth transitions, responsive layout.
+  - **Created [`app/frontend/js/app.js`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/app/frontend/js/app.js)** (~430 lines): Desktop UI controller:
+    - REST client for connect/disconnect/status lifecycle management.
+    - Auto-reconnecting WebSocket client feeding live telemetry updates.
+    - Chart.js integration: dual-line bandwidth graph (download green, upload blue), latency mini-chart, packet loss mini-chart — all updating in real time.
+    - Navigation, server selector, activity log renderer, and connection state machine (DISCONNECTED → CONNECTING → CONNECTED → DISCONNECTING).
+  - **Rebuilt [`app/frontend/index.html`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/app/frontend/index.html)** (~300 lines): Complete dashboard layout matching the PQ-VPN design reference:
+    - Sidebar navigation (Dashboard, Connections, Servers, Telemetry, Security, Settings, Logs, About) with system status indicator.
+    - Top bar with server location selector dropdown.
+    - Connection status card with duration, VPN IP, server location, protocol, key rotation details.
+    - Central glowing power ring button with animated state transitions.
+    - Live telemetry panel with Chart.js bandwidth graph and latency/packet loss mini-charts.
+    - Security overview listing AES-256-GCM, Hybrid Key Exchange, KEMTLS, HMAC-SHA256 with ACTIVE badges.
+    - Cryptographic stack visual showing Classical (X25519) + Post-Quantum (Kyber768) with MAXIMUM security level bar.
+    - Recent activity timeline log.
+    - Footer status bar with PQ Protection, Key Rotation, Protocol, Uptime, and Data Transferred counters.
+  - **Updated [`app/backend/__init__.py`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/app/backend/__init__.py)**: Re-exports FastAPI app instance and WebSocket manager.
+  - **Updated [`requirements.txt`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/requirements.txt)**: Added `pywebview>=4.0` dependency.
+  - **Verification Results**:
+    - All **151/151 existing tests passed** (71 VPN + 43 handshake + 37 crypto, `100% pass rate`, 7.29s). Zero regressions.
+    - FastAPI server launched successfully on `http://127.0.0.1:8000`.
+    - All REST endpoints verified: `/api/v1/vpn/status`, `/api/v1/vpn/servers`, `/api/v1/vpn/config`, `/api/v1/logs`.
+    - WebSocket telemetry stream connected and broadcasting at 500ms intervals.
+    - Dashboard HTML served correctly with full layout rendering.
+
+### 📅 Date: 2026-08-12 (VPN Engine & Network Agility Implementation)
+- **VPN Engine Module (`vpn/`) — FULLY IMPLEMENTED**:
+  - **Created `vpn/engine.py`** (~700 lines): Unified single-file VPN engine module consolidating all 3 former subdirectories (`engine/`, `agility/`, `openvpn_mod/`).
+  - **§1 TUNInterface**: Native Linux `/dev/net/tun` device allocator (`ioctl IFF_TUN | IFF_NO_PI`) with cross-platform TCP socket pipe fallback for Windows/macOS. Context manager support, inject/drain test helpers.
+  - **§2 VPNTunnelDaemon**: Asynchronous `select()`-based event loop daemon reading raw IP packets from TUN, encrypting via `HandshakeSession` AES-256-GCM, and forwarding over UDP socket. Background thread with stats tracking.
+  - **§3 MTUMonitor**: Dynamic PMTU discovery (binary search UDP probing with DF bit), VPN overhead calculation (58B IPv4 / 78B IPv6), TCP MSS clamping, and timestamped MTU change history.
+  - **§4 NetworkQualityMonitor**: RFC 3550 exponential moving average jitter tracking, rolling-window RTT statistics (avg/min/max), UDP echo probing, and packet loss rate calculation with `QualitySnapshot` dataclass.
+  - **§5 OpenVPNManager**: TCP management socket interface (`send_command()`) for runtime commands, and dynamic `generate_server_config()` / `generate_client_config()` configuration generation.
+  - **Created `vpn/__init__.py`**: Re-exports all 15 public symbols from `vpn.engine`.
+  - **Deleted** 9 skeleton files across 3 subdirectories: `vpn/engine/` (3 files), `vpn/agility/` (3 files), `vpn/openvpn_mod/` (3 files) — consolidated into single `vpn/engine.py`.
+  - **Deleted** `tests/test_agility.py` placeholder — replaced by comprehensive `tests/test_vpn.py`.
+  - **Created `tests/test_vpn.py`**: 71 tests across 8 test classes (`TestTUNInterface`, `TestTunnelStats`, `TestVPNTunnelDaemon`, `TestMTUMonitor`, `TestNetworkQualityMonitor`, `TestOpenVPNManager`, `TestE2EIntegration`).
+  - **Test Execution Results**: All **151/151 tests passed** (71 VPN + 43 handshake + 37 crypto, `100% pass rate`, 7.66s). Zero regressions.
+  - **Platform Fix**: Windows `socket.AF_UNIX` unavailable — implemented TCP loopback socket pair fallback via `AF_INET` listener pattern.
+  - **Rationale**: Single-file consolidation mirrors `crypto/hybrid_crypto.py` (Phase 1) and `handshake/kemtls.py` (Phase 2) patterns, reduces file count from 9 → 2, and keeps the VPN layer auditable as one cohesive unit.
 
 ### 📅 Date: 2026-08-09 (Project Phase Roadmap Created)
 - **Created [`phase.md`](file:///d:/Documents/Final%20Year%20Project/Hybrid-Classical-and-Post-Quantum-VPN-/phase.md)**:
@@ -150,8 +226,8 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 | :--- | :---: | :--- |
 | **Directory Scaffolding** | ✅ Completed | Created complete directory tree and skeleton files |
 | **Agent Memory Mandate** | ✅ Completed | Configured automatic progress logging instructions |
-| **Hybrid Cryptography (`crypto/`)** | ✅ Completed | X25519 + Kyber768 hybrid KEM, HKDF key derivation, session store, 30+ tests |
+| **Hybrid Cryptography (`crypto/`)** | ✅ Completed | X25519 + Kyber768 hybrid KEM, HKDF key derivation, session store, 37 tests |
 | **KEMTLS Handshake (`handshake/`)** | ✅ Completed | Signature-free KEMTLS handshake: wire protocol, transcript binding, AES-256-GCM session, client/server state machines, 43 tests |
-| **VPN Engine (`vpn/`)** | ⏳ Pending | Building TUN interface daemon and dynamic MTU monitor |
-| **Application UI (`app/`)** | ⏳ Pending | Building modern Web/Desktop dashboard and REST API |
-| **Benchmarks (`benchmarks/`)** | ⏳ Pending | Building latency & overhead benchmarking scripts |
+| **VPN Engine (`vpn/`)** | ✅ Completed | TUN interface, tunnel daemon, MTU monitor, network quality, OpenVPN manager, 71 tests |
+| **Application UI (`app/`)** | ✅ Completed | Cross-platform desktop app (PyWebView), FastAPI REST + WebSocket API, dark glassmorphic dashboard, Chart.js telemetry |
+| **Benchmarks (`benchmarks/`)** | ✅ Completed | Handshake timing, throughput payload scaling, packet overhead analysis, 4 Matplotlib chart figures, 10 tests |

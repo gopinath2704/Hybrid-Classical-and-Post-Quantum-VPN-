@@ -1,0 +1,32 @@
+{
+  "ML-KEM-768 (Kyber768)": {
+    "suite_name": "ML-KEM-768 (Kyber768)",
+    "iterations": 20,
+    "avg_latency_ms": 0.258,
+    "median_latency_ms": 0.257,
+    "p95_latency_ms": 0.274,
+    "min_latency_ms": 0.248,
+    "max_latency_ms": 0.274,
+    "stddev_latency_ms": 0.008,
+    "avg_total_bytes": 4824,
+    "client_hello_bytes": 1286,
+    "server_hello_bytes": 2374,
+    "client_key_exchange_bytes": 1126,
+    "server_finished_bytes": 38
+  },
+  "Hybrid (X25519 + Kyber768)": {
+    "suite_name": "Hybrid (X25519 + Kyber768)",
+    "iterations": 20,
+    "avg_latency_ms": 0.257,
+    "median_latency_ms": 0.252,
+    "p95_latency_ms": 0.298,
+    "min_latency_ms": 0.247,
+    "max_latency_ms": 0.298,
+    "stddev_latency_ms": 0.013,
+    "avg_total_bytes": 4824,
+    "client_hello_bytes": 1286,
+    "server_hello_bytes": 2374,
+    "client_key_exchange_bytes": 1126,
+    "server_finished_bytes": 38
+  }
+}
