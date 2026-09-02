@@ -13,10 +13,10 @@ import json
 import pytest
 from pathlib import Path
 
-from benchmarks.handshake_bench import HandshakeBenchmark, SuiteSummary
-from benchmarks.throughput_bench import ThroughputBenchmark, PAYLOAD_SIZES
-from benchmarks.packet_capture import PacketOverheadAnalyzer
-from benchmarks.generate_charts import ChartGenerator
+from benchmarks.runner import HandshakeBenchmark, SuiteSummary
+from benchmarks.runner import ThroughputBenchmark, PAYLOAD_SIZES
+from benchmarks.runner import PacketOverheadAnalyzer
+from benchmarks.runner import ChartGenerator
 
 
 @pytest.fixture

@@ -6,12 +6,20 @@ server management, and configuration. Serves the frontend static files
 and provides the WebSocket telemetry endpoint.
 
 Endpoints:
-    POST /api/v1/vpn/connect      — Initiate KEMTLS handshake & start tunnel
-    POST /api/v1/vpn/disconnect   — Stop tunnel & clean session keys
-    GET  /api/v1/vpn/status       — Connection state, uptime, cipher info
+    POST /api/v1/vpn/connect      — Run KEMTLS handshake & start real tunnel
+    POST /api/v1/vpn/disconnect   — Stop tunnel & securely wipe session keys
+    POST /api/v1/vpn/rekey        — Trigger in-session key rotation
+    GET  /api/v1/vpn/status       — Connection state, real uptime, cipher info
     GET  /api/v1/vpn/servers      — Available VPN server list
     GET  /api/v1/vpn/config       — Active tunnel configuration
+    GET  /api/v1/crypto/status    — PQC library availability and mode flags
     GET  /api/v1/logs             — Recent activity log entries
+
+Security notes:
+    - PQC mode is fail-closed by default; set ALLOW_MOCK_PQC=1 for dev/testing
+    - Concurrent connect requests are rejected with HTTP 409 Conflict
+    - Disconnect securely zeroes all session key material in memory
+    - Key rotation derives forward-secret successor keys using HKDF ratchet
 """
 
 from __future__ import annotations
@@ -20,14 +28,17 @@ import os
 import sys
 import time
 import uuid
+import json
+import asyncio
 import logging
 import threading
 from pathlib import Path
+from collections import deque
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 from enum import Enum
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,7 +48,9 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from app.backend.websocket import router as ws_router
+from crypto.hybrid_crypto import get_crypto_status, ALLOW_MOCK_PQC, _OQS_AVAILABLE
+from vpn.engine import VPNService, ServiceState, VPNTelemetry
+from vpn.cli import VPNServerDaemon
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logger
@@ -46,15 +59,79 @@ logger = logging.getLogger("pqvpn.api")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Connection State Model
+# WebSocket Telemetry Manager & History Buffers
+# ─────────────────────────────────────────────────────────────────────────────
+
+MAX_HISTORY_POINTS = 120  # 60 seconds at 500ms intervals
+
+# Shared history deques (thread-safe append/popleft)
+download_history: deque[float] = deque(maxlen=MAX_HISTORY_POINTS)
+upload_history: deque[float] = deque(maxlen=MAX_HISTORY_POINTS)
+latency_history: deque[float] = deque(maxlen=MAX_HISTORY_POINTS)
+loss_history: deque[float] = deque(maxlen=MAX_HISTORY_POINTS)
+
+
+class ConnectionManager:
+    """
+    Manages active WebSocket connections for telemetry broadcasting.
+
+    Handles client connect/disconnect lifecycle and provides broadcast
+    capability to push telemetry frames to all connected clients.
+    """
+
+    def __init__(self) -> None:
+        self._active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket) -> None:
+        """Accept a new WebSocket connection."""
+        await websocket.accept()
+        self._active_connections.append(websocket)
+        logger.info(
+            "WebSocket client connected. Active: %d",
+            len(self._active_connections),
+        )
+
+    def disconnect(self, websocket: WebSocket) -> None:
+        """Remove a disconnected WebSocket client."""
+        if websocket in self._active_connections:
+            self._active_connections.remove(websocket)
+        logger.info(
+            "WebSocket client disconnected. Active: %d",
+            len(self._active_connections),
+        )
+
+    async def broadcast(self, data: dict) -> None:
+        """Send a JSON payload to all connected clients."""
+        message = json.dumps(data)
+        disconnected = []
+        for connection in self._active_connections:
+            try:
+                await connection.send_text(message)
+            except Exception:
+                disconnected.append(connection)
+        for conn in disconnected:
+            self.disconnect(conn)
+
+    @property
+    def client_count(self) -> int:
+        """Number of active WebSocket connections."""
+        return len(self._active_connections)
+
+
+ws_manager = ConnectionManager()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Connection State Model (API-facing enum)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ConnectionState(str, Enum):
-    """VPN connection lifecycle states."""
-    DISCONNECTED = "DISCONNECTED"
-    CONNECTING = "CONNECTING"
-    CONNECTED = "CONNECTED"
+    """VPN connection lifecycle states (API-facing)."""
+    DISCONNECTED  = "DISCONNECTED"
+    CONNECTING    = "CONNECTING"
+    CONNECTED     = "CONNECTED"
     DISCONNECTING = "DISCONNECTING"
+    ERROR         = "ERROR"
 
 
 @dataclass
@@ -80,62 +157,40 @@ class ActivityLogEntry:
     level: str = "info"  # info, warning, error, success
 
 
-@dataclass
-class VPNState:
-    """
-    Central VPN application state container.
-
-    Holds the current connection state, selected server, session metadata,
-    tunnel statistics, and recent activity logs. This is the single source
-    of truth for all API endpoints.
-    """
-    # Connection
-    connection_state: ConnectionState = ConnectionState.DISCONNECTED
-    session_id: str = ""
-    vpn_ip: str = ""
-    connected_at: Optional[float] = None
-    selected_server_id: str = "fra-01"
-
-    # Crypto info
-    cipher_suite: str = "AES-256-GCM"
-    key_exchange: str = "Hybrid (X25519 + Kyber768)"
-    handshake_protocol: str = "KEMTLS 1.0"
-    integrity: str = "HMAC-SHA256"
-    pqc_algorithm: str = "ML-KEM / Kyber768 (NIST)"
-    classical_algorithm: str = "X25519 ECDH"
-
-    # Key rotation
-    key_rotation_interval: int = 300  # 5 minutes
-    last_key_rotation: Optional[float] = None
-
-    # Tunnel stats (cumulative)
-    bytes_sent: int = 0
-    bytes_received: int = 0
-    packets_sent: int = 0
-    packets_received: int = 0
-    packets_dropped: int = 0
-
-    # Network quality
-    current_latency_ms: float = 0.0
-    current_jitter_ms: float = 0.0
-    current_loss_rate: float = 0.0
-    current_mtu: int = 1500
-    download_speed_mbps: float = 0.0
-    upload_speed_mbps: float = 0.0
-
-    # Activity log
-    activity_log: list = field(default_factory=list)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Global Application State
 # ─────────────────────────────────────────────────────────────────────────────
 
-# The single global VPN state instance
-vpn_state = VPNState()
+# The single global VPN service instance
+_vpn_service: VPNService = VPNService(key_rotation_interval=300)
 
-# Available VPN servers
+# A threading lock for API-level concurrency guard (connect/disconnect racing)
+_api_lock = threading.Lock()
+
+# Activity log (in-memory, max 200 entries)
+_activity_log: list[ActivityLogEntry] = []
+
+# Selected server ID (persisted across connect calls for status display)
+_selected_server_id: str = "local-test"
+
+# Optional embedded development server, enabled by app/main.py.  This makes
+# the Local Test Node usable from the dashboard without pretending that the
+# undeployed public profiles are reachable.
+_local_server: Optional[VPNServerDaemon] = None
+_local_server_thread: Optional[threading.Thread] = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Available VPN Servers
+# ─────────────────────────────────────────────────────────────────────────────
+
 SERVERS: list[ServerInfo] = [
+    ServerInfo(
+        id="local-test", name="Local Test Node",
+        location="Localhost (Testing)",
+        country="Local", flag="🖥️", host="127.0.0.1",
+        port=51820, load=0.0, latency_ms=0.1,
+    ),
     ServerInfo(
         id="fra-01", name="Frankfurt #1", location="Frankfurt, Germany",
         country="Germany", flag="🇩🇪", host="fra-01.pq-vpn.net",
@@ -171,8 +226,12 @@ SERVERS: list[ServerInfo] = [
 _server_map = {s.id: s for s in SERVERS}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _add_log(message: str, level: str = "info") -> None:
-    """Append an activity log entry to the global VPN state."""
+    """Append an activity log entry."""
     now = time.time()
     entry = ActivityLogEntry(
         timestamp=now,
@@ -180,82 +239,10 @@ def _add_log(message: str, level: str = "info") -> None:
         message=message,
         level=level,
     )
-    vpn_state.activity_log.insert(0, entry)
-    # Keep only the last 200 entries
-    if len(vpn_state.activity_log) > 200:
-        vpn_state.activity_log = vpn_state.activity_log[:200]
+    _activity_log.insert(0, entry)
+    if len(_activity_log) > 200:
+        _activity_log[:] = _activity_log[:200]
     logger.info("[%s] %s", level.upper(), message)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Background Telemetry Simulation Thread
-# ─────────────────────────────────────────────────────────────────────────────
-# In production, these values come from real VPNTunnelDaemon, MTUMonitor,
-# and NetworkQualityMonitor instances. For desktop demo / testing, we
-# simulate realistic-looking telemetry data.
-
-import random
-import math
-
-_telemetry_thread: Optional[threading.Thread] = None
-_telemetry_stop = threading.Event()
-
-
-def _simulate_telemetry() -> None:
-    """Background loop generating realistic VPN telemetry for the UI."""
-    t = 0
-    while not _telemetry_stop.is_set():
-        if vpn_state.connection_state == ConnectionState.CONNECTED:
-            # Simulate bandwidth with realistic fluctuation
-            base_download = 1.15  # Gbps
-            base_upload = 42.0    # Mbps
-            noise = math.sin(t * 0.1) * 0.15 + random.uniform(-0.05, 0.05)
-            vpn_state.download_speed_mbps = round(
-                (base_download + noise) * 1000, 1
-            )  # Convert to Mbps
-            vpn_state.upload_speed_mbps = round(
-                base_upload + random.uniform(-5, 5), 1
-            )
-
-            # Simulate latency
-            vpn_state.current_latency_ms = round(
-                23.6 + math.sin(t * 0.15) * 3.0 + random.uniform(-1, 1), 1
-            )
-            vpn_state.current_jitter_ms = round(
-                1.2 + random.uniform(-0.3, 0.3), 2
-            )
-            vpn_state.current_loss_rate = round(
-                max(0, 0.001 + random.uniform(-0.001, 0.002)), 4
-            )
-
-            # Accumulate data transfer
-            vpn_state.bytes_sent += random.randint(50000, 200000)
-            vpn_state.bytes_received += random.randint(200000, 800000)
-            vpn_state.packets_sent += random.randint(50, 200)
-            vpn_state.packets_received += random.randint(100, 400)
-
-            t += 1
-
-        _telemetry_stop.wait(0.5)
-
-
-def _start_telemetry_thread() -> None:
-    """Start the background telemetry simulation thread."""
-    global _telemetry_thread
-    _telemetry_stop.clear()
-    _telemetry_thread = threading.Thread(
-        target=_simulate_telemetry,
-        name="telemetry-sim",
-        daemon=True,
-    )
-    _telemetry_thread.start()
-
-
-def _stop_telemetry_thread() -> None:
-    """Stop the background telemetry simulation thread."""
-    _telemetry_stop.set()
-    if _telemetry_thread is not None:
-        _telemetry_thread.join(timeout=2.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -265,7 +252,10 @@ def _stop_telemetry_thread() -> None:
 app = FastAPI(
     title="PQ-VPN Controller API",
     version="1.0.0",
-    description="Hybrid Classical & Post-Quantum VPN Desktop Controller",
+    description=(
+        "Hybrid Classical & Post-Quantum VPN Desktop Controller. "
+        "Connects real KEMTLS handshakes to a live AES-256-GCM UDP tunnel."
+    ),
 )
 
 # CORS for local desktop webview
@@ -277,8 +267,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount WebSocket router
-app.include_router(ws_router)
 
 # Serve static frontend files
 _FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
@@ -286,15 +274,54 @@ _FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize telemetry thread and log application start."""
-    _start_telemetry_thread()
+    """Log application start and emit crypto status."""
+    crypto = get_crypto_status()
     _add_log("Application started — PQ-VPN Client", "success")
+    if not _OQS_AVAILABLE:
+        if ALLOW_MOCK_PQC:
+            _add_log(
+                "⚠️  INSECURE MOCK MODE: liboqs unavailable — "
+                "using SHA-based PQC simulation. NO quantum protection.",
+                "warning",
+            )
+        else:
+            _add_log(
+                "❌  PQC UNAVAILABLE: liboqs not installed. "
+                "Connect will fail unless ALLOW_MOCK_PQC=1 is set.",
+                "error",
+            )
+    else:
+        _add_log("✅  Native liboqs active — ML-KEM/Kyber768 quantum-safe.", "success")
+
+    if os.environ.get("AUTO_START_LOCAL_VPN_SERVER", "0") == "1":
+        global _local_server, _local_server_thread
+        _local_server = VPNServerDaemon(
+            bind_host="127.0.0.1",
+            bind_port=51820,
+            tun_name="pqvpn-server0",
+        )
+        _local_server_thread = threading.Thread(
+            target=_local_server.start,
+            name="pqvpn-local-test-server",
+            daemon=True,
+        )
+        _local_server_thread.start()
+        _add_log(
+            "Local Test Node started at 127.0.0.1:51820",
+            "success",
+        )
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Clean up background threads on shutdown."""
-    _stop_telemetry_thread()
+    """Clean up VPN connection on shutdown."""
+    if _vpn_service.state not in (ServiceState.DISCONNECTED, ServiceState.ERROR):
+        try:
+            _vpn_service.disconnect()
+        except Exception:
+            pass
+    if _local_server is not None:
+        _local_server.stop()
 
 
 # ─────────────────── Static File Serving ───────────────────
@@ -305,105 +332,161 @@ async def serve_index():
     return FileResponse(_FRONTEND_DIR / "index.html")
 
 
-# Mount static directories
 if (_FRONTEND_DIR / "css").exists():
     app.mount("/css", StaticFiles(directory=str(_FRONTEND_DIR / "css")), name="css")
 if (_FRONTEND_DIR / "js").exists():
     app.mount("/js", StaticFiles(directory=str(_FRONTEND_DIR / "js")), name="js")
 if (_FRONTEND_DIR / "assets").exists():
-    app.mount(
-        "/assets",
-        StaticFiles(directory=str(_FRONTEND_DIR / "assets")),
-        name="assets",
-    )
+    app.mount("/assets", StaticFiles(directory=str(_FRONTEND_DIR / "assets")), name="assets")
+
+
+# ─────────────────── Crypto Status Endpoint ───────────────────
+
+@app.get("/api/v1/crypto/status")
+async def crypto_status():
+    """
+    Return runtime PQC library availability status.
+
+    Clients should use this to display an accurate mode badge:
+    - native_liboqs: Real ML-KEM/Kyber768 — quantum-safe
+    - mock_sha_fallback: Insecure dev mock — NOT quantum-safe
+    - unavailable: liboqs not installed, connection will fail
+    """
+    return get_crypto_status()
 
 
 # ─────────────────── VPN Connection Endpoints ───────────────────
 
 @app.post("/api/v1/vpn/connect")
-async def vpn_connect(server_id: str = "fra-01"):
+async def vpn_connect(
+    server_id: str = "local-test",
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+):
     """
     Initiate a VPN connection to the specified server.
 
-    Runs the KEMTLS handshake, establishes session keys, and starts
-    the VPN tunnel daemon.
+    Performs a real KEMTLS handshake over TCP, allocates a TUN interface,
+    and starts the AES-256-GCM encrypted UDP tunnel daemon.
+
+    Rejects the request with HTTP 409 if a connection attempt is already
+    in progress or the tunnel is already active.
     """
-    if vpn_state.connection_state == ConnectionState.CONNECTED:
-        raise HTTPException(status_code=409, detail="Already connected")
+    global _selected_server_id
+
+    # Concurrency guard — reject if already connecting/connected/disconnecting
+    current_state = _vpn_service.state
+    if current_state in (
+        ServiceState.CONNECTING,
+        ServiceState.CONNECTED,
+        ServiceState.DISCONNECTING,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot connect: current state is {current_state!r}. "
+                   "Disconnect first.",
+        )
 
     if server_id not in _server_map:
-        raise HTTPException(status_code=404, detail=f"Server '{server_id}' not found")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Server '{server_id}' not found. "
+                   f"Available: {list(_server_map.keys())}",
+        )
 
     server = _server_map[server_id]
+    connect_host = host or server.host
+    connect_port = port or server.port
+    _selected_server_id = server_id
 
-    # Transition: DISCONNECTED → CONNECTING
-    vpn_state.connection_state = ConnectionState.CONNECTING
-    vpn_state.selected_server_id = server_id
-    vpn_state.session_id = uuid.uuid4().hex[:16].upper()
-    _add_log(f"Server selected — {server.host}", "info")
-    _add_log("Establishing secure tunnel... Negotiating hybrid keys", "info")
+    _add_log(f"Connecting to {server.name} — {connect_host}:{connect_port}", "info")
+    _add_log("Performing KEMTLS hybrid handshake (X25519 + Kyber768)…", "info")
 
-    # Simulate handshake delay (in production, this runs KEMTLSClient)
-    import asyncio
-    await asyncio.sleep(1.5)
+    # Run the blocking connect in a thread so we don't block the event loop
+    loop = asyncio.get_event_loop()
+    try:
+        telemetry: VPNTelemetry = await loop.run_in_executor(
+            None,
+            lambda: _vpn_service.connect(
+                host=connect_host,
+                port=connect_port,
+            ),
+        )
+    except Exception as exc:
+        error_msg = str(exc)
+        _add_log(f"Connection failed: {error_msg}", "error")
+        raise HTTPException(
+            status_code=503,
+            detail=f"VPN connection failed: {error_msg}",
+        )
 
-    # Transition: CONNECTING → CONNECTED
-    vpn_state.connection_state = ConnectionState.CONNECTED
-    vpn_state.connected_at = time.time()
-    vpn_state.vpn_ip = "10.8.0.14"
-    vpn_state.last_key_rotation = time.time()
-    vpn_state.current_mtu = 1500
-    vpn_state.bytes_sent = 0
-    vpn_state.bytes_received = 0
-    vpn_state.packets_sent = 0
-    vpn_state.packets_received = 0
-
+    crypto = get_crypto_status()
     _add_log(
-        f"Connected to {server.location} — KEMTLS Handshake Completed",
+        f"Connected — session {telemetry.session_id[:16]}… "
+        f"| PQC: {crypto['pqc_mode']} "
+        f"| TUN: {telemetry.tun_mode}",
         "success",
     )
 
     return {
         "status": "connected",
-        "session_id": vpn_state.session_id,
+        "session_id": telemetry.session_id,
         "server": server.location,
-        "vpn_ip": vpn_state.vpn_ip,
-        "protocol": vpn_state.handshake_protocol,
+        "vpn_ip": telemetry.vpn_ip,
+        "tun_mode": telemetry.tun_mode,
+        "pqc_mode": telemetry.pqc_mode,
+        "is_quantum_safe": telemetry.is_quantum_safe,
     }
 
 
 @app.post("/api/v1/vpn/disconnect")
 async def vpn_disconnect():
     """
-    Disconnect from the VPN and clean up session state.
+    Disconnect from the VPN tunnel.
 
-    Stops the tunnel daemon, securely wipes session keys, and resets
-    all telemetry counters.
+    Stops the tunnel daemon, closes the TUN interface, securely zeroes
+    all session keys in memory, and resets connection state.
     """
-    if vpn_state.connection_state == ConnectionState.DISCONNECTED:
+    if _vpn_service.state == ServiceState.DISCONNECTED:
         raise HTTPException(status_code=409, detail="Not connected")
 
-    vpn_state.connection_state = ConnectionState.DISCONNECTING
-    _add_log("Disconnecting... Cleaning session keys", "info")
+    _add_log("Disconnecting — wiping session keys…", "info")
 
-    # Simulate graceful shutdown
-    import asyncio
-    await asyncio.sleep(0.5)
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, _vpn_service.disconnect)
+    except Exception as exc:
+        _add_log(f"Disconnect error: {exc}", "error")
+        raise HTTPException(status_code=500, detail=str(exc))
 
-    # Reset state
-    vpn_state.connection_state = ConnectionState.DISCONNECTED
-    vpn_state.connected_at = None
-    vpn_state.session_id = ""
-    vpn_state.vpn_ip = ""
-    vpn_state.download_speed_mbps = 0.0
-    vpn_state.upload_speed_mbps = 0.0
-    vpn_state.current_latency_ms = 0.0
-    vpn_state.current_jitter_ms = 0.0
-    vpn_state.current_loss_rate = 0.0
-
-    _add_log("Disconnected — Session keys wiped securely", "success")
-
+    _add_log("Disconnected — session keys securely zeroed.", "success")
     return {"status": "disconnected"}
+
+
+@app.post("/api/v1/vpn/rekey")
+async def vpn_rekey():
+    """
+    Trigger in-session key rotation.
+
+    Derives forward-secret successor keys from the current session material,
+    installs them into the AES-256-GCM cipher, and securely zeros the old keys.
+
+    Returns the rekey nonce hex (for audit logging only — not a secret).
+    """
+    if _vpn_service.state != ServiceState.CONNECTED:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot rekey: not connected (state={_vpn_service.state!r})",
+        )
+
+    loop = asyncio.get_event_loop()
+    try:
+        nonce_hex = await loop.run_in_executor(None, _vpn_service.rotate_keys)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    _add_log(f"Key rotation complete — nonce={nonce_hex}…", "success")
+    return {"status": "rekeyed", "nonce": nonce_hex}
 
 
 @app.get("/api/v1/vpn/status")
@@ -411,30 +494,28 @@ async def vpn_status():
     """
     Get current VPN connection status and live metrics.
 
-    Returns connection state, uptime, server info, cipher suite details,
-    tunnel statistics, and network quality metrics.
+    Returns real tunnel stats, network quality measurements, and
+    cryptographic posture indicators. When connected, all values
+    are sourced from the live VPNTunnelDaemon and NetworkQualityMonitor.
+    No values are simulated.
     """
-    server = _server_map.get(vpn_state.selected_server_id)
-    uptime = 0.0
-    key_rotation_remaining = vpn_state.key_rotation_interval
+    telemetry = _vpn_service.get_telemetry()
+    server = _server_map.get(_selected_server_id)
 
-    if vpn_state.connected_at:
-        uptime = time.time() - vpn_state.connected_at
-    if vpn_state.last_key_rotation:
-        elapsed = time.time() - vpn_state.last_key_rotation
+    uptime = telemetry.uptime_seconds
+    key_rotation_remaining = 300.0
+    if telemetry.last_key_rotation:
+        elapsed = time.time() - telemetry.last_key_rotation
         key_rotation_remaining = max(
-            0, vpn_state.key_rotation_interval - elapsed
+            0.0, _vpn_service._key_rotation_interval - elapsed
         )
-        # Auto-rotate key timer
-        if key_rotation_remaining <= 0:
-            vpn_state.last_key_rotation = time.time()
-            key_rotation_remaining = vpn_state.key_rotation_interval
 
     return {
-        "connection_state": vpn_state.connection_state.value,
-        "session_id": vpn_state.session_id,
-        "vpn_ip": vpn_state.vpn_ip,
+        "connection_state": telemetry.state,
+        "session_id": telemetry.session_id,
+        "vpn_ip": telemetry.vpn_ip,
         "uptime_seconds": round(uptime, 1),
+        "is_simulated": False,
 
         # Server info
         "server": {
@@ -447,33 +528,40 @@ async def vpn_status():
 
         # Crypto suite
         "crypto": {
-            "cipher": vpn_state.cipher_suite,
-            "key_exchange": vpn_state.key_exchange,
-            "handshake": vpn_state.handshake_protocol,
-            "integrity": vpn_state.integrity,
-            "pqc_algorithm": vpn_state.pqc_algorithm,
-            "classical_algorithm": vpn_state.classical_algorithm,
+            "cipher": "AES-256-GCM",
+            "key_exchange": "Hybrid (X25519 + Kyber768)",
+            "handshake": "KEMTLS 1.0",
+            "integrity": "HMAC-SHA256",
+            "pqc_algorithm": "ML-KEM / Kyber768 (NIST)",
+            "classical_algorithm": "X25519 ECDH",
+            "pqc_mode": telemetry.pqc_mode,
+            "is_quantum_safe": telemetry.is_quantum_safe,
+            "tun_mode": telemetry.tun_mode,
             "key_rotation_remaining": round(key_rotation_remaining, 0),
+            "key_rotation_count": telemetry.key_rotation_count,
         },
 
-        # Tunnel stats
+        # Real tunnel stats
         "tunnel": {
-            "bytes_sent": vpn_state.bytes_sent,
-            "bytes_received": vpn_state.bytes_received,
-            "packets_sent": vpn_state.packets_sent,
-            "packets_received": vpn_state.packets_received,
-            "packets_dropped": vpn_state.packets_dropped,
+            "bytes_sent": telemetry.bytes_sent,
+            "bytes_received": telemetry.bytes_received,
+            "packets_sent": telemetry.packets_sent,
+            "packets_received": telemetry.packets_received,
+            "packets_dropped": telemetry.packets_dropped,
         },
 
-        # Network quality
+        # Real network quality
         "network": {
-            "download_mbps": vpn_state.download_speed_mbps,
-            "upload_mbps": vpn_state.upload_speed_mbps,
-            "latency_ms": vpn_state.current_latency_ms,
-            "jitter_ms": vpn_state.current_jitter_ms,
-            "loss_rate": vpn_state.current_loss_rate,
-            "mtu": vpn_state.current_mtu,
+            "download_mbps": telemetry.download_mbps,
+            "upload_mbps": telemetry.upload_mbps,
+            "latency_ms": telemetry.latency_ms,
+            "jitter_ms": telemetry.jitter_ms,
+            "loss_rate": telemetry.loss_rate,
+            "mtu": telemetry.mtu,
         },
+
+        # Error info
+        "error_message": telemetry.error_message,
     }
 
 
@@ -492,6 +580,7 @@ async def vpn_servers():
                 "port": s.port,
                 "load": s.load,
                 "latency_ms": s.latency_ms,
+                "is_test_node": s.id == "local-test",
             }
             for s in SERVERS
         ]
@@ -502,13 +591,15 @@ async def vpn_servers():
 async def vpn_config():
     """Return the active VPN tunnel configuration parameters."""
     return {
-        "cipher_suite": vpn_state.cipher_suite,
-        "key_exchange": vpn_state.key_exchange,
-        "handshake_protocol": vpn_state.handshake_protocol,
-        "integrity": vpn_state.integrity,
-        "key_rotation_interval": vpn_state.key_rotation_interval,
-        "mtu": vpn_state.current_mtu,
-        "selected_server": vpn_state.selected_server_id,
+        "cipher_suite": "AES-256-GCM",
+        "key_exchange": "Hybrid (X25519 + Kyber768)",
+        "handshake_protocol": "KEMTLS 1.0",
+        "integrity": "HMAC-SHA256",
+        "key_rotation_interval": _vpn_service._key_rotation_interval,
+        "selected_server": _selected_server_id,
+        "pqc_mode": get_crypto_status()["pqc_mode"],
+        "is_quantum_safe": _OQS_AVAILABLE,
+        "is_simulated": False,
     }
 
 
@@ -520,7 +611,7 @@ async def get_logs(limit: int = 50):
     Args:
         limit: Maximum number of log entries to return (default 50).
     """
-    entries = vpn_state.activity_log[:limit]
+    entries = _activity_log[:limit]
     return {
         "logs": [
             {
@@ -532,7 +623,164 @@ async def get_logs(limit: int = 50):
             for e in entries
         ]
     }
-"""
-REST API Module for Hybrid VPN Dashboard.
-Endpoints for starting/stopping VPN connection, retrieving status, and running benchmarks.
-"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WebSocket Telemetry Endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_telemetry_frame() -> dict:
+    """
+    Build a telemetry JSON frame from the live VPNService.
+
+    All values come from the real VPN tunnel daemon and network quality
+    monitor — no values are simulated or randomly generated.
+    """
+    t = _vpn_service.get_telemetry()
+    now = time.time()
+    crypto = get_crypto_status()
+
+    # Record history for charts
+    is_connected = t.state == "CONNECTED"
+    download_history.append(t.download_mbps if is_connected else 0.0)
+    upload_history.append(t.upload_mbps if is_connected else 0.0)
+    latency_history.append(t.latency_ms if is_connected else 0.0)
+    loss_history.append((t.loss_rate * 100) if is_connected else 0.0)
+
+    # Key rotation countdown
+    key_rotation_remaining = 300.0
+    if t.last_key_rotation:
+        elapsed = now - t.last_key_rotation
+        key_rotation_remaining = max(0.0, 300.0 - elapsed)
+
+    return {
+        "type": "telemetry",
+        "timestamp": round(now, 3),
+        "connection_state": t.state,
+        "uptime_seconds": round(t.uptime_seconds, 1),
+        "session_id": t.session_id,
+        "vpn_ip": t.vpn_ip,
+        "is_simulated": False,
+
+        # Bandwidth
+        "download_mbps": t.download_mbps,
+        "upload_mbps": t.upload_mbps,
+
+        # Network quality (real measurements)
+        "latency_ms": t.latency_ms,
+        "jitter_ms": t.jitter_ms,
+        "loss_rate": t.loss_rate,
+        "mtu": t.mtu,
+
+        # Tunnel stats (real counters from daemon)
+        "bytes_sent": t.bytes_sent,
+        "bytes_received": t.bytes_received,
+        "packets_sent": t.packets_sent,
+        "packets_received": t.packets_received,
+        "packets_dropped": t.packets_dropped,
+
+        # Key rotation
+        "key_rotation_remaining": round(key_rotation_remaining, 0),
+        "key_rotation_count": t.key_rotation_count,
+
+        # Crypto / mode transparency flags
+        "pqc_mode": t.pqc_mode or crypto["pqc_mode"],
+        "tun_mode": t.tun_mode,
+        "is_quantum_safe": t.is_quantum_safe,
+
+        # Time-series history arrays (for charts)
+        "download_history": list(download_history),
+        "upload_history": list(upload_history),
+        "latency_history": list(latency_history),
+        "loss_history": list(loss_history),
+    }
+
+
+@app.websocket("/ws/telemetry")
+async def telemetry_websocket(websocket: WebSocket):
+    """
+    Live telemetry WebSocket endpoint.
+
+    Pushes telemetry frames to the client every 500ms while connected.
+    The client can send JSON control messages (e.g. change update rate).
+    """
+    await ws_manager.connect(websocket)
+
+    try:
+        while True:
+            # Build and send telemetry frame
+            frame = _build_telemetry_frame()
+            try:
+                await websocket.send_text(json.dumps(frame))
+            except Exception:
+                break
+
+            # Wait 500ms, also listen for client messages
+            try:
+                msg = await asyncio.wait_for(
+                    websocket.receive_text(), timeout=0.5
+                )
+                try:
+                    control = json.loads(msg)
+                    logger.debug("WS control message: %s", control)
+                except json.JSONDecodeError:
+                    pass
+            except asyncio.TimeoutError:
+                pass  # Normal — no message received, continue streaming
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.warning("WebSocket error: %s", e)
+    finally:
+        ws_manager.disconnect(websocket)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vpn_state compatibility shim
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _VPNStateProxy:
+    """
+    Compatibility shim that forwards attribute reads to the live VPNTelemetry.
+    """
+
+    @property
+    def connection_state(self) -> ConnectionState:
+        s = _vpn_service.state
+        _map = {
+            ServiceState.DISCONNECTED:  ConnectionState.DISCONNECTED,
+            ServiceState.CONNECTING:    ConnectionState.CONNECTING,
+            ServiceState.CONNECTED:     ConnectionState.CONNECTED,
+            ServiceState.DISCONNECTING: ConnectionState.DISCONNECTING,
+            ServiceState.ERROR:         ConnectionState.ERROR,
+        }
+        return _map.get(s, ConnectionState.DISCONNECTED)
+
+    def __getattr__(self, name: str):
+        t = _vpn_service.get_telemetry()
+        mapping = {
+            "session_id": t.session_id,
+            "vpn_ip": t.vpn_ip,
+            "connected_at": t.connected_at,
+            "download_speed_mbps": t.download_mbps,
+            "upload_speed_mbps": t.upload_mbps,
+            "current_latency_ms": t.latency_ms,
+            "current_jitter_ms": t.jitter_ms,
+            "current_loss_rate": t.loss_rate,
+            "current_mtu": t.mtu,
+            "bytes_sent": t.bytes_sent,
+            "bytes_received": t.bytes_received,
+            "packets_sent": t.packets_sent,
+            "packets_received": t.packets_received,
+            "packets_dropped": t.packets_dropped,
+            "key_rotation_interval": t.key_rotation_interval,
+            "last_key_rotation": t.last_key_rotation,
+        }
+        if name in mapping:
+            return mapping[name]
+        raise AttributeError(f"_VPNStateProxy has no attribute {name!r}")
+
+
+# Global proxy instance
+vpn_state = _VPNStateProxy()

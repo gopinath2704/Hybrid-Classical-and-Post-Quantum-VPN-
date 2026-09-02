@@ -90,12 +90,23 @@
                 <p>Secure. Private. <span>Post-Quantum.</span></p>
             </div>
             <div class="topbar-actions">
+                <!-- Operation mode badge: updated by JS from /api/v1/crypto/status -->
+                <div class="mode-badge-group">
+                    <span class="mode-badge" id="badge-tun-mode" title="TUN interface mode">TUN: —</span>
+                    <span class="mode-badge" id="badge-pqc-mode" title="Post-quantum cryptography mode">PQC: —</span>
+                </div>
                 <div class="server-selector">
                     <span>📍</span>
                     <select id="server-select">
-                        <option value="fra-01">🇩🇪 Frankfurt, Germany</option>
+                        <option value="local-test">🖥️ Localhost (Testing)</option>
                     </select>
                 </div>
+                <!-- Custom server override -->
+                <div class="custom-server-group" id="custom-server-group" style="display:none;">
+                    <input id="custom-host" class="custom-input" type="text" placeholder="host / IP" />
+                    <input id="custom-port" class="custom-input custom-port" type="number" placeholder="port" value="51820" min="1" max="65535" />
+                </div>
+                <button class="topbar-btn" id="toggle-custom-server" title="Custom server">✏️</button>
                 <button class="topbar-btn" title="Telemetry">📊</button>
                 <button class="topbar-btn" title="Settings">⚙️</button>
             </div>
@@ -121,8 +132,11 @@
                             <div id="connection-state" class="connection-state disconnected">Disconnected</div>
                             <div id="connection-subtitle" class="connection-subtitle">Not connected to any server</div>
 
-                            <div class="pq-badge" id="pq-badge" style="display: none;">
-                                🛡 Post-Quantum Secure
+                            <!-- Dynamic mode badges -->
+                            <div class="pq-badge-group" id="pq-badge-group" style="display: none;">
+                                <div class="pq-badge pq-badge--live" id="pq-badge-live">🛡 Quantum-Safe LIVE</div>
+                                <div class="pq-badge pq-badge--emulated" id="pq-badge-emulated" style="display:none;">🔧 TUN EMULATED</div>
+                                <div class="pq-badge pq-badge--mock" id="pq-badge-mock" style="display:none;">⚠️ MOCK PQC — NOT SECURE</div>
                             </div>
 
                             <div class="connection-details">
@@ -139,7 +153,7 @@
                                 <div class="detail-row">
                                     <span class="detail-icon">📍</span>
                                     <span class="detail-label">Server Location</span>
-                                    <span class="detail-value" id="detail-location">Frankfurt, Germany 🇩🇪</span>
+                                    <span class="detail-value" id="detail-location">—</span>
                                 </div>
                                 <div class="detail-row">
                                     <span class="detail-icon">🔒</span>
@@ -148,13 +162,18 @@
                                 </div>
                                 <div class="detail-row">
                                     <span class="detail-icon">🌐</span>
-                                    <span class="detail-label">Network</span>
-                                    <span class="detail-value">Secure Tunnel</span>
+                                    <span class="detail-label">TUN Mode</span>
+                                    <span class="detail-value" id="detail-tun-mode">—</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="detail-icon">⚛️</span>
+                                    <span class="detail-label">PQC Mode</span>
+                                    <span class="detail-value" id="detail-pqc-mode">—</span>
                                 </div>
                                 <div class="detail-row">
                                     <span class="detail-icon">🔑</span>
                                     <span class="detail-label">Next Key Rotation</span>
-                                    <span class="detail-value" id="detail-key-rotation">05:00</span>
+                                    <span class="detail-value" id="detail-key-rotation">—</span>
                                 </div>
                             </div>
                         </div>

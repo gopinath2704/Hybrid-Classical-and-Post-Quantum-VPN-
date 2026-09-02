@@ -1,8 +1,8 @@
 """
 Performance Benchmarking Suite — Public API & Unified Runner.
 
-Re-exports all benchmark components and provides a unified CLI entry point
-to run handshake timing, throughput, packet overhead analysis, and chart generation:
+Re-exports all benchmark components from the unified runner module
+and provides a CLI entry point:
 
     python -m benchmarks --all
     python -m benchmarks --iterations 50
@@ -14,10 +14,18 @@ import argparse
 import logging
 from pathlib import Path
 
-from benchmarks.handshake_bench import HandshakeBenchmark, HandshakeMetric, SuiteSummary
-from benchmarks.throughput_bench import ThroughputBenchmark, PayloadResult, PAYLOAD_SIZES
-from benchmarks.packet_capture import PacketOverheadAnalyzer, LayerOverhead, PacketEfficiencyResult
-from benchmarks.generate_charts import ChartGenerator
+from benchmarks.runner import (
+    HandshakeBenchmark,
+    HandshakeMetric,
+    SuiteSummary,
+    ThroughputBenchmark,
+    PayloadResult,
+    PAYLOAD_SIZES,
+    PacketOverheadAnalyzer,
+    LayerOverhead,
+    PacketEfficiencyResult,
+    ChartGenerator,
+)
 
 __all__ = [
     "HandshakeBenchmark",

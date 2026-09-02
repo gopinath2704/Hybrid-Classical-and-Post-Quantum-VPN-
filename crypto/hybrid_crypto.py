@@ -2,16 +2,27 @@
 Hybrid Classical + Post-Quantum Cryptography — Unified Module.
 
 Consolidates all cryptographic primitives into a single file:
-    1. ECCProvider       — Classical X25519 ECDH key exchange
-    2. PQCProvider       — Post-Quantum ML-KEM (Kyber) via liboqs (+ software fallback)
-    3. KeyManager        — HKDF-SHA256 key derivation
-    4. SessionKeyStore   — In-memory session key storage with secure revocation
-    5. HybridKEM         — Combined hybrid key exchange orchestrator
+    1. ECCProvider           — Classical X25519 ECDH key exchange
+    2. PQCProvider           — Post-Quantum ML-KEM (Kyber) via liboqs (fail-closed)
+    3. KeyManager            — HKDF-SHA256 key derivation + rekeying support
+    4. SessionKeyStore       — In-memory session key storage with secure revocation
+    5. HybridKEM             — Combined hybrid key exchange orchestrator
 
 Security model:
     The hybrid approach concatenates classical and post-quantum shared secrets
     and feeds them through HKDF-SHA256. The resulting session key is secure as
     long as *at least one* of the two primitives remains unbroken.
+
+Fail-closed PQC policy:
+    When native liboqs is unavailable, `PQCProvider` raises `PQCUnavailableError`
+    by default.  Set the environment variable `ALLOW_MOCK_PQC=1` **only** during
+    development/testing to enable the insecure SHA-based mock fallback.  When the
+    mock is active every API call returns `is_quantum_safe=False` and a
+    `security_warning` field.  Production deployments MUST install native liboqs.
+
+Installing liboqs-python:
+    pip install liboqs-python          # may require cmake + gcc
+    # or build from source: https://github.com/open-quantum-safe/liboqs-python
 """
 
 from __future__ import annotations
@@ -20,6 +31,7 @@ import os
 import time
 import ctypes
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -33,6 +45,30 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+_logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# §0  PQC Availability — Fail-Closed Enforcement
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PQCUnavailableError(RuntimeError):
+    """
+    Raised when native liboqs is required but not available.
+
+    Install liboqs-python and its native C library to use real post-quantum
+    cryptography.  During testing only, set environment variable
+    ``ALLOW_MOCK_PQC=1`` to enable the insecure SHA-based mock fallback.
+
+    WARNING: The mock fallback provides NO quantum security whatsoever.  It
+    exists only to allow unit tests to run without the native library.
+    """
+
+
+# Allow mock only when explicitly opted-in via environment variable.
+# Default (unset or "0") is fail-closed: raise PQCUnavailableError.
+ALLOW_MOCK_PQC: bool = os.environ.get("ALLOW_MOCK_PQC", "0").strip() == "1"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -174,60 +210,108 @@ KYBER_PARAMS = {
 
 _OQS_AVAILABLE = False
 _oqs_module = None
+_OQS_LOAD_ERROR: Optional[str] = None
 
 try:
-    import oqs as _oqs_module
-    if hasattr(_oqs_module, "KeyEncapsulation"):
-        with _oqs_module.KeyEncapsulation("Kyber768") as _test_kem:
-            _OQS_AVAILABLE = True
-except BaseException:
-    _OQS_AVAILABLE = False
+    import oqs as _oqs_module  # type: ignore[import-untyped]
+    if not hasattr(_oqs_module, "KeyEncapsulation"):
+        raise ImportError(
+            "oqs module loaded but KeyEncapsulation class is missing — "
+            "the installed liboqs-python may be incomplete or mismatched."
+        )
+    with _oqs_module.KeyEncapsulation("Kyber768") as _test_kem:
+        _OQS_AVAILABLE = True
+    _logger.debug("liboqs loaded successfully — native ML-KEM active.")
+except (ImportError, ModuleNotFoundError) as _e:
+    _OQS_LOAD_ERROR = f"liboqs-python not installed: {_e}"
+    _logger.warning(
+        "[PQC] liboqs-python not installed. %s. "
+        "Set ALLOW_MOCK_PQC=1 for insecure dev-only mock fallback.",
+        _OQS_LOAD_ERROR,
+    )
+    _oqs_module = None
+except AttributeError as _e:
+    _OQS_LOAD_ERROR = f"liboqs-python API mismatch: {_e}"
+    _logger.error(
+        "[PQC] liboqs API mismatch — library may be corrupt or wrong version: %s",
+        _OQS_LOAD_ERROR,
+    )
+    _oqs_module = None
+except Exception as _e:
+    _OQS_LOAD_ERROR = f"liboqs initialisation failed: {_e}"
+    _logger.error(
+        "[PQC] Unexpected error loading liboqs: %s", _OQS_LOAD_ERROR
+    )
     _oqs_module = None
 
 
-class _SoftwarePQCProvider:
+class _MockInsecurePQCProvider:
     """
-    Pure Python software fallback for ML-KEM when native liboqs C library is unavailable.
-    Uses SHA-256 key-derivation to simulate Kyber KEM behavior with exact wire lengths.
+    DEV/TEST ONLY — SHA-based mock of ML-KEM KEM interface.
+
+    WARNING: This provider performs NO real post-quantum cryptography.
+    Key material is derived from SHA-256/SHA-512 hashes and provides
+    ZERO quantum security.  It exists solely to allow the test suite to
+    run without native liboqs installed.
+
+    This class MUST NOT be used in any production or security-sensitive
+    context.  Every method returns `is_quantum_safe=False` in its details
+    and logs a prominent warning.
     """
+
+    _SECURITY_WARNING = (
+        "INSECURE_MOCK_DO_NOT_USE_IN_PRODUCTION — "
+        "SHA-based pseudo-KEM, provides NO quantum security"
+    )
 
     def __init__(self, algorithm: str) -> None:
         self.algorithm = algorithm
         self.params = KYBER_PARAMS[algorithm]
+        _logger.warning(
+            "[PQC] *** MOCK INSECURE PROVIDER ACTIVE *** "
+            "Algorithm %s is being simulated with SHA hashes. "
+            "This provides NO quantum-safe protection.",
+            algorithm,
+        )
 
     def generate_keypair(self) -> tuple[bytes, bytes]:
         params = self.params
         seed = os.urandom(32)
-        # Derive public key & secret key deterministically from seed
-        pk_raw = hashlib.sha512(b"PQC_PK_" + seed).digest()
-        sk_raw = hashlib.sha512(b"PQC_SK_" + seed).digest()
-
-        # Pad to spec lengths
-        public_key = (pk_raw * (params["public_key_length"] // len(pk_raw) + 1))[:params["public_key_length"]]
-        secret_key = seed + (sk_raw * (params["secret_key_length"] // len(sk_raw) + 1))[:params["secret_key_length"] - 32]
+        pk_raw = hashlib.sha512(b"MOCK_PQC_PK_" + seed).digest()
+        sk_raw = hashlib.sha512(b"MOCK_PQC_SK_" + seed).digest()
+        public_key = (
+            pk_raw * (params["public_key_length"] // len(pk_raw) + 1)
+        )[: params["public_key_length"]]
+        secret_key = seed + (
+            sk_raw * (params["secret_key_length"] // len(sk_raw) + 1)
+        )[: params["secret_key_length"] - 32]
         return secret_key, public_key
 
     def encapsulate(self, peer_public_key: bytes) -> tuple[bytes, bytes]:
         params = self.params
         ephemeral = os.urandom(32)
-
-        # Derive shared secret and ciphertext
-        shared_secret = hashlib.sha256(b"PQC_SS_" + ephemeral + peer_public_key[:32]).digest()
-        ct_raw = hashlib.sha512(b"PQC_CT_" + ephemeral + peer_public_key[:32]).digest()
-
-        ciphertext = ephemeral + (ct_raw * (params["ciphertext_length"] // len(ct_raw) + 1))[:params["ciphertext_length"] - 32]
+        shared_secret = hashlib.sha256(
+            b"MOCK_PQC_SS_" + ephemeral + peer_public_key[:32]
+        ).digest()
+        ct_raw = hashlib.sha512(
+            b"MOCK_PQC_CT_" + ephemeral + peer_public_key[:32]
+        ).digest()
+        ciphertext = ephemeral + (
+            ct_raw * (params["ciphertext_length"] // len(ct_raw) + 1)
+        )[: params["ciphertext_length"] - 32]
         return ciphertext, shared_secret
 
     def decapsulate(self, secret_key: bytes, ciphertext: bytes) -> bytes:
         seed = secret_key[:32]
         ephemeral = ciphertext[:32]
-
-        pk_raw = hashlib.sha512(b"PQC_PK_" + seed).digest()
+        pk_raw = hashlib.sha512(b"MOCK_PQC_PK_" + seed).digest()
         params = self.params
-        public_key_prefix = (pk_raw * (params["public_key_length"] // len(pk_raw) + 1))[:32]
-
-        shared_secret = hashlib.sha256(b"PQC_SS_" + ephemeral + public_key_prefix).digest()
-        return shared_secret
+        public_key_prefix = (
+            pk_raw * (params["public_key_length"] // len(pk_raw) + 1)
+        )[:32]
+        return hashlib.sha256(
+            b"MOCK_PQC_SS_" + ephemeral + public_key_prefix
+        ).digest()
 
     def get_algorithm_details(self) -> dict:
         p = self.params
@@ -238,7 +322,9 @@ class _SoftwarePQCProvider:
             "secret_key_length": p["secret_key_length"],
             "ciphertext_length": p["ciphertext_length"],
             "shared_secret_length": p["shared_secret_length"],
-            "provider": "software_fallback",
+            "provider": "mock_sha_fallback",
+            "is_quantum_safe": False,
+            "security_warning": self._SECURITY_WARNING,
         }
 
 
@@ -261,7 +347,19 @@ class PQCProvider:
         assert shared_secret_sender == shared_secret_receiver
     """
 
-    def __init__(self, algorithm: str = "Kyber768") -> None:
+    def __init__(
+        self,
+        algorithm: str = "Kyber768",
+        allow_mock: bool = False,
+    ) -> None:
+        """
+        Args:
+            algorithm:  ML-KEM variant — 'Kyber512', 'Kyber768', or 'Kyber1024'.
+            allow_mock: If True, allow the insecure SHA-based mock fallback
+                        when native liboqs is unavailable.  Has no effect when
+                        native liboqs is present.  Defaults to False (fail-closed).
+                        The global ``ALLOW_MOCK_PQC`` env variable also enables this.
+        """
         if algorithm not in SUPPORTED_ALGORITHMS:
             raise ValueError(
                 f"Unsupported algorithm '{algorithm}'. "
@@ -269,13 +367,23 @@ class PQCProvider:
             )
         self.algorithm = algorithm
         self._use_native = _OQS_AVAILABLE
+
         if not self._use_native:
-            self._fallback = _SoftwarePQCProvider(algorithm)
+            _mock_enabled = allow_mock or ALLOW_MOCK_PQC
+            if not _mock_enabled:
+                raise PQCUnavailableError(
+                    f"Native liboqs is required but not available. "
+                    f"Reason: {_OQS_LOAD_ERROR or 'unknown'}. "
+                    f"Install liboqs-python with its native C library, or set "
+                    f"ALLOW_MOCK_PQC=1 to enable an insecure SHA-based mock "
+                    f"(development/testing only — provides NO quantum security)."
+                )
+            self._mock = _MockInsecurePQCProvider(algorithm)
 
     def generate_keypair(self) -> tuple[bytes, bytes]:
         """Generate a fresh ML-KEM keypair."""
         if not self._use_native:
-            return self._fallback.generate_keypair()
+            return self._mock.generate_keypair()
 
         with _oqs_module.KeyEncapsulation(self.algorithm) as kem:
             public_key = kem.generate_keypair()
@@ -285,7 +393,7 @@ class PQCProvider:
     def encapsulate(self, peer_public_key: bytes) -> tuple[bytes, bytes]:
         """Encapsulate: generate a shared secret and ciphertext for the peer."""
         if not self._use_native:
-            return self._fallback.encapsulate(peer_public_key)
+            return self._mock.encapsulate(peer_public_key)
 
         with _oqs_module.KeyEncapsulation(self.algorithm) as kem:
             ciphertext, shared_secret = kem.encap_secret(peer_public_key)
@@ -294,16 +402,21 @@ class PQCProvider:
     def decapsulate(self, secret_key: bytes, ciphertext: bytes) -> bytes:
         """Decapsulate: recover the shared secret from ciphertext."""
         if not self._use_native:
-            return self._fallback.decapsulate(secret_key, ciphertext)
+            return self._mock.decapsulate(secret_key, ciphertext)
 
         with _oqs_module.KeyEncapsulation(self.algorithm, secret_key) as kem:
             shared_secret = kem.decap_secret(ciphertext)
         return shared_secret
 
+    @property
+    def is_quantum_safe(self) -> bool:
+        """True only when backed by the native liboqs C library."""
+        return self._use_native
+
     def get_algorithm_details(self) -> dict:
         """Return detailed information about the configured algorithm."""
         if not self._use_native:
-            return self._fallback.get_algorithm_details()
+            return self._mock.get_algorithm_details()
 
         nist_levels = {
             "Kyber512": 1,
@@ -320,6 +433,7 @@ class PQCProvider:
             "ciphertext_length": details["length_ciphertext"],
             "shared_secret_length": details["length_shared_secret"],
             "provider": "native_liboqs",
+            "is_quantum_safe": True,
         }
 
 
@@ -448,6 +562,61 @@ class KeyManager:
             bytes: Random salt.
         """
         return os.urandom(size)
+
+    def derive_rekey_material(
+        self,
+        current_key: bytes,
+        rekey_nonce: bytes,
+        info: bytes = b"hybrid-vpn-rekey",
+        length: int = DEFAULT_KEY_LENGTH,
+    ) -> bytes:
+        """
+        Derive a new key from an existing key for in-session rekeying.
+
+        Uses the current session key as HKDF input keying material combined
+        with a fresh random nonce to produce a forward-secret successor key.
+        After calling this, the caller should securely erase the old key.
+
+        Args:
+            current_key:  The current session key (will be used as IKM).
+            rekey_nonce:  A fresh random nonce (≥16 bytes) to ensure uniqueness.
+            info:         HKDF context label (default b"hybrid-vpn-rekey").
+            length:       Output key length in bytes (default 32).
+
+        Returns:
+            bytes: New derived key for use as successor session key.
+        """
+        if len(rekey_nonce) < 16:
+            raise ValueError("rekey_nonce must be at least 16 bytes")
+        # Use the nonce as salt so each rekeying round is independent
+        return self.derive_key(current_key, salt=rekey_nonce, info=info, length=length)
+
+    def derive_rekey_pair(
+        self,
+        current_enc_key: bytes,
+        rekey_nonce: bytes,
+    ) -> tuple[bytes, bytes]:
+        """
+        Derive new encryption + MAC keys for in-session rekeying.
+
+        Both keys use the same rekey_nonce so they are bound together.
+
+        Args:
+            current_enc_key: The current AES encryption key (used as IKM).
+            rekey_nonce:     A fresh random nonce (≥16 bytes).
+
+        Returns:
+            tuple: (new_encryption_key, new_mac_key) — both 32 bytes.
+        """
+        new_enc = self.derive_rekey_material(
+            current_enc_key, rekey_nonce,
+            info=b"hybrid-vpn-rekey-enc",
+        )
+        new_mac = self.derive_rekey_material(
+            current_enc_key, rekey_nonce,
+            info=b"hybrid-vpn-rekey-mac",
+        )
+        return new_enc, new_mac
 
 
 class SessionKeyStore:
@@ -628,15 +797,21 @@ class HybridKEM:
         assert session_key_client == session_key_server
     """
 
-    def __init__(self, pqc_algorithm: str = "Kyber768") -> None:
+    def __init__(
+        self,
+        pqc_algorithm: str = "Kyber768",
+        allow_mock_pqc: bool = False,
+    ) -> None:
         """
         Initialise the hybrid KEM.
 
         Args:
-            pqc_algorithm: ML-KEM variant — 'Kyber512', 'Kyber768', or 'Kyber1024'.
+            pqc_algorithm:   ML-KEM variant — 'Kyber512', 'Kyber768', or 'Kyber1024'.
+            allow_mock_pqc:  Forward to PQCProvider — enables insecure mock fallback
+                             when liboqs is unavailable.  Dev/testing only.
         """
         self.ecc = ECCProvider()
-        self.pqc = PQCProvider(algorithm=pqc_algorithm)
+        self.pqc = PQCProvider(algorithm=pqc_algorithm, allow_mock=allow_mock_pqc)
         self.key_manager = KeyManager()
         self.pqc_algorithm = pqc_algorithm
 
@@ -787,4 +962,27 @@ class HybridKEM:
         }
 
 
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level availability summary (for logging / status endpoints)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_crypto_status() -> dict:
+    """
+    Return a dictionary describing the runtime cryptographic capability.
+
+    This is used by the API and UI to display accurate mode indicators.
+    """
+    return {
+        "liboqs_available": _OQS_AVAILABLE,
+        "pqc_mode": "native_liboqs" if _OQS_AVAILABLE else (
+            "mock_sha_fallback" if ALLOW_MOCK_PQC else "unavailable"
+        ),
+        "is_quantum_safe": _OQS_AVAILABLE,
+        "allow_mock_pqc": ALLOW_MOCK_PQC,
+        "load_error": _OQS_LOAD_ERROR,
+        "security_warning": (
+            None if _OQS_AVAILABLE
+            else "INSECURE_MOCK — NO quantum protection" if ALLOW_MOCK_PQC
+            else "PQC unavailable — install liboqs-python"
+        ),
+    }

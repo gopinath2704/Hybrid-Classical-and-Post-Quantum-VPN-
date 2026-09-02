@@ -40,7 +40,14 @@ from typing import Optional, Callable
 from collections import deque
 
 # Import from project modules
-from handshake.kemtls import HandshakeSession, HandshakeError
+from handshake.kemtls import (
+    HandshakeSession,
+    HandshakeError,
+    KEMTLSClient,
+    KEMTLSServer,
+    HandshakeState,
+)
+from crypto.hybrid_crypto import get_crypto_status, ALLOW_MOCK_PQC
 
 
 # Module-level logger
@@ -1254,5 +1261,697 @@ class OpenVPNManager:
             "mgmt_port": self.mgmt_port,
         }
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# §6  VPN Service Orchestration Layer
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────────────────────────────────────────
+_HANDSHAKE_TIMEOUT = 10.0   # seconds to complete a full handshake
+_LENGTH_PREFIX_FMT = "!I"   # 4-byte big-endian uint32 for message length
+_LENGTH_PREFIX_SIZE = struct.calcsize(_LENGTH_PREFIX_FMT)
+
+
+def _send_message(sock: socket.socket, data: bytes) -> None:
+    """Send a length-prefixed message over a TCP socket."""
+    header = struct.pack(_LENGTH_PREFIX_FMT, len(data))
+    sock.sendall(header + data)
+
+
+def _recv_message(sock: socket.socket) -> bytes:
+    """Receive a length-prefixed message from a TCP socket."""
+    header = _recv_exact(sock, _LENGTH_PREFIX_SIZE)
+    (length,) = struct.unpack(_LENGTH_PREFIX_FMT, header)
+    if length > 2 * 1024 * 1024:   # 2 MiB safety cap
+        raise HandshakeError(f"Incoming message too large: {length} bytes")
+    return _recv_exact(sock, length)
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    """Read exactly n bytes from sock, raising on EOF."""
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise HandshakeError("Connection closed during message receive")
+        buf += chunk
+    return buf
+
+
+def perform_client_handshake(
+    host: str,
+    port: int,
+    pqc_algorithm: str = "Kyber768",
+    timeout: float = _HANDSHAKE_TIMEOUT,
+) -> tuple[socket.socket, HandshakeSession]:
+    """
+    Connect to a VPN server and perform the full KEMTLS handshake.
+
+    Protocol (1.5 RTT):
+        Client → Server : ClientHello
+        Server → Client : ServerHello
+        Client → Server : ClientKeyExchange
+        Server → Client : ServerFinished
+
+    Args:
+        host:          Server hostname or IP address.
+        port:          Server port.
+        pqc_algorithm: ML-KEM variant (default Kyber768).
+        timeout:       Socket timeout in seconds.
+
+    Returns:
+        (sock, session): The connected TCP socket and established HandshakeSession.
+                         The caller owns the socket and must close it on disconnect.
+
+    Raises:
+        HandshakeError: On any protocol or authentication failure.
+        OSError:        On TCP connection failure.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((host, port))
+        logger.info("[KEMTLS] Connected to %s:%d — starting handshake", host, port)
+
+        client = KEMTLSClient(
+            pqc_algorithm=pqc_algorithm,
+            allow_mock_pqc=ALLOW_MOCK_PQC,
+        )
+
+        # 1. ClientHello
+        ch_bytes = client.initiate_handshake()
+        _send_message(sock, ch_bytes)
+        logger.debug("[KEMTLS] Sent ClientHello (%d bytes)", len(ch_bytes))
+
+        # 2. ServerHello
+        sh_bytes = _recv_message(sock)
+        logger.debug("[KEMTLS] Received ServerHello (%d bytes)", len(sh_bytes))
+        cke_bytes = client.process_server_hello(sh_bytes)
+
+        # 3. ClientKeyExchange
+        _send_message(sock, cke_bytes)
+        logger.debug("[KEMTLS] Sent ClientKeyExchange (%d bytes)", len(cke_bytes))
+
+        # 4. ServerFinished
+        sf_bytes = _recv_message(sock)
+        logger.debug("[KEMTLS] Received ServerFinished (%d bytes)", len(sf_bytes))
+        session = client.process_server_finished(sf_bytes)
+
+        logger.info(
+            "[KEMTLS] Handshake complete — session %s established",
+            session.session_id.hex()[:16],
+        )
+        sock.settimeout(None)
+        return sock, session
+
+    except Exception:
+        sock.close()
+        raise
+
+
+def perform_server_handshake(
+    client_sock: socket.socket,
+    pqc_algorithm: str = "Kyber768",
+) -> HandshakeSession:
+    """
+    Process a single client connection and complete the KEMTLS handshake.
+
+    Args:
+        client_sock: Accepted TCP socket for the connecting client.
+        pqc_algorithm: ML-KEM variant.
+
+    Returns:
+        HandshakeSession: Established session for this client.
+
+    Raises:
+        HandshakeError: On protocol failure.
+    """
+    server = KEMTLSServer(
+        pqc_algorithm=pqc_algorithm,
+        allow_mock_pqc=ALLOW_MOCK_PQC,
+    )
+
+    # 1. ClientHello
+    ch_bytes = _recv_message(client_sock)
+    logger.debug("[KEMTLS-srv] Received ClientHello (%d bytes)", len(ch_bytes))
+
+    # 2. ServerHello
+    sh_bytes = server.process_client_hello(ch_bytes)
+    _send_message(client_sock, sh_bytes)
+    logger.debug("[KEMTLS-srv] Sent ServerHello (%d bytes)", len(sh_bytes))
+
+    # 3. ClientKeyExchange
+    cke_bytes = _recv_message(client_sock)
+    logger.debug("[KEMTLS-srv] Received ClientKeyExchange (%d bytes)", len(cke_bytes))
+
+    # 4. ServerFinished
+    sf_bytes, session = server.process_client_key_exchange(cke_bytes)
+    _send_message(client_sock, sf_bytes)
+    logger.debug("[KEMTLS-srv] Sent ServerFinished (%d bytes)", len(sf_bytes))
+
+    logger.info(
+        "[KEMTLS-srv] Handshake complete — session %s",
+        session.session_id.hex()[:16],
+    )
+    return session
+
+
+class ServiceState:
+    """Named constants for VPNService connection states."""
+    DISCONNECTED = "DISCONNECTED"
+    CONNECTING   = "CONNECTING"
+    CONNECTED    = "CONNECTED"
+    DISCONNECTING = "DISCONNECTING"
+    ERROR        = "ERROR"
+
+
+@dataclass
+class VPNTelemetry:
+    """Live telemetry snapshot from the active VPN connection."""
+    state: str = ServiceState.DISCONNECTED
+    session_id: str = ""
+    vpn_ip: str = ""
+    connected_at: Optional[float] = None
+    server_host: str = ""
+    server_port: int = 0
+
+    # Tunnel stats
+    bytes_sent: int = 0
+    bytes_received: int = 0
+    packets_sent: int = 0
+    packets_received: int = 0
+    packets_dropped: int = 0
+    uptime_seconds: float = 0.0
+
+    # Network quality
+    latency_ms: float = 0.0
+    jitter_ms: float = 0.0
+    loss_rate: float = 0.0
+    download_mbps: float = 0.0
+    upload_mbps: float = 0.0
+    mtu: int = 1500
+
+    # Crypto posture
+    tun_mode: str = ""
+    pqc_mode: str = ""
+    is_quantum_safe: bool = False
+    is_simulated: bool = False
+    key_rotation_interval: int = 300
+    last_key_rotation: Optional[float] = None
+    key_rotation_count: int = 0
+
+    # Error info
+    error_message: str = ""
+
+
+class VPNService:
+    """
+    Unified VPN Connection Orchestration Service.
+
+    Manages the full lifecycle:
+        connect()     — KEMTLS handshake → TUN allocation → tunnel start
+        disconnect()  — graceful teardown + key zeroization
+        rotate_keys() — in-session rekeying
+        get_telemetry() — real-time stats snapshot
+    """
+
+    DEFAULT_VPN_IP = "10.8.0.2"
+    DEFAULT_NETMASK = "255.255.255.0"
+
+    def __init__(
+        self,
+        key_rotation_interval: int = 300,
+        pqc_algorithm: str = "Kyber768",
+    ) -> None:
+        self._lock = threading.Lock()
+        self._state = ServiceState.DISCONNECTED
+        self._pqc_algorithm = pqc_algorithm
+        self._key_rotation_interval = key_rotation_interval
+
+        # Active resources (set on connect, cleared on disconnect)
+        self._handshake_sock: Optional[socket.socket] = None
+        self._session: Optional[HandshakeSession] = None
+        self._tun: Optional[TUNInterface] = None
+        self._daemon: Optional[VPNTunnelDaemon] = None
+        self._quality_monitor: Optional[NetworkQualityMonitor] = None
+        self._mtu_monitor: Optional[MTUMonitor] = None
+
+        # Telemetry tracking
+        self._connected_at: Optional[float] = None
+        self._server_host: str = ""
+        self._server_port: int = 0
+        self._vpn_ip: str = ""
+        self._key_rotation_count: int = 0
+        self._last_key_rotation: Optional[float] = None
+
+        # Throughput sampling (rolling 1-second window)
+        self._prev_bytes_sent: int = 0
+        self._prev_bytes_recv: int = 0
+        self._prev_sample_time: float = 0.0
+        self._download_mbps: float = 0.0
+        self._upload_mbps: float = 0.0
+
+        # Error tracking
+        self._error_message: str = ""
+
+        crypto = get_crypto_status()
+        logger.info(
+            "[VPNService] PQC status: %s | quantum_safe=%s",
+            crypto["pqc_mode"], crypto["is_quantum_safe"],
+        )
+
+    def connect(
+        self,
+        host: str,
+        port: int = DEFAULT_VPN_PORT,
+        vpn_ip: str = DEFAULT_VPN_IP,
+        tun_name: str = "tun0",
+        udp_port: int = 0,
+    ) -> VPNTelemetry:
+        """
+        Establish a VPN connection.
+
+        Steps:
+            1. KEMTLS handshake over TCP → HandshakeSession
+            2. Allocate TUN interface (native or socket-pipe)
+            3. Configure TUN IP (best-effort; requires CAP_NET_ADMIN)
+            4. Start VPNTunnelDaemon (AES-256-GCM UDP forwarding)
+            5. Start NetworkQualityMonitor
+        """
+        with self._lock:
+            if self._state in (
+                ServiceState.CONNECTING,
+                ServiceState.CONNECTED,
+                ServiceState.DISCONNECTING,
+            ):
+                raise RuntimeError(
+                    f"Cannot connect: current state is {self._state!r}"
+                )
+            self._state = ServiceState.CONNECTING
+            self._error_message = ""
+
+        logger.info("[VPNService] Connecting to %s:%d …", host, port)
+
+        try:
+            # Step 1: KEMTLS handshake
+            logger.info("[VPNService] Performing KEMTLS handshake…")
+            sock, session = perform_client_handshake(
+                host=host,
+                port=port,
+                pqc_algorithm=self._pqc_algorithm,
+            )
+
+            # Step 2: TUN interface
+            tun = self._allocate_tun(tun_name)
+
+            # Step 3: Configure TUN IP (best-effort)
+            self._configure_tun_ip(tun.name, vpn_ip, self.DEFAULT_NETMASK)
+
+            # Step 4: VPN tunnel daemon
+            bind_port = udp_port if udp_port else self._pick_free_udp_port()
+            daemon = VPNTunnelDaemon(
+                tun=tun,
+                session=session,
+                remote_addr=(host, port),
+                bind_addr=("0.0.0.0", bind_port),
+            )
+            daemon.start()
+
+            # Step 5: Quality monitor
+            quality = NetworkQualityMonitor()
+
+            # Store everything
+            with self._lock:
+                self._handshake_sock = sock
+                self._session = session
+                self._tun = tun
+                self._daemon = daemon
+                self._quality_monitor = quality
+                self._mtu_monitor = MTUMonitor(path_mtu=tun.mtu)
+                self._server_host = host
+                self._server_port = port
+                self._vpn_ip = vpn_ip
+                self._connected_at = time.time()
+                self._last_key_rotation = time.time()
+                self._key_rotation_count = 0
+                self._prev_bytes_sent = 0
+                self._prev_bytes_recv = 0
+                self._prev_sample_time = time.time()
+                self._state = ServiceState.CONNECTED
+
+            logger.info(
+                "[VPNService] Connected — session=%s vpn_ip=%s tun=%s",
+                session.session_id.hex()[:16], vpn_ip, tun.name,
+            )
+            return self.get_telemetry()
+
+        except Exception as exc:
+            self._error_message = str(exc)
+            with self._lock:
+                self._state = ServiceState.ERROR
+            self._cleanup_resources()
+            raise
+
+    def disconnect(self) -> None:
+        """
+        Gracefully disconnect, stop tunnel, and securely erase session keys.
+        """
+        with self._lock:
+            if self._state == ServiceState.DISCONNECTED:
+                return
+            self._state = ServiceState.DISCONNECTING
+
+        logger.info("[VPNService] Disconnecting…")
+
+        if self._session is not None:
+            try:
+                self._session.secure_wipe()
+                logger.info("[VPNService] Session keys securely zeroed.")
+            except Exception as e:
+                logger.warning("[VPNService] Error wiping session keys: %s", e)
+            self._session = None
+
+        self._cleanup_resources()
+
+        with self._lock:
+            self._state = ServiceState.DISCONNECTED
+            self._connected_at = None
+            self._vpn_ip = ""
+            self._server_host = ""
+            self._server_port = 0
+
+        logger.info("[VPNService] Disconnected.")
+
+    def rotate_keys(self) -> str:
+        """
+        Perform in-session key rotation (forward secrecy ratchet).
+        """
+        with self._lock:
+            if self._state != ServiceState.CONNECTED:
+                raise RuntimeError(
+                    f"Cannot rotate keys: not connected (state={self._state!r})"
+                )
+            if self._session is None:
+                raise RuntimeError("No active session to rekey")
+
+        rekey_nonce = self._session.rekey()
+        now = time.time()
+
+        with self._lock:
+            self._last_key_rotation = now
+            self._key_rotation_count += 1
+
+        nonce_hex = rekey_nonce.hex()[:16]
+        logger.info(
+            "[VPNService] Keys rotated (epoch %d) — nonce=%s…",
+            self._key_rotation_count, nonce_hex,
+        )
+        return nonce_hex
+
+    def get_telemetry(self) -> VPNTelemetry:
+        """Return a real-time telemetry snapshot."""
+        crypto = get_crypto_status()
+        t = VPNTelemetry(
+            pqc_mode=crypto["pqc_mode"],
+            is_quantum_safe=crypto["is_quantum_safe"],
+            is_simulated=False,
+            key_rotation_interval=self._key_rotation_interval,
+        )
+
+        with self._lock:
+            t.state = self._state
+            t.vpn_ip = self._vpn_ip
+            t.server_host = self._server_host
+            t.server_port = self._server_port
+            t.last_key_rotation = self._last_key_rotation
+            t.key_rotation_count = self._key_rotation_count
+            t.error_message = self._error_message
+            if self._session:
+                t.session_id = self._session.session_id.hex()
+            if self._tun:
+                t.tun_mode = self._tun.mode.value
+                t.mtu = self._tun.mtu
+            if self._connected_at:
+                t.uptime_seconds = round(time.time() - self._connected_at, 1)
+                t.connected_at = self._connected_at
+
+        if self._daemon and self._daemon.state == TunnelState.RUNNING:
+            stats = self._daemon.stats
+            t.bytes_sent = stats.bytes_sent
+            t.bytes_received = stats.bytes_received
+            t.packets_sent = stats.packets_sent
+            t.packets_received = stats.packets_received
+            t.packets_dropped = stats.packets_dropped
+            now = time.time()
+            dt = now - self._prev_sample_time
+            if dt > 0:
+                d_sent = stats.bytes_sent - self._prev_bytes_sent
+                d_recv = stats.bytes_received - self._prev_bytes_recv
+                t.upload_mbps = round((d_sent * 8) / (dt * 1e6), 2)
+                t.download_mbps = round((d_recv * 8) / (dt * 1e6), 2)
+                self._prev_bytes_sent = stats.bytes_sent
+                self._prev_bytes_recv = stats.bytes_received
+                self._prev_sample_time = now
+
+        if self._quality_monitor:
+            snap = self._quality_monitor.snapshot()
+            t.latency_ms = round(snap.rtt_ms, 1)
+            t.jitter_ms = round(snap.jitter_ms, 2)
+            t.loss_rate = round(snap.loss_rate, 4)
+
+        if self._mtu_monitor:
+            t.mtu = self._mtu_monitor.path_mtu
+
+        return t
+
+    @property
+    def state(self) -> str:
+        """Current connection state."""
+        with self._lock:
+            return self._state
+
+    @property
+    def session(self) -> Optional[HandshakeSession]:
+        """Active HandshakeSession, or None if not connected."""
+        return self._session
+
+    def _allocate_tun(self, name: str) -> TUNInterface:
+        """
+        Allocate a TUN interface, choosing the appropriate mode.
+        """
+        import sys as _sys
+        if _sys.platform == "linux":
+            try:
+                tun = TUNInterface(name=name, mode=TUNMode.NATIVE)
+                tun.open()
+                logger.info("[VPNService] TUN allocated: %s (native)", tun.name)
+                return tun
+            except (PermissionError, OSError) as e:
+                logger.warning(
+                    "[VPNService] Could not open native TUN (%s). "
+                    "Falling back to SOCKET_PIPE mode. "
+                    "Traffic will NOT leave the host. "
+                    "Run as root or grant CAP_NET_ADMIN for a real tunnel.",
+                    e,
+                )
+
+        tun = TUNInterface(name=name, mode=TUNMode.SOCKET_PIPE)
+        tun.open()
+        logger.warning(
+            "[VPNService] TUN running in SOCKET_PIPE (emulated) mode. "
+            "No real network packets will be routed."
+        )
+        return tun
+
+    @staticmethod
+    def _configure_tun_ip(iface: str, ip: str, netmask: str) -> None:
+        """Assign an IP address to the TUN interface via `ip addr add` (Linux only)."""
+        import subprocess, sys as _sys
+        if _sys.platform != "linux":
+            return
+        try:
+            prefix = _netmask_to_prefix(netmask)
+            subprocess.run(
+                ["ip", "addr", "add", f"{ip}/{prefix}", "dev", iface],
+                check=True, capture_output=True, timeout=5,
+            )
+            subprocess.run(
+                ["ip", "link", "set", "dev", iface, "up"],
+                check=True, capture_output=True, timeout=5,
+            )
+            logger.info(
+                "[VPNService] TUN %s configured: %s/%s", iface, ip, prefix
+            )
+        except Exception as e:
+            logger.warning(
+                "[VPNService] Could not configure TUN IP (requires root): %s. "
+                "TUN is open but IP routing is not configured.", e
+            )
+
+    @staticmethod
+    def _pick_free_udp_port() -> int:
+        """Find a free UDP port by binding to port 0 and immediately releasing."""
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.bind(("0.0.0.0", 0))
+            return s.getsockname()[1]
+
+    def _cleanup_resources(self) -> None:
+        """Stop daemon, close TUN, and close handshake socket in safe order."""
+        if self._daemon is not None:
+            try:
+                self._daemon.stop()
+            except Exception as e:
+                logger.warning("[VPNService] Error stopping daemon: %s", e)
+            self._daemon = None
+
+        if self._tun is not None:
+            try:
+                self._tun.close()
+            except Exception as e:
+                logger.warning("[VPNService] Error closing TUN: %s", e)
+            self._tun = None
+
+        if self._handshake_sock is not None:
+            try:
+                self._handshake_sock.close()
+            except Exception:
+                pass
+            self._handshake_sock = None
+
+        self._quality_monitor = None
+        self._mtu_monitor = None
+
+
+def _netmask_to_prefix(netmask: str) -> int:
+    """Convert a dotted-decimal netmask to CIDR prefix length."""
+    import ipaddress
+    return ipaddress.IPv4Network(f"0.0.0.0/{netmask}").prefixlen
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# §7  VPN Server Daemon
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class VPNServerDaemon:
+    """
+    Standalone VPN server that listens for client connections, performs
+    the KEMTLS handshake, and manages per-client tunnel sessions.
+    """
+
+    def __init__(
+        self,
+        bind_host: str = "0.0.0.0",
+        bind_port: int = DEFAULT_VPN_PORT,
+        pqc_algorithm: str = "Kyber768",
+        tun_name: str = "tun0",
+        server_vpn_ip: str = "10.8.0.1",
+    ) -> None:
+        self.bind_host = bind_host
+        self.bind_port = bind_port
+        self.pqc_algorithm = pqc_algorithm
+        self.tun_name = tun_name
+        self.server_vpn_ip = server_vpn_ip
+        self._running = False
+        self._server_sock: socket.socket | None = None
+        self._clients: list[threading.Thread] = []
+
+    def start(self) -> None:
+        """Start the TCP handshake listener."""
+        crypto = get_crypto_status()
+        logger.info("━" * 60)
+        logger.info("  PQ-VPN Server v1.0.0")
+        logger.info("  PQC mode  : %s", crypto["pqc_mode"])
+        logger.info("  Quantum   : %s", "✅ SAFE" if crypto["is_quantum_safe"] else "❌ NOT SAFE")
+        if not crypto["is_quantum_safe"] and ALLOW_MOCK_PQC:
+            logger.warning(
+                "  ⚠️  RUNNING WITH MOCK PQC — FOR DEVELOPMENT ONLY"
+            )
+        logger.info("━" * 60)
+
+        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server_sock.bind((self.bind_host, self.bind_port))
+        self._server_sock.listen(5)
+        self._running = True
+        logger.info("Listening on %s:%d", self.bind_host, self.bind_port)
+
+        while self._running:
+            try:
+                self._server_sock.settimeout(1.0)
+                try:
+                    client_sock, addr = self._server_sock.accept()
+                except socket.timeout:
+                    continue
+                logger.info("Client connected from %s:%d", *addr)
+                t = threading.Thread(
+                    target=self._handle_client,
+                    args=(client_sock, addr),
+                    daemon=True,
+                )
+                t.start()
+                self._clients.append(t)
+            except OSError:
+                break
+
+    def stop(self) -> None:
+        """Stop the server gracefully."""
+        self._running = False
+        if self._server_sock:
+            self._server_sock.close()
+            self._server_sock = None
+        logger.info("Server stopped.")
+
+    def _handle_client(
+        self, client_sock: socket.socket, addr: tuple[str, int]
+    ) -> None:
+        """Handle a single client: KEMTLS handshake → TUN → tunnel."""
+        try:
+            client_sock.settimeout(10.0)
+            session = perform_server_handshake(client_sock, self.pqc_algorithm)
+            logger.info(
+                "[%s:%d] Handshake complete — session %s",
+                *addr, session.session_id.hex()[:16],
+            )
+
+            # Allocate TUN (SOCKET_PIPE on non-root; NATIVE if privileged)
+            try:
+                tun = TUNInterface(name=self.tun_name, mode=TUNMode.NATIVE)
+                tun.open()
+            except (PermissionError, OSError):
+                logger.warning(
+                    "[%s:%d] Cannot open native TUN — using SOCKET_PIPE",
+                    *addr,
+                )
+                tun = TUNInterface(name=self.tun_name, mode=TUNMode.SOCKET_PIPE)
+                tun.open()
+
+            # Start tunnel daemon
+            daemon = VPNTunnelDaemon(
+                tun=tun,
+                session=session,
+                remote_addr=addr,
+                bind_addr=("0.0.0.0", 0),
+            )
+            daemon.start()
+            logger.info("[%s:%d] Tunnel active", *addr)
+
+            # Keep alive until client disconnects
+            try:
+                client_sock.settimeout(None)
+                while True:
+                    data = client_sock.recv(1)
+                    if not data:
+                        break
+            except OSError:
+                pass
+            finally:
+                daemon.stop()
+                tun.close()
+                try:
+                    session.secure_wipe()
+                except Exception:
+                    pass
+                logger.info("[%s:%d] Session closed and keys wiped.", *addr)
+
+        except Exception as exc:
+            logger.error("[%s:%d] Client handler error: %s", *addr, exc)
+        finally:
+            client_sock.close()

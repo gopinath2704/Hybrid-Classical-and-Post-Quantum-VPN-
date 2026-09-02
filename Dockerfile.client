@@ -1,22 +1,49 @@
 # Dockerfile for Hybrid VPN Client Node
+# Usage: docker compose up --build
+#
+# Connects to the VPN server, performs KEMTLS handshake, and runs the
+# AES-256-GCM encrypted UDP tunnel.
+#
+# Requires:
+#   - NET_ADMIN capability (for TUN interface allocation)
+#   - /dev/net/tun device mapped in from the host
+#   - SERVER_HOST env var pointing to the server container name/IP
+#
 FROM ubuntu:22.04
 
-ENV DEBIAN_FRONTEND=noninteractive
+# ─── Environment ─────────────────────────────────────────────────────────────
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    MODE=client \
+    SERVER_HOST=vpn-server \
+    SERVER_PORT=51820 \
+    VPN_IP=10.8.0.2
 
-RUN apt-get update && apt-get install -y \
+# ─── System dependencies ──────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
-    openvpn \
+    python3-dev \
+    cmake \
+    gcc \
+    g++ \
+    ninja-build \
+    libssl-dev \
     net-tools \
     iproute2 \
     iptables \
     iputils-ping \
-    liboqs-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# ─── Python dependencies ─────────────────────────────────────────────────────
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-CMD ["python3", "-m", "vpn.engine.tunnel_daemon"]
+# ─── Application source ───────────────────────────────────────────────────────
+COPY . .
+
+# SERVER_HOST / SERVER_PORT are injected from docker-compose environment
+CMD ["sh", "-c", "python3 -m vpn.cli client --server ${SERVER_HOST} --port ${SERVER_PORT} --vpn-ip ${VPN_IP}"]

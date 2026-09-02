@@ -36,7 +36,12 @@ from typing import Optional
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # Import from the consolidated crypto module
-from crypto.hybrid_crypto import HybridKEM, HybridKeyBundle, KeyManager
+from crypto.hybrid_crypto import (
+    HybridKEM,
+    HybridKeyBundle,
+    KeyManager,
+    ALLOW_MOCK_PQC,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -66,6 +71,8 @@ class MessageType(enum.IntEnum):
     SERVER_HELLO = 0x02
     CLIENT_KEY_EXCHANGE = 0x03
     SERVER_FINISHED = 0x04
+    REKEY_REQUEST = 0x05    # Initiator requests in-session key rotation
+    REKEY_RESPONSE = 0x06  # Responder acknowledges with new cipher material
     HANDSHAKE_ERROR = 0xFF
 
 
@@ -545,6 +552,81 @@ class HandshakeSession:
         except Exception as e:
             raise HandshakeError(f"Frame decryption failed: {e}") from e
 
+    def rekey(
+        self,
+        key_manager: Optional["KeyManager"] = None,
+    ) -> bytes:
+        """
+        Perform in-session key rotation (forward secrecy ratchet).
+
+        Derives a fresh AES-256-GCM encryption key and MAC key from the
+        current key material plus a fresh random nonce, installs the new
+        keys into the cipher, and securely zeroes the old keys.
+
+        Returns:
+            bytes: The 32-byte rekey nonce (for logging / audit only).
+                   This should NOT be sent over the wire; each peer performs
+                   rekeying independently using locally stored key material.
+        """
+        if key_manager is None:
+            key_manager = KeyManager()
+
+        rekey_nonce = os.urandom(32)
+
+        # Derive successor keys from current encryption_key + fresh nonce
+        new_enc_key, new_mac_key = key_manager.derive_rekey_pair(
+            bytes(self.encryption_key) if isinstance(self.encryption_key, bytearray)
+            else self.encryption_key,
+            rekey_nonce,
+        )
+
+        # Securely erase old key material
+        if isinstance(self.encryption_key, bytearray):
+            import ctypes
+            ctypes.memset(
+                (ctypes.c_char * len(self.encryption_key))
+                .from_buffer(self.encryption_key),
+                0, len(self.encryption_key),
+            )
+        if isinstance(self.mac_key, bytearray):
+            import ctypes
+            ctypes.memset(
+                (ctypes.c_char * len(self.mac_key))
+                .from_buffer(self.mac_key),
+                0, len(self.mac_key),
+            )
+
+        # Install new keys
+        self.encryption_key = new_enc_key
+        self.mac_key = new_mac_key
+        self._cipher = AESGCM(new_enc_key)
+        # Reset sequence counter for new cipher epoch
+        self._seq_num = 0
+
+        return rekey_nonce
+
+    def secure_wipe(self) -> None:
+        """
+        Securely zero all session key material in memory.
+
+        Call this on disconnect or session expiry to minimise the window
+        during which keys are recoverable from process memory.
+        """
+        import ctypes
+
+        def _wipe(buf: bytes | bytearray) -> None:
+            ba = bytearray(buf) if isinstance(buf, bytes) else buf
+            ctypes.memset(
+                (ctypes.c_char * len(ba)).from_buffer(ba), 0, len(ba)
+            )
+
+        _wipe(self.encryption_key if isinstance(self.encryption_key, bytearray)
+              else bytearray(self.encryption_key))
+        _wipe(self.mac_key if isinstance(self.mac_key, bytearray)
+              else bytearray(self.mac_key))
+        self._cipher = None
+        self._seq_num = 0
+
     def get_info(self) -> dict:
         """Return session metadata as a dictionary."""
         return {
@@ -579,8 +661,15 @@ class KEMTLSClient:
         # session is now a HandshakeSession with AES-256-GCM
     """
 
-    def __init__(self, pqc_algorithm: str = "Kyber768") -> None:
-        self._hybrid = HybridKEM(pqc_algorithm=pqc_algorithm)
+    def __init__(
+        self,
+        pqc_algorithm: str = "Kyber768",
+        allow_mock_pqc: bool = False,
+    ) -> None:
+        self._hybrid = HybridKEM(
+            pqc_algorithm=pqc_algorithm,
+            allow_mock_pqc=allow_mock_pqc or ALLOW_MOCK_PQC,
+        )
         self._key_manager = KeyManager()
         self._state = HandshakeState.IDLE
         self._transcript = TranscriptHasher()
@@ -800,8 +889,15 @@ class KEMTLSServer:
         # session is now a HandshakeSession with AES-256-GCM
     """
 
-    def __init__(self, pqc_algorithm: str = "Kyber768") -> None:
-        self._hybrid = HybridKEM(pqc_algorithm=pqc_algorithm)
+    def __init__(
+        self,
+        pqc_algorithm: str = "Kyber768",
+        allow_mock_pqc: bool = False,
+    ) -> None:
+        self._hybrid = HybridKEM(
+            pqc_algorithm=pqc_algorithm,
+            allow_mock_pqc=allow_mock_pqc or ALLOW_MOCK_PQC,
+        )
         self._key_manager = KeyManager()
         self._state = HandshakeState.IDLE
         self._transcript = TranscriptHasher()

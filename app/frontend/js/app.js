@@ -15,8 +15,11 @@
 // Configuration
 // ─────────────────────────────────────────────────────────────────────────────
 
-const API_BASE = `${window.location.origin}/api/v1`;
-const WS_URL = `ws://${window.location.host}/ws/telemetry`;
+const isFileProto = window.location.protocol === 'file:' || !window.location.host;
+const API_BASE = isFileProto ? 'http://127.0.0.1:8000/api/v1' : `${window.location.origin}/api/v1`;
+const WS_URL = isFileProto 
+    ? 'ws://127.0.0.1:8000/ws/telemetry' 
+    : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/telemetry`;
 const STATUS_POLL_INTERVAL = 2000; // ms
 const WS_RECONNECT_DELAY = 2000;  // ms
 
@@ -29,7 +32,7 @@ const state = {
     sessionId: '',
     vpnIp: '',
     uptimeSeconds: 0,
-    selectedServerId: 'fra-01',
+    selectedServerId: 'local-test',
     servers: [],
 
     // Telemetry
@@ -42,6 +45,13 @@ const state = {
     bytesSent: 0,
     bytesReceived: 0,
     keyRotationRemaining: 300,
+
+    // Crypto posture (updated by fetchCryptoStatus)
+    pqcMode: null,
+    tunMode: null,
+    isQuantumSafe: null,
+    isMockPqc: false,
+    tunModeLabel: null,
 
     // Chart history
     downloadHistory: [],
@@ -115,21 +125,35 @@ async function apiPost(path, params = {}) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function connectVPN() {
-    if (state.connectionState !== 'DISCONNECTED') return;
+    if (state.connectionState !== 'DISCONNECTED' && state.connectionState !== 'ERROR') return;
+
+    // Determine server_id (custom or dropdown)
+    let params = { server_id: state.selectedServerId };
+    const customGroup = $('#custom-server-group');
+    if (customGroup && customGroup.style.display !== 'none') {
+        const host = $('#custom-host')?.value.trim();
+        const port = parseInt($('#custom-port')?.value || '51820');
+        if (host) {
+            // Use local-test profile but override host via query params
+            params = { server_id: 'local-test', host, port };
+        }
+    }
 
     try {
         updateConnectionUI('CONNECTING');
-        const result = await apiPost('/vpn/connect', {
-            server_id: state.selectedServerId,
-        });
-        state.connectionState = 'CONNECTED';
-        state.sessionId = result.session_id;
-        state.vpnIp = result.vpn_ip;
+        const result = await apiPost('/vpn/connect', params);
+        state.sessionId = result.session_id || '';
+        state.vpnIp = result.vpn_ip || '';
+        state.pqcMode = result.pqc_mode || '';
+        state.tunMode = result.tun_mode || '';
+        state.isQuantumSafe = result.is_quantum_safe || false;
         updateConnectionUI('CONNECTED');
         refreshLogs();
+        fetchCryptoStatus();
     } catch (err) {
         console.error('Connect failed:', err);
-        updateConnectionUI('DISCONNECTED');
+        updateConnectionUI('ERROR');
+        setTimeout(() => updateConnectionUI('DISCONNECTED'), 3000);
     }
 }
 
@@ -139,10 +163,11 @@ async function disconnectVPN() {
     try {
         updateConnectionUI('DISCONNECTING');
         await apiPost('/vpn/disconnect');
-        state.connectionState = 'DISCONNECTED';
         state.sessionId = '';
         state.vpnIp = '';
         state.uptimeSeconds = 0;
+        state.tunMode = null;
+        state.pqcMode = null;
         updateConnectionUI('DISCONNECTED');
         refreshLogs();
     } catch (err) {
@@ -151,8 +176,19 @@ async function disconnectVPN() {
     }
 }
 
+async function rekeyVPN() {
+    if (state.connectionState !== 'CONNECTED') return;
+    try {
+        const result = await apiPost('/vpn/rekey');
+        console.log('[PQ-VPN] Keys rotated — nonce:', result.nonce);
+        refreshLogs();
+    } catch (err) {
+        console.error('Rekey failed:', err);
+    }
+}
+
 function toggleConnection() {
-    if (state.connectionState === 'DISCONNECTED') {
+    if (state.connectionState === 'DISCONNECTED' || state.connectionState === 'ERROR') {
         connectVPN();
     } else if (state.connectionState === 'CONNECTED') {
         disconnectVPN();
@@ -172,91 +208,148 @@ function updateConnectionUI(connState) {
     const heroStatus = $('#hero-status-text');
     const heroSub = $('#hero-status-sub');
     const connectBtn = $('#connect-btn');
-    const pqBadge = $('#pq-badge');
+    const pqBadgeGroup = $('#pq-badge-group');
+    const pqBadgeLive = $('#pq-badge-live');
+    const pqBadgeEmulated = $('#pq-badge-emulated');
+    const pqBadgeMock = $('#pq-badge-mock');
 
     // Reset classes
-    powerRing.className = 'power-ring';
-    heroStatus.className = 'hero-status-text';
-    stateEl.className = 'connection-state';
+    if (powerRing) powerRing.className = 'power-ring';
+    if (heroStatus) heroStatus.className = 'hero-status-text';
+    if (stateEl) stateEl.className = 'connection-state';
+
+    const hideBadges = () => {
+        if (pqBadgeGroup) pqBadgeGroup.style.display = 'none';
+    };
+    const showBadges = () => {
+        if (pqBadgeGroup) pqBadgeGroup.style.display = 'flex';
+        // Show live/emulated/mock based on current crypto posture
+        if (pqBadgeLive) pqBadgeLive.style.display = state.isQuantumSafe ? 'inline-flex' : 'none';
+        if (pqBadgeEmulated) pqBadgeEmulated.style.display = (state.tunMode && state.tunMode.includes('SOCKET')) ? 'inline-flex' : 'none';
+        if (pqBadgeMock) pqBadgeMock.style.display = (!state.isQuantumSafe && state.pqcMode === 'mock_sha_fallback') ? 'inline-flex' : 'none';
+    };
 
     switch (connState) {
         case 'CONNECTED':
-            stateEl.textContent = 'Connected';
-            stateEl.classList.add('connected');
-            subtitleEl.textContent = 'Your connection is secure and encrypted';
-            powerRing.classList.add('connected');
-            heroStatus.textContent = 'CONNECTED';
-            heroStatus.classList.add('connected');
-            heroSub.textContent = 'Secure Tunnel Active';
-            connectBtn.textContent = 'Disconnect';
-            connectBtn.className = 'connect-btn disconnect';
-            pqBadge.style.display = 'inline-flex';
+            if (stateEl) { stateEl.textContent = 'Connected'; stateEl.classList.add('connected'); }
+            if (subtitleEl) subtitleEl.textContent = 'Your connection is secure and encrypted';
+            if (powerRing) powerRing.classList.add('connected');
+            if (heroStatus) { heroStatus.textContent = 'CONNECTED'; heroStatus.classList.add('connected'); }
+            if (heroSub) heroSub.textContent = 'Secure Tunnel Active';
+            if (connectBtn) { connectBtn.textContent = 'Disconnect'; connectBtn.className = 'connect-btn disconnect'; }
+            showBadges();
             break;
 
         case 'CONNECTING':
-            stateEl.textContent = 'Connecting...';
-            stateEl.classList.add('connecting');
-            subtitleEl.textContent = 'Establishing KEMTLS handshake...';
-            powerRing.classList.add('connecting');
-            heroStatus.textContent = 'CONNECTING';
-            heroStatus.classList.add('connecting');
-            heroSub.textContent = 'Negotiating Hybrid Keys...';
-            connectBtn.textContent = 'Connecting...';
-            connectBtn.className = 'connect-btn disconnect';
-            connectBtn.style.pointerEvents = 'none';
-            pqBadge.style.display = 'none';
-            setTimeout(() => { connectBtn.style.pointerEvents = ''; }, 3000);
+            if (stateEl) { stateEl.textContent = 'Connecting...'; stateEl.classList.add('connecting'); }
+            if (subtitleEl) subtitleEl.textContent = 'Establishing KEMTLS handshake...';
+            if (powerRing) powerRing.classList.add('connecting');
+            if (heroStatus) { heroStatus.textContent = 'CONNECTING'; heroStatus.classList.add('connecting'); }
+            if (heroSub) heroSub.textContent = 'Negotiating Hybrid Keys...';
+            if (connectBtn) { connectBtn.textContent = 'Connecting...'; connectBtn.className = 'connect-btn disconnect'; connectBtn.style.pointerEvents = 'none'; }
+            hideBadges();
+            setTimeout(() => { if (connectBtn) connectBtn.style.pointerEvents = ''; }, 30000);
             break;
 
         case 'DISCONNECTING':
-            stateEl.textContent = 'Disconnecting...';
-            stateEl.classList.add('connecting');
-            subtitleEl.textContent = 'Cleaning session keys...';
-            heroStatus.textContent = 'DISCONNECTING';
-            heroSub.textContent = 'Wiping session keys...';
+            if (stateEl) { stateEl.textContent = 'Disconnecting...'; stateEl.classList.add('connecting'); }
+            if (subtitleEl) subtitleEl.textContent = 'Wiping session keys...';
+            if (heroStatus) { heroStatus.textContent = 'DISCONNECTING'; }
+            if (heroSub) heroSub.textContent = 'Wiping session keys...';
+            hideBadges();
+            break;
+
+        case 'ERROR':
+            if (stateEl) { stateEl.textContent = 'Error'; stateEl.classList.add('disconnected'); }
+            if (subtitleEl) subtitleEl.textContent = 'Connection failed — see logs';
+            if (heroStatus) { heroStatus.textContent = 'ERROR'; heroStatus.classList.add('disconnected'); }
+            if (heroSub) heroSub.textContent = 'Check logs and retry';
+            if (connectBtn) { connectBtn.textContent = 'Connect'; connectBtn.className = 'connect-btn connect'; }
+            hideBadges();
             break;
 
         case 'DISCONNECTED':
         default:
-            stateEl.textContent = 'Disconnected';
-            stateEl.classList.add('disconnected');
-            subtitleEl.textContent = 'Not connected to any server';
-            heroStatus.textContent = 'DISCONNECTED';
-            heroStatus.classList.add('disconnected');
-            heroSub.textContent = 'Click to connect';
-            connectBtn.textContent = 'Connect';
-            connectBtn.className = 'connect-btn connect';
-            pqBadge.style.display = 'none';
+            if (stateEl) { stateEl.textContent = 'Disconnected'; stateEl.classList.add('disconnected'); }
+            if (subtitleEl) subtitleEl.textContent = 'Not connected to any server';
+            if (heroStatus) { heroStatus.textContent = 'DISCONNECTED'; heroStatus.classList.add('disconnected'); }
+            if (heroSub) heroSub.textContent = 'Click to connect';
+            if (connectBtn) { connectBtn.textContent = 'Connect'; connectBtn.className = 'connect-btn connect'; }
+            hideBadges();
             break;
+    }
+}
+
+/**
+ * Fetch the runtime PQC/TUN status and update topbar mode badges.
+ */
+async function fetchCryptoStatus() {
+    try {
+        const status = await apiGet('/crypto/status');
+        state.pqcMode = status.pqc_mode;
+        state.isQuantumSafe = status.is_quantum_safe;
+        state.isMockPqc = status.allow_mock_pqc;
+
+        // Update topbar badges
+        const badgePqc = $('#badge-pqc-mode');
+        const badgeTun = $('#badge-tun-mode');
+
+        if (badgePqc) {
+            badgePqc.textContent = `PQC: ${status.pqc_mode}`;
+            badgePqc.className = 'mode-badge ' + (status.is_quantum_safe ? 'mode-badge--live' : (status.allow_mock_pqc ? 'mode-badge--mock' : 'mode-badge--error'));
+        }
+        if (badgeTun && state.tunMode) {
+            const isNative = !state.tunMode.includes('SOCKET');
+            badgeTun.textContent = `TUN: ${isNative ? 'NATIVE' : 'SOCKET_PIPE'}`;
+            badgeTun.className = 'mode-badge ' + (isNative ? 'mode-badge--live' : 'mode-badge--emulated');
+        }
+    } catch (e) {
+        console.warn('[PQ-VPN] Could not fetch crypto status:', e.message);
     }
 }
 
 function updateTelemetryUI(data) {
     // Update state from telemetry frame
     state.connectionState = data.connection_state;
-    state.uptimeSeconds = data.uptime_seconds;
-    state.downloadMbps = data.download_mbps;
-    state.uploadMbps = data.upload_mbps;
-    state.latencyMs = data.latency_ms;
-    state.jitterMs = data.jitter_ms;
-    state.lossRate = data.loss_rate;
-    state.mtu = data.mtu;
-    state.bytesSent = data.bytes_sent;
-    state.bytesReceived = data.bytes_received;
-    state.keyRotationRemaining = data.key_rotation_remaining;
+    state.uptimeSeconds = data.uptime_seconds || 0;
+    state.downloadMbps = data.download_mbps || 0;
+    state.uploadMbps = data.upload_mbps || 0;
+    state.latencyMs = data.latency_ms || 0;
+    state.jitterMs = data.jitter_ms || 0;
+    state.lossRate = data.loss_rate || 0;
+    state.mtu = data.mtu || 1500;
+    state.bytesSent = data.bytes_sent || 0;
+    state.bytesReceived = data.bytes_received || 0;
+    state.keyRotationRemaining = data.key_rotation_remaining || 0;
     state.downloadHistory = data.download_history || [];
     state.uploadHistory = data.upload_history || [];
     state.latencyHistory = data.latency_history || [];
     state.lossHistory = data.loss_history || [];
 
+    // Update mode from live telemetry
+    if (data.pqc_mode) state.pqcMode = data.pqc_mode;
+    if (data.tun_mode) {
+        state.tunMode = data.tun_mode;
+        const badgeTun = $('#badge-tun-mode');
+        if (badgeTun) {
+            const isNative = !data.tun_mode.includes('SOCKET');
+            badgeTun.textContent = `TUN: ${isNative ? 'NATIVE' : 'SOCKET_PIPE'}`;
+            badgeTun.className = 'mode-badge ' + (isNative ? 'mode-badge--live' : 'mode-badge--emulated');
+        }
+    }
+
     // Connection details
     const durationEl = $('#detail-duration');
     const ipEl = $('#detail-ip');
     const keyRotEl = $('#detail-key-rotation');
+    const tunModeEl = $('#detail-tun-mode');
+    const pqcModeEl = $('#detail-pqc-mode');
 
     if (durationEl) durationEl.textContent = formatUptime(state.uptimeSeconds);
-    if (ipEl) ipEl.textContent = state.vpnIp || '—';
+    if (ipEl) ipEl.textContent = state.vpnIp || data.vpn_ip || '—';
     if (keyRotEl) keyRotEl.textContent = formatKeyRotation(state.keyRotationRemaining);
+    if (tunModeEl) tunModeEl.textContent = data.tun_mode || '—';
+    if (pqcModeEl) pqcModeEl.textContent = data.pqc_mode || '—';
 
     // Bandwidth header value
     const bwValue = $('#bandwidth-value');
@@ -277,7 +370,7 @@ function updateTelemetryUI(data) {
     if (footerUptime) footerUptime.textContent = formatUptime(state.uptimeSeconds);
     if (footerDataSent) footerDataSent.textContent = `↑ ${formatBytes(state.bytesSent)}`;
     if (footerDataRecv) footerDataRecv.textContent = `↓ ${formatBytes(state.bytesReceived)}`;
-    if (footerKeyRot) footerKeyRot.textContent = `Every ${Math.ceil(state.keyRotationRemaining / 60)} Minutes`;
+    if (footerKeyRot) footerKeyRot.textContent = `Every ${Math.ceil((state.keyRotationRemaining || 60) / 60)} Minutes`;
 
     // Update charts
     updateCharts();
@@ -606,15 +699,11 @@ function setupNavigation() {
 function setupEventListeners() {
     // Power ring click
     const powerRing = $('#power-ring');
-    if (powerRing) {
-        powerRing.addEventListener('click', toggleConnection);
-    }
+    if (powerRing) powerRing.addEventListener('click', toggleConnection);
 
     // Connect/Disconnect button
     const connectBtn = $('#connect-btn');
-    if (connectBtn) {
-        connectBtn.addEventListener('click', toggleConnection);
-    }
+    if (connectBtn) connectBtn.addEventListener('click', toggleConnection);
 
     // Server selector change
     const serverSelect = $('#server-select');
@@ -622,6 +711,20 @@ function setupEventListeners() {
         serverSelect.addEventListener('change', (e) => {
             state.selectedServerId = e.target.value;
             updateServerInfo();
+        });
+    }
+
+    // Custom server toggle
+    const toggleCustom = $('#toggle-custom-server');
+    const customGroup = $('#custom-server-group');
+    if (toggleCustom && customGroup) {
+        toggleCustom.addEventListener('click', () => {
+            const visible = customGroup.style.display !== 'none';
+            customGroup.style.display = visible ? 'none' : 'flex';
+            toggleCustom.textContent = visible ? '✏️' : '✕';
+            // Show/hide standard server selector
+            const serverSel = $('.server-selector');
+            if (serverSel) serverSel.style.opacity = visible ? '1' : '0.4';
         });
     }
 }
@@ -655,6 +758,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Connect WebSocket telemetry
     connectWebSocket();
+
+    // Fetch crypto / PQC status to populate mode badges
+    fetchCryptoStatus();
 
     console.log('[PQ-VPN] Dashboard ready.');
 });

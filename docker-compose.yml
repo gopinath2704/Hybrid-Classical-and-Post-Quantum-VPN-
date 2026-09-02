@@ -11,12 +11,17 @@ services:
     devices:
       - "/dev/net/tun:/dev/net/tun"
     ports:
-      - "8000:8000"   # Web Dashboard / REST API
-      - "1194:1194/udp" # OpenVPN / Hybrid VPN UDP port
+      - "8000:8000"        # FastAPI management dashboard / REST API
+      - "51820:51820"      # KEMTLS handshake TCP
+      - "51820:51820/udp"  # AES-256-GCM VPN tunnel UDP
     volumes:
       - .:/app
     environment:
       - MODE=server
+      - PYTHONUNBUFFERED=1
+    networks:
+      vpn-net:
+        ipv4_address: 10.100.0.2
 
   vpn-client:
     build:
@@ -33,3 +38,17 @@ services:
       - .:/app
     environment:
       - MODE=client
+      - SERVER_HOST=vpn-server
+      - SERVER_PORT=51820
+      - VPN_IP=10.8.0.2
+      - PYTHONUNBUFFERED=1
+    networks:
+      vpn-net:
+        ipv4_address: 10.100.0.3
+
+networks:
+  vpn-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.100.0.0/24

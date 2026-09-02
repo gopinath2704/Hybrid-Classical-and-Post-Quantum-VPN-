@@ -11,6 +11,9 @@ Public API:
     HybridKeyBundle   — Dataclass holding a party's complete key material
     KeyManager        — HKDF-SHA256 key derivation
     SessionKeyStore   — In-memory session key store with secure revocation
+    PQCUnavailableError
+    get_crypto_status
+    ALLOW_MOCK_PQC
 """
 
 from crypto.hybrid_crypto import (
@@ -22,6 +25,9 @@ from crypto.hybrid_crypto import (
     SessionKeyStore,
     SUPPORTED_ALGORITHMS,
     KYBER_PARAMS,
+    PQCUnavailableError,
+    get_crypto_status,
+    ALLOW_MOCK_PQC,
 )
 
 __all__ = [
@@ -33,4 +39,7 @@ __all__ = [
     "SessionKeyStore",
     "SUPPORTED_ALGORITHMS",
     "KYBER_PARAMS",
+    "PQCUnavailableError",
+    "get_crypto_status",
+    "ALLOW_MOCK_PQC",
 ]
