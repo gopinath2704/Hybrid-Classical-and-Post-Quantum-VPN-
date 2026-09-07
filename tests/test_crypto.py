@@ -86,10 +86,10 @@ class TestPQCProvider:
     """Tests for the post-quantum ML-KEM (Kyber) provider."""
 
     def setup_method(self):
-        self.pqc = PQCProvider("Kyber768")
+        self.pqc = PQCProvider("ML-KEM-768")
 
     def test_keypair_generation(self):
-        """Kyber768 keypair produces non-empty key material."""
+        """ML-KEM-768 keypair produces non-empty key material."""
         secret_key, public_key = self.pqc.generate_keypair()
         assert isinstance(secret_key, bytes) and len(secret_key) > 0
         assert isinstance(public_key, bytes) and len(public_key) > 0
@@ -117,7 +117,7 @@ class TestPQCProvider:
 
     @pytest.mark.parametrize("algorithm", SUPPORTED_ALGORITHMS)
     def test_all_supported_algorithms(self, algorithm):
-        """All supported Kyber variants work correctly."""
+        """All supported ML-KEM variants work correctly."""
         pqc = PQCProvider(algorithm)
         sk, pk = pqc.generate_keypair()
         ct, ss_sender = pqc.encapsulate(pk)
@@ -127,12 +127,12 @@ class TestPQCProvider:
     def test_unsupported_algorithm_raises(self):
         """Requesting an unsupported algorithm raises ValueError."""
         with pytest.raises(ValueError, match="Unsupported algorithm"):
-            PQCProvider("Kyber256")
+            PQCProvider("ML-KEM-256")
 
     def test_algorithm_details(self):
         """get_algorithm_details() returns a dict with expected keys."""
         details = self.pqc.get_algorithm_details()
-        assert details["algorithm"] == "Kyber768"
+        assert details["algorithm"] == "ML-KEM-768"
         assert details["nist_level"] == 3
         assert "public_key_length" in details
         assert "ciphertext_length" in details
@@ -278,7 +278,7 @@ class TestHybridKEM:
     """Integration tests for the full hybrid key exchange."""
 
     def setup_method(self):
-        self.hybrid = HybridKEM("Kyber768")
+        self.hybrid = HybridKEM("ML-KEM-768")
 
     def test_generate_keypairs(self):
         """generate_keypairs() returns a complete HybridKeyBundle."""
@@ -356,7 +356,7 @@ class TestHybridKEM:
         """get_info() returns both classical and PQ algorithm details."""
         info = self.hybrid.get_info()
         assert info["classical"]["algorithm"] == "X25519"
-        assert info["post_quantum"]["algorithm"] == "Kyber768"
+        assert info["post_quantum"]["algorithm"] == "ML-KEM-768"
 
     def test_end_to_end_with_session_store(self):
         """
@@ -381,12 +381,12 @@ class TestHybridKEM:
             "vpn-session-001",
             enc_key,
             mac_key,
-            metadata={"peer": "192.168.1.100", "algorithm": "Kyber768"},
+            metadata={"peer": "192.168.1.100", "algorithm": "ML-KEM-768"},
         )
 
         record = store.get_session("vpn-session-001")
         assert bytes(record.encryption_key) == enc_key
-        assert record.metadata["algorithm"] == "Kyber768"
+        assert record.metadata["algorithm"] == "ML-KEM-768"
 
         # Clean up
         store.revoke_session("vpn-session-001")

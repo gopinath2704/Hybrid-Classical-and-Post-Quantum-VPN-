@@ -30,6 +30,8 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from crypto.hybrid_crypto import ECCProvider, PQCProvider, HybridKEM, KeyManager
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from vpn.identity import fingerprint
 from handshake.kemtls import (
     KEMTLSClient,
     KEMTLSServer,
@@ -119,13 +121,13 @@ class HandshakeBenchmark:
         self.results_dir = results_dir or (_PROJECT_ROOT / "benchmarks" / "results")
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
-    def run_suite(self, suite_name: str, kyber_variant: str = "Kyber768") -> SuiteSummary:
+    def run_suite(self, suite_name: str, kyber_variant: str = "ML-KEM-768") -> SuiteSummary:
         """
         Run handshake benchmark for a specific cryptographic suite.
 
         Args:
             suite_name: Display name for the suite.
-            kyber_variant: Kyber variant ("Kyber512", "Kyber768", "Kyber1024").
+            kyber_variant: ML-KEM variant ("ML-KEM-512", "ML-KEM-768", "ML-KEM-1024").
 
         Returns:
             SuiteSummary: Aggregated latency and payload metrics.
@@ -173,9 +175,12 @@ class HandshakeBenchmark:
         kyber_variant: str,
     ) -> HandshakeMetric:
         """Execute a single full handshake and measure timing + byte sizes."""
-        # Initialize client and server
-        client = KEMTLSClient(pqc_algorithm=kyber_variant)
-        server = KEMTLSServer(pqc_algorithm=kyber_variant)
+        identity = PQCProvider("ML-KEM-768")
+        server_secret, server_public = identity.generate_keypair()
+        client_private = Ed25519PrivateKey.generate()
+        client_public = client_private.public_key().public_bytes_raw()
+        client = KEMTLSClient(server_public, fingerprint(server_public), client_private)
+        server = KEMTLSServer(server_secret, server_public, lambda key: {"client_id": "benchmark"} if key == client_public else None)
 
         start_time = time.perf_counter()
         c_cpu_start = time.process_time()
@@ -223,12 +228,12 @@ class HandshakeBenchmark:
         Run benchmarks across all cryptographic suites and save JSON results.
 
         Suites:
-            - ML-KEM-768 (Kyber768)
-            - Hybrid (X25519 + Kyber768 — Signature-Free KEMTLS)
+            - ML-KEM-768 (ML-KEM-768)
+            - Hybrid (X25519 + ML-KEM-768 — Signature-Free KEMTLS)
         """
         suites = [
-            ("ML-KEM-768 (Kyber768)", "Kyber768"),
-            ("Hybrid (X25519 + Kyber768)", "Kyber768"),
+            ("ML-KEM-768", "ML-KEM-768"),
+            ("Hybrid (X25519 + ML-KEM-768)", "ML-KEM-768"),
         ]
 
         results = {}
@@ -285,17 +290,11 @@ class ThroughputBenchmark:
         self.results_dir = results_dir or (_PROJECT_ROOT / "benchmarks" / "results")
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
-    def _create_mock_session(self) -> HandshakeSession:
-        """Create a HandshakeSession initialized with random 32-byte AES-256-GCM key."""
-        session_key = os.urandom(32)
-        session_id = os.urandom(32)
-        return HandshakeSession(
-            session_id=session_id,
-            client_random=os.urandom(32),
-            server_random=os.urandom(32),
-            encryption_key=session_key,
-            mac_key=os.urandom(32),
-        )
+    def _create_mock_session(self):
+        identity=PQCProvider("ML-KEM-768");secret,public=identity.generate_keypair();private=Ed25519PrivateKey.generate();client_public=private.public_key().public_bytes_raw()
+        client=KEMTLSClient(public,fingerprint(public),private);server=KEMTLSServer(secret,public,lambda key:{"client_id":"benchmark"} if key==client_public else None)
+        ch=client.initiate_handshake();sh=server.process_client_hello(ch);cke=client.process_server_hello(sh);sf,server_session=server.process_client_key_exchange(cke)
+        return client.process_server_finished(sf),server_session
 
     def benchmark_payload_size(self, size: int) -> PayloadResult:
         """
@@ -307,13 +306,13 @@ class ThroughputBenchmark:
         Returns:
             PayloadResult: Performance metrics for this payload size.
         """
-        session = self._create_mock_session()
+        session, receiver = self._create_mock_session()
         payload = os.urandom(size)
 
         # Warmup
         for _ in range(10):
             frame = session.encrypt_frame(payload)
-            session.decrypt_frame(frame)
+            receiver.decrypt_frame(frame)
 
         enc_times_us: list[float] = []
         dec_times_us: list[float] = []
@@ -331,7 +330,7 @@ class ThroughputBenchmark:
         # Measure Decryption
         for frame in frames:
             t0 = time.perf_counter()
-            session.decrypt_frame(frame)
+            receiver.decrypt_frame(frame)
             t1 = time.perf_counter()
             dec_times_us.append((t1 - t0) * 1_000_000.0)
         end_total = time.perf_counter()
@@ -429,11 +428,11 @@ class PacketOverheadAnalyzer:
             ipv6: Whether to calculate for IPv6 (True) or IPv4 (False).
         """
         ip_size = IPV6_HEADER_SIZE if ipv6 else IPV4_HEADER_SIZE
-        total = ip_size + UDP_HEADER_SIZE + FRAME_OVERHEAD_NONCE + FRAME_OVERHEAD_TAG + VPN_LENGTH_PREFIX
+        total = ip_size + UDP_HEADER_SIZE + FRAME_OVERHEAD_TOTAL
         return LayerOverhead(
             ip_header_bytes=ip_size,
             udp_header_bytes=UDP_HEADER_SIZE,
-            crypto_nonce_bytes=FRAME_OVERHEAD_NONCE,
+            crypto_nonce_bytes=FRAME_OVERHEAD_TOTAL - FRAME_OVERHEAD_TAG,
             crypto_tag_bytes=FRAME_OVERHEAD_TAG,
             length_prefix_bytes=VPN_LENGTH_PREFIX,
             total_overhead_bytes=total,

@@ -1,222 +1,109 @@
-# Hybrid Classical & Post-Quantum Cryptography VPN
+# Hybrid Classical and Post-Quantum VPN
 
-> **Project Status**: ✅ **100% PRODUCTION-READY** (Phases 0 through 5 Fully Implemented)  
-> **Cipher Suite**: **AES-256-GCM + Hybrid X25519 (ECDH) & ML-KEM-768 (Kyber768) + Signature-Free KEMTLS**  
-> **Key Architecture**: **HKDF-SHA256 Forward-Secret Ratchet + In-Session Rekeying + Instant Memory Zero-Wipe**  
-> **Repository**: [https://github.com/gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-.git](https://github.com/gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-.git)
+PQVPN is a Linux TUN/UDP VPN research implementation using ephemeral X25519 plus ML-KEM-768, HKDF-SHA256, directional AES-256-GCM traffic keys, a pinned static ML-KEM-768 server identity, and authorized Ed25519 client identities.
 
----
+The protocol is KEMTLS-inspired, not formally KEMTLS-compatible and not formally proven. The design reduces post-quantum handshake communication overhead and fragmentation/segmentation pressure; it does not eliminate fragmentation.
 
-## 📌 Project Overview
+## Security modes
 
-This repository implements a production-grade **Hybrid Classical and Post-Quantum Cryptography VPN (PQ-VPN)** application. It combines **ECDH (X25519)** with **NIST ML-KEM (Kyber-768)** for quantum-safe key exchange, uses a **Signature-Free KEMTLS Handshake** for fast connection setup, features **Dynamic Network Agility** (PMTU discovery and RFC 3550 jitter/RTT quality monitoring), and provides a modern **Cross-Platform Desktop Application (PyWebView / FastAPI)** with live telemetry and cryptographic transparency badges.
+- Native mode: current liboqs must report `ML-KEM-768` from `oqs.get_enabled_kem_mechanisms()` and pass a startup keygen/encapsulation/decapsulation self-test. Production fails closed otherwise.
+- Development mode: `ALLOW_MOCK_PQC=1` makes the insecure SHA mock available, and a runtime additionally requires `--allow-mock-pqc`. It is always reported as not quantum-safe. Add `--dev-emulated-tun` separately only when no real TUN is intended.
 
----
+## Provision and run
 
-## 👥 Team Roles & Responsibilities
-
-### 👤 Gowtham supported by Shadow – Networking & VPN Engine (`vpn/`)
-- Implemented native `/dev/net/tun` interface with cross-platform TCP loopback socket fallback for development environments.
-- Implemented asynchronous `VPNTunnelDaemon` event loop for packet encapsulation and UDP transport.
-- Implemented `MTUMonitor` for dynamic PMTU discovery (DF-bit probing), TCP MSS clamping, and overhead math (58B IPv4 / 78B IPv6).
-- Implemented `NetworkQualityMonitor` for RFC 3550 exponential moving average jitter, RTT rolling window, and packet loss tracking.
-- Implemented `OpenVPNManager` for runtime control sockets and dynamic `.ovpn` configuration generation.
-- Implemented standalone VPN server daemon (`vpn/server.py`) and standalone VPN client CLI (`vpn/client.py`).
-
-### 👤 Karthik supported by Shadow – Hybrid Cryptography (`crypto/`)
-- Implemented `ECCProvider` for X25519 ECDH keypair generation and raw 32-byte public key serialization.
-- Implemented `PQCProvider` wrapping `liboqs` for ML-KEM (Kyber-512, Kyber-768, Kyber-1024) with **fail-closed security enforcement** (`PQCUnavailableError`) and explicit `ALLOW_MOCK_PQC=1` dev mode.
-- Implemented `KeyManager` with HKDF-SHA256 (RFC 5869) key derivation for separate encryption (`b"hybrid-vpn-encryption-key"`) and MAC (`b"hybrid-vpn-mac-key"`) keys.
-- Implemented forward-secret in-session key rotation (`derive_rekey_pair`, `derive_rekey_material`).
-- Implemented `SessionKeyStore` with in-memory CRUD and instant zero-wipe (`ctypes.memset`) for secure key revocation.
-- Implemented `HybridKEM` orchestrator combining classical + post-quantum key exchange into 64-byte master secrets.
-
-### 👤 Nandha supported by Shadow – Signature-Free KEMTLS Handshake & Benchmarks (`handshake/`, `benchmarks/`)
-- Implemented binary wire protocol with 6-byte header (`0x4856` magic, `ClientHello`, `ServerHello`, `ClientKeyExchange`, `ServerFinished`, `RekeyRequest`, `RekeyResponse`).
-- Implemented `TranscriptHasher` SHA-256 cumulative transcript binding and `HMAC-SHA256` Finished MAC verification.
-- Implemented `HandshakeSession.rekey()` with HKDF ratchet key derivation and instant zeroing of expired session keys.
-- Implemented `KEMTLSClient` and `KEMTLSServer` state machines driving full handshake lifecycle over TCP transport.
-- Implemented benchmark suite (`benchmarks/`) for handshake setup timing (ms), throughput payload scaling (Mbps), and Scapy packet overhead analysis.
-- Built Matplotlib chart generator producing 4 publication-quality 300 DPI chart PNGs (`benchmarks/results/`).
-
-### 👤 Shadow – Integration, GUI Application, Testing & Documentation (`app/`, `tests/`, `docs/`)
-- Built cross-platform desktop application launcher (`app/main.py`) with PyWebView native window, `--web` browser mode, and `--cli` headless mode.
-- Developed FastAPI REST API (`app/backend/api.py`) & real-time WebSocket telemetry broadcaster (`app/backend/websocket.py`) with zero simulation and direct VPN service telemetry.
-- Built dark glassmorphic HTML/CSS/JS dashboard UI with live Chart.js bandwidth graphs, cryptographic transparency badges (`🛡 Quantum-Safe LIVE`, `🔧 TUN EMULATED`, `⚠️ MOCK PQC`), and in-session rekey button.
-- Orchestrated `VPNService` (`vpn/service.py`) for thread-safe connection management, TUN allocation, and handshake orchestration.
-- Created multi-container Docker deployment (`docker-compose.yml`, `Dockerfile.server`, `Dockerfile.client`) with `NET_ADMIN` privileges.
-
----
-
-## 🏗 Architecture & System Flow
-
-```text
- ┌─────────────────────────────────────────────────────────────┐
- │                  Desktop GUI / Web App UI                  │
- │   (Status, Transparency Badges, Live Graphs, Rekey Button)  │
- └──────────────────────────────┬──────────────────────────────┘
-                                │ REST API / WebSocket (/ws/telemetry)
- ┌──────────────────────────────▼──────────────────────────────┐
- │                VPN Service Controller Layer                 │
- │                                                             │
- │  ┌──────────────────┐  ┌──────────────────┐  ┌───────────┐  │
- │  │ Hybrid Key Exch. │  │ Signature-Free   │  │  Dynamic  │  │
- │  │ (X25519+Kyber768)│  │ Handshake Engine │  │ Network   │  │
- │  │ + HKDF Ratchet   │  │ (KEMTLS + Rekey) │  │  Agility  │  │
- │  └─────────┬────────┘  └─────────┬────────┘  │ (PMTU/RTT)│  │
- │            └─────────────────────┤           └─────┬─────┘  │
- │                                  │ Derived Keys    │ MTU/Route
- ┌──────────────────────────────────▼─────────────────▼────────┐
- │                      VPN Tunnel Layer                       │
- │    - Native Linux /dev/net/tun Interface (Root/NET_ADMIN)   │
- │    - Cross-Platform Emulated Socket Pipe (Development Mode) │
- └─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🚀 Getting Started & Execution Modes
-
-### 1. Installation
-Clone the repository and install Python dependencies:
-```bash
-git clone https://github.com/gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-.git
-cd Hybrid-Classical-and-Post-Quantum-VPN-
-pip install -r requirements.txt
-```
-
-> **Note on Native liboqs**: For quantum-safe security, install `liboqs` with `cmake`, `gcc`, and `libssl-dev`. In sandbox development environments without liboqs, set `export ALLOW_MOCK_PQC=1` to run functional tests with mock post-quantum keys.
-
----
-
-### 2. Standalone VPN Server & Client CLI (Unified Entrypoint)
-
-#### Running the VPN Server:
-```bash
-# Start server on default port 51820 with integrated web dashboard on port 8000
-python -m vpn.cli server --port 51820 --dashboard --api-port 8000
-
-# Or start headless server without dashboard
-python -m vpn.cli server --port 51820
-```
-
-#### Running the VPN Client:
-```bash
-# Connect client to VPN server
-python -m vpn.cli client --server 127.0.0.1 --port 51820
-```
-
----
-
-### 3. Launching the GUI Dashboard
+Status: **Deployable research/prototype PQ-VPN**. Root namespace integration and
+real VPS/client validation remain pending. Follow the [server deployment guide](docs/server_deployment.md)
+for OS prerequisites, explicit native liboqs installation, provisioning and the
+systemd validation gate. The tested baseline is Python 3.14.7, liboqs-python 0.16.0,
+and native liboqs 0.16.0; no virtual environment is shipped.
 
 ```bash
-# Mode 1: Native Desktop Application (PyWebView)
-python app/main.py
-
-# Mode 2: Web Browser Dashboard (opens http://127.0.0.1:8000)
-python app/main.py --web
-
-# Mode 3: Headless REST & WebSocket API Server
-python app/main.py --cli --port 8000
+# After installing the OS prerequisites from the deployment guide:
+sudo bash scripts/install-liboqs.sh /usr/local
+python3.14 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m vpn.cli identity generate
+.venv/bin/python -m vpn.cli client-key generate
+.venv/bin/python -m vpn.cli client authorize config/client_identity_public.key --client-id local-client
+# Set the server fingerprint and actual hostname in config/client.toml.
+# Set server interfaces/subnet and provision the service account as described in the guide.
+.venv/bin/python -m pytest -q -m native_pqc
+.venv/bin/python -m vpn.cli doctor server --config config/server.toml
+.venv/bin/python -m vpn.cli doctor client --config config/client.toml
 ```
 
----
+Use `requirements-server.txt` for daemon-only installation, `requirements-client.txt`
+for the CLI client, `requirements-management.txt` for optional browser management,
+and `requirements-dev.txt` for validation/benchmarks. All use `constraints-tested.txt`;
+`requirements.txt` is the full development compatibility entrypoint. The optional
+PyWebView desktop shell is outside the pinned/tested installation; browser management
+needs no desktop libraries. Native crypto is installed before starting any service;
+the daemon does not download or build it.
 
-### 4. Running Multi-Container Docker Setup
+The server owns one `pqvpn0` TUN and one 51820/UDP listener. It assigns client IPs, authenticates UDP_BIND from the client's real NAT-mapped source, demultiplexes sessions, and routes return packets by inner destination IP. The retained TCP channel carries encrypted configuration, synchronized rekey, CLOSE, and errors. Encrypted UDP PING/PONG feeds actual tunnel RTT/jitter telemetry.
+
+The management API binds to 127.0.0.1 by default. Set a strong `PQVPN_MANAGEMENT_TOKEN`; APIs use `Authorization: Bearer ...` and WebSocket telemetry uses a 30-second, single-use `?ticket=...` obtained through authenticated `POST /api/v1/ws-ticket`. The bearer never belongs in a WebSocket URL. See the [management contract](docs/management-api.md); remote exposure requires explicit HTTPS origins and a TLS reverse proxy.
+
+CLI-client mode and API-owned client mode are alternatives. A separate Uvicorn process cannot control an already-running `vpn.cli client connect` process. For management endpoints, start the API first and let `POST /api/v1/vpn/connect` create and own its `VPNClient`; `/rekey` and `/disconnect` operate on that same in-process instance.
+
+Relative key/database paths resolve against the TOML file location, including configurations stored under `/etc/pqvpn`, rather than against the process working directory.
+
+## Tests
+
 ```bash
-# Build and start server and client containers with NET_ADMIN and TUN support
-docker-compose up --build
+source .venv/bin/activate
+pytest -q
+python -m pytest -q
+ALLOW_MOCK_PQC=0 python -m pytest -q -m native_pqc
+sudo env PATH="$VIRTUAL_ENV/bin:$PATH" "$VIRTUAL_ENV/bin/python" -m pytest -q -m 'integration and requires_root'
 ```
 
----
+Passing mock tests does not validate native ML-KEM. See [protocol](docs/protocol.md), [threat model](docs/threat_model.md), [server deployment](docs/server_deployment.md), [client setup](docs/client_setup.md), and the [security audit](docs/security_audit.md).
 
-### 5. Running Performance Benchmarks
-```bash
-python -m benchmarks --iterations 50
-```
-This executes:
-1. **Handshake Benchmark**: Hybrid KEMTLS vs. Classical ECDHE-RSA latency & wire size.
-2. **Throughput Scaling**: Tunnel performance across payload sizes (64B to 8192B).
-3. **Packet Capture Analysis**: Protocol overhead breakdown.
-4. **Figure Generation**: Generates 4 publication-quality 300 DPI charts in `benchmarks/results/`.
+### Authentication boundary
 
----
+PQVPN KEMTLS-inspired v2 is a custom protocol, not standardized KEMTLS.
+Static ML-KEM-768 authenticates the server; X25519 + ML-KEM-768 establish
+hybrid session keys. Ed25519 authenticates clients and is classical, not
+post-quantum. This is not fully post-quantum mutual authentication.
+Status: deployable research/prototype PQ-VPN. Root namespace validation and
+a real VPS/client deployment must both succeed before revising that status.
 
-### 6. Running Automated Tests
-```bash
-ALLOW_MOCK_PQC=1 pytest tests/ -v
-```
+## Session liveness
 
----
+Authenticated keepalive traffic refreshes session liveness. Invalid, unauthenticated,
+replayed, or wrong-endpoint traffic does not. UDP PING and PONG retain the existing
+DATA-domain directional AES-256-GCM protection and replay/epoch checks; PING has
+an eight-byte timestamp payload. Only accepted inner IPv4 DATA (including assigned
+source-IP validation), valid endpoint binding, and authorized CONTROL activity
+count. A bound endpoint cannot be replaced by traffic from another endpoint;
+reconnect to establish a new binding. Rekey activity counts only after validation.
 
-## 🔐 Cryptographic Architecture
+A quiet session with healthy PING/PONG survives `idle_timeout`; a genuinely inactive
+session still expires. Expiry removes session/IP mappings and the endpoint, releases
+the lease, wipes session keys best-effort, closes control, and logs the reason with
+client ID and VPN IP, without key material. Client control-loss detection enters
+FAILED and runs network cleanup. The absolute `session_timeout` remains independent
+of keepalive. Python cannot guarantee complete key zeroization.
 
-### 1. Classical Cryptography (ECC)
-* **Algorithm**: **X25519** (Elliptic Curve Diffie-Hellman over Curve25519)
-* **Classical Security**: 128-bit security level
-* **Key Size**: 32-byte private key, 32-byte uncompressed public key
+Client receive liveness also uses a monotonic `dead_peer_timeout` (30 seconds by
+default). Valid PONG or DATA keeps it alive; outgoing PING does not. A UDP blackhole
+enters FAILED and restores routes/DNS even while TCP remains established.
 
-### 2. Post-Quantum Cryptography (PQC)
-* **Algorithm**: **ML-KEM** (NIST FIPS 203 / CRYSTALS-Kyber)
-* **Default Variant**: **Kyber768** (NIST Category 3 / AES-192 equivalent)
-* **Security Enforcement**: Fail-closed by default (`PQCUnavailableError`)
+## Network policy
 
-| Variant | NIST Level | Public Key | Secret Key | Ciphertext | Shared Secret |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Kyber512** | Level 1 | 800 B | 1,632 B | 768 B | 32 B |
-| **Kyber768** *(Default)* | Level 3 | **1,184 B** | **2,400 B** | **1,088 B** | **32 B** |
-| **Kyber1024** | Level 5 | 1,568 B | 3,168 B | 1,568 B | 32 B |
+PQVPN-owned nftables tables isolate clients, block VPS host services (optional
+server-IP ping only), metadata and private destinations, and allow public forwarding
+through the configured WAN. `allowed_forward_networks` deliberately permits selected
+forwarded private networks; setup reconciles only owned tables. Managed IPv4 forwarding
+saves the original value once and cleanup restores it. Unmanaged forwarding must
+already be enabled. Existing host/provider policy still requires operator verification.
 
-### 3. Key Derivation & In-Session Rekeying (HKDF Ratchet)
-```text
-  [ ECC Shared Secret (32B) ] + [ PQC Shared Secret (32B) ]
-                                │
-                                ▼
-                   [ Master Secret (64 Bytes) ]
-                                │
-                                ▼  HKDF-SHA256 (RFC 5869)
-           ┌────────────────────┴────────────────────┐
-           ▼                                         ▼
-  [ Encryption Key (32B) ]                 [ MAC Key (32B) ]
-  (b"hybrid-vpn-encryption-key")         (b"hybrid-vpn-mac-key")
-                                │
-                                ▼  In-Session Rekey (HKDF Ratchet)
-           ┌────────────────────┴────────────────────┐
-           ▼                                         ▼
-  [ Successor Enc Key (32B) ]              [ Successor MAC Key (32B) ]
-  (Old keys securely erased with ctypes.memset)
-```
+Full-tunnel managed DNS requires working `resolvectl` when DNS is configured; failure
+rolls back network setup. `dns_mode="none"` explicitly accepts unmanaged DNS with a
+warning. Split DNS uses `dns_routing_domains` and does not implicitly install `~.`.
+See the [client guide](docs/client_setup.md).
 
----
-
-## 🤝 Signature-Free Handshake Protocol (KEMTLS)
-
-Fixed 6-byte network header: `Magic (2B: 0x4856 "HV") | Version (1B: 0x10) | Type (1B) | PayloadLength (2B)`
-
-| Message Type | Type Code | Wire Size | Description |
-| :--- | :---: | :---: | :--- |
-| **ClientHello** | `0x01` | 1,286 B | Client Random (32B) + Session ID (32B) + Ephemeral X25519 PK (32B) + Kyber768 PK (1,184B) |
-| **ServerHello** | `0x02` | 2,374 B | Server Random (32B) + Session ID (32B) + Ephemeral X25519 PK (32B) + Kyber768 PK (1,184B) + Kyber768 Ciphertext (1,088B) |
-| **ClientKeyExchange** | `0x03` | 1,126 B | Kyber768 Ciphertext (1,088B) + Client Finished HMAC over transcript (32B) |
-| **ServerFinished** | `0x04` | 38 B | Server Finished HMAC over transcript (32B) |
-| **RekeyRequest** | `0x05` | 38 B | Fresh Rekey Nonce (32B) |
-| **RekeyResponse** | `0x06` | 38 B | Rekey Confirmation HMAC (32B) |
-| **HandshakeError** | `0xFF` | Variable | Error Code + UTF-8 Diagnostic Description |
-
-## 🧪 Test Suite & Code Metrics
-
-| Component | Module Path | Test File | Test Count | Status |
-| :--- | :--- | :--- | :---: | :---: |
-| **Hybrid Crypto** | `crypto/hybrid_crypto.py` | `tests/test_crypto.py` | **37** | ✅ 100% Passed |
-| **KEMTLS Handshake** | `handshake/kemtls.py` | `tests/test_handshake.py` | **43** | ✅ 100% Passed |
-| **VPN Engine** | `vpn/engine.py` | `tests/test_vpn.py` | **71** | ✅ 100% Passed |
-| **Benchmarks Suite** | `benchmarks/` | `tests/test_benchmarks.py` | **10** | ✅ 100% Passed |
-| **TOTAL** | — | — | **161** | ✅ **100% Passed** |
-
----
-
-## 📄 License & Team
-Developed for Final Year Project (2026) — **Hybrid Classical & Post-Quantum VPN**.  
-All cryptographic and networking components are designed for high assurance and post-quantum readiness.
-
+Current results and their limits are recorded in the [final validation matrix](docs/security_audit.md#final-validation--2026-09-07).
+Routed IPv6, a kill switch, dynamic authenticated PMTU discovery, independent protocol
+review and post-compromise recovery remain incomplete.

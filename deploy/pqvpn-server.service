@@ -1,0 +1,27 @@
+[Unit]
+Description=Hybrid X25519 and ML-KEM-768 VPN server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pqvpn
+Group=pqvpn
+WorkingDirectory=/opt/pqvpn
+Environment=PQVPN_PYTHON=/opt/pqvpn/.venv/bin/python
+ExecStartPre=+/opt/pqvpn/scripts/server-setup.sh /etc/pqvpn/server.toml
+ExecStart=/opt/pqvpn/.venv/bin/python -m vpn.cli server --config /etc/pqvpn/server.toml
+ExecStopPost=+/opt/pqvpn/scripts/server-cleanup.sh
+Restart=on-failure
+RestartSec=3
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RuntimeDirectory=pqvpn
+ReadWritePaths=/run/pqvpn
+
+[Install]
+WantedBy=multi-user.target

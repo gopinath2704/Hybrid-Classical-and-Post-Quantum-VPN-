@@ -1,0 +1,18 @@
+[client]
+server_host = "127.0.0.1"
+server_control_port = 51820
+server_identity_public_key = "server_identity_public.key"
+server_identity_fingerprint = "REPLACE_WITH_SHA256_FINGERPRINT"
+client_identity_private_key = "client_identity_private.key"
+full_tunnel = true
+split_tunnel = []
+dns_servers = []
+kill_switch = false
+tun_name = "pqvpn0"
+dev_emulated_tun = false
+ping_interval = 5.0
+ping_timeout = 4.0
+dead_peer_timeout = 30.0
+dns_mode = "systemd-resolved"
+dns_routing_domains = []
+expected_vpn_subnet = "10.8.0.0/24"

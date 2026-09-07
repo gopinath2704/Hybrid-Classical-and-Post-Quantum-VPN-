@@ -1,92 +1,50 @@
-# System Architecture & Deployment Guide
+# Architecture
 
-## 1. System Overview
-This document specifies the system architecture and deployment guidelines for the Hybrid Classical and Post-Quantum Cryptography VPN Application.
+PQVPN separates an authenticated TCP control plane from an encrypted UDP data plane.
 
-The system combines:
-- **Classical Elliptic Curve Cryptography**: X25519 ECDH for classical forward secrecy.
-- **Post-Quantum Cryptography**: ML-KEM-768 (Kyber768 NIST FIPS 203 Standard) for quantum resistance.
-- **Signature-Free Handshake**: KEMTLS-inspired exchange eliminating digital signature overhead.
-- **Data Plane Encryption**: Authenticated AES-256-GCM symmetric tunnel framing with forward-secret HKDF-SHA256 rekeying.
-- **Unified Engine**: Direct Linux TUN device packet processing with dynamic MTU probing and jitter/loss monitoring.
+1. The client verifies a provisioned SHA-256 fingerprint for the server's static ML-KEM-768 identity.
+2. A strict KEMTLS-inspired handshake combines ephemeral X25519, one ephemeral ML-KEM session secret, and a static server-identity ML-KEM authentication secret. The client proves its authorized Ed25519 identity. The provisioned identity key is not retransmitted; its transcript-bound SHA-256 identifier selects and binds the pinned key.
+3. HKDF derives role- and channel-separated Finished, DATA, CONTROL, nonce, rekey, and confirmation secrets bound to protocol/version/algorithms/session/randoms/transcript.
+4. Encrypted CONFIG assigns the VPN address, server address, prefix, MTU, UDP port, routes, DNS, and epoch.
+5. Authenticated UDP_BIND teaches the server the client's actual NAT endpoint. No TCP source port is reused or inferred.
+6. One server TUN and UDP listener serve all clients. Maps connect compact session IDs, client VPN addresses, endpoints, and traffic-key state.
+7. Client TUN packets become AES-GCM DATA frames. The server decrypts them into `pqvpn0`; Linux forwarding and the project-specific nftables masquerade route them to WAN. Return packets are selected by inner destination, encrypted, and injected into the client TUN.
 
----
+Every record header is AAD, including its DATA/CONTROL channel. Each channel and direction has an independent key, nonce base, send counter, and receive state. Sequence allocation plus encryption is atomic. DATA uses a locked 128-packet replay window; ordered CONTROL requires exactly the next sequence. TCP control rekey is confirmed under the old epoch before either side installs matching successor material.
 
-## 2. Cryptographic Protocol Specification
+Production never falls back to socket-pipe TUN. Emulation requires `--dev-emulated-tun`. Host changes are transactional on the client; server firewall helpers own isolated nftables tables and do not flush user rules.
 
-### 2.1 Hybrid Key Encapsulation (ECC + ML-KEM)
-- **Classical Component**: X25519 (RFC 7748) generating a 32-byte shared secret `ss_classical`.
-- **Post-Quantum Component**: ML-KEM-768 / Kyber768 generating a 32-byte shared secret `ss_pqc`.
-- **Key Derivation Function**: HKDF-SHA256 (RFC 5869) combining both secrets:
-  $$\text{PRK} = \text{HKDF-Extract}(\text{salt}, \text{ss}_{\text{classical}} \parallel \text{ss}_{\text{pqc}})$$
-  Deriving separated AES-256-GCM encryption and HMAC-SHA256 integrity keys.
+Current limitations are tracked in `progress.md`: IPv4 routing is implemented; IPv6 forwarding/data-route coverage, optional kill switch, dynamic PMTU discovery, stateless pre-PQ cookies, and fresh hybrid post-compromise recovery remain future work. The root namespace integration marker requires a privileged Linux runner and is not evidence until executed there.
 
-### 2.2 Signature-Free KEMTLS-Inspired Handshake
-1. **ClientHello** (1,286 B): Client ephemeral X25519 public key (32 B) + Kyber768 public key (1,184 B) + Client Random + Session ID.
-2. **ServerHello** (2,374 B): Server ephemeral X25519 public key (32 B) + Kyber768 public key (1,184 B) + Kyber768 ciphertext (1,088 B) + Server Random.
-3. **ClientKeyExchange** (1,126 B): Client Kyber768 ciphertext (1,088 B) encapsulating server key + Client Finished HMAC (32 B).
-4. **ServerFinished** (38 B): Server Finished HMAC (32 B).
+## Deployment and diagnostics
 
-### 2.3 Wire Framing & Encapsulation Overhead
-Tunnel packets are encapsulated over UDP:
-- IPv4 Header (20 B) / IPv6 Header (40 B)
-- UDP Header (8 B)
-- AES-256-GCM Nonce (12 B: 8B sequence counter + 4B random salt)
-- AES-256-GCM Auth Tag (16 B)
-- Packet Length Prefix (2 B)
-- **Total Overhead**: 58 Bytes (IPv4) / 78 Bytes (IPv6)
+`vpn/config.py` validates TOML before networking. Relative paths and omitted identity
+filenames resolve beside the TOML. `vpn/identity.py` checks private permissions,
+server ML-KEM pair consistency and the authorized-client database; locked atomic
+updates use file fsync, replace and directory fsync. Static leases are excluded from
+dynamic allocation, and configured maximum clients cannot exceed usable subnet capacity.
 
----
+`vpn/firewall.py` renders scoped client/host/private isolation and WAN NAT;
+`scripts/server-setup.sh` atomically replaces only PQVPN-owned tables and preserves
+the original forwarding sysctl once. Cleanup restores that value. The systemd unit
+runs these helpers around the daemon. Raw Python and current Docker entrypoints do
+not invoke the helpers: Docker examples require explicit setup and remain runtime
+unvalidated. Client Docker managed DNS also requires a resolver manager unavailable
+in the base image; an explicit development `dns_mode="none"` accepts unmanaged DNS.
+Compose configuration checks establish syntax only.
 
-## 3. Deployment & Execution Guide
+`vpn/doctor.py`, exposed as `python -m vpn.cli doctor server|client --config PATH`,
+reads deployment state without creating TUN, binding ports or changing routes/DNS.
+FAIL rows return 1; PASS/WARN-only results return 0. Temporary native test identities
+allow validating its operation without provisioning a real deployment.
 
-### 3.1 Prerequisites
-- Linux OS with `CAP_NET_ADMIN` privileges (or WSL2 / Docker with `/dev/net/tun` mapped).
-- Python 3.10+
-- OpenSSL & `liboqs` (or set `ALLOW_MOCK_PQC=1` for testing environments).
+Server session expiry and client authenticated UDP receive deadlines use monotonic
+clocks. A UDP blackhole causes FAILED and transactional cleanup; accepted DATA can
+keep the client alive without PONG. Managed DNS setup is transactional and split DNS
+only installs configured routing domains. Source rate-limit state is capped and stale
+entries are pruned on subsequent traffic.
 
-### 3.2 Running with Docker Compose
-To run both server and client in isolated containers with full network agility:
-```bash
-docker compose up --build
-```
-
-### 3.3 Running Standalone via Unified CLI
-
-#### Server Node:
-```bash
-# Start server daemon on default port 51820 with dashboard on 8000
-python3 -m vpn.cli server --bind 0.0.0.0 --port 51820 --dashboard --api-port 8000
-
-# Server with specific PQC algorithm variant
-python3 -m vpn.cli server --pqc Kyber1024 -v
-```
-
-#### Client Node:
-```bash
-# Connect to local test server
-python3 -m vpn.cli client --server 127.0.0.1 --port 51820
-
-# Connect to remote server with custom VPN IP
-python3 -m vpn.cli client --server fra-01.pq-vpn.net --port 51820 --vpn-ip 10.8.0.2 -v
-```
-
-### 3.4 Running Desktop & Web Application
-```bash
-# Desktop PyWebView GUI
-python3 app/main.py
-
-# Headless / Web browser mode
-python3 app/main.py --web --port 8000
-
-# Direct Uvicorn server
-uvicorn app.backend.api:app --reload --port 8000
-```
-Open `http://localhost:8000` to access the live glassmorphic dashboard with real-time WebSocket telemetry streaming.
-
-### 3.5 Benchmarks
-Execute performance benchmarks across handshake latency, tunnel throughput, and wire overhead:
-```bash
-ALLOW_MOCK_PQC=1 python3 -m benchmarks --iterations 50
-```
-Results and publication charts will be generated in `benchmarks/results/`.
+The optional browser management API has pinned dependencies separate from the daemon.
+HTTP bearer authentication issues bounded single-use telemetry tickets; the dashboard
+currently polls HTTP. See [management API](management-api.md) and the
+[validation matrix](security_audit.md#final-validation--2026-09-07).

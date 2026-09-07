@@ -1,7 +1,7 @@
 """
 Hybrid Cryptography Package.
 
-Provides classical ECC (X25519), post-quantum ML-KEM (Kyber-768),
+Provides classical ECC (X25519), post-quantum ML-KEM (ML-KEM-768),
 and hybrid key exchange combining both with HKDF-SHA256 derivation.
 
 Public API:
@@ -25,6 +25,7 @@ from crypto.hybrid_crypto import (
     SessionKeyStore,
     SUPPORTED_ALGORITHMS,
     KYBER_PARAMS,
+    MLKEM_PARAMS,
     PQCUnavailableError,
     get_crypto_status,
     ALLOW_MOCK_PQC,
@@ -39,6 +40,7 @@ __all__ = [
     "SessionKeyStore",
     "SUPPORTED_ALGORITHMS",
     "KYBER_PARAMS",
+    "MLKEM_PARAMS",
     "PQCUnavailableError",
     "get_crypto_status",
     "ALLOW_MOCK_PQC",

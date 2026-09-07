@@ -1,36 +1,3 @@
-# ─── Dependencies for Hybrid Classical and Post-Quantum VPN ───────────────────
-#
-# All versions are pinned for reproducible builds.
-#
-# NOTE on liboqs-python:
-#   Building liboqs-python requires cmake + gcc + libssl-dev on the host.
-#   In Docker, these are installed in the Dockerfile.
-#   On Linux desktop: sudo apt install cmake gcc libssl-dev
-#   Then: pip install liboqs-python
-#   Without native liboqs, the application will refuse to connect unless
-#   the ALLOW_MOCK_PQC=1 environment variable is set (dev/testing only).
-
-# ─── Cryptography & PQC ───────────────────────────────────────────────────────
-cryptography==42.0.8
-liboqs-python>=0.10.0          # Requires native C liboqs — see above
-
-# ─── Networking ───────────────────────────────────────────────────────────────
-scapy==2.5.0
-psutil==5.9.8
-
-# ─── Application Backend & Web Dashboard API ─────────────────────────────────
-fastapi==0.111.0
-uvicorn[standard]==0.30.1
-websockets==12.0
-python-multipart==0.0.9
-
-# ─── Desktop GUI (optional — only needed for PyWebView native window) ─────────
-pywebview>=4.4.1
-
-# ─── Benchmarking & Visualization ────────────────────────────────────────────
-matplotlib==3.9.0
-pandas==2.2.2
-
-# ─── Testing ──────────────────────────────────────────────────────────────────
-pytest==8.2.2
-pytest-asyncio==0.23.7
+# Compatibility entrypoint for the full tested development environment.
+# Daemon-only installations should use requirements-server.txt instead.
+-r requirements-dev.txt

@@ -1,201 +1,52 @@
-"""
-Unified VPN CLI — Server & Client Entrypoints.
-
-Consolidates the standalone server daemon and client into a single CLI
-with subcommands:
-
-    python -m vpn.cli server                         # default settings
-    python -m vpn.cli server --bind 0.0.0.0 --port 51820
-    python -m vpn.cli server --dashboard --api-port 8000
-    python -m vpn.cli client --server 127.0.0.1 --port 51820
-    python -m vpn.cli client --server fra-01.pq-vpn.net --vpn-ip 10.8.0.2 -v
-
-Environment:
-    ALLOW_MOCK_PQC=1   Enable insecure SHA-based PQC mock (dev/testing only)
-"""
-
+"""Provisioning and Linux VPN client/server command line."""
 from __future__ import annotations
-
-import os
-import sys
-import time
-import signal
-import socket
-import logging
-import argparse
-import threading
+import argparse, base64, logging, signal, sys, time
 from pathlib import Path
+from crypto.hybrid_crypto import get_crypto_status
+from vpn.config import load_client_config,load_server_config
+from vpn.identity import AuthorizedClients,generate_client_identity,generate_server_identity
+from vpn.runtime import VPNClient,VPNServer
 
-# Ensure project root is importable
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-
-from crypto.hybrid_crypto import get_crypto_status, ALLOW_MOCK_PQC
-from vpn.engine import (
-    VPNServerDaemon,
-    VPNService,
-    ServiceState,
-    DEFAULT_VPN_PORT,
-)
-
-
-def _setup_logging(verbose: bool = False) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s │ %(name)-24s │ %(levelname)-7s │ %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-
-logger = logging.getLogger("pqvpn.cli")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# CLI Subcommands
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _run_server(args) -> None:
-    """Run the VPN server daemon."""
-    _setup_logging(args.verbose)
-
-    if args.dashboard:
-        import uvicorn
-        def _run_api():
-            uvicorn.run(
-                "app.backend.api:app",
-                host="0.0.0.0",
-                port=args.api_port,
-                log_level="info",
-            )
-        threading.Thread(target=_run_api, daemon=True).start()
-        logger.info("Dashboard starting on http://0.0.0.0:%d", args.api_port)
-
-    server = VPNServerDaemon(
-        bind_host=args.bind,
-        bind_port=args.port,
-        pqc_algorithm=args.pqc,
-    )
-    try:
-        server.start()
-    except KeyboardInterrupt:
-        server.stop()
-
-
-def _run_client(args) -> None:
-    """Run the VPN client daemon."""
-    _setup_logging(args.verbose)
-
-    crypto = get_crypto_status()
-    logger.info("━" * 60)
-    logger.info("  PQ-VPN Client v1.0.0")
-    logger.info("  PQC mode  : %s", crypto["pqc_mode"])
-    logger.info("  Quantum   : %s", "✅ SAFE" if crypto["is_quantum_safe"] else "❌ NOT SAFE")
-    if not crypto["is_quantum_safe"] and ALLOW_MOCK_PQC:
-        logger.warning("  ⚠️  RUNNING WITH MOCK PQC — FOR DEVELOPMENT ONLY")
-    logger.info("━" * 60)
-
-    service = VPNService(
-        key_rotation_interval=args.rekey_interval,
-        pqc_algorithm=args.pqc,
-    )
-
-    # Graceful shutdown on SIGINT/SIGTERM
-    def _shutdown(sig, frame):
-        logger.info("Signal %d received — disconnecting…", sig)
-        if service.state == ServiceState.CONNECTED:
-            service.disconnect()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
-
-    # Connect
-    logger.info("Connecting to %s:%d…", args.server, args.port)
-    try:
-        telemetry = service.connect(
-            host=args.server,
-            port=args.port,
-            vpn_ip=args.vpn_ip,
-        )
-    except Exception as exc:
-        logger.error("Connection failed: %s", exc)
-        sys.exit(1)
-
-    logger.info(
-        "Connected — session=%s | vpn_ip=%s | tun=%s | pqc=%s",
-        telemetry.session_id[:16], telemetry.vpn_ip,
-        telemetry.tun_mode, telemetry.pqc_mode,
-    )
-
-    # Main loop: periodic stats + key rotation
-    next_rekey = time.time() + args.rekey_interval
-    while service.state == ServiceState.CONNECTED:
-        time.sleep(5)
-        t = service.get_telemetry()
-        logger.info(
-            "Up %ds | ↑%s MB ↓%s MB | pkt_sent=%d pkt_recv=%d | "
-            "latency=%.1fms jitter=%.2fms loss=%.3f%%",
-            int(t.uptime_seconds),
-            round(t.bytes_sent / 1e6, 2),
-            round(t.bytes_received / 1e6, 2),
-            t.packets_sent, t.packets_received,
-            t.latency_ms, t.jitter_ms, t.loss_rate * 100,
-        )
-
-        if time.time() >= next_rekey:
-            try:
-                nonce = service.rotate_keys()
-                logger.info("Keys rotated — nonce=%s…", nonce)
-            except Exception as e:
-                logger.warning("Key rotation failed: %s", e)
-            next_rekey = time.time() + args.rekey_interval
-
-
-def main() -> None:
-    """Unified VPN CLI entry point."""
-    parser = argparse.ArgumentParser(
-        description="PQ-VPN — Hybrid Classical & Post-Quantum VPN",
-    )
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
-
-    # Server subcommand
-    server_parser = subparsers.add_parser(
-        "server",
-        description="PQ-VPN Server — Hybrid Classical & Post-Quantum VPN Server",
-        help="Start VPN server daemon",
-    )
-    server_parser.add_argument("--bind", default="0.0.0.0", help="Bind address")
-    server_parser.add_argument("--port", type=int, default=DEFAULT_VPN_PORT, help="Handshake port")
-    server_parser.add_argument("--pqc", default="Kyber768", choices=["Kyber512", "Kyber768", "Kyber1024"])
-    server_parser.add_argument("--dashboard", action="store_true", help="Also start FastAPI dashboard")
-    server_parser.add_argument("--api-port", type=int, default=8000, help="Dashboard API port")
-    server_parser.add_argument("-v", "--verbose", action="store_true")
-
-    # Client subcommand
-    client_parser = subparsers.add_parser(
-        "client",
-        description="PQ-VPN Client — Hybrid Classical & Post-Quantum VPN Client",
-        help="Connect to VPN server",
-    )
-    client_parser.add_argument("--server", required=True, help="Server hostname or IP")
-    client_parser.add_argument("--port", type=int, default=DEFAULT_VPN_PORT, help="Server port")
-    client_parser.add_argument("--vpn-ip", default="10.8.0.2", help="VPN IP to assign to TUN")
-    client_parser.add_argument("--pqc", default="Kyber768", choices=["Kyber512", "Kyber768", "Kyber1024"])
-    client_parser.add_argument("--rekey-interval", type=int, default=300, help="Key rotation interval (s)")
-    client_parser.add_argument("-v", "--verbose", action="store_true")
-
-    args = parser.parse_args()
-
-    if args.command == "server":
-        _run_server(args)
-    elif args.command == "client":
-        _run_client(args)
+def main():
+    p=argparse.ArgumentParser(prog="python -m vpn.cli"); p.add_argument("-v","--verbose",action="store_true"); sub=p.add_subparsers(dest="command",required=True)
+    doctor=sub.add_parser("doctor"); doctor.add_argument("role", choices=["server", "client"]); doctor.add_argument("--config", required=True)
+    identity=sub.add_parser("identity"); ids=identity.add_subparsers(dest="action",required=True); gen=ids.add_parser("generate"); gen.add_argument("--private",default="config/server_identity_private.key"); gen.add_argument("--public",default="config/server_identity_public.key")
+    ck=sub.add_parser("client-key"); cks=ck.add_subparsers(dest="action",required=True); cg=cks.add_parser("generate"); cg.add_argument("--private",default="config/client_identity_private.key"); cg.add_argument("--public",default="config/client_identity_public.key")
+    client_admin=sub.add_parser("client"); ca=client_admin.add_subparsers(dest="action",required=True)
+    auth=ca.add_parser("authorize"); auth.add_argument("public_key"); auth.add_argument("--database",default="config/authorized_clients.json"); auth.add_argument("--client-id"); auth.add_argument("--vpn-ip")
+    rev=ca.add_parser("revoke"); rev.add_argument("fingerprint"); rev.add_argument("--database",default="config/authorized_clients.json")
+    connect=ca.add_parser("connect"); connect.add_argument("--config",default="config/client.toml"); connect.add_argument("--dev-emulated-tun",action="store_true"); connect.add_argument("--allow-mock-pqc",action="store_true",help="explicitly permit insecure mock PQC for tests/development")
+    server=sub.add_parser("server"); server.add_argument("--config",default="config/server.toml"); server.add_argument("--dev-emulated-tun",action="store_true"); server.add_argument("--allow-mock-pqc",action="store_true",help="explicitly permit insecure mock PQC for tests/development")
+    args=p.parse_args(); logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
+    if args.command=="doctor":
+        from vpn.doctor import run
+        sys.exit(run(args.role, args.config))
+    if args.command=="identity":
+        fp=generate_server_identity(Path(args.private),Path(args.public)); print(f"server identity fingerprint: {fp}"); return
+    if args.command=="client-key":
+        fp=generate_client_identity(Path(args.private),Path(args.public)); print(f"client identity fingerprint: {fp}"); return
+    if args.command=="client" and args.action=="authorize":
+        raw=Path(args.public_key).read_bytes() if Path(args.public_key).exists() else base64.b64decode(args.public_key,validate=True)
+        print(AuthorizedClients(Path(args.database)).authorize(raw,args.client_id,args.vpn_ip)); return
+    if args.command=="client" and args.action=="revoke":
+        if not AuthorizedClients(Path(args.database)).revoke(args.fingerprint): sys.exit("client fingerprint not found")
+        print("revoked"); return
+    status=get_crypto_status()
+    dev_mode=getattr(args,"dev_emulated_tun",False)
+    if not status["is_quantum_safe"]:
+        if status["pqc_mode"]=="mock_sha_fallback" and getattr(args,"allow_mock_pqc",False): logging.critical("*** INSECURE MOCK PQC ACTIVE: NOT QUANTUM SAFE; DEVELOPMENT ONLY ***")
+        else: sys.exit("native ML-KEM-768 unavailable; production start refused")
+    if args.command=="server":
+        cfg=load_server_config(args.config); cfg.dev_emulated_tun=args.dev_emulated_tun
+        service=VPNServer(cfg); signal.signal(signal.SIGTERM,lambda *_:service.stop())
+        try:service.start()
+        except KeyboardInterrupt:service.stop()
     else:
-        parser.print_help()
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+        cfg=load_client_config(args.config); cfg.dev_emulated_tun=args.dev_emulated_tun; service=VPNClient(cfg)
+        signal.signal(signal.SIGTERM,lambda *_:service.stop_event.set()); info=service.connect(); print(f"connected: {info['client_vpn_ip']} via UDP {info['udp_port']}")
+        try:
+            service.stop_event.wait()
+        except KeyboardInterrupt:pass
+        finally:service.disconnect()
+        if getattr(service, "state", "") == "FAILED": sys.exit(service.error)
+if __name__=="__main__":main()

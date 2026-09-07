@@ -238,13 +238,9 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    if args.host not in {"127.0.0.1", "localhost", "::1"}:
+        parser.error("bind management to loopback; use an explicitly configured TLS reverse proxy for remote access")
     _setup_logging(verbose=args.verbose)
-
-    # The standalone dashboard is also the development entry point.  Give its
-    # Local Test Node a real KEMTLS peer so clicking Connect works without
-    # requiring a second terminal.  ``vpn.server --dashboard`` does not set
-    # this flag because it already owns the handshake listener.
-    os.environ.setdefault("AUTO_START_LOCAL_VPN_SERVER", "1")
 
     logger.info("━" * 60)
     logger.info("  PQ-VPN v%s — Hybrid Classical & Post-Quantum VPN", APP_VERSION)

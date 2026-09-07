@@ -1,0 +1,181 @@
+# Linux VPS deployment gate
+
+Status: **Deployable research/prototype PQ-VPN**. Unit tests are not a deployment
+approval. First pass doctor, native ML-KEM tests, and the full root namespace
+suite on a disposable Linux VM. Then validate a real VPS with a separate Linux
+client. Privileged namespace, systemd, and VPS results must be recorded separately.
+
+## Exact tested dependencies
+
+The recorded baseline is CPython **3.14.7**, **liboqs-python 0.16.0**, native
+**liboqs 0.16.0**, Linux x86_64. `deploy/tested-versions.txt` records the versions;
+`constraints-tested.txt` pins every Python dependency in the test environment.
+Use `requirements-server.txt` for the daemon and `requirements-client.txt` for the
+CLI client. Neither installs GUI, API, benchmark, or test packages. Management is
+optional (`requirements-management.txt`); tests use `requirements-dev.txt`.
+`requirements.txt` remains the full development compatibility entrypoint.
+No environment is shipped. Other Python versions/platforms require fresh validation.
+The Ubuntu 24.04 Docker examples use distro Python and remain independently
+unvalidated; Compose syntax validation does not establish image/runtime validity.
+
+Install Python 3.14.7 from a trusted distribution/build, plus venv support, git,
+CMake, Ninja, a C compiler, OpenSSL development headers, iproute2, nftables,
+util-linux (flock), rsync and procps (sysctl). Native liboqs must be installed
+explicitly before importing the application or starting the service:
+
+```bash
+python3.14 --version  # must report the tested 3.14.7 baseline
+sudo bash scripts/install-liboqs.sh /usr/local
+# The helper builds the 0.16.0 release as a shared library and runs ldconfig.
+ldconfig -p | grep liboqs
+```
+
+The build procedure follows the upstream [liboqs shared-library build instructions](https://github.com/open-quantum-safe/liboqs)
+and [Python binding installation guidance](https://github.com/open-quantum-safe/liboqs-python).
+PQVPN probes for a preinstalled library before importing the binding; missing
+native liboqs fails closed without triggering its automatic download/build path.
+For a custom prefix set `OQS_INSTALL_PATH` and configure the dynamic loader before
+launch. Do not use mock PQC in deployment. Save the native build/compiler provenance
+alongside test results; version pins alone do not reproduce an operating-system image.
+
+## Install and provision, then diagnose
+
+```bash
+sudo useradd --system --home /opt/pqvpn --shell /usr/sbin/nologin pqvpn
+sudo install -d -o pqvpn -g pqvpn -m 0750 /opt/pqvpn /etc/pqvpn
+sudo rsync -a --chown=pqvpn:pqvpn --exclude=.git --exclude=.venv --exclude=venv --exclude=env --exclude=ENV --exclude=__pycache__ --exclude=.pytest_cache ./ /opt/pqvpn/
+sudo -u pqvpn python3.14 -m venv /opt/pqvpn/.venv
+sudo -u pqvpn /opt/pqvpn/.venv/bin/python -m pip install -r /opt/pqvpn/requirements-server.txt
+cd /opt/pqvpn
+sudo -u pqvpn .venv/bin/python -m vpn.cli identity generate --private /etc/pqvpn/server_identity_private.key --public /etc/pqvpn/server_identity_public.key
+sudo install -o pqvpn -g pqvpn -m 0640 config/server.toml /etc/pqvpn/server.toml
+sudo editor /etc/pqvpn/server.toml
+# Obtain only the client's public key through authenticated provisioning.
+sudo -u pqvpn .venv/bin/python -m vpn.cli client authorize /tmp/alice_public.key --database /etc/pqvpn/authorized_clients.json --client-id alice
+```
+
+Private identity files must be regular, non-symlink files with mode 0600 or 0400.
+The server checks static key lengths and keypair consistency before opening TUN
+or listeners. The client checks its private identity equivalently. Never copy a
+server private key to clients; provision only its public key and SHA-256 pin.
+The database is strictly validated at startup; malformed records, mismatched
+fingerprints, duplicate identities/client IDs/static leases and unusable addresses
+fail startup. CLI updates lock, fsync and atomically replace the database. Restart
+after authorization/static-address changes so startup validates the entire new
+allocation policy. Keep private keys and the authorization database out of archives.
+
+Doctor is read-only: PASS/WARN/FAIL, nonzero for blocking failures. It checks
+native crypto, configuration, identities, visible routes/interfaces (including
+Docker routes), command availability, WAN/default route, ports, forwarding state,
+and service-user readability. Port availability is a snapshot, not a reservation;
+provider policy and hidden networks cannot be inferred from local checks.
+
+## Native and root namespace gate
+
+Install dev dependencies in a fresh validation environment with the same Python:
+
+```bash
+python3.14 -m venv /tmp/pqvpn-validation
+/tmp/pqvpn-validation/bin/python -m pip install -r requirements-dev.txt
+ALLOW_MOCK_PQC=0 /tmp/pqvpn-validation/bin/python -m pytest -q -m native_pqc
+sudo -u pqvpn /opt/pqvpn/.venv/bin/python -m vpn.cli doctor server --config /etc/pqvpn/server.toml
+sudo env PATH="/tmp/pqvpn-validation/bin:$PATH" /tmp/pqvpn-validation/bin/python -m pytest -q -m 'integration and requires_root'
+```
+
+The namespace test requires root, `/dev/net/tun`, iproute2, nftables, curl and ping.
+It is bounded at 180 seconds and includes two clients, public TCP/UDP/NAT, isolation,
+metadata/private blocking and allowlist reconciliation, quiet/idle sessions,
+manual/automatic rekey, a real UDP blackhole, reconnect and forwarding-state restore.
+Its isolated namespaces deliberately do not call the host's systemd-resolved.
+DNS command rollback is unit-tested; actual resolver integration/restoration must
+also be checked on the disposable systemd VM and real client. A SKIP is not a PASS.
+
+## Firewall policy and subnet selection
+
+The exclusively owned tables are `inet pqvpn`, `ip pqvpn_nat`, and
+`inet pqvpn_mangle`. Setup atomically replaces these tables from validated TOML;
+repeated setup reconciles changes. No unrelated tables or global DROP policy are
+installed. Existing host policy can still deny PQVPN traffic.
+
+Default TUN policy:
+
+- Allow IPv4 traffic through the configured WAN, after destination filtering.
+- Allow established/related WAN return traffic to VPN clients.
+- Deny client-to-client, other-interface forwarding, and arbitrary VPS host services.
+- Allow only ICMP echo to `server_vpn_ip` when `allow_server_ping=true`.
+- Deny link-local metadata `169.254.0.0/16`, RFC1918, CGNAT, loopback, unspecified,
+  benchmarking, multicast and reserved destination ranges.
+
+`allowed_forward_networks=[]` is empty by default. To deliberately allow a private
+service through WAN set e.g. `["10.50.0.10/32"]`. Exceptions precede destination
+denies but cannot enable client-to-client or VPS-host access. Filtering uses the
+inner destination, so a private-address WAN gateway does not block public Internet.
+There is no host-service or client-to-client opt-in in this pass.
+
+`manage_ip_forward=true` records the original sysctl once under
+`/run/pqvpn/ip_forward.prev`; repeated setup preserves it, and cleanup restores then
+removes it. `false` requires forwarding already enabled. Coordinate ownership with
+other forwarding services. Only one PQVPN firewall instance manages these tables
+and this saved state; the namespace harness uses its own runtime directory.
+
+Use doctor to detect visible VPN-subnet collisions on both server and client.
+If `10.8.0.0/24` is already used, explicitly choose e.g. `10.66.0.0/24`, update
+`server_vpn_ip`, static leases, and the client's `expected_vpn_subnet`. Do not
+silently select a random subnet. Client control uses the provisioned TCP port;
+the UDP port comes from authenticated server CONFIG (`server_udp_port` was removed).
+
+## Start systemd only after the VM gate
+
+```bash
+sudo cp deploy/pqvpn-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pqvpn-server
+sudo journalctl -u pqvpn-server -f
+sudo ss -lntup
+sudo nft list ruleset
+ip addr show pqvpn0
+```
+
+The unit runs `User=pqvpn`, `Group=pqvpn`, `WorkingDirectory=/opt/pqvpn` and
+`ExecStart=/opt/pqvpn/.venv/bin/python -m vpn.cli server --config /etc/pqvpn/server.toml`.
+There is no EnvironmentFile. `PQVPN_PYTHON` selects the same Python for setup;
+relative key/database paths resolve within `/etc/pqvpn`, including standard identity/database filenames when fields are omitted. `RuntimeDirectory=pqvpn`
+recreates runtime storage. Setup/cleanup are privileged helpers; the Python daemon
+retains CAP_NET_ADMIN, a meaningful privilege boundary. Existing systemd restrictions
+are retained. No additional hardening directives were added without actual systemd
+startup testing; that test remains a deployment gate.
+
+## Provider and real-client checklist
+
+Open only the configured VPN TCP/UDP ports (defaults 51820/TCP and 51820/UDP) in the
+provider and host policy. Keep SSH reachable, preferably only from administrator
+addresses. PQVPN does not require any public 8000/API/database port. Local doctor,
+`ss`, and nftables checks cannot certify the provider firewall.
+
+Verify with a separate Linux client: exit IP becomes the VPS address; TCP/UDP and
+approved DNS work; two clients remain isolated; metadata/private/host services are
+blocked; rekey succeeds under traffic; server restart and temporary UDP blackhole
+trigger FAILED and restore routes/DNS; manual reconnect succeeds. Recheck VPS SSH
+access, TUN, listeners, nftables and absence of public management exposure.
+
+The service does not launch FastAPI. Optional management binds loopback. Remote
+management requires an explicitly configured TLS reverse proxy, a random 32-byte
+bearer token, and explicit HTTPS CORS origins; no direct public Uvicorn listener.
+See [management API](management-api.md) for short-lived WebSocket tickets.
+
+## Current validation record
+
+The [2026-09-07 validation matrix](security_audit.md#final-validation--2026-09-07)
+records the complete regression, syntax, dependency installation, native ML-KEM and
+read-only doctor checks. The development doctor used temporary native identities,
+`service_user="shadow"`, and the visible WAN; it did not provision `/etc/pqvpn` or
+start systemd. Run doctor again with the actual service account and VPS config.
+The host is UID 1000 with TUN visible outside the sandbox: root namespace integration
+is still SKIPPED, not passed. Real VPS/client validation is NOT PERFORMED.
+
+Current Docker examples are not the validated native installation path. Their raw
+Python entrypoints do not invoke firewall helpers: explicit setup/cleanup inside the
+server network namespace is required for NAT/isolation. The development client image
+also lacks systemd-resolved; its managed DNS config fails safely unless a supported
+manager is supplied or the operator explicitly chooses `dns_mode="none"`. Do not treat
+`docker compose config` success as a working container VPN or native systemd result.

@@ -1,0 +1,25 @@
+[server]
+listen_host = "0.0.0.0"
+control_port = 51820
+udp_port = 51820
+vpn_subnet = "10.8.0.0/24"
+server_vpn_ip = "10.8.0.1"
+tun_name = "pqvpn0"
+mtu = 1380
+outbound_interface = ""
+dns_servers = ["1.1.1.1", "9.9.9.9"]
+max_clients = 64
+handshake_timeout = 10
+idle_timeout = 300
+session_timeout = 86400
+rekey_interval = 3600
+connections_per_source = 10
+rate_limit_window = 60.0
+server_identity_private_key = "server_identity_private.key"
+server_identity_public_key = "server_identity_public.key"
+authorized_clients_file = "authorized_clients.json"
+dev_emulated_tun = false
+allowed_forward_networks = []
+allow_server_ping = true
+manage_ip_forward = true
+service_user = "pqvpn"

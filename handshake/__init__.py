@@ -11,6 +11,9 @@ from handshake.kemtls import (
     PROTOCOL_VERSION,
     HEADER_SIZE,
     MessageType,
+    FrameType,
+    Direction,
+    Channel,
     HandshakeError,
 
     # Message data classes
@@ -25,6 +28,8 @@ from handshake.kemtls import (
     # Session context
     HandshakeState,
     HandshakeSession,
+    TrafficSecrets,
+    ReplayWindow,
 
     # State machines
     KEMTLSClient,
@@ -36,6 +41,9 @@ __all__ = [
     "PROTOCOL_VERSION",
     "HEADER_SIZE",
     "MessageType",
+    "FrameType",
+    "Direction",
+    "Channel",
     "HandshakeError",
     "ClientHello",
     "ServerHello",
@@ -44,6 +52,8 @@ __all__ = [
     "TranscriptHasher",
     "HandshakeState",
     "HandshakeSession",
+    "TrafficSecrets",
+    "ReplayWindow",
     "KEMTLSClient",
     "KEMTLSServer",
 ]

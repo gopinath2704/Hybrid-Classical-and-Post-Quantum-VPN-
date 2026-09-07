@@ -1,471 +1,335 @@
-"""
-Signature-Free KEMTLS-Inspired Handshake — Unified Module.
-
-Consolidates the entire handshake layer into a single file:
-    §1  Wire Protocol       — Binary message types, headers, pack/unpack
-    §2  Transcript Hasher   — SHA-256 cumulative transcript binding
-    §3  Session Context     — HandshakeSession with AES-256-GCM frame cipher
-    §4  Client State Machine — KEMTLSClient (initiator)
-    §5  Server State Machine — KEMTLSServer (responder)
-
-Protocol overview (1.5 RTT):
-    Client → Server : ClientHello       (client ECC+PQC public keys)
-    Server → Client : ServerHello       (server ECC+PQC public keys + KEM ciphertext)
-    Client → Server : ClientKeyExchange (KEM ciphertext + finished MAC)
-    Server → Client : ServerFinished    (finished MAC)
-
-Security model:
-    Both classical (X25519 ECDH) and post-quantum (ML-KEM / Kyber768) shared
-    secrets are combined via HKDF-SHA256 to derive symmetric session keys.
-    The handshake is authenticated through transcript MACs — any tampering
-    causes immediate abort. The resulting AES-256-GCM session encrypts all
-    subsequent data frames.
-"""
-
+"""Strict authenticated KEMTLS-inspired handshake and thread-safe record layer."""
 from __future__ import annotations
 
-import os
 import enum
-import hmac
-import struct
 import hashlib
+import hmac
+import os
+import struct
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable
 
+from cryptography.exceptions import InvalidSignature, InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 
-# Import from the consolidated crypto module
-from crypto.hybrid_crypto import (
-    HybridKEM,
-    HybridKeyBundle,
-    KeyManager,
-    ALLOW_MOCK_PQC,
-)
+from crypto.hybrid_crypto import HybridKEM, KeyManager, _secure_zero
+from vpn.identity import fingerprint, verify_client_signature
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# §1  Wire Protocol — Binary Message Types, Headers, Pack / Unpack
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# Wire-format constants
-MAGIC = 0x4856          # "HV" — Hybrid VPN protocol magic bytes
-PROTOCOL_VERSION = 0x10  # Version 1.0
-
-# Fixed sizes (bytes) — matching Kyber768 NIST FIPS 203
+MAGIC = 0x4856
+PROTOCOL_VERSION = 0x20
+PROTOCOL_NAME = b"PQVPN-KEMTLS-INSPIRED-v2"
 RANDOM_SIZE = 32
 SESSION_ID_SIZE = 32
+COMPACT_SESSION_ID_SIZE = 8
 ECC_PUBLIC_KEY_SIZE = 32
-PQC_PUBLIC_KEY_SIZE = 1184       # Kyber768 public key
-PQC_CIPHERTEXT_SIZE = 1088      # Kyber768 ciphertext
-FINISHED_MAC_SIZE = 32           # HMAC-SHA256 tag
-
-# Header: Magic(2) + Version(1) + Type(1) + Length(2) = 6 bytes
+PQC_PUBLIC_KEY_SIZE = 1184
+PQC_CIPHERTEXT_SIZE = 1088
+CLIENT_PUBLIC_KEY_SIZE = 32
+CLIENT_SIGNATURE_SIZE = 64
+FINISHED_MAC_SIZE = 32
+IDENTITY_ID_SIZE = 32
 HEADER_FORMAT = "!HBBH"
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 6 bytes
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+MAX_HANDSHAKE_MESSAGE = 8192
 
 
 class MessageType(enum.IntEnum):
-    """Handshake message type identifiers carried in the wire header."""
-    CLIENT_HELLO = 0x01
-    SERVER_HELLO = 0x02
-    CLIENT_KEY_EXCHANGE = 0x03
-    SERVER_FINISHED = 0x04
-    REKEY_REQUEST = 0x05    # Initiator requests in-session key rotation
-    REKEY_RESPONSE = 0x06  # Responder acknowledges with new cipher material
+    CLIENT_HELLO = 1
+    SERVER_HELLO = 2
+    CLIENT_KEY_EXCHANGE = 3
+    SERVER_FINISHED = 4
     HANDSHAKE_ERROR = 0xFF
 
 
+class FrameType(enum.IntEnum):
+    DATA = 1
+    UDP_BIND = 2
+    UDP_BIND_ACK = 3
+    PING = 4
+    PONG = 5
+    CLOSE = 6
+    CONFIG = 7
+    REKEY_REQUEST = 8
+    REKEY_RESPONSE = 9
+    ERROR = 10
+
+
+class Direction(enum.IntEnum):
+    CLIENT_TO_SERVER = 1
+    SERVER_TO_CLIENT = 2
+
+
+class Channel(enum.IntEnum):
+    DATA = 1
+    CONTROL = 2
+
+
 class HandshakeError(Exception):
-    """Raised when the handshake encounters a fatal protocol error."""
     pass
 
 
 def _pack_header(msg_type: MessageType, payload_length: int) -> bytes:
-    """
-    Pack a 6-byte wire header.
-
-    Format: Magic(2B) | Version(1B) | Type(1B) | PayloadLength(2B)
-    All fields are big-endian (network byte order).
-    """
-    return struct.pack(HEADER_FORMAT, MAGIC, PROTOCOL_VERSION, msg_type, payload_length)
+    if payload_length <= 0 or payload_length > MAX_HANDSHAKE_MESSAGE - HEADER_SIZE:
+        raise HandshakeError("invalid handshake payload length")
+    return struct.pack(HEADER_FORMAT, MAGIC, PROTOCOL_VERSION, int(msg_type), payload_length)
 
 
 def _unpack_header(data: bytes) -> tuple[int, int, int, int]:
-    """
-    Unpack a 6-byte wire header.
-
-    Returns:
-        tuple: (magic, version, msg_type, payload_length)
-
-    Raises:
-        HandshakeError: If data is too short, magic is wrong, or version
-                        is unsupported.
-    """
     if len(data) < HEADER_SIZE:
-        raise HandshakeError(
-            f"Header too short: expected {HEADER_SIZE} bytes, got {len(data)}"
-        )
-    magic, version, msg_type, payload_length = struct.unpack(
-        HEADER_FORMAT, data[:HEADER_SIZE]
-    )
+        raise HandshakeError(f"Header too short: expected {HEADER_SIZE} bytes, got {len(data)}")
+    magic, version, msg_type, length = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
     if magic != MAGIC:
-        raise HandshakeError(
-            f"Invalid magic: expected 0x{MAGIC:04X}, got 0x{magic:04X}"
-        )
+        raise HandshakeError("Invalid magic")
     if version != PROTOCOL_VERSION:
-        raise HandshakeError(
-            f"Unsupported version: expected 0x{PROTOCOL_VERSION:02X}, "
-            f"got 0x{version:02X}"
-        )
-    return magic, version, msg_type, payload_length
+        raise HandshakeError("Unsupported version")
+    if length <= 0 or length > MAX_HANDSHAKE_MESSAGE - HEADER_SIZE:
+        raise HandshakeError("invalid handshake payload length")
+    if len(data) != HEADER_SIZE + length:
+        raise HandshakeError("handshake header length mismatch")
+    try:
+        MessageType(msg_type)
+    except ValueError as exc:
+        raise HandshakeError("unexpected handshake message type") from exc
+    return magic, version, msg_type, length
 
 
-# ─── Message Data Classes ────────────────────────────────────────────────────
+def _fixed(data: bytes, wanted: MessageType, expected: int) -> bytes:
+    _, _, msg_type, length = _unpack_header(data)
+    if msg_type != wanted:
+        raise HandshakeError(f"Expected {wanted.name}")
+    if length != expected:
+        raise HandshakeError(f"{wanted.name} payload length mismatch")
+    return data[HEADER_SIZE:]
 
 
-@dataclass
+def _fields(**values: tuple[bytes, int]) -> None:
+    for name, (value, size) in values.items():
+        if len(value) != size:
+            raise HandshakeError(f"{name} must be exactly {size} bytes")
+
+
+@dataclass(frozen=True)
 class ClientHello:
-    """
-    Client → Server: First handshake flight.
-
-    Payload layout:
-        client_random      (32B)
-        session_id         (32B)
-        ecc_public_key     (32B)
-        pqc_public_key     (1184B)
-    Total payload: 1,280 bytes
-    """
     client_random: bytes
     session_id: bytes
     ecc_public_key: bytes
     pqc_public_key: bytes
+    client_public_key: bytes
+    SIZE = 1312
 
     def pack(self) -> bytes:
-        """Serialize to wire bytes (header + payload)."""
-        payload = (
-            self.client_random
-            + self.session_id
-            + self.ecc_public_key
-            + self.pqc_public_key
-        )
-        header = _pack_header(MessageType.CLIENT_HELLO, len(payload))
-        return header + payload
+        _fields(client_random=(self.client_random, 32), session_id=(self.session_id, 32),
+                ecc_public_key=(self.ecc_public_key, 32), pqc_public_key=(self.pqc_public_key, 1184),
+                client_public_key=(self.client_public_key, 32))
+        payload = self.client_random + self.session_id + self.ecc_public_key + self.pqc_public_key + self.client_public_key
+        return _pack_header(MessageType.CLIENT_HELLO, len(payload)) + payload
 
     @classmethod
     def unpack(cls, data: bytes) -> "ClientHello":
-        """
-        Deserialize from wire bytes.
-
-        Args:
-            data: Raw bytes including the 6-byte header.
-
-        Returns:
-            ClientHello: Parsed message.
-
-        Raises:
-            HandshakeError: On invalid header, wrong type, or bad length.
-        """
-        _, _, msg_type, payload_length = _unpack_header(data)
-        if msg_type != MessageType.CLIENT_HELLO:
-            raise HandshakeError(
-                f"Expected CLIENT_HELLO (0x{MessageType.CLIENT_HELLO:02X}), "
-                f"got 0x{msg_type:02X}"
-            )
-
-        payload = data[HEADER_SIZE:]
-        expected = RANDOM_SIZE + SESSION_ID_SIZE + ECC_PUBLIC_KEY_SIZE + PQC_PUBLIC_KEY_SIZE
-        if len(payload) < expected:
-            raise HandshakeError(
-                f"ClientHello payload too short: expected {expected}, got {len(payload)}"
-            )
-
-        offset = 0
-        client_random = payload[offset: offset + RANDOM_SIZE]; offset += RANDOM_SIZE
-        session_id = payload[offset: offset + SESSION_ID_SIZE]; offset += SESSION_ID_SIZE
-        ecc_pk = payload[offset: offset + ECC_PUBLIC_KEY_SIZE]; offset += ECC_PUBLIC_KEY_SIZE
-        pqc_pk = payload[offset: offset + PQC_PUBLIC_KEY_SIZE]
-
-        return cls(
-            client_random=client_random,
-            session_id=session_id,
-            ecc_public_key=ecc_pk,
-            pqc_public_key=pqc_pk,
-        )
+        payload = _fixed(data, MessageType.CLIENT_HELLO, cls.SIZE)
+        return cls(payload[:32], payload[32:64], payload[64:96], payload[96:1280], payload[1280:])
 
 
-@dataclass
+@dataclass(frozen=True)
 class ServerHello:
-    """
-    Server → Client: Second handshake flight.
-
-    Payload layout:
-        server_random      (32B)
-        session_id         (32B)    — echoed from ClientHello
-        ecc_public_key     (32B)
-        pqc_public_key     (1184B)
-        pqc_ciphertext     (1088B)  — KEM ciphertext to client's PQC key
-    Total payload: 2,368 bytes
-    """
     server_random: bytes
     session_id: bytes
     ecc_public_key: bytes
-    pqc_public_key: bytes
     pqc_ciphertext: bytes
+    identity_id: bytes
+    SIZE = 1216
 
     def pack(self) -> bytes:
-        """Serialize to wire bytes (header + payload)."""
-        payload = (
-            self.server_random
-            + self.session_id
-            + self.ecc_public_key
-            + self.pqc_public_key
-            + self.pqc_ciphertext
-        )
-        header = _pack_header(MessageType.SERVER_HELLO, len(payload))
-        return header + payload
+        _fields(server_random=(self.server_random, 32), session_id=(self.session_id, 32),
+                ecc_public_key=(self.ecc_public_key, 32), pqc_ciphertext=(self.pqc_ciphertext, 1088),
+                identity_id=(self.identity_id, 32))
+        payload = self.server_random + self.session_id + self.ecc_public_key + self.pqc_ciphertext + self.identity_id
+        return _pack_header(MessageType.SERVER_HELLO, len(payload)) + payload
 
     @classmethod
     def unpack(cls, data: bytes) -> "ServerHello":
-        """
-        Deserialize from wire bytes.
-
-        Raises:
-            HandshakeError: On invalid header, wrong type, or bad length.
-        """
-        _, _, msg_type, payload_length = _unpack_header(data)
-        if msg_type != MessageType.SERVER_HELLO:
-            raise HandshakeError(
-                f"Expected SERVER_HELLO (0x{MessageType.SERVER_HELLO:02X}), "
-                f"got 0x{msg_type:02X}"
-            )
-
-        payload = data[HEADER_SIZE:]
-        expected = (
-            RANDOM_SIZE + SESSION_ID_SIZE + ECC_PUBLIC_KEY_SIZE
-            + PQC_PUBLIC_KEY_SIZE + PQC_CIPHERTEXT_SIZE
-        )
-        if len(payload) < expected:
-            raise HandshakeError(
-                f"ServerHello payload too short: expected {expected}, got {len(payload)}"
-            )
-
-        offset = 0
-        server_random = payload[offset: offset + RANDOM_SIZE]; offset += RANDOM_SIZE
-        session_id = payload[offset: offset + SESSION_ID_SIZE]; offset += SESSION_ID_SIZE
-        ecc_pk = payload[offset: offset + ECC_PUBLIC_KEY_SIZE]; offset += ECC_PUBLIC_KEY_SIZE
-        pqc_pk = payload[offset: offset + PQC_PUBLIC_KEY_SIZE]; offset += PQC_PUBLIC_KEY_SIZE
-        pqc_ct = payload[offset: offset + PQC_CIPHERTEXT_SIZE]
-
-        return cls(
-            server_random=server_random,
-            session_id=session_id,
-            ecc_public_key=ecc_pk,
-            pqc_public_key=pqc_pk,
-            pqc_ciphertext=pqc_ct,
-        )
+        payload = _fixed(data, MessageType.SERVER_HELLO, cls.SIZE)
+        return cls(payload[:32], payload[32:64], payload[64:96], payload[96:1184], payload[1184:])
 
 
-@dataclass
+@dataclass(frozen=True)
 class ClientKeyExchange:
-    """
-    Client → Server: Third handshake flight.
-
-    Payload layout:
-        pqc_ciphertext     (1088B)  — KEM ciphertext to server's PQC key
-        finished_mac       (32B)    — HMAC-SHA256 over transcript hash
-    Total payload: 1,120 bytes
-    """
-    pqc_ciphertext: bytes
+    identity_ciphertext: bytes
+    client_signature: bytes
     finished_mac: bytes
+    SIZE = 1184
+
+    def unsigned(self) -> bytes:
+        return self.identity_ciphertext
 
     def pack(self) -> bytes:
-        """Serialize to wire bytes (header + payload)."""
-        payload = self.pqc_ciphertext + self.finished_mac
-        header = _pack_header(MessageType.CLIENT_KEY_EXCHANGE, len(payload))
-        return header + payload
+        _fields(identity_ciphertext=(self.identity_ciphertext, 1088),
+                client_signature=(self.client_signature, 64), finished_mac=(self.finished_mac, 32))
+        payload = self.identity_ciphertext + self.client_signature + self.finished_mac
+        return _pack_header(MessageType.CLIENT_KEY_EXCHANGE, len(payload)) + payload
 
     @classmethod
     def unpack(cls, data: bytes) -> "ClientKeyExchange":
-        """
-        Deserialize from wire bytes.
-
-        Raises:
-            HandshakeError: On invalid header, wrong type, or bad length.
-        """
-        _, _, msg_type, payload_length = _unpack_header(data)
-        if msg_type != MessageType.CLIENT_KEY_EXCHANGE:
-            raise HandshakeError(
-                f"Expected CLIENT_KEY_EXCHANGE (0x{MessageType.CLIENT_KEY_EXCHANGE:02X}), "
-                f"got 0x{msg_type:02X}"
-            )
-
-        payload = data[HEADER_SIZE:]
-        expected = PQC_CIPHERTEXT_SIZE + FINISHED_MAC_SIZE
-        if len(payload) < expected:
-            raise HandshakeError(
-                f"ClientKeyExchange payload too short: expected {expected}, "
-                f"got {len(payload)}"
-            )
-
-        pqc_ct = payload[:PQC_CIPHERTEXT_SIZE]
-        finished_mac = payload[PQC_CIPHERTEXT_SIZE: PQC_CIPHERTEXT_SIZE + FINISHED_MAC_SIZE]
-        return cls(pqc_ciphertext=pqc_ct, finished_mac=finished_mac)
+        payload = _fixed(data, MessageType.CLIENT_KEY_EXCHANGE, cls.SIZE)
+        return cls(payload[:1088], payload[1088:1152], payload[1152:])
 
 
-@dataclass
+@dataclass(frozen=True)
 class ServerFinished:
-    """
-    Server → Client: Fourth (final) handshake flight.
-
-    Payload layout:
-        finished_mac       (32B)    — HMAC-SHA256 over transcript hash
-    Total payload: 32 bytes
-    """
     finished_mac: bytes
 
     def pack(self) -> bytes:
-        """Serialize to wire bytes (header + payload)."""
-        header = _pack_header(MessageType.SERVER_FINISHED, len(self.finished_mac))
-        return header + self.finished_mac
+        _fields(finished_mac=(self.finished_mac, 32))
+        return _pack_header(MessageType.SERVER_FINISHED, 32) + self.finished_mac
 
     @classmethod
     def unpack(cls, data: bytes) -> "ServerFinished":
-        """
-        Deserialize from wire bytes.
-
-        Raises:
-            HandshakeError: On invalid header, wrong type, or bad length.
-        """
-        _, _, msg_type, payload_length = _unpack_header(data)
-        if msg_type != MessageType.SERVER_FINISHED:
-            raise HandshakeError(
-                f"Expected SERVER_FINISHED (0x{MessageType.SERVER_FINISHED:02X}), "
-                f"got 0x{msg_type:02X}"
-            )
-
-        payload = data[HEADER_SIZE:]
-        if len(payload) < FINISHED_MAC_SIZE:
-            raise HandshakeError(
-                f"ServerFinished payload too short: expected {FINISHED_MAC_SIZE}, "
-                f"got {len(payload)}"
-            )
-        return cls(finished_mac=payload[:FINISHED_MAC_SIZE])
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# §2  Transcript Hasher — SHA-256 Cumulative Transcript Binding
-# ═══════════════════════════════════════════════════════════════════════════════
+        return cls(_fixed(data, MessageType.SERVER_FINISHED, 32))
 
 
 class TranscriptHasher:
-    """
-    Accumulates handshake message bytes and computes a running SHA-256
-    digest over the full transcript.
-
-    Every packed message exchanged during the handshake is fed into this
-    hasher. The current digest is used to compute Finished MACs, binding
-    authentication to the exact byte sequence both parties observed.
-
-    Usage:
-        hasher = TranscriptHasher()
-        hasher.update(client_hello_bytes)
-        hasher.update(server_hello_bytes)
-        digest = hasher.digest()   # 32-byte SHA-256 of all messages so far
-    """
-
     def __init__(self) -> None:
         self._hash = hashlib.sha256()
         self._message_count = 0
 
     def update(self, data: bytes) -> None:
-        """
-        Feed raw message bytes (header + payload) into the transcript.
-
-        Args:
-            data: Complete wire-format message bytes.
-        """
         self._hash.update(data)
         self._message_count += 1
 
     def digest(self) -> bytes:
-        """
-        Return the current 32-byte SHA-256 digest of the transcript.
-
-        This does NOT finalize the hasher — subsequent updates are allowed.
-        """
         return self._hash.copy().digest()
 
     @property
     def message_count(self) -> int:
-        """Number of messages fed into the transcript so far."""
         return self._message_count
 
     def copy(self) -> "TranscriptHasher":
-        """Return an independent copy of this hasher's state."""
-        clone = TranscriptHasher()
-        clone._hash = self._hash.copy()
-        clone._message_count = self._message_count
-        return clone
+        other = TranscriptHasher()
+        other._hash = self._hash.copy()
+        other._message_count = self._message_count
+        return other
 
 
-def _compute_finished_mac(
-    transcript_digest: bytes,
-    finished_key: bytes,
-    label: bytes,
-) -> bytes:
-    """
-    Compute a Finished MAC using HMAC-SHA256.
-
-    Args:
-        transcript_digest: Current 32-byte transcript hash.
-        finished_key: 32-byte key derived from the handshake secret.
-        label: Context label (b"client finished" or b"server finished").
-
-    Returns:
-        bytes: 32-byte HMAC tag.
-    """
-    return hmac.new(
-        finished_key,
-        label + transcript_digest,
-        hashlib.sha256,
-    ).digest()
+def _compute_finished_mac(digest: bytes, key: bytes, label: bytes) -> bytes:
+    return hmac.new(key, label + digest, hashlib.sha256).digest()
 
 
-def _verify_finished_mac(
-    transcript_digest: bytes,
-    finished_key: bytes,
-    label: bytes,
-    received_mac: bytes,
-) -> bool:
-    """
-    Verify a Finished MAC in constant time.
-
-    Returns:
-        bool: True if the MAC is valid, False otherwise.
-    """
-    expected = _compute_finished_mac(transcript_digest, finished_key, label)
-    return hmac.compare_digest(expected, received_mac)
+def _verify_finished_mac(digest: bytes, key: bytes, label: bytes, value: bytes) -> bool:
+    return hmac.compare_digest(_compute_finished_mac(digest, key, label), value)
 
 
-# Finished MAC labels (distinct for client and server to prevent reflection)
 _CLIENT_FINISHED_LABEL = b"client finished"
 _SERVER_FINISHED_LABEL = b"server finished"
 
-# HKDF info labels for handshake key derivation
-_INFO_HANDSHAKE_SECRET = b"hybrid-vpn-handshake-secret"
-_INFO_FINISHED_KEY = b"hybrid-vpn-finished-key"
-_INFO_SESSION_ENC = b"hybrid-vpn-session-enc"
-_INFO_SESSION_MAC = b"hybrid-vpn-session-mac"
+
+def _expand(prk: bytes, label: bytes, context: bytes, length: int) -> bytes:
+    info = PROTOCOL_NAME + b"|" + label + b"|" + context
+    return HKDFExpand(algorithm=hashes.SHA256(), length=length, info=info).derive(prk)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# §3  Session Context — HandshakeSession with AES-256-GCM Frame Cipher
-# ═══════════════════════════════════════════════════════════════════════════════
+_SECRET_SPECS = (
+    ("client_finished_key", b"client finished", 32),
+    ("server_finished_key", b"server finished", 32),
+    ("data_c2s_key", b"data c2s key", 32),
+    ("data_s2c_key", b"data s2c key", 32),
+    ("data_c2s_nonce_base", b"data c2s nonce", 12),
+    ("data_s2c_nonce_base", b"data s2c nonce", 12),
+    ("control_c2s_key", b"control c2s key", 32),
+    ("control_s2c_key", b"control s2c key", 32),
+    ("control_c2s_nonce_base", b"control c2s nonce", 12),
+    ("control_s2c_nonce_base", b"control s2c nonce", 12),
+    ("rekey_secret", b"rekey", 32),
+    ("control_confirm_key", b"control confirm", 32),
+)
+
+
+@dataclass
+class TrafficSecrets:
+    client_finished_key: bytearray
+    server_finished_key: bytearray
+    data_c2s_key: bytearray
+    data_s2c_key: bytearray
+    data_c2s_nonce_base: bytearray
+    data_s2c_nonce_base: bytearray
+    control_c2s_key: bytearray
+    control_s2c_key: bytearray
+    control_c2s_nonce_base: bytearray
+    control_s2c_nonce_base: bytearray
+    rekey_secret: bytearray
+    control_confirm_key: bytearray
+
+    # Read-only compatibility aliases used by older callers.
+    @property
+    def client_to_server_key(self): return self.data_c2s_key
+    @property
+    def server_to_client_key(self): return self.data_s2c_key
+    @property
+    def client_to_server_nonce_base(self): return self.data_c2s_nonce_base
+    @property
+    def server_to_client_nonce_base(self): return self.data_s2c_nonce_base
+    @property
+    def control_key(self): return self.control_confirm_key
+
+    def wipe(self) -> None:
+        for value in vars(self).values():
+            if isinstance(value, bytearray):
+                _secure_zero(value)
+
+
+def _derive_secrets(seed: bytes, context: bytes) -> TrafficSecrets:
+    return TrafficSecrets(*[
+        bytearray(_expand(seed, label, context, size)) for _, label, size in _SECRET_SPECS
+    ])
+
+
+def derive_schedule(hybrid_input: bytes, client_random: bytes, server_random: bytes,
+                    session_id: bytes, transcript_hash: bytes) -> TrafficSecrets:
+    context = (PROTOCOL_NAME + bytes([PROTOCOL_VERSION]) + b"|X25519|ML-KEM-768|AES-256-GCM|"
+               + session_id + client_random + server_random + transcript_hash)
+    salt = hashlib.sha256(b"pqvpn extract" + client_random + server_random + session_id).digest()
+    master = KeyManager().derive_key(hybrid_input, salt=salt, info=b"pqvpn master secret")
+    return _derive_secrets(master, context)
+
+
+DATA_MAGIC = b"PV"
+DATA_HEADER_FORMAT = "!2sBBBB8sIQ"
+DATA_HEADER_SIZE = struct.calcsize(DATA_HEADER_FORMAT)  # 26 bytes
+GCM_TAG_SIZE = 16
+DATA_FRAME_OVERHEAD = DATA_HEADER_SIZE + GCM_TAG_SIZE  # 42 bytes
+MAX_SEQUENCE = (1 << 64) - 1
+
+
+class ReplayWindow:
+    def __init__(self, size: int = 128) -> None:
+        self.size = size
+        self.highest = -1
+        self.bitmap = 0
+
+    def check(self, sequence: int) -> None:
+        if sequence < 0 or sequence > MAX_SEQUENCE:
+            raise HandshakeError("invalid sequence")
+        if self.highest >= 0:
+            delta = self.highest - sequence
+            if delta >= self.size:
+                raise HandshakeError("packet is outside replay window")
+            if delta >= 0 and self.bitmap & (1 << delta):
+                raise HandshakeError("replayed packet")
+
+    def commit(self, sequence: int) -> None:
+        if sequence > self.highest:
+            shift = sequence - self.highest
+            self.bitmap = 1 if shift >= self.size else ((self.bitmap << shift) | 1) & ((1 << self.size) - 1)
+            self.highest = sequence
+        else:
+            self.bitmap |= 1 << (self.highest - sequence)
 
 
 class HandshakeState(enum.Enum):
-    """State machine states for the handshake lifecycle."""
     IDLE = "IDLE"
     CLIENT_HELLO_SENT = "CLIENT_HELLO_SENT"
     SERVER_HELLO_SENT = "SERVER_HELLO_SENT"
@@ -476,611 +340,295 @@ class HandshakeState(enum.Enum):
 
 @dataclass
 class HandshakeSession:
-    """
-    Represents a fully established handshake session.
-
-    After a successful KEMTLS exchange, this object holds:
-    - The derived AES-256-GCM encryption key and MAC key.
-    - An AESGCM cipher instance for frame-level encryption.
-    - Session metadata (IDs, randoms, timing).
-
-    Usage:
-        session = HandshakeSession(...)
-        ciphertext = session.encrypt_frame(b"hello world")
-        plaintext  = session.decrypt_frame(ciphertext)
-    """
     session_id: bytes
-    encryption_key: bytes
-    mac_key: bytes
+    secrets: TrafficSecrets
     client_random: bytes
     server_random: bytes
+    role: str
+    client_id: str = ""
     established_at: float = field(default_factory=time.time)
-    _cipher: Optional[AESGCM] = field(default=None, repr=False)
-    _seq_num: int = field(default=0, repr=False)
+    epoch: int = 0
+    _data_send_sequence: int = field(default=0, repr=False)
+    _control_send_sequence: int = field(default=0, repr=False)
+    _control_receive_sequence: int = field(default=0, repr=False)
+    _data_replay: ReplayWindow = field(default_factory=ReplayWindow, repr=False)
+    _data_send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _data_receive_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _control_send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _control_receive_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _epoch_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def __post_init__(self) -> None:
-        """Initialise the AES-256-GCM cipher from the encryption key."""
-        if self._cipher is None:
-            self._cipher = AESGCM(self.encryption_key)
+        if self.role not in {"client", "server"} or len(self.session_id) != 32:
+            raise ValueError("invalid session role or id")
+        self._install()
 
-    def encrypt_frame(self, plaintext: bytes) -> bytes:
-        """
-        Encrypt a data frame using AES-256-GCM.
+    def _install(self) -> None:
+        if self.role == "client":
+            self.send_direction, self.recv_direction = Direction.CLIENT_TO_SERVER, Direction.SERVER_TO_CLIENT
+            data_send, data_recv = self.secrets.data_c2s_key, self.secrets.data_s2c_key
+            data_send_nonce, data_recv_nonce = self.secrets.data_c2s_nonce_base, self.secrets.data_s2c_nonce_base
+            control_send, control_recv = self.secrets.control_c2s_key, self.secrets.control_s2c_key
+            control_send_nonce, control_recv_nonce = self.secrets.control_c2s_nonce_base, self.secrets.control_s2c_nonce_base
+        else:
+            self.send_direction, self.recv_direction = Direction.SERVER_TO_CLIENT, Direction.CLIENT_TO_SERVER
+            data_send, data_recv = self.secrets.data_s2c_key, self.secrets.data_c2s_key
+            data_send_nonce, data_recv_nonce = self.secrets.data_s2c_nonce_base, self.secrets.data_c2s_nonce_base
+            control_send, control_recv = self.secrets.control_s2c_key, self.secrets.control_c2s_key
+            control_send_nonce, control_recv_nonce = self.secrets.control_s2c_nonce_base, self.secrets.control_c2s_nonce_base
+        self._data_send_cipher, self._data_recv_cipher = AESGCM(bytes(data_send)), AESGCM(bytes(data_recv))
+        self._control_send_cipher, self._control_recv_cipher = AESGCM(bytes(control_send)), AESGCM(bytes(control_recv))
+        self._data_send_nonce_base, self._data_recv_nonce_base = data_send_nonce, data_recv_nonce
+        self._control_send_nonce_base, self._control_recv_nonce_base = control_send_nonce, control_recv_nonce
 
-        Format of returned bytes:
-            nonce (12B) || ciphertext+tag (variable)
+    @staticmethod
+    def _nonce(base: bytearray, sequence: int) -> bytes:
+        encoded = b"\0" * 4 + sequence.to_bytes(8, "big")
+        return bytes(a ^ b for a, b in zip(base, encoded))
 
-        The nonce is constructed as:
-            seq_num (8B big-endian) || random_pad (4B)
+    def _encrypt(self, plaintext: bytes, frame_type: FrameType, channel: Channel) -> bytes:
+        lock = self._data_send_lock if channel == Channel.DATA else self._control_send_lock
+        with lock:
+            if self._data_send_cipher is None:
+                raise HandshakeError("session closed")
+            sequence = self._data_send_sequence if channel == Channel.DATA else self._control_send_sequence
+            if sequence == MAX_SEQUENCE:
+                raise HandshakeError("sequence exhausted; rekey required")
+            header = struct.pack(DATA_HEADER_FORMAT, DATA_MAGIC, PROTOCOL_VERSION, int(channel), int(frame_type),
+                                 int(self.send_direction), self.session_id[:8], self.epoch, sequence)
+            cipher = self._data_send_cipher if channel == Channel.DATA else self._control_send_cipher
+            nonce_base = self._data_send_nonce_base if channel == Channel.DATA else self._control_send_nonce_base
+            result = header + cipher.encrypt(self._nonce(nonce_base, sequence), plaintext, header)
+            if channel == Channel.DATA:
+                self._data_send_sequence += 1
+            else:
+                self._control_send_sequence += 1
+            return result
 
-        Args:
-            plaintext: Raw data to encrypt.
+    def encrypt_frame(self, plaintext: bytes, frame_type: FrameType = FrameType.DATA) -> bytes:
+        if frame_type in {FrameType.CONFIG, FrameType.REKEY_REQUEST, FrameType.REKEY_RESPONSE, FrameType.CLOSE, FrameType.ERROR}:
+            raise HandshakeError("control frame type requires encrypt_control")
+        return self._encrypt(plaintext, frame_type, Channel.DATA)
 
-        Returns:
-            bytes: Nonce-prepended authenticated ciphertext.
-        """
-        # Build 12-byte nonce: 8-byte sequence number + 4-byte random
-        nonce = struct.pack("!Q", self._seq_num) + os.urandom(4)
-        self._seq_num += 1
+    def encrypt_control(self, plaintext: bytes, frame_type: FrameType) -> bytes:
+        if frame_type not in {FrameType.CONFIG, FrameType.REKEY_REQUEST, FrameType.REKEY_RESPONSE, FrameType.CLOSE, FrameType.ERROR}:
+            raise HandshakeError("data frame type requires encrypt_frame")
+        return self._encrypt(plaintext, frame_type, Channel.CONTROL)
 
-        ciphertext = self._cipher.encrypt(nonce, plaintext, None)
-        return nonce + ciphertext
-
-    def decrypt_frame(self, frame: bytes) -> bytes:
-        """
-        Decrypt a data frame encrypted by encrypt_frame().
-
-        Args:
-            frame: Nonce-prepended ciphertext as returned by encrypt_frame().
-
-        Returns:
-            bytes: Decrypted plaintext.
-
-        Raises:
-            HandshakeError: If the frame is too short or authentication fails.
-        """
-        nonce_size = 12
-        if len(frame) < nonce_size + 16:  # 16-byte GCM tag minimum
-            raise HandshakeError(
-                f"Frame too short for decryption: {len(frame)} bytes"
-            )
-        nonce = frame[:nonce_size]
-        ciphertext = frame[nonce_size:]
-
+    def _decrypt(self, frame: bytes, channel: Channel, expected_type: FrameType | None) -> tuple[FrameType, bytes]:
+        if len(frame) < DATA_FRAME_OVERHEAD:
+            raise HandshakeError("Frame too short")
+        header = frame[:DATA_HEADER_SIZE]
+        magic, version, wire_channel, wire_type, direction, session_id, epoch, sequence = struct.unpack(DATA_HEADER_FORMAT, header)
+        if magic != DATA_MAGIC or version != PROTOCOL_VERSION or wire_channel != channel:
+            raise HandshakeError("invalid record protocol or channel")
         try:
-            return self._cipher.decrypt(nonce, ciphertext, None)
-        except Exception as e:
-            raise HandshakeError(f"Frame decryption failed: {e}") from e
+            frame_type = FrameType(wire_type)
+        except ValueError as exc:
+            raise HandshakeError("invalid frame type") from exc
+        if expected_type is not None and frame_type != expected_type:
+            raise HandshakeError("unexpected frame type")
+        if channel == Channel.DATA:
+            # Eligibility, AEAD authentication, and commit are one critical section.
+            with self._data_receive_lock:
+                if session_id != self.session_id[:8] or epoch != self.epoch or direction != self.recv_direction:
+                    raise HandshakeError("wrong session, epoch, or direction")
+                if self._data_recv_cipher is None:
+                    raise HandshakeError("session closed")
+                self._data_replay.check(sequence)
+                try:
+                    plaintext = self._data_recv_cipher.decrypt(self._nonce(self._data_recv_nonce_base, sequence), frame[DATA_HEADER_SIZE:], header)
+                except InvalidTag as exc:
+                    raise HandshakeError("Frame decryption failed") from exc
+                self._data_replay.commit(sequence)
+                return frame_type, plaintext
+        with self._control_receive_lock:
+            if session_id != self.session_id[:8] or epoch != self.epoch or direction != self.recv_direction:
+                raise HandshakeError("wrong session, epoch, or direction")
+            if self._control_recv_cipher is None:
+                raise HandshakeError("session closed")
+            if sequence != self._control_receive_sequence:
+                raise HandshakeError("unexpected control sequence")
+            try:
+                plaintext = self._control_recv_cipher.decrypt(self._nonce(self._control_recv_nonce_base, sequence), frame[DATA_HEADER_SIZE:], header)
+            except InvalidTag as exc:
+                raise HandshakeError("Control decryption failed") from exc
+            self._control_receive_sequence += 1
+            return frame_type, plaintext
 
-    def rekey(
-        self,
-        key_manager: Optional["KeyManager"] = None,
-    ) -> bytes:
-        """
-        Perform in-session key rotation (forward secrecy ratchet).
+    def decrypt_frame(self, frame: bytes, expected_type: FrameType | None = None) -> tuple[FrameType, bytes]:
+        return self._decrypt(frame, Channel.DATA, expected_type)
 
-        Derives a fresh AES-256-GCM encryption key and MAC key from the
-        current key material plus a fresh random nonce, installs the new
-        keys into the cipher, and securely zeroes the old keys.
+    def decrypt_control(self, frame: bytes, expected_type: FrameType | None = None) -> tuple[FrameType, bytes]:
+        return self._decrypt(frame, Channel.CONTROL, expected_type)
 
-        Returns:
-            bytes: The 32-byte rekey nonce (for logging / audit only).
-                   This should NOT be sent over the wire; each peer performs
-                   rekeying independently using locally stored key material.
-        """
-        if key_manager is None:
-            key_manager = KeyManager()
+    def derive_next_epoch(self, epoch: int, nonce: bytes) -> TrafficSecrets:
+        with self._epoch_lock:
+            if self._data_send_cipher is None:
+                raise HandshakeError("session closed")
+            if epoch != self.epoch + 1 or len(nonce) != 32:
+                raise HandshakeError("invalid rekey epoch or nonce")
+            context = self.session_id + epoch.to_bytes(4, "big") + nonce
+            seed = _expand(bytes(self.secrets.rekey_secret), b"epoch", context, 32)
+            return _derive_secrets(seed, context)
 
-        rekey_nonce = os.urandom(32)
-
-        # Derive successor keys from current encryption_key + fresh nonce
-        new_enc_key, new_mac_key = key_manager.derive_rekey_pair(
-            bytes(self.encryption_key) if isinstance(self.encryption_key, bytearray)
-            else self.encryption_key,
-            rekey_nonce,
-        )
-
-        # Securely erase old key material
-        if isinstance(self.encryption_key, bytearray):
-            import ctypes
-            ctypes.memset(
-                (ctypes.c_char * len(self.encryption_key))
-                .from_buffer(self.encryption_key),
-                0, len(self.encryption_key),
-            )
-        if isinstance(self.mac_key, bytearray):
-            import ctypes
-            ctypes.memset(
-                (ctypes.c_char * len(self.mac_key))
-                .from_buffer(self.mac_key),
-                0, len(self.mac_key),
-            )
-
-        # Install new keys
-        self.encryption_key = new_enc_key
-        self.mac_key = new_mac_key
-        self._cipher = AESGCM(new_enc_key)
-        # Reset sequence counter for new cipher epoch
-        self._seq_num = 0
-
-        return rekey_nonce
+    def activate_epoch(self, epoch: int, secrets: TrafficSecrets) -> None:
+        # Stop both channels while installing keys and resetting all independent counters.
+        with self._epoch_lock, self._data_send_lock, self._data_receive_lock, self._control_send_lock, self._control_receive_lock:
+            if self._data_send_cipher is None:
+                raise HandshakeError("session closed")
+            if epoch != self.epoch + 1:
+                raise HandshakeError("non-monotonic epoch")
+            old = self.secrets
+            self.secrets = secrets
+            self.epoch = epoch
+            self._data_send_sequence = 0
+            self._control_send_sequence = 0
+            self._control_receive_sequence = 0
+            self._data_replay = ReplayWindow()
+            self._install()
+            old.wipe()
 
     def secure_wipe(self) -> None:
-        """
-        Securely zero all session key material in memory.
-
-        Call this on disconnect or session expiry to minimise the window
-        during which keys are recoverable from process memory.
-        """
-        import ctypes
-
-        def _wipe(buf: bytes | bytearray) -> None:
-            ba = bytearray(buf) if isinstance(buf, bytes) else buf
-            ctypes.memset(
-                (ctypes.c_char * len(ba)).from_buffer(ba), 0, len(ba)
-            )
-
-        _wipe(self.encryption_key if isinstance(self.encryption_key, bytearray)
-              else bytearray(self.encryption_key))
-        _wipe(self.mac_key if isinstance(self.mac_key, bytearray)
-              else bytearray(self.mac_key))
-        self._cipher = None
-        self._seq_num = 0
+        # Global order: epoch, DATA send, DATA receive, CONTROL send, CONTROL receive.
+        # Record operations never acquire epoch while holding a record lock.
+        with self._epoch_lock, self._data_send_lock, self._data_receive_lock, self._control_send_lock, self._control_receive_lock:
+            self.secrets.wipe()
+            self._data_send_cipher = self._data_recv_cipher = None
+            self._control_send_cipher = self._control_recv_cipher = None
 
     def get_info(self) -> dict:
-        """Return session metadata as a dictionary."""
-        return {
-            "session_id": self.session_id.hex(),
-            "established_at": self.established_at,
-            "encryption_key_size": len(self.encryption_key),
-            "mac_key_size": len(self.mac_key),
-        }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# §4  Client State Machine — KEMTLSClient (Initiator)
-# ═══════════════════════════════════════════════════════════════════════════════
+        return {"session_id": self.session_id.hex(), "established_at": self.established_at,
+                "epoch": self.epoch, "role": self.role, "encryption_key_size": 32}
 
 
 class KEMTLSClient:
-    """
-    Client-side KEMTLS handshake state machine.
-
-    Drives the initiator through the full handshake lifecycle:
-        1. initiate_handshake()   → produces ClientHello wire bytes
-        2. process_server_hello() → consumes ServerHello, produces ClientKeyExchange
-        3. process_server_finished() → consumes ServerFinished, returns HandshakeSession
-
-    Usage:
-        client = KEMTLSClient()
-        ch_bytes = client.initiate_handshake()
-        # ... send ch_bytes, receive sh_bytes ...
-        cke_bytes = client.process_server_hello(sh_bytes)
-        # ... send cke_bytes, receive sf_bytes ...
-        session = client.process_server_finished(sf_bytes)
-        # session is now a HandshakeSession with AES-256-GCM
-    """
-
-    def __init__(
-        self,
-        pqc_algorithm: str = "Kyber768",
-        allow_mock_pqc: bool = False,
-    ) -> None:
-        self._hybrid = HybridKEM(
-            pqc_algorithm=pqc_algorithm,
-            allow_mock_pqc=allow_mock_pqc or ALLOW_MOCK_PQC,
-        )
-        self._key_manager = KeyManager()
+    def __init__(self, server_identity_public: bytes, server_fingerprint: str,
+                 client_private_key: Ed25519PrivateKey, allow_mock_pqc: bool = False) -> None:
+        expected = fingerprint(server_identity_public)
+        if len(server_identity_public) != 1184 or not hmac.compare_digest(expected, server_fingerprint.lower()):
+            raise HandshakeError("server identity fingerprint mismatch")
+        self.identity_public = server_identity_public
+        self.identity_id = bytes.fromhex(expected)
+        self.client_private = client_private_key
+        self.client_public = client_private_key.public_key().public_bytes_raw()
+        self._hybrid = HybridKEM("ML-KEM-768", allow_mock_pqc)
         self._state = HandshakeState.IDLE
         self._transcript = TranscriptHasher()
 
-        # Ephemeral key material (populated during handshake)
-        self._client_keys: Optional[HybridKeyBundle] = None
-        self._client_random: Optional[bytes] = None
-        self._session_id: Optional[bytes] = None
-
-        # Derived secrets (populated after processing ServerHello)
-        self._handshake_secret: Optional[bytes] = None
-        self._finished_key: Optional[bytes] = None
-        self._encryption_key: Optional[bytes] = None
-        self._mac_key: Optional[bytes] = None
-        self._server_random: Optional[bytes] = None
-
     @property
-    def state(self) -> HandshakeState:
-        """Current handshake state."""
-        return self._state
+    def state(self): return self._state
 
     def initiate_handshake(self) -> bytes:
-        """
-        Start the handshake by generating a ClientHello message.
-
-        Generates ephemeral ECC + PQC keypairs and a random session ID.
-
-        Returns:
-            bytes: Wire-format ClientHello message.
-
-        Raises:
-            HandshakeError: If not in IDLE state.
-        """
         if self._state != HandshakeState.IDLE:
-            raise HandshakeError(
-                f"Cannot initiate handshake from state {self._state.value}"
-            )
-
-        # Generate ephemeral key material
-        self._client_keys = self._hybrid.generate_keypairs()
-        self._client_random = os.urandom(RANDOM_SIZE)
-        self._session_id = os.urandom(SESSION_ID_SIZE)
-
-        # Build and serialize ClientHello
-        msg = ClientHello(
-            client_random=self._client_random,
-            session_id=self._session_id,
-            ecc_public_key=self._client_keys.ecc_public,
-            pqc_public_key=self._client_keys.pqc_public,
-        )
-        wire_bytes = msg.pack()
-
-        # Update transcript
-        self._transcript.update(wire_bytes)
+            raise HandshakeError("Cannot initiate handshake")
+        self.keys = self._hybrid.generate_keypairs()
+        self.client_random, self.session_id = os.urandom(32), os.urandom(32)
+        wire = ClientHello(self.client_random, self.session_id, self.keys.ecc_public,
+                           self.keys.pqc_public, self.client_public).pack()
+        self._transcript.update(wire)
         self._state = HandshakeState.CLIENT_HELLO_SENT
+        return wire
 
-        return wire_bytes
-
-    def process_server_hello(self, server_hello_bytes: bytes) -> bytes:
-        """
-        Process the ServerHello and produce a ClientKeyExchange.
-
-        Performs:
-        1. Parse ServerHello (server ECC/PQC keys + PQC ciphertext).
-        2. Decapsulate the server's PQC ciphertext → pqc_shared_secret_1.
-        3. Perform X25519 ECDH with server ECC key → ecc_shared_secret.
-        4. Encapsulate towards server's PQC public key → pqc_shared_secret_2 + ciphertext.
-        5. Combine all secrets via HKDF → handshake keys.
-        6. Compute Finished MAC over transcript.
-
-        Args:
-            server_hello_bytes: Wire-format ServerHello message.
-
-        Returns:
-            bytes: Wire-format ClientKeyExchange message.
-
-        Raises:
-            HandshakeError: On state error, parse failure, or crypto failure.
-        """
+    def process_server_hello(self, wire: bytes) -> bytes:
         if self._state != HandshakeState.CLIENT_HELLO_SENT:
-            raise HandshakeError(
-                f"Cannot process ServerHello from state {self._state.value}"
-            )
-
-        # Parse ServerHello
-        sh = ServerHello.unpack(server_hello_bytes)
-
-        # Verify session ID echo
-        if sh.session_id != self._session_id:
-            raise HandshakeError("Session ID mismatch in ServerHello")
-
-        self._server_random = sh.server_random
-
-        # Update transcript with ServerHello
-        self._transcript.update(server_hello_bytes)
-
-        # --- Cryptographic operations ---
-
-        # 1. X25519 ECDH → shared secret
-        ecc_shared = self._hybrid.ecc.derive_shared_secret(
-            self._client_keys.ecc_private, sh.ecc_public_key
-        )
-
-        # 2. Decapsulate server's PQC ciphertext (encrypted to our PQC public key)
-        pqc_shared_1 = self._hybrid.pqc.decapsulate(
-            self._client_keys.pqc_secret, sh.pqc_ciphertext
-        )
-
-        # 3. Encapsulate towards server's PQC public key
-        pqc_ciphertext_to_server, pqc_shared_2 = self._hybrid.pqc.encapsulate(
-            sh.pqc_public_key
-        )
-
-        # 4. Combine all shared secrets: ECC || PQC_1 || PQC_2
-        combined_secret = ecc_shared + pqc_shared_1 + pqc_shared_2
-
-        # 5. Derive handshake keys via HKDF
-        salt = self._client_random + self._server_random
-        self._handshake_secret = self._key_manager.derive_key(
-            combined_secret, salt=salt, info=_INFO_HANDSHAKE_SECRET
-        )
-        self._finished_key = self._key_manager.derive_key(
-            self._handshake_secret, salt=None, info=_INFO_FINISHED_KEY
-        )
-        self._encryption_key = self._key_manager.derive_key(
-            self._handshake_secret, salt=None, info=_INFO_SESSION_ENC
-        )
-        self._mac_key = self._key_manager.derive_key(
-            self._handshake_secret, salt=None, info=_INFO_SESSION_MAC
-        )
-
-        # 6. Compute Client Finished MAC
-        transcript_digest = self._transcript.digest()
-        client_finished_mac = _compute_finished_mac(
-            transcript_digest, self._finished_key, _CLIENT_FINISHED_LABEL
-        )
-
-        # Build ClientKeyExchange
-        cke = ClientKeyExchange(
-            pqc_ciphertext=pqc_ciphertext_to_server,
-            finished_mac=client_finished_mac,
-        )
-        cke_bytes = cke.pack()
-
-        # Update transcript with ClientKeyExchange
-        self._transcript.update(cke_bytes)
+            raise HandshakeError("Cannot process ServerHello")
+        hello = ServerHello.unpack(wire)
+        if hello.session_id != self.session_id:
+            raise HandshakeError("Session ID mismatch")
+        if not hmac.compare_digest(hello.identity_id, self.identity_id):
+            raise HandshakeError("server identity substitution detected")
+        self._transcript.update(wire)
+        self.server_random = hello.server_random
+        ecc = self._hybrid.ecc.derive_shared_secret(self.keys.ecc_private, hello.ecc_public_key)
+        ephemeral_pq = self._hybrid.pqc.decapsulate(self.keys.pqc_secret, hello.pqc_ciphertext)
+        identity_ciphertext, identity_secret = self._hybrid.pqc.encapsulate(self.identity_public)
+        digest = self._transcript.digest()
+        self.schedule = derive_schedule(ecc + ephemeral_pq + identity_secret, self.client_random,
+                                        self.server_random, self.session_id, digest)
+        signed = PROTOCOL_NAME + b" client proof " + digest + identity_ciphertext
+        signature = self.client_private.sign(signed)
+        partial = identity_ciphertext + signature
+        finished = _compute_finished_mac(hashlib.sha256(digest + partial).digest(),
+                                         bytes(self.schedule.client_finished_key), _CLIENT_FINISHED_LABEL)
+        exchange = ClientKeyExchange(identity_ciphertext, signature, finished).pack()
+        self._transcript.update(exchange)
         self._state = HandshakeState.KEY_EXCHANGE_SENT
+        return exchange
 
-        return cke_bytes
-
-    def process_server_finished(self, server_finished_bytes: bytes) -> HandshakeSession:
-        """
-        Process the ServerFinished message and establish the session.
-
-        Verifies the server's transcript MAC. On success, returns a fully
-        initialized HandshakeSession with AES-256-GCM encryption.
-
-        Args:
-            server_finished_bytes: Wire-format ServerFinished message.
-
-        Returns:
-            HandshakeSession: Ready for encrypted data transport.
-
-        Raises:
-            HandshakeError: On state error, MAC verification failure.
-        """
+    def process_server_finished(self, wire: bytes) -> HandshakeSession:
         if self._state != HandshakeState.KEY_EXCHANGE_SENT:
-            raise HandshakeError(
-                f"Cannot process ServerFinished from state {self._state.value}"
-            )
-
-        # Parse ServerFinished
-        sf = ServerFinished.unpack(server_finished_bytes)
-
-        # Verify server finished MAC
-        transcript_digest = self._transcript.digest()
-        if not _verify_finished_mac(
-            transcript_digest, self._finished_key,
-            _SERVER_FINISHED_LABEL, sf.finished_mac
-        ):
+            raise HandshakeError("Cannot process ServerFinished")
+        finished = ServerFinished.unpack(wire)
+        if not _verify_finished_mac(self._transcript.digest(), bytes(self.schedule.server_finished_key),
+                                    _SERVER_FINISHED_LABEL, finished.finished_mac):
             self._state = HandshakeState.FAILED
             raise HandshakeError("Server Finished MAC verification failed")
-
-        # Update transcript with ServerFinished
-        self._transcript.update(server_finished_bytes)
+        self._transcript.update(wire)
         self._state = HandshakeState.ESTABLISHED
-
-        return HandshakeSession(
-            session_id=self._session_id,
-            encryption_key=self._encryption_key,
-            mac_key=self._mac_key,
-            client_random=self._client_random,
-            server_random=self._server_random,
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# §5  Server State Machine — KEMTLSServer (Responder)
-# ═══════════════════════════════════════════════════════════════════════════════
+        return HandshakeSession(self.session_id, self.schedule, self.client_random, self.server_random, "client")
 
 
 class KEMTLSServer:
-    """
-    Server-side KEMTLS handshake state machine.
-
-    Drives the responder through the full handshake lifecycle:
-        1. process_client_hello()       → consumes ClientHello, produces ServerHello
-        2. process_client_key_exchange() → consumes ClientKeyExchange, produces
-                                           (ServerFinished bytes, HandshakeSession)
-
-    Usage:
-        server = KEMTLSServer()
-        sh_bytes = server.process_client_hello(ch_bytes)
-        # ... send sh_bytes, receive cke_bytes ...
-        sf_bytes, session = server.process_client_key_exchange(cke_bytes)
-        # ... send sf_bytes ...
-        # session is now a HandshakeSession with AES-256-GCM
-    """
-
-    def __init__(
-        self,
-        pqc_algorithm: str = "Kyber768",
-        allow_mock_pqc: bool = False,
-    ) -> None:
-        self._hybrid = HybridKEM(
-            pqc_algorithm=pqc_algorithm,
-            allow_mock_pqc=allow_mock_pqc or ALLOW_MOCK_PQC,
-        )
-        self._key_manager = KeyManager()
+    def __init__(self, server_identity_secret: bytes, server_identity_public: bytes,
+                 authorize_client: Callable[[bytes], dict | None], allow_mock_pqc: bool = False) -> None:
+        if len(server_identity_public) != 1184:
+            raise ValueError("invalid server identity public key")
+        self.identity_secret = server_identity_secret
+        self.identity_id = bytes.fromhex(fingerprint(server_identity_public))
+        self.authorize_client = authorize_client
+        self._hybrid = HybridKEM("ML-KEM-768", allow_mock_pqc)
         self._state = HandshakeState.IDLE
         self._transcript = TranscriptHasher()
 
-        # Ephemeral key material
-        self._server_keys: Optional[HybridKeyBundle] = None
-        self._server_random: Optional[bytes] = None
-        self._session_id: Optional[bytes] = None
-        self._client_random: Optional[bytes] = None
-
-        # Peer key material (from ClientHello)
-        self._client_ecc_public: Optional[bytes] = None
-        self._client_pqc_public: Optional[bytes] = None
-
-        # Derived secrets
-        self._ecc_shared: Optional[bytes] = None
-        self._pqc_shared_1: Optional[bytes] = None
-        self._handshake_secret: Optional[bytes] = None
-        self._finished_key: Optional[bytes] = None
-        self._encryption_key: Optional[bytes] = None
-        self._mac_key: Optional[bytes] = None
-
     @property
-    def state(self) -> HandshakeState:
-        """Current handshake state."""
-        return self._state
+    def state(self): return self._state
 
-    def process_client_hello(self, client_hello_bytes: bytes) -> bytes:
-        """
-        Process the ClientHello and produce a ServerHello.
-
-        Performs:
-        1. Parse ClientHello (client ECC/PQC public keys).
-        2. Generate server ephemeral ECC + PQC keypairs.
-        3. Perform X25519 ECDH → ecc_shared_secret.
-        4. Encapsulate towards client's PQC key → pqc_shared_secret_1 + ciphertext.
-
-        Args:
-            client_hello_bytes: Wire-format ClientHello message.
-
-        Returns:
-            bytes: Wire-format ServerHello message.
-
-        Raises:
-            HandshakeError: On state error or parse failure.
-        """
+    def process_client_hello(self, wire: bytes) -> bytes:
         if self._state != HandshakeState.IDLE:
-            raise HandshakeError(
-                f"Cannot process ClientHello from state {self._state.value}"
-            )
-
-        # Parse ClientHello
-        ch = ClientHello.unpack(client_hello_bytes)
-
-        # Update transcript
-        self._transcript.update(client_hello_bytes)
-
-        # Store client's material
-        self._session_id = ch.session_id
-        self._client_random = ch.client_random
-        self._client_ecc_public = ch.ecc_public_key
-        self._client_pqc_public = ch.pqc_public_key
-
-        # Generate server ephemeral keys
-        self._server_keys = self._hybrid.generate_keypairs()
-        self._server_random = os.urandom(RANDOM_SIZE)
-
-        # X25519 ECDH
-        self._ecc_shared = self._hybrid.ecc.derive_shared_secret(
-            self._server_keys.ecc_private, self._client_ecc_public
-        )
-
-        # KEM encapsulate towards client PQC public key
-        pqc_ct_to_client, self._pqc_shared_1 = self._hybrid.pqc.encapsulate(
-            self._client_pqc_public
-        )
-
-        # Build ServerHello
-        sh = ServerHello(
-            server_random=self._server_random,
-            session_id=self._session_id,
-            ecc_public_key=self._server_keys.ecc_public,
-            pqc_public_key=self._server_keys.pqc_public,
-            pqc_ciphertext=pqc_ct_to_client,
-        )
-        sh_bytes = sh.pack()
-
-        # Update transcript
-        self._transcript.update(sh_bytes)
+            raise HandshakeError("Cannot process ClientHello")
+        hello = ClientHello.unpack(wire)
+        authorization = self.authorize_client(hello.client_public_key)
+        if not authorization:
+            self._state = HandshakeState.FAILED
+            raise HandshakeError("unauthorized client")
+        self.authz, self.ch = authorization, hello
+        self._transcript.update(wire)
+        self.server_ecc_private, server_ecc_public = self._hybrid.ecc.generate_keypair()
+        self.server_random = os.urandom(32)
+        self.ecc = self._hybrid.ecc.derive_shared_secret(self.server_ecc_private, hello.ecc_public_key)
+        ciphertext, self.ephemeral_pq = self._hybrid.pqc.encapsulate(hello.pqc_public_key)
+        response = ServerHello(self.server_random, hello.session_id, server_ecc_public,
+                               ciphertext, self.identity_id).pack()
+        self._transcript.update(response)
         self._state = HandshakeState.SERVER_HELLO_SENT
+        return response
 
-        return sh_bytes
-
-    def process_client_key_exchange(
-        self, client_key_exchange_bytes: bytes
-    ) -> tuple[bytes, HandshakeSession]:
-        """
-        Process the ClientKeyExchange and produce ServerFinished + session.
-
-        Performs:
-        1. Parse ClientKeyExchange (PQC ciphertext + finished MAC).
-        2. Decapsulate client's PQC ciphertext → pqc_shared_secret_2.
-        3. Combine all secrets: ECC || PQC_1 || PQC_2 → HKDF → keys.
-        4. Verify client's finished MAC.
-        5. Compute server finished MAC.
-
-        Args:
-            client_key_exchange_bytes: Wire-format ClientKeyExchange message.
-
-        Returns:
-            tuple: (ServerFinished wire bytes, HandshakeSession)
-
-        Raises:
-            HandshakeError: On state error, parse failure, or MAC mismatch.
-        """
+    def process_client_key_exchange(self, wire: bytes) -> tuple[bytes, HandshakeSession]:
         if self._state != HandshakeState.SERVER_HELLO_SENT:
-            raise HandshakeError(
-                f"Cannot process ClientKeyExchange from state {self._state.value}"
-            )
-
-        # Parse ClientKeyExchange
-        cke = ClientKeyExchange.unpack(client_key_exchange_bytes)
-
-        # Decapsulate client's PQC ciphertext (encrypted to our PQC key)
-        pqc_shared_2 = self._hybrid.pqc.decapsulate(
-            self._server_keys.pqc_secret, cke.pqc_ciphertext
-        )
-
-        # Combine all shared secrets: ECC || PQC_1 || PQC_2
-        combined_secret = self._ecc_shared + self._pqc_shared_1 + pqc_shared_2
-
-        # Derive handshake keys
-        salt = self._client_random + self._server_random
-        self._handshake_secret = self._key_manager.derive_key(
-            combined_secret, salt=salt, info=_INFO_HANDSHAKE_SECRET
-        )
-        self._finished_key = self._key_manager.derive_key(
-            self._handshake_secret, salt=None, info=_INFO_FINISHED_KEY
-        )
-        self._encryption_key = self._key_manager.derive_key(
-            self._handshake_secret, salt=None, info=_INFO_SESSION_ENC
-        )
-        self._mac_key = self._key_manager.derive_key(
-            self._handshake_secret, salt=None, info=_INFO_SESSION_MAC
-        )
-
-        # Verify client finished MAC
-        # The transcript at this point contains: ClientHello + ServerHello
-        # (ClientKeyExchange is NOT yet in the transcript for verification)
-        transcript_digest = self._transcript.digest()
-        if not _verify_finished_mac(
-            transcript_digest, self._finished_key,
-            _CLIENT_FINISHED_LABEL, cke.finished_mac
-        ):
+            raise HandshakeError("Cannot process ClientKeyExchange")
+        exchange = ClientKeyExchange.unpack(wire)
+        digest = self._transcript.digest()
+        identity_secret = self._hybrid.pqc.decapsulate(self.identity_secret, exchange.identity_ciphertext)
+        schedule = derive_schedule(self.ecc + self.ephemeral_pq + identity_secret, self.ch.client_random,
+                                   self.server_random, self.ch.session_id, digest)
+        try:
+            verify_client_signature(self.ch.client_public_key, exchange.client_signature,
+                                    PROTOCOL_NAME + b" client proof " + digest + exchange.unsigned())
+        except InvalidSignature as exc:
+            self._state = HandshakeState.FAILED
+            raise HandshakeError("client identity proof failed") from exc
+        partial = exchange.unsigned() + exchange.client_signature
+        if not _verify_finished_mac(hashlib.sha256(digest + partial).digest(),
+                                    bytes(schedule.client_finished_key), _CLIENT_FINISHED_LABEL,
+                                    exchange.finished_mac):
             self._state = HandshakeState.FAILED
             raise HandshakeError("Client Finished MAC verification failed")
-
-        # Update transcript with ClientKeyExchange
-        self._transcript.update(client_key_exchange_bytes)
-
-        # Compute server finished MAC (over transcript including CKE)
-        server_transcript_digest = self._transcript.digest()
-        server_finished_mac = _compute_finished_mac(
-            server_transcript_digest, self._finished_key, _SERVER_FINISHED_LABEL
-        )
-
-        # Build ServerFinished
-        sf = ServerFinished(finished_mac=server_finished_mac)
-        sf_bytes = sf.pack()
-
-        # Update transcript
-        self._transcript.update(sf_bytes)
+        self._transcript.update(wire)
+        finished = ServerFinished(_compute_finished_mac(self._transcript.digest(),
+                                  bytes(schedule.server_finished_key), _SERVER_FINISHED_LABEL)).pack()
+        self._transcript.update(finished)
         self._state = HandshakeState.ESTABLISHED
-
-        session = HandshakeSession(
-            session_id=self._session_id,
-            encryption_key=self._encryption_key,
-            mac_key=self._mac_key,
-            client_random=self._client_random,
-            server_random=self._server_random,
-        )
-
-        return sf_bytes, session
-
-
-# ─────────────────────────────────────────────────────────────────────────────
+        session = HandshakeSession(self.ch.session_id, schedule, self.ch.client_random,
+                                   self.server_random, "server", self.authz.get("client_id", ""))
+        return finished, session

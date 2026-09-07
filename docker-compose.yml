@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   vpn-server:
     build:
@@ -11,11 +9,13 @@ services:
     devices:
       - "/dev/net/tun:/dev/net/tun"
     ports:
-      - "8000:8000"        # FastAPI management dashboard / REST API
       - "51820:51820"      # KEMTLS handshake TCP
       - "51820:51820/udp"  # AES-256-GCM VPN tunnel UDP
     volumes:
-      - .:/app
+      - ./config/server.toml:/etc/pqvpn/server.toml:ro
+      - ./config/server_identity_private.key:/etc/pqvpn/server_identity_private.key:ro
+      - ./config/server_identity_public.key:/etc/pqvpn/server_identity_public.key:ro
+      - ./config/authorized_clients.json:/etc/pqvpn/authorized_clients.json:ro
     environment:
       - MODE=server
       - PYTHONUNBUFFERED=1
@@ -34,13 +34,13 @@ services:
       - "/dev/net/tun:/dev/net/tun"
     depends_on:
       - vpn-server
+    profiles: ["development-client"]
     volumes:
-      - .:/app
+      - ./config/client.docker.toml:/etc/pqvpn/client.toml:ro
+      - ./config/client_identity_private.key:/etc/pqvpn/client_identity_private.key:ro
+      - ./config/server_identity_public.key:/etc/pqvpn/server_identity_public.key:ro
     environment:
       - MODE=client
-      - SERVER_HOST=vpn-server
-      - SERVER_PORT=51820
-      - VPN_IP=10.8.0.2
       - PYTHONUNBUFFERED=1
     networks:
       vpn-net:

@@ -20,9 +20,9 @@ Fail-closed PQC policy:
     mock is active every API call returns `is_quantum_safe=False` and a
     `security_warning` field.  Production deployments MUST install native liboqs.
 
-Installing liboqs-python:
-    pip install liboqs-python          # may require cmake + gcc
-    # or build from source: https://github.com/open-quantum-safe/liboqs-python
+Installing native crypto:
+    Install native liboqs explicitly before the pinned Python binding.
+    See docs/server_deployment.md; imports never initiate a native build.
 """
 
 from __future__ import annotations
@@ -30,7 +30,10 @@ from __future__ import annotations
 import os
 import time
 import ctypes
+import ctypes.util
+from pathlib import Path
 import hashlib
+import hmac
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -179,48 +182,64 @@ class ECCProvider:
 # §2  Post-Quantum KEM — ML-KEM (Kyber) via liboqs
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Supported ML-KEM / Kyber variants
-SUPPORTED_ALGORITHMS = ("Kyber512", "Kyber768", "Kyber1024")
+# Protocol version 2 deliberately supports one fixed-size standardized KEM.
+SUPPORTED_ALGORITHMS = ("ML-KEM-768",)
 
 # Algorithm parameter specs (bytes)
 # Matches NIST FIPS 203 / Kyber specifications
-KYBER_PARAMS = {
-    "Kyber512": {
-        "nist_level": 1,
-        "public_key_length": 800,
-        "secret_key_length": 1632,
-        "ciphertext_length": 768,
-        "shared_secret_length": 32,
-    },
-    "Kyber768": {
+MLKEM_PARAMS = {
+    "ML-KEM-768": {
         "nist_level": 3,
         "public_key_length": 1184,
         "secret_key_length": 2400,
         "ciphertext_length": 1088,
         "shared_secret_length": 32,
     },
-    "Kyber1024": {
-        "nist_level": 5,
-        "public_key_length": 1568,
-        "secret_key_length": 3168,
-        "ciphertext_length": 1568,
-        "shared_secret_length": 32,
-    },
 }
+# Compatibility import only; no legacy name is accepted by the provider.
+KYBER_PARAMS = MLKEM_PARAMS
 
 _OQS_AVAILABLE = False
 _oqs_module = None
 _OQS_LOAD_ERROR: Optional[str] = None
 
+def _require_installed_liboqs():
+    # liboqs-python otherwise downloads/builds on import. Probe exactly its Linux
+    # search locations first, so missing native installations fail closed offline.
+    prefix = Path(os.environ.get("OQS_INSTALL_PATH", str(Path.home() / "_oqs")))
+    candidates = [ctypes.util.find_library("oqs"), ctypes.util.find_library("liboqs"),
+                  str(prefix / "lib/liboqs.so"), str(prefix / "lib64/liboqs.so")]
+    for candidate in candidates:
+        if candidate:
+            try: return ctypes.CDLL(candidate)
+            except OSError: pass
+    raise ImportError("native liboqs is not preinstalled; automatic download/build is disabled")
+
+
 try:
+    _native_library = _require_installed_liboqs()
     import oqs as _oqs_module  # type: ignore[import-untyped]
     if not hasattr(_oqs_module, "KeyEncapsulation"):
         raise ImportError(
             "oqs module loaded but KeyEncapsulation class is missing — "
             "the installed liboqs-python may be incomplete or mismatched."
         )
-    with _oqs_module.KeyEncapsulation("Kyber768") as _test_kem:
-        _OQS_AVAILABLE = True
+    enabled = tuple(_oqs_module.get_enabled_kem_mechanisms())
+    if "ML-KEM-768" not in enabled:
+        raise ImportError(
+            "liboqs does not expose required ML-KEM-768; enabled mechanisms: "
+            + ", ".join(enabled)
+        )
+    with _oqs_module.KeyEncapsulation("ML-KEM-768") as _test_kem:
+        _pk = _test_kem.generate_keypair()
+        _sk = _test_kem.export_secret_key()
+    with _oqs_module.KeyEncapsulation("ML-KEM-768") as _enc:
+        _ct, _ss1 = _enc.encap_secret(_pk)
+    with _oqs_module.KeyEncapsulation("ML-KEM-768", _sk) as _dec:
+        _ss2 = _dec.decap_secret(_ct)
+    if not hmac.compare_digest(_ss1, _ss2):
+        raise ImportError("ML-KEM-768 startup self-test failed")
+    _OQS_AVAILABLE = True
     _logger.debug("liboqs loaded successfully — native ML-KEM active.")
 except (ImportError, ModuleNotFoundError) as _e:
     _OQS_LOAD_ERROR = f"liboqs-python not installed: {_e}"
@@ -266,7 +285,7 @@ class _MockInsecurePQCProvider:
 
     def __init__(self, algorithm: str) -> None:
         self.algorithm = algorithm
-        self.params = KYBER_PARAMS[algorithm]
+        self.params = MLKEM_PARAMS[algorithm]
         _logger.warning(
             "[PQC] *** MOCK INSECURE PROVIDER ACTIVE *** "
             "Algorithm %s is being simulated with SHA hashes. "
@@ -333,7 +352,7 @@ class PQCProvider:
     Post-Quantum KEM provider backed by liboqs (with software fallback).
 
     Usage (two-party KEM):
-        provider = PQCProvider("Kyber768")
+        provider = PQCProvider("ML-KEM-768")
 
         # --- Receiver generates keypair ---
         secret_key, public_key = provider.generate_keypair()
@@ -349,12 +368,12 @@ class PQCProvider:
 
     def __init__(
         self,
-        algorithm: str = "Kyber768",
+        algorithm: str = "ML-KEM-768",
         allow_mock: bool = False,
     ) -> None:
         """
         Args:
-            algorithm:  ML-KEM variant — 'Kyber512', 'Kyber768', or 'Kyber1024'.
+            algorithm:  Only 'ML-KEM-768' is supported by protocol v2.
             allow_mock: If True, allow the insecure SHA-based mock fallback
                         when native liboqs is unavailable.  Has no effect when
                         native liboqs is present.  Defaults to False (fail-closed).
@@ -418,16 +437,11 @@ class PQCProvider:
         if not self._use_native:
             return self._mock.get_algorithm_details()
 
-        nist_levels = {
-            "Kyber512": 1,
-            "Kyber768": 3,
-            "Kyber1024": 5,
-        }
         with _oqs_module.KeyEncapsulation(self.algorithm) as kem:
             details = kem.details
         return {
             "algorithm": self.algorithm,
-            "nist_level": nist_levels.get(self.algorithm),
+            "nist_level": 3,
             "public_key_length": details["length_public_key"],
             "secret_key_length": details["length_secret_key"],
             "ciphertext_length": details["length_ciphertext"],
@@ -574,7 +588,8 @@ class KeyManager:
         Derive a new key from an existing key for in-session rekeying.
 
         Uses the current session key as HKDF input keying material combined
-        with a fresh random nonce to produce a forward-secret successor key.
+        with a fresh random nonce to produce a successor key. This is key
+        evolution, not recovery from compromise of the current key.
         After calling this, the caller should securely erase the old key.
 
         Args:
@@ -799,14 +814,14 @@ class HybridKEM:
 
     def __init__(
         self,
-        pqc_algorithm: str = "Kyber768",
+        pqc_algorithm: str = "ML-KEM-768",
         allow_mock_pqc: bool = False,
     ) -> None:
         """
         Initialise the hybrid KEM.
 
         Args:
-            pqc_algorithm:   ML-KEM variant — 'Kyber512', 'Kyber768', or 'Kyber1024'.
+            pqc_algorithm:   Only 'ML-KEM-768' is supported by protocol v2.
             allow_mock_pqc:  Forward to PQCProvider — enables insecure mock fallback
                              when liboqs is unavailable.  Dev/testing only.
         """

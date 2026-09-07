@@ -4,10 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PQ-VPN — Post-Quantum Secure VPN</title>
-    <meta name="description" content="Hybrid Classical & Post-Quantum VPN Desktop Application with real-time telemetry, KEMTLS handshake, and X25519 + Kyber768 encryption.">
+    <meta name="description" content="Hybrid Classical & Post-Quantum VPN Desktop Application with real-time telemetry, KEMTLS handshake, and X25519 + ML-KEM-768 encryption.">
     <link rel="stylesheet" href="css/style.css">
-    <!-- Chart.js CDN -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 </head>
 <body>
     <div id="app">
@@ -50,10 +48,6 @@
                 <a href="#" class="nav-link" id="nav-settings">
                     <span class="nav-icon">⚙️</span>
                     <span>Settings</span>
-                </a>
-                <a href="#" class="nav-link" id="nav-logs">
-                    <span class="nav-icon">📄</span>
-                    <span>Logs</span>
                 </a>
 
                 <div class="nav-divider"></div>
@@ -101,12 +95,7 @@
                         <option value="local-test">🖥️ Localhost (Testing)</option>
                     </select>
                 </div>
-                <!-- Custom server override -->
-                <div class="custom-server-group" id="custom-server-group" style="display:none;">
-                    <input id="custom-host" class="custom-input" type="text" placeholder="host / IP" />
-                    <input id="custom-port" class="custom-input custom-port" type="number" placeholder="port" value="51820" min="1" max="65535" />
-                </div>
-                <button class="topbar-btn" id="toggle-custom-server" title="Custom server">✏️</button>
+
                 <button class="topbar-btn" title="Telemetry">📊</button>
                 <button class="topbar-btn" title="Settings">⚙️</button>
             </div>
@@ -152,13 +141,13 @@
                                 </div>
                                 <div class="detail-row">
                                     <span class="detail-icon">📍</span>
-                                    <span class="detail-label">Server Location</span>
+                                    <span class="detail-label">Server</span>
                                     <span class="detail-value" id="detail-location">—</span>
                                 </div>
                                 <div class="detail-row">
                                     <span class="detail-icon">🔒</span>
                                     <span class="detail-label">Protocol</span>
-                                    <span class="detail-value">KEMTLS 1.0</span>
+                                    <span class="detail-value">PQVPN KEMTLS-inspired v2</span>
                                 </div>
                                 <div class="detail-row">
                                     <span class="detail-icon">🌐</span>
@@ -201,25 +190,7 @@
                         </div>
                     </div>
 
-                    <!-- Bandwidth Section -->
-                    <div class="bandwidth-header">
-                        <h3>Bandwidth</h3>
-                        <span class="bandwidth-value" id="bandwidth-value">0 Mbps</span>
-                    </div>
-                    <div class="bandwidth-legend">
-                        <div class="legend-item">
-                            <span class="legend-dot download"></span>
-                            <span>Download</span>
-                        </div>
-                        <div class="legend-item">
-                            <span class="legend-dot upload"></span>
-                            <span>Upload</span>
-                        </div>
-                    </div>
-                    <div class="chart-container">
-                        <canvas id="bandwidth-chart"></canvas>
-                    </div>
-
+                    <p>Jitter: <span id="jitter-value">—</span> · MTU: <span id="mtu-value">—</span> · Epoch: <span id="epoch-value">—</span></p>
                     <!-- Latency & Packet Loss Mini Stats -->
                     <div class="telemetry-mini-row">
                         <div class="mini-stat">
@@ -260,31 +231,31 @@
                                 <h4>Encryption</h4>
                                 <span>AES-256-GCM</span>
                             </div>
-                            <span class="security-status active">ACTIVE</span>
+                            <span class="security-status active">Configured</span>
                         </div>
                         <div class="security-item">
                             <div class="security-icon key-exchange">🔑</div>
                             <div class="security-info">
                                 <h4>Key Exchange</h4>
-                                <span>Hybrid (X25519 + Kyber768)</span>
+                                <span>Hybrid (X25519 + ML-KEM-768)</span>
                             </div>
-                            <span class="security-status active">ACTIVE</span>
+                            <span class="security-status active">Configured</span>
                         </div>
                         <div class="security-item">
                             <div class="security-icon handshake">🤝</div>
                             <div class="security-info">
                                 <h4>Handshake</h4>
-                                <span>Signature-Free KEMTLS</span>
+                                <span>ML-KEM server authentication; Ed25519 client authentication</span>
                             </div>
-                            <span class="security-status active">ACTIVE</span>
+                            <span class="security-status active">Configured</span>
                         </div>
                         <div class="security-item">
                             <div class="security-icon integrity">#</div>
                             <div class="security-info">
-                                <h4>Integrity</h4>
-                                <span>HMAC-SHA256</span>
+                                <h4>Record Integrity</h4>
+                                <span>AES-GCM authentication tag</span>
                             </div>
-                            <span class="security-status active">ACTIVE</span>
+                            <span class="security-status active">Configured</span>
                         </div>
                     </div>
                 </div>
@@ -303,18 +274,18 @@
                             <div class="crypto-visual classical">🔐</div>
                             <span class="crypto-name">Curves</span>
                             <span class="crypto-sub">X25519 ECDH</span>
-                            <span class="crypto-status-badge active">ACTIVE</span>
+                            <span class="crypto-status-badge active">Configured</span>
                         </div>
 
                         <span class="crypto-plus">+</span>
 
                         <!-- Post-Quantum Column -->
                         <div class="crypto-column">
-                            <span class="crypto-column-title">Post-Quantum (Kyber768)</span>
+                            <span class="crypto-column-title">Post-Quantum (ML-KEM-768)</span>
                             <div class="crypto-visual quantum">🔮</div>
                             <span class="crypto-name">ML-KEM</span>
-                            <span class="crypto-sub">Kyber768 (NIST)</span>
-                            <span class="crypto-status-badge active">ACTIVE</span>
+                            <span class="crypto-sub">ML-KEM-768 (NIST)</span>
+                            <span class="crypto-status-badge active">Configured</span>
                         </div>
                     </div>
 
@@ -322,7 +293,7 @@
                     <div class="security-level">
                         <div class="security-level-header">
                             <span>Hybrid Security Level</span>
-                            <strong>MAXIMUM</strong>
+                            <strong>Hybrid key establishment</strong>
                         </div>
                         <div class="security-bar">
                             <div class="security-bar-fill" style="width: 100%;"></div>
@@ -330,23 +301,6 @@
                     </div>
                 </div>
 
-                <!-- Recent Activity Card -->
-                <div class="card">
-                    <div class="card-header">
-                        <h3>Recent Activity</h3>
-                    </div>
-                    <div class="activity-list" id="activity-list">
-                        <!-- Dynamic content rendered by app.js -->
-                        <div class="activity-item">
-                            <span class="activity-time">—</span>
-                            <span class="activity-dot info"></span>
-                            <span class="activity-message">Waiting for connection...</span>
-                        </div>
-                    </div>
-                    <a href="#" class="view-logs-link" id="view-logs-link">
-                        View full logs →
-                    </a>
-                </div>
             </section>
         </main>
 
@@ -358,39 +312,24 @@
             <div class="footer-item">
                 <span class="footer-icon">🛡</span>
                 <span class="footer-label">Post-Quantum Protection</span>
-                <span class="footer-value enabled">Enabled</span>
+                <span class="footer-value" id="crypto-posture">—</span>
             </div>
             <div class="footer-item">
                 <span class="footer-icon">🔑</span>
                 <span class="footer-label">Key Rotation</span>
-                <span class="footer-value" id="footer-key-rotation">Every 5 Minutes</span>
+                <span class="footer-value" id="footer-key-rotation">—</span>
             </div>
             <div class="footer-item">
                 <span class="footer-icon">🔒</span>
                 <span class="footer-label">Protocol</span>
-                <span class="footer-value">KEMTLS 1.0</span>
+                <span class="footer-value">PQVPN KEMTLS-inspired v2</span>
             </div>
             <div class="footer-item">
                 <span class="footer-icon">⏱</span>
                 <span class="footer-label">Uptime</span>
                 <span class="footer-value" id="footer-uptime">00:00:00</span>
             </div>
-            <div class="footer-item">
-                <span class="footer-icon">📡</span>
-                <span class="footer-label">Data Transferred</span>
-                <span class="footer-value" id="footer-data-sent">↑ 0 B</span>
-                <span class="footer-value" id="footer-data-recv">↓ 0 B</span>
-                <div class="footer-data-bars">
-                    <span style="height: 6px;"></span>
-                    <span style="height: 10px;"></span>
-                    <span style="height: 8px;"></span>
-                    <span style="height: 14px;"></span>
-                    <span style="height: 12px;"></span>
-                    <span style="height: 16px;"></span>
-                    <span style="height: 10px;"></span>
-                    <span style="height: 14px;"></span>
-                </div>
-            </div>
+
         </footer>
 
     </div>
