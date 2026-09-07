@@ -26,19 +26,22 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 │   ├── config.py          # Strict TOML models
 │   ├── doctor.py          # Read-only deployment diagnostics
 │   ├── firewall.py        # Scoped nftables policy renderer
+│   ├── ipv6.py            # Transactional client IPv6 leak protection
 │   ├── engine.py          # Linux TUN, exact MTU, quality primitives
 │   ├── identity.py        # Static server/client identity lifecycle
 │   └── runtime.py         # One-TUN/UDP server and transactional client
 ├── config/                 # Server/client TOML examples; private keys ignored
 │   └── client.docker.toml  # Docker DNS hostname and provisioned pin
 ├── scripts/                # Isolated nftables setup and cleanup
-├── deploy/                 # systemd service and tested versions
+├── deploy/                 # systemd service, tested versions, native-build.txt provenance
 ├── tests/                  # Unit, security, native-PQC, root integration markers
+│   ├── test_ipv6_policy.py # IPv6 lifecycle, revocation and source pin regressions
 │   ├── test_session_activity.py # Quiet keepalive, idle cleanup, rejected activity
 │   └── test_runtime_fixes.py # Shutdown, liveness, delayed rekey, deployment regressions
 ├── benchmarks/             # Historical benchmark code/results (not security proof)
 ├── docs/                   # Architecture, protocol, audit, threat/deployment/setup
-│   └── management-api.md  # Shared dashboard/telemetry contract
+│   ├── management-api.md  # Shared dashboard/telemetry contract
+│   └── pre_vps_handoff.md # Local-tag transfer and exact privileged/VPS next steps
 ├── requirements*.txt       # Server/client/management/dev roles
 ├── constraints-tested.txt  # Pinned tested Python dependencies
 ├── pytest.ini
@@ -50,6 +53,40 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ---
 
 ## 📝 Modification Log & Project Progress
+
+### 2026-09-07 — Source-review continuation and local validation release
+
+- Resumed the existing 20-file staged change on `c50dee0`; inspected the complete staged diff, configs, client networking, server helpers/service, namespace tests, dependency pins, current documentation and secret/artifact exclusions before committing. No IPv6 enforcement or frozen v2 cryptographic regression found. Full-mode block/fail/allow, split defaults, atomic owned-table cleanup and read-only doctor semantics match source. Handshake, crypto, rekey and networking behavior unchanged during continuation.
+- Corrected doctor wording: Python >=3.11 is a runtime minimum, not a tested support claim; 3.14.7 remains the tested baseline and other versions warn. Added one parametrized regression in `tests/test_doctor_management.py`. CLI revocation explicitly states that existing active sessions continue until disconnect/expiration/server restart; strengthened its existing `tests/test_ipv6_policy.py` assertion. No session-kill implementation added.
+- Prior temporary environments/builds were gone. Recreated `/tmp/pqvpn-continuation.PdFUxu/venv` from unchanged requirements; all 36 constrained versions match and pip check passes. Rebuilt native ML-KEM-only liboqs 0.16.0 from verified clean source commit `5a1a854b0dc9f2141bdc771c555ee60c37950183`, using GCC 16.2.1, CMake 4.4.3 and Ninja 1.13.2. Verified the loaded library in `/proc/self/maps`; updated `deploy/native-build.txt` with the current digest while retaining the prior digest.
+- Validation: focused IPv6/doctor tests **41 passed**. Both `pytest -q` and `python -m pytest -q`: **243 passed, 2 skipped, 245 collected**. Native marker: **2 passed, 243 deselected**, mock disabled, Python **3.14.7**, binding/native **0.16.0**. Compileall, four shell scripts, JS syntax, both Compose profiles and diff checks PASS. Final available validation is rerun after the last file edits before commit/tag.
+- Temporary provisioned server doctor: PASS/WARN only for external firewall, exit 0; client doctor: PASS including IPv6 block, exit 0. Before/after files, links, IPv4/IPv6 routes, IPv6 addresses, forwarding and resolver snapshots match. Shipped sample profiles correctly exit 1 for absent identities/database and absent pqvpn account; no deployment material was added to source. Host WAN is enp0s20f0u4; IPv6 snapshot sees 3 routes/addresses.
+- **ROOT NAMESPACE: SKIPPED — non-root session**, UID 1000; TUN and required tools exist, but `sudo -n true` reports a password is required. Root marker: 1 skipped, 244 deselected. Docker runtime, systemd runtime and real systemd-resolved restoration: NOT VALIDATED. Real VPS/client: NOT PERFORMED.
+- Added `docs/pre_vps_handoff.md`, linked from README and server deployment, with local bundle/tag transfer (no push), actual bounded namespace invocation, pinned provisioning/systemd commands and real-client gates. Updated the current audit/status counts only; historical progress entries are preserved. No tracked deployment secrets or local build artifacts found.
+- Authorized local release: `Pre-VPS PQVPN v2 validation baseline`, annotated tag `v2-pre-vps`, annotation `Validated PQVPN v2 baseline before root namespace and VPS testing`; create only after final checks, inspect staged paths, then verify clean tree and tag target. The final report records the exact commit hash. No push or remote deployment is performed.
+- Status: **Deployable research/prototype PQ-VPN. IPv4 full tunnel includes IPv6 leak prevention. Native ML-KEM validation passed. Root/TUN integration pending. Real VPS/client validation pending.** Next milestone: root namespace validation, then real VPS + real Linux client validation.
+
+### 2026-09-07 — Pre-VPS IPv6 leak protection, revocation and source baseline
+
+- Inspected current Edit-5 tree first: base `c50dee0`, only the existing GitHub push-history entry in this file was dirty; preserved it. Current v2 handshake and crypto source remain byte-for-byte unchanged.
+- Added `vpn/ipv6.py`: transactional IPv6 block/fail/allow policy. Full mode defaults to block, split mode defaults to leaving unrelated IPv6 alone. Exclusive random ip6 table blocks non-loopback OUTPUT/FORWARD before IPv4 tunnel routes; cleanup removes only the owned table. Added config fields/examples and read-only IPv6 diagnostics. No routed IPv6 or persistent sysctl changes.
+- Added `tests/test_ipv6_policy.py`: 34 cases cover policy/default validation, IPv6 route/address detection, atomic setup failure, disconnect/setup/dead-peer/control/rekey/SIGTERM cleanup, read-only doctor, new-handshake revocation and installer source mismatch. Related focused run: 95 passed. Extended root namespace script with a physical IPv6 default route, bounded ICMPv6/TCP leak checks, loopback, and IPv6 restoration after disconnect/SIGTERM/dead peer; real execution remains pending.
+- CLI revoke help/output states future authentication only; existing sessions/already-authorized handshakes continue until expiry/disconnect/restart. Server restart terminates all clients; no live reload/active-identity termination was added.
+- Pinned native liboqs 0.16.0 to source commit `5a1a854b0dc9f2141bdc771c555ee60c37950183`, verified from upstream tag and checkout. Installer fails on mismatch before build. No dependency versions upgraded. Added `deploy/native-build.txt` with explicit temporary ML-KEM-only build provenance, compiler and binary digest. Prior binary source provenance was unavailable, so validation used this freshly built library, verified via loaded process mappings.
+- Native versions: Python **3.14.7**, liboqs-python **0.16.0**, liboqs **0.16.0**. Separate native marker with mock disabled: **2 passed, 242 deselected in 0.19s**. Both full suites used the verified source build: `pytest -q` **242 passed, 0 failed, 2 skipped, 38.35s**; `python -m pytest -q` **242 passed, 0 failed, 2 skipped, 38.30s**; **244 collected** each. Existing 2 skips remain root namespace and native-provider precedence over mock.
+- Compileall PASS; setup/cleanup/install-liboqs/namespace shell syntax each PASS; Node JS syntax PASS; Docker Compose config PASS; pip check PASS; diff whitespace PASS. No Docker runtime claim.
+- Server doctor **WARN, exit 0**, external firewall verification only; client doctor **PASS, exit 0**, including IPv6 block policy with 3 visible IPv6 routes/addresses. Temporary native profiles used; snapshots proved unchanged files, links, IPv4/IPv6 routes, IPv6 addresses, resolver state and forwarding. No doctor network mutations.
+- **ROOT NAMESPACE: SKIPPED** — actual host UID 1000; TUN, ip and nft present. The root marker reported SKIP; privileged IPv6 enforcement remains unexecuted. **Docker/systemd/real systemd-resolved: NOT VALIDATED. Real VPS: NOT PERFORMED.**
+- Upstream security policy/releases/advisories checked 2026-09-07: liboqs 0.16.0 remains supported/current; no published advisory requiring an upgrade was found. Sources and scope are recorded in the [pre-VPS report](docs/security_audit.md#pre-vps-hardening--2026-09-07). Python artifact hash locking was not added; existing version constraints retained.
+- Release hygiene: no tracked private-key/authorized-client DB/.env paths; environment/cache/private-profile ignores verified. Prepare the local `Pre-VPS PQVPN v2 validation baseline` commit and annotated `v2-pre-vps` tag only after successful validation; no push. The tag resolves the exact validated commit without a self-referential hash in this file. All native build/identity/test outputs stay under /tmp.
+- Documentation now defines full tunnel as supported IPv4 routing plus default IPv6 blocking, explicitly describes snapshot fail/unsafe allow modes and revocation boundaries, and retains Docker development-only, native systemd and real-client DNS gates. Status: **Deployable research/prototype PQ-VPN. IPv6 leak protection validated at unit level. Root/TUN integration pending. Real VPS/client validation pending.** Next milestone: **REAL VPS + SEPARATE REAL LINUX CLIENT**, following the privileged disposable-machine gates. No protocol redesign or optional feature expansion.
+
+### 2026-09-07 10:17 IST — Push all pending changes to GitHub
+
+- Staged all 72 changed files (31 modified, 40 new) and committed as `c50dee0` on `main`.
+- Commit: `feat: add deployment configs, security hardening, management API, comprehensive tests, and documentation`.
+- Pushed `8e6f125..c50dee0 main -> main` to `origin` (`https://github.com/gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-.git`).
+- 5,157 insertions, 6,989 deletions across deployment configs, VPN modules (config, doctor, firewall, identity, runtime), documentation (protocol, threat model, security audit, setup guides), comprehensive test suite, and updated benchmarks/crypto/handshake/engine.
 
 ### 2026-09-07 — Final handoff validation and documentation consistency
 
@@ -300,7 +337,9 @@ transparent, honest, production-ready VPN implementation as audited and approved
 
 | Task / Module | Status | Description |
 | :--- | :---: | :--- |
-| **Final Handoff Validation** | ✅ Completed | 210 collected; both entrypoints 208 passed / 2 skipped; native 2 passed; doctors and static checks recorded |
+| **Pre-VPS Hardening Validation** | ✅ Completed | Source review complete; 245 collected; both entrypoints 243 passed / 2 skipped; native 2 passed at pinned source; provisioned doctors/static checks PASS (external firewall WARN) |
+| **IPv6 Leak Prevention** | ✅ Completed | Unit/static policy and cleanup validated; real kernel namespace enforcement pending |
+| **Local Release Baseline** | ✅ Completed | Validated source baseline for local commit/tag v2-pre-vps; exact hash and clean-tree verification in final handoff; no push |
 | **Dependency / Deployment Hardening** | ✅ Completed | Pinned role dependencies; explicit native install; scoped firewall, forwarding restoration, UDP dead-peer/DNS safety, strict identities/database and telemetry tickets |
 | **Edit-3 Idle Activity / Packaging** | ✅ Completed | Authenticated keepalive refresh; invalid activity rejected; fresh-environment deployment |
 | **Directory Scaffolding** | ✅ Completed | Created complete directory tree and skeleton files |
@@ -315,9 +354,9 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | **PQC Fail-Closed Enforcement** | ✅ Completed | `PQCUnavailableError` + `ALLOW_MOCK_PQC` env + `_MockInsecurePQCProvider` w/ security warnings |
 | **In-Session Rekeying** | ✅ Completed | Dedicated control reader/rekey scheduler; existing epoch and record security preserved |
 | **UI Transparency Badges** | ✅ Completed | Configured-profile UI; measured telemetry; classical client-auth boundary |
-| **Docker Configuration** | ✅ Completed | Entrypoints updated to `vpn.cli`, `NET_ADMIN`, `/dev/net/tun`, bridge network |
+| **Docker Configuration** | ✅ Completed | Development/integration convenience; schema PASS, runtime routing NOT VALIDATED |
 | **Unified Documentation** | ✅ Completed | Consolidated architecture & deployment guide in `docs/architecture.md`, merged roadmap |
-| **Automated Test Validation** | ✅ Completed | 208 passed / 2 skipped under both pytest entrypoints; current evidence in latest log |
+| **Automated Test Validation** | ✅ Completed | 243 passed / 2 skipped under both pytest entrypoints; current evidence in latest log |
 | **Install Native liboqs** | ✅ Completed | Current environment exposes native ML-KEM-768 and passes the isolated self-test/integration marker |
 | **2026 Security Remediation** | 🔄 In Progress | Confirmed code fixes are implemented; privileged end-to-end VPS/namespace proof remains pending |
 | **Authenticated v2 Handshake/Records** | ✅ Completed | Pinned server identity, authorized clients, directional AEAD, replay/AAD/epoch controls |

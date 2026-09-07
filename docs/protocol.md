@@ -76,3 +76,8 @@ do not. Outgoing PING and CONTROL rekey cannot mask a UDP blackhole. Exceeding
 `dead_peer_timeout` enters FAILED and performs route/DNS/TUN/socket cleanup.
 The wire format and 1,318 / 1,222 / 1,190 / 38-byte handshake remain unchanged by
 the final validation pass.
+
+IPv6 leak prevention is a local client network policy, not a v2 wire extension.
+The tunnel remains IPv4-only; full mode blocks unsupported IPv6 by default. Client
+revocation disables future ClientHello authorization and does not terminate sessions
+already authenticated. Both boundaries are detailed in the deployment/client guides.

@@ -1,6 +1,7 @@
 CPython=3.14.7
 liboqs-python=0.16.0
 liboqs=0.16.0
+liboqs-source-commit=5a1a854b0dc9f2141bdc771c555ee60c37950183
 Platform=Linux x86_64
 Python constraints=constraints-tested.txt
 Native systemd/root namespace/VPS validation=PENDING

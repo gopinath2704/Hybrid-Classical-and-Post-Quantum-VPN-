@@ -57,3 +57,18 @@ CAP_NET_ADMIN privilege are trusted. Private keys require mode 0600/0400 and ser
 ML-KEM keypairs are tested for consistency. These checks and passing regression/native
 tests do not substitute for independent protocol review, root namespace execution,
 or real VPS/client validation.
+
+## IPv6 leakage and revocation boundaries
+
+The IPv4-only tunnel previously left a functional physical IPv6 path available.
+Full-tunnel default policy now blocks non-loopback IPv6 output and forwarding using
+an owned temporary nftables table. Split mode does not implicitly block unrelated
+IPv6. `allow` explicitly accepts exposure of the normal IPv6 source; `fail` rejects
+visible IPv6 at setup but is only a snapshot. No IPv6 tunnel or protocol change was
+introduced. Network changes after a `fail` preflight are not continuously monitored;
+use `block`. SIGKILL/crash can leave the temporary block installed, and root can remove
+or bypass the policy. Real kernel enforcement still requires namespace validation.
+
+Revocation rejects new authentication; it does not retroactively invalidate active
+sessions or in-progress handshakes already authorized. Restart the server to terminate
+all sessions immediately. Ordinary idle/absolute expiry remains unchanged.

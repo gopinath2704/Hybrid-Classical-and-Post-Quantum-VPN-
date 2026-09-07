@@ -70,7 +70,8 @@ def test_remote_management_rejects_trivial_token(monkeypatch):
     load_api(monkeypatch)
 
 
-def test_doctor_is_read_only_and_reports_failures(monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize('version,baseline_level', [((3, 14, 7), 'PASS'), ((3, 11, 0), 'WARN')])
+def test_doctor_is_read_only_and_reports_failures(monkeypatch, tmp_path, capsys, version, baseline_level):
     config=tmp_path/'server.toml';config.write_text('[server]\n')
     calls=[]
     def command(*args):
@@ -82,9 +83,12 @@ def test_doctor_is_read_only_and_reports_failures(monkeypatch, tmp_path, capsys)
         return ''
     monkeypatch.setattr(doctor,'command',command)
     monkeypatch.setattr(doctor,'_OQS_AVAILABLE',False)
+    monkeypatch.setattr(doctor.sys,'version_info',version)
     assert doctor.run('server',config)==1
     output=capsys.readouterr().out
     assert 'FAIL Native ML-KEM' in output and 'External provider/host firewall' in output
+    assert 'PASS Python minimum runtime version (3.11)' in output
+    assert f'{baseline_level} Python tested baseline: 3.14.7; other versions require fresh validation' in output
     assert config.read_text()=='[server]\n' and list(tmp_path.iterdir())==[config]
     assert all(not any(word in ('add','replace','delete','-w','set') for word in call) for call in calls)
 

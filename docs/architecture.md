@@ -47,4 +47,20 @@ entries are pruned on subsequent traffic.
 The optional browser management API has pinned dependencies separate from the daemon.
 HTTP bearer authentication issues bounded single-use telemetry tickets; the dashboard
 currently polls HTTP. See [management API](management-api.md) and the
-[validation matrix](security_audit.md#final-validation--2026-09-07).
+[validation matrix](security_audit.md#pre-vps-hardening--2026-09-07).
+
+## Unsupported IPv6 and revocation
+
+`vpn/ipv6.py` implements client-local IPv6 policy without altering the v2 protocol.
+Full mode defaults to an atomic, randomly named, exclusively created `ip6` nftables
+table blocking non-loopback OUTPUT and FORWARD. `ClientNetwork` owns its cleanup
+alongside routes/DNS; disconnect and failure paths remove that exact table. Split
+mode leaves IPv6 alone unless `block` is explicit. `fail` checks visible connectivity
+before mutation; `allow` warns about bypass. This is IPv4 tunneling with IPv6 leak
+prevention, not routed IPv6 support. See [client policy](client_setup.md#ipv6-policy).
+
+Authorized-client revocation affects future ClientHello authorization. Existing
+sessions and already-authorized handshakes are not actively terminated. Server restart
+terminates all sessions; no live reload/remote termination mechanism is implemented.
+Native source provenance is pinned to the exact 0.16.0 commit in
+`deploy/tested-versions.txt`; cryptographic components and versions are unchanged.

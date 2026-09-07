@@ -34,6 +34,51 @@ the deadline means FAILED, TUN/socket close, key wipe best-effort and route/DNS
 cleanup even if TCP is still established. Manual reconnect is supported; no automatic
 reconnect was added. Healthy PING/PONG refreshes server idle activity as well.
 
+## IPv6 policy
+
+IPv4 tunnel: supported. IPv6 tunnel: unsupported. IPv6 leak prevention: supported
+through temporary blocking or a fail-closed preflight policy. Full tunnel means all
+supported IPv4 Internet traffic is routed through PQVPN, while unsupported IPv6 is
+blocked by default; existing more-specific IPv4/LAN routes retain normal precedence.
+This does not provide dual-stack tunneling.
+
+`ipv6_policy` accepts only:
+
+- `block`: full-tunnel default. Requires `nft` and CAP_NET_ADMIN/root. An exclusively
+  created `ip6 pqvpn_client6_<random>` table blocks all non-loopback IPv6 OUTPUT and
+  IPv6 FORWARD traffic in the client's network namespace, including existing flows.
+  Loopback remains available. The policy also blocks IPv6 LAN, link-local, multicast
+  and neighbor-discovery output while active; routed IPv4 is unaffected. No persistent
+  sysctl, global config file or unrelated firewall table is changed.
+- `fail`: read IPv6 routes in all tables and IPv6 addresses before TUN/routing mutation,
+  and check again before tunnel route installation. A unicast default/non-link-local
+  route or usable global-scope address (including ULA) refuses connection. Errors
+  inspecting state also abort. This is a conservative snapshot, not an Internet
+  reachability test or continuous monitor; later network changes are not blocked.
+  Use `block` for protection on changing networks.
+- `allow`: explicitly allow unsupported IPv6 to bypass PQVPN, with a prominent warning.
+  IPv6 traffic is unprotected and can expose the client's normal Internet address.
+  This is never the full-tunnel default.
+
+If omitted, the policy is `block` in full mode and `allow` in split mode. Explicit
+`block` also works in split mode. The shipped full-tunnel TOML examples explicitly
+set `block`; remove that setting when switching to split mode if unrelated IPv6
+should remain available. Emulated TUN mode performs no real networking or blocking.
+
+The block installs atomically before IPv4 tunnel routes, and its exact owned table
+is removed after route/DNS rollback on disconnect, failed setup, dead-peer/control
+loss, SIGTERM and rekey failure. Failed installation cannot replace an existing table.
+If kernel cleanup is denied, the table name is logged for operator recovery. SIGKILL
+or process/kernel crashes cannot run cleanup and may leave the IPv6 block installed;
+this is not a general kill switch. Do not flush unrelated firewall tables to recover.
+
+Doctor reports the effective policy and inspects IPv6 state without installing rules.
+On a disposable test client, record `ip -6 route show table all` and verify a working
+IPv6 destination before connection, failure to reach it while `block` is active, and
+restored IPv6 reachability after disconnect. The expanded root namespace suite includes
+bounded ICMPv6/TCP checks, preserved loopback, SIGTERM restoration and dead-peer cleanup.
+Those kernel checks remain pending until the root suite actually runs.
+
 ## DNS policy
 
 `dns_mode="systemd-resolved"` is the safe default. For full tunnel, configured VPN
@@ -71,7 +116,7 @@ Ed25519, with hybrid X25519 + ML-KEM session establishment.
 
 ## Current validation record
 
-The [2026-09-07 validation matrix](security_audit.md#final-validation--2026-09-07)
+The [2026-09-07 validation matrix](security_audit.md#pre-vps-hardening--2026-09-07)
 records a successful client doctor with native temporary identities, a matching pin,
 managed DNS and a loopback server address used only for read-only route diagnostics.
 This is not a connection to a deployed server. Re-run doctor against the real server

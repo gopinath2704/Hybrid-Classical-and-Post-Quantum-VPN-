@@ -14,7 +14,7 @@ def main():
     ck=sub.add_parser("client-key"); cks=ck.add_subparsers(dest="action",required=True); cg=cks.add_parser("generate"); cg.add_argument("--private",default="config/client_identity_private.key"); cg.add_argument("--public",default="config/client_identity_public.key")
     client_admin=sub.add_parser("client"); ca=client_admin.add_subparsers(dest="action",required=True)
     auth=ca.add_parser("authorize"); auth.add_argument("public_key"); auth.add_argument("--database",default="config/authorized_clients.json"); auth.add_argument("--client-id"); auth.add_argument("--vpn-ip")
-    rev=ca.add_parser("revoke"); rev.add_argument("fingerprint"); rev.add_argument("--database",default="config/authorized_clients.json")
+    rev=ca.add_parser("revoke", description="Revoke new sessions only. Restart the VPN server to terminate existing sessions; no live reload is implemented."); rev.add_argument("fingerprint"); rev.add_argument("--database",default="config/authorized_clients.json")
     connect=ca.add_parser("connect"); connect.add_argument("--config",default="config/client.toml"); connect.add_argument("--dev-emulated-tun",action="store_true"); connect.add_argument("--allow-mock-pqc",action="store_true",help="explicitly permit insecure mock PQC for tests/development")
     server=sub.add_parser("server"); server.add_argument("--config",default="config/server.toml"); server.add_argument("--dev-emulated-tun",action="store_true"); server.add_argument("--allow-mock-pqc",action="store_true",help="explicitly permit insecure mock PQC for tests/development")
     args=p.parse_args(); logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
@@ -30,7 +30,7 @@ def main():
         print(AuthorizedClients(Path(args.database)).authorize(raw,args.client_id,args.vpn_ip)); return
     if args.command=="client" and args.action=="revoke":
         if not AuthorizedClients(Path(args.database)).revoke(args.fingerprint): sys.exit("client fingerprint not found")
-        print("revoked"); return
+        print("Client revoked for new sessions. Existing active sessions continue until disconnect/expiration/server restart. Restart the VPN server to terminate existing sessions (all clients); live reload is not implemented."); return
     status=get_crypto_status()
     dev_mode=getattr(args,"dev_emulated_tun",False)
     if not status["is_quantum_safe"]:

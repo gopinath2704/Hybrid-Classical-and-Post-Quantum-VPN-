@@ -15,6 +15,7 @@ import sys
 from vpn.config import load_client_config, load_server_config
 from vpn.identity import AuthorizedClients, fingerprint, load_client_private, validate_server_identity
 from crypto.hybrid_crypto import PQCProvider, _OQS_AVAILABLE, _oqs_module
+from vpn.ipv6 import connectivity, effective_policy
 
 
 def command(*args):
@@ -57,7 +58,9 @@ def run(role, config_path):
             report('PASS', label, '' if detail is None or detail is True else str(detail))
         except Exception as exc:
             report('FAIL', label, str(exc))
-    check('Python supported', lambda: sys.version_info >= (3, 11))
+    check('Python minimum runtime version (3.11)', lambda: sys.version_info >= (3, 11))
+    report('PASS' if sys.version_info[:3] == (3, 14, 7) else 'WARN',
+           'Python tested baseline', '3.14.7; other versions require fresh validation')
     def native():
         if not _OQS_AVAILABLE: raise ValueError('native ML-KEM-768 is unavailable; install liboqs explicitly')
         if os.environ.get('ALLOW_MOCK_PQC') == '1': raise ValueError('unset ALLOW_MOCK_PQC for deployment')
@@ -118,6 +121,19 @@ def run(role, config_path):
             report('WARN', 'External provider/host firewall requires operator verification',
                    f'allow {cfg.control_port}/TCP and {cfg.udp_port}/UDP; keep 8000 private; restrict SSH administrator sources; inspect ss -lntup and nft list ruleset')
         else:
+            policy = effective_policy(cfg.full_tunnel, cfg.ipv6_policy)
+            def ipv6_policy():
+                visible = connectivity(command)
+                if policy == 'fail' and visible:
+                    raise ValueError('IPv6 connectivity exists: ' + '; '.join(visible))
+                if policy == 'block' and not shutil.which('nft'):
+                    raise ValueError('ipv6_policy=block requires nft')
+                return f'{policy}; {len(visible)} visible IPv6 routes/addresses (read-only snapshot)'
+            if cfg.full_tunnel or cfg.ipv6_policy is not None:
+                check('IPv6 leak policy', ipv6_policy)
+            if policy == 'allow':
+                report('WARN', 'IPv6 bypass explicitly permitted' if cfg.ipv6_policy else 'Split-tunnel IPv6 outside VPN scope',
+                       'IPv6 traffic is not protected by PQVPN')
             def server_pin():
                 public = Path(cfg.server_identity_public_key).read_bytes()
                 if len(public) != 1184: raise ValueError('server public key must be 1184 bytes')

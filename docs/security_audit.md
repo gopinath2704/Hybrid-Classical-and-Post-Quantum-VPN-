@@ -386,3 +386,133 @@ independent review of the custom KEMTLS-inspired protocol; classical Ed25519 cli
 authentication; epoch key evolution without post-compromise recovery; incomplete
 routed IPv6, dynamic authenticated PMTU and kill switch. Python key wiping remains
 best-effort. Passing these checks does not establish production suitability.
+
+## Pre-VPS hardening — 2026-09-07
+
+Status: **Deployable research/prototype PQ-VPN.
+IPv4 full tunnel includes IPv6 leak prevention.
+Native ML-KEM validation passed.
+Root/TUN integration pending.
+Real VPS/client validation pending.**
+This record supersedes the Edit-5 validation counts above; historical evidence is
+retained. No changes were made to `handshake/kemtls.py` or `crypto/hybrid_crypto.py`.
+
+### Changes and boundaries
+
+- Added `vpn/ipv6.py` and the optional client `ipv6_policy` field: omitted policy
+  blocks in full mode and permits out-of-scope IPv6 in split mode; explicit values
+  are `block`, `fail`, `allow`. Shipped full-mode profiles explicitly select block.
+- Blocking uses one exclusively created random `ip6 pqvpn_client6_<random>` table.
+  An atomic nft batch blocks non-loopback OUTPUT and FORWARD before IPv4 route setup,
+  including existing connections. No unrelated table, persistent sysctl or IPv6
+  routing is changed. Loopback works; other IPv6, including link-local/ND, is blocked.
+  ClientNetwork removes its exact table on ordinary cleanup and every failure path;
+  SIGKILL/crash can leave a block behind and root can bypass it.
+- `fail` checks IPv6 routes and usable global-scope addresses before TUN mutation
+  and again before route setup, rejecting connectivity or inspection failures.
+  This is snapshot protection only; subsequent IPv6 network changes require block
+  mode. `allow` visibly warns about bypass. Doctor only inspects policy/state.
+- Revocation remains future-authentication revocation. New ClientHello authorization
+  is rejected after database update; already-authorized handshakes/active sessions
+  may continue. CLI help/output now says server restart terminates all sessions;
+  no live reload or per-client active termination is implemented.
+- The native installer pins tag 0.16.0 to commit
+  `5a1a854b0dc9f2141bdc771c555ee60c37950183` and aborts before build on mismatch.
+  Production Python versions remain unchanged. Existing constraints/version evidence
+  are retained; package artifact hash locking was not added.
+
+### Current validation matrix
+
+| Check | Result |
+|---|---|
+| `pytest -q` | PASS: 245 collected, 243 passed, 0 failed, 2 skipped |
+| `python -m pytest -q` | PASS: 245 collected, 243 passed, 0 failed, 2 skipped |
+| New IPv6/revocation/provenance coverage | PASS: 34 initial cases; continuation adds one Python-baseline case; focused IPv6/doctor run 41 passed |
+| Native ML-KEM marker, separately | PASS: 2 passed, 243 deselected; `ALLOW_MOCK_PQC=0` |
+| Python / liboqs-python / native liboqs | 3.14.7 / 0.16.0 / 0.16.0 |
+| Native source commit | `5a1a854b0dc9f2141bdc771c555ee60c37950183` |
+| Native provenance | PASS: exact upstream tag/checkout verified, ML-KEM-only shared library built; loaded path verified in `/proc/self/maps`; options/digest in `deploy/native-build.txt` |
+| Compileall | PASS: crypto, handshake, vpn, app, benchmarks, tests |
+| Setup shell syntax | PASS |
+| Cleanup shell syntax | PASS |
+| liboqs installer shell syntax | PASS |
+| Namespace shell syntax | PASS |
+| JavaScript syntax | PASS: `node --check app/frontend/js/app.js` |
+| Docker Compose config | PASS: schema only |
+| Dependency consistency | PASS: `pip check`; production pins unchanged |
+| `git diff --check` | PASS |
+| Server doctor | WARN only for external provider/host firewall; exit 0; configuration/native identities PASS |
+| Client doctor | PASS including `IPv6 leak policy: block`; exit 0; configuration/native identities PASS |
+| Read-only doctors | PASS: files, links, IPv4/IPv6 routes, IPv6 addresses, forwarding and resolver before/after snapshots identical |
+| IPv6 leak prevention | PASS at unit/static policy level; actual client setup/disconnect/dead-peer/control/rekey/SIGTERM cleanup exercised with simulated kernel commands |
+| Root namespace | SKIPPED: host UID 1000; TUN, ip and nft present; passwordless sudo unavailable; marker returned 1 skipped / 244 deselected |
+| Privileged IPv6 leak test | NOT EXECUTED: namespace harness expanded, root gate unavailable |
+| Docker runtime | NOT VALIDATED; development/integration convenience only |
+| Systemd runtime | NOT VALIDATED; real TUN/nft/listeners/journal gate pending |
+| Real systemd-resolved | NOT VALIDATED; real-client before/during/after DNS verification pending |
+| Real VPS | NOT PERFORMED |
+| Release secret-path checks | PASS: no tracked private.key / authorized_clients.json / .env paths; environments/caches/private profiles remain ignored |
+
+The 2 normal-suite skips are root namespace and mock-only fallback while native
+crypto is available. Full suites ran sequentially with 120-second outer timeouts
+and loopback socket access as UID 1000. The namespace harness now creates a separate
+IPv6 physical default route, proves pre-connect reachability, checks blocked ICMPv6
+and TCP plus working loopback during full mode, then checks restored IPv6 reachability
+and routes after SIGTERM/disconnect and dead-peer cleanup. These are executable
+privileged tests, not claimed kernel validation on this host.
+
+Continuation doctor profiles are `/tmp/pqvpn-continuation.PdFUxu/doctor/server.toml`
+and `client.toml`. Server used service_user shadow, detected WAN enp0s20f0u4, forwarding
+0 with management enabled and one authorized native test identity. Client used a
+matching pin, managed DNS and loopback server address for read-only route diagnosis.
+Doctor saw 3 usable IPv6 routes/addresses and reported the default block policy
+without installing it. Both temporary profiles exited 0. The unchanged shipped
+sample profiles exited 1 because deployment identities/database are intentionally
+absent and the pqvpn service account is not installed. This is not a provisioned
+deployment failure or a reason to commit keys. Run doctor again with actual
+deployment identities/config.
+
+The explicit native build used source commit above, GCC 16.2.1, CMake 4.4.3,
+Ninja 1.13.2, shared Release library and `OQS_MINIMAL_BUILD=KEM_ml_kem_768`, installed
+under `/tmp/pqvpn-continuation.PdFUxu/native` for this continuation. The prior
+temporary build and virtual environment were gone, so both were recreated without
+changing source or dependency versions. Full/native runs selected the new build with
+`OQS_INSTALL_PATH` and `LD_LIBRARY_PATH`. It is independent of the previously
+installed 0.16.0 binary whose source revision was not recoverable from its version
+string. No system library was replaced. The installer uses the same pinned revision
+with the existing broader default build; unused algorithms are not validated here.
+
+Upstream [liboqs security policy/advisories](https://github.com/open-quantum-safe/liboqs/security)
+and [releases](https://github.com/open-quantum-safe/liboqs/releases) checked on 2026-09-07
+still list 0.16.0 as the supported/current release; no published advisory requiring
+a newer version was found. [liboqs-python security](https://github.com/open-quantum-safe/liboqs-python/security)
+was checked too. Recheck before deployment; any required upgrade must get its own
+dependency-validation pass.
+
+The local annotated `v2-pre-vps` tag identifies this validated source baseline.
+Resolve its exact commit with `git rev-parse 'v2-pre-vps^{commit}'`; the final task
+report records the hash. No automatic push or remote deployment occurs. Private
+identities and the authorization DB are separately provisioned inputs, not source
+artifacts. This is not independent cryptographic review or deployment approval.
+
+### Source-review continuation
+
+The complete staged diff and final IPv6 lifecycle were reviewed before release.
+No IPv6 enforcement or frozen cryptographic regression was found. Doctor's former
+`Python supported` label incorrectly suggested every version at least 3.11 was
+tested; it now reports the runtime minimum separately and warns outside 3.14.7.
+One additional parametrized regression verifies that boundary. CLI revocation now
+explicitly says existing active sessions continue until disconnect/expiration/server
+restart; its existing regression checks that sentence. No session-kill mechanism,
+handshake, rekey, route or firewall behavior changed during continuation.
+
+The [next-phase handoff](pre_vps_handoff.md) records local-tag transfer without pushing,
+the actual bounded namespace invocation and the VPS/client sequence. Full available
+tests, native validation, static checks and doctors are rerun after the final file
+edits before the local commit/tag. Historical counts in progress.md remain intact.
+
+Remaining limitations: custom protocol lacks independent review; Ed25519 client
+identity proof is classical; epoch rekey provides key evolution rather than
+post-compromise recovery; routed IPv6, dynamic authenticated PMTU and general kill
+switch remain incomplete. Root namespaces, native systemd, real client DNS and
+**REAL VPS + SEPARATE REAL LINUX CLIENT** remain the next validation gates.

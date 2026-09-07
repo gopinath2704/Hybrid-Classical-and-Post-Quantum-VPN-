@@ -11,10 +11,12 @@ The recorded baseline is CPython **3.14.7**, **liboqs-python 0.16.0**, native
 **liboqs 0.16.0**, Linux x86_64. `deploy/tested-versions.txt` records the versions;
 `constraints-tested.txt` pins every Python dependency in the test environment.
 Use `requirements-server.txt` for the daemon and `requirements-client.txt` for the
-CLI client. Neither installs GUI, API, benchmark, or test packages. Management is
+CLI client. IPv6 leak blocking additionally needs nftables on the client. Neither installs GUI, API, benchmark, or test packages. Management is
 optional (`requirements-management.txt`); tests use `requirements-dev.txt`.
 `requirements.txt` remains the full development compatibility entrypoint.
 No environment is shipped. Other Python versions/platforms require fresh validation.
+Doctor distinguishes the Python 3.11 runtime minimum from the tested 3.14.7 baseline;
+meeting the minimum does not validate another Python version.
 The Ubuntu 24.04 Docker examples use distro Python and remain independently
 unvalidated; Compose syntax validation does not establish image/runtime validity.
 
@@ -26,7 +28,7 @@ explicitly before importing the application or starting the service:
 ```bash
 python3.14 --version  # must report the tested 3.14.7 baseline
 sudo bash scripts/install-liboqs.sh /usr/local
-# The helper builds the 0.16.0 release as a shared library and runs ldconfig.
+# The helper verifies the exact 0.16.0 commit, builds a shared library and runs ldconfig.
 ldconfig -p | grep liboqs
 ```
 
@@ -165,7 +167,7 @@ See [management API](management-api.md) for short-lived WebSocket tickets.
 
 ## Current validation record
 
-The [2026-09-07 validation matrix](security_audit.md#final-validation--2026-09-07)
+The [2026-09-07 validation matrix](security_audit.md#pre-vps-hardening--2026-09-07)
 records the complete regression, syntax, dependency installation, native ML-KEM and
 read-only doctor checks. The development doctor used temporary native identities,
 `service_user="shadow"`, and the visible WAN; it did not provision `/etc/pqvpn` or
@@ -179,3 +181,57 @@ server network namespace is required for NAT/isolation. The development client i
 also lacks systemd-resolved; its managed DNS config fails safely unless a supported
 manager is supplied or the operator explicitly chooses `dns_mode="none"`. Do not treat
 `docker compose config` success as a working container VPN or native systemd result.
+
+## Native source provenance and advisory review
+
+`liboqs 0.16.0` is pinned to full source commit
+`5a1a854b0dc9f2141bdc771c555ee60c37950183` in `scripts/install-liboqs.sh` and
+`deploy/tested-versions.txt`. The helper clones tag 0.16.0 and compares HEAD with that
+commit before running CMake; any mismatch fails. It never selects latest/main.
+The Python binding remains 0.16.0 and every Python dependency version remains unchanged.
+
+On 2026-09-07, the upstream [security policy/advisories](https://github.com/open-quantum-safe/liboqs/security)
+and [release list](https://github.com/open-quantum-safe/liboqs/releases) still identified
+0.16.0 as the supported current release. No published advisory requiring a newer
+version for this baseline was found. The [Python binding security page](https://github.com/open-quantum-safe/liboqs-python/security)
+was also checked. Recheck before deployment; a required security update needs a separate
+dependency-validation pass, not an untested upgrade.
+
+This pass built the verified revision in a temporary prefix with only ML-KEM-768
+enabled and ran native tests and complete regressions against that loaded library.
+`deploy/native-build.txt` records compiler/build options and the tested binary digest.
+The installer keeps its broader default algorithm build; the validation does not
+certify unused algorithms or an OS image. The prior installed library exposed the
+same 0.16.0 version but lacked a source provenance record. Python versions are pinned
+through the existing tested constraints; package artifact hash locking remains outside
+this prototype baseline.
+
+## Revocation semantics
+
+```bash
+sudo -u pqvpn /opt/pqvpn/.venv/bin/python -m vpn.cli client revoke FINGERPRINT --database /etc/pqvpn/authorized_clients.json
+```
+
+Revocation disables future authentication: a new ClientHello reads the updated
+database and is rejected. Existing sessions and handshakes already authorized may
+continue until disconnect, expiry or server restart. The CLI says this explicitly.
+There is no live reload or per-identity active-session termination API. For immediate
+termination, `sudo systemctl restart pqvpn-server` disconnects **all clients**;
+revoked identities cannot establish a new session afterward.
+
+## Reproducible pre-VPS source
+
+Use the local annotated `v2-pre-vps` tag, resolve it with
+`git rev-parse 'v2-pre-vps^{commit}'`, and deploy that exact commit after the disposable
+root namespace gate. The hardening pass creates no automatic push. Never archive or
+copy private keys, the authorized-client DB, tokens, virtual environments or build
+outputs as part of source distribution. Provision secrets separately.
+
+Docker remains a development/integration convenience, not the first VPS path.
+Native systemd is the intended path, but actual daemon-reload/start/status/journal,
+real TUN/nft/listeners remain unvalidated until executed. Real systemd-resolved
+before/during/after state and approved-resolver lookups remain a separate Linux-client
+gate. IPv6 leak unit tests do not replace the expanded privileged namespace test.
+
+See the [exact next-phase handoff](pre_vps_handoff.md) for local-tag transfer,
+disposable root namespace execution, provisioning and separate real-runtime gates.

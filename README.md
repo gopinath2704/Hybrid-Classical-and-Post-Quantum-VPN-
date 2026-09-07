@@ -92,6 +92,14 @@ enters FAILED and restores routes/DNS even while TCP remains established.
 
 ## Network policy
 
+Full tunnel means supported IPv4 Internet traffic uses PQVPN, while unsupported
+IPv6 is **blocked by default**. This is not dual-stack tunneling. The client requires
+nftables for `ipv6_policy="block"`; loopback remains available and the temporary IPv6
+policy is removed on cleanup. `fail` refuses existing IPv6 connectivity before setup;
+`allow` explicitly accepts IPv6 bypass with a warning. An omitted policy in split
+mode leaves unrelated IPv6 alone. See the [IPv6 policy details](docs/client_setup.md#ipv6-policy).
+
+
 PQVPN-owned nftables tables isolate clients, block VPS host services (optional
 server-IP ping only), metadata and private destinations, and allow public forwarding
 through the configured WAN. `allowed_forward_networks` deliberately permits selected
@@ -104,6 +112,16 @@ rolls back network setup. `dns_mode="none"` explicitly accepts unmanaged DNS wit
 warning. Split DNS uses `dns_routing_domains` and does not implicitly install `~.`.
 See the [client guide](docs/client_setup.md).
 
-Current results and their limits are recorded in the [final validation matrix](docs/security_audit.md#final-validation--2026-09-07).
+Current results and their limits are recorded in the [final validation matrix](docs/security_audit.md#pre-vps-hardening--2026-09-07).
 Routed IPv6, a kill switch, dynamic authenticated PMTU discovery, independent protocol
 review and post-compromise recovery remain incomplete.
+
+Docker is a **development/integration convenience** with unvalidated runtime routing.
+The first VPS deployment should follow the native systemd guide; actual systemd
+startup and real Linux-client DNS restoration remain mandatory real-machine gates.
+The local `v2-pre-vps` annotated tag identifies the pre-VPS source baseline; verify
+`git rev-parse 'v2-pre-vps^{commit}'` before deploying that exact revision. No push or
+remote deployment is part of this hardening pass. See the
+[pre-VPS validation record](docs/security_audit.md#pre-vps-hardening--2026-09-07).
+The [root namespace and VPS handoff](docs/pre_vps_handoff.md) gives the next commands,
+including transfer of the local tag without a push.
