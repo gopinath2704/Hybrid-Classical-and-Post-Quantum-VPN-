@@ -9,9 +9,11 @@ User=pqvpn
 Group=pqvpn
 WorkingDirectory=/opt/pqvpn
 Environment=PQVPN_PYTHON=/opt/pqvpn/.venv/bin/python
-ExecStartPre=+/opt/pqvpn/scripts/server-setup.sh /etc/pqvpn/server.toml
+# Privileged execution chain (including Python imports/venv) must be root-owned,
+# never writable by pqvpn. See docs/deployment.md.
+ExecStartPre=+/opt/pqvpn/scripts/server-network.sh setup /etc/pqvpn/server.toml
 ExecStart=/opt/pqvpn/.venv/bin/python -m vpn.cli server --config /etc/pqvpn/server.toml
-ExecStopPost=+/opt/pqvpn/scripts/server-cleanup.sh
+ExecStopPost=+/opt/pqvpn/scripts/server-network.sh cleanup /etc/pqvpn/server.toml
 Restart=on-failure
 RestartSec=3
 AmbientCapabilities=CAP_NET_ADMIN

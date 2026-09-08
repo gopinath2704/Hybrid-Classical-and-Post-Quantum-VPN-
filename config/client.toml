@@ -5,6 +5,8 @@ server_identity_public_key = "server_identity_public.key"
 server_identity_fingerprint = "REPLACE_WITH_SHA256_FINGERPRINT"
 client_identity_private_key = "client_identity_private.key"
 full_tunnel = true
+# Remove this explicit setting when switching to split tunnel to leave unrelated IPv6 alone.
+ipv6_policy = "block"
 split_tunnel = []
 dns_servers = []
 kill_switch = false

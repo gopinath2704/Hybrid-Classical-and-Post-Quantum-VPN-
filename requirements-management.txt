@@ -1,5 +1,0 @@
-# Optional loopback management API. Not needed by pqvpn-server.service.
--r requirements-client.txt
-fastapi==0.141.1
-uvicorn==0.52.4
-websockets==17.1

@@ -12,7 +12,7 @@ from unittest.mock import Mock
 import pytest
 from vpn.config import ServerConfig, ClientConfig, validate_server, validate_client, load_client_config
 from vpn.identity import AuthorizedClients, generate_server_identity, generate_client_identity, validate_server_identity, load_client_private
-from vpn.firewall import render, DENIED
+from vpn.network import render, DENIED
 from vpn.doctor import overlapping_routes
 import vpn.runtime as runtime
 
@@ -85,7 +85,7 @@ def test_forwarding_restore_and_reconcile(firewall_commands, original):
     root,state,logs,batches,env=firewall_commands
     state.write_text(original)
     cfg=root/'server.toml'; cfg.write_text('[server]\noutbound_interface="wan0"\n')
-    def setup(): subprocess.run(['bash','scripts/server-setup.sh',str(cfg)],env=env,check=True,capture_output=True,timeout=10)
+    def setup(): subprocess.run(['bash','scripts/server-network.sh','setup',str(cfg)],env=env,check=True,capture_output=True,timeout=10)
     setup();setup()
     assert state.read_text()=='1'
     assert (root/'run/ip_forward.prev').read_text().strip()==original
@@ -94,7 +94,7 @@ def test_forwarding_restore_and_reconcile(firewall_commands, original):
     setup()
     latest=batches.read_text().split('---END---\n')[-2]
     assert 'wan1' in latest and 'wan0' not in latest and '10.8.0.0/24' not in latest
-    subprocess.run(['bash','scripts/server-cleanup.sh'],env=env,check=True,capture_output=True,timeout=10)
+    subprocess.run(['bash','scripts/server-network.sh','cleanup',str(cfg)],env=env,check=True,capture_output=True,timeout=10)
     assert state.read_text()==original and not (root/'run/ip_forward.prev').exists()
     assert 'delete table inet unrelated' not in logs.read_text()
 
@@ -102,13 +102,13 @@ def test_forwarding_restore_and_reconcile(firewall_commands, original):
 def test_unmanaged_forwarding_fails_if_disabled(firewall_commands):
     root,state,logs,batches,env=firewall_commands
     cfg=root/'server.toml';cfg.write_text('[server]\noutbound_interface="wan0"\nmanage_ip_forward=false\n')
-    result=subprocess.run(['bash','scripts/server-setup.sh',str(cfg)],env=env,capture_output=True,timeout=10)
+    result=subprocess.run(['bash','scripts/server-network.sh','setup',str(cfg)],env=env,capture_output=True,timeout=10)
     assert result.returncode and state.read_text()=='0' and not batches.exists()
 
 
 @pytest.mark.parametrize('mode,available,full', [('systemd-resolved',True,True),('systemd-resolved',False,True),('none',False,True),('systemd-resolved',True,False)])
 def test_dns_fail_safe_and_restore(monkeypatch, mode, available, full, caplog):
-    from test_network_transactions import Tun
+    from test_networking import Tun
     calls=[]
     def ip(*args,**kwargs):
         calls.append(args)
@@ -204,3 +204,158 @@ def test_static_leases_are_reserved_from_dynamic_allocations():
     pool.reserved={'10.8.0.2':'static'}
     assert pool.allocate('dynamic')=='10.8.0.3'
     assert pool.allocate('static','10.8.0.2')=='10.8.0.2'
+
+
+@pytest.fixture
+def staged_privileged_tree(tmp_path, monkeypatch):
+    """Real staged files, simulated root ownership: no sudo or host changes."""
+    root = tmp_path / 'opt/pqvpn'
+    for relative in ('scripts/server-network.sh',
+                     'vpn/network.py', 'handshake/__init__.py',
+                     'crypto/__init__.py', '.venv/bin/python',
+                     '.venv/lib/site-packages/dependency.py'):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('# staged deployment\n')
+        path.chmod(0o755 if relative.endswith(('.sh', 'python')) else 0o644)
+    overrides = {}
+    original = Path.stat
+    def metadata(path, *, follow_symlinks=True):
+        info = original(path, follow_symlinks=follow_symlinks)
+        values = list(info)
+        values[4] = 0
+        values[5] = 0
+        # Model production ancestors, not the shared writable /tmp fixture path.
+        if path in root.parents:
+            values[0] = stat.S_IFDIR | 0o755
+        for index, value in overrides.get(path, {}).items():
+            values[index] = value
+        return os.stat_result(values)
+    import stat
+    monkeypatch.setattr(Path, 'stat', metadata)
+    monkeypatch.setattr(Path, 'lstat', lambda path: metadata(path, follow_symlinks=False))
+    return root, overrides
+
+
+@pytest.mark.parametrize('relative,uid,gid,mode', [
+    ('scripts/server-network.sh', 1001, 1001, 0o755),
+    ('scripts/server-network.sh', 1001, 0, 0o555),
+    ('scripts/server-network.sh', 0, 1001, 0o775),
+    ('scripts/server-network.sh', 0, 0, 0o757),
+    ('vpn/network.py', 1001, 1001, 0o644),
+    ('.venv/bin/python', 1001, 1001, 0o755),
+    ('.venv/lib/site-packages/dependency.py', 0, 1001, 0o664),
+    ('vpn', 0, 1001, 0o775),
+])
+def test_privileged_code_rejects_unsafe_metadata(staged_privileged_tree, relative, uid, gid, mode):
+    from vpn.doctor import privileged_code_permissions
+    import stat
+    root, overrides = staged_privileged_tree
+    target = root / relative
+    kind = stat.S_IFDIR if target.is_dir() else stat.S_IFREG
+    overrides[target] = {0: kind | mode, 4: uid, 5: gid}
+    with pytest.raises(ValueError, match='root-owned|writable'):
+        privileged_code_permissions(root)
+
+
+def test_privileged_root_owned_code_and_venv_pass(staged_privileged_tree):
+    from vpn.doctor import privileged_code_permissions
+    root, _ = staged_privileged_tree
+    assert 'root-owned code/venv' in privileged_code_permissions(root)
+
+
+def test_privileged_interpreter_symlink_target_and_parent(staged_privileged_tree):
+    from vpn.doctor import privileged_code_permissions
+    import stat
+    root, overrides = staged_privileged_tree
+    interpreter = root / '.venv/bin/python'
+    interpreter.unlink()
+    target = root.parent / 'system/bin/python'
+    target.parent.mkdir(parents=True)
+    target.write_text('# system interpreter')
+    interpreter.symlink_to(target)
+    assert privileged_code_permissions(root)
+    overrides[target] = {4: 1001}
+    with pytest.raises(ValueError, match='root-owned'):
+        privileged_code_permissions(root)
+    overrides.clear()
+    overrides[target.parent] = {0: stat.S_IFDIR | 0o777}
+    with pytest.raises(ValueError, match='ancestor'):
+        privileged_code_permissions(root)
+
+
+def test_privileged_missing_interpreter_fails(staged_privileged_tree):
+    from vpn.doctor import privileged_code_permissions
+    root, _ = staged_privileged_tree
+    (root / '.venv/bin/python').unlink()
+    with pytest.raises(FileNotFoundError):
+        privileged_code_permissions(root)
+
+
+def test_doctor_production_scope(monkeypatch, tmp_path):
+    import vpn.doctor as doctor
+    monkeypatch.setattr(doctor, '__file__', str(tmp_path / 'vpn/doctor.py'))
+    monkeypatch.setattr(doctor.sys, 'executable', '/usr/bin/python')
+    assert not doctor.production_deployment(tmp_path / 'server.toml')
+    assert doctor.production_deployment('/etc/pqvpn/server.toml')
+    monkeypatch.setattr(doctor.sys, 'executable', '/opt/pqvpn/.venv/bin/python')
+    assert doctor.production_deployment(tmp_path / 'server.toml')
+
+
+def test_doctor_reports_privileged_code_failure(monkeypatch, tmp_path, capsys):
+    import vpn.doctor as doctor
+    monkeypatch.setattr(doctor, 'production_deployment', lambda _: True)
+    def unsafe():
+        raise ValueError('server-network.sh: privileged code is group/world writable')
+    monkeypatch.setattr(doctor, 'privileged_code_permissions', unsafe)
+    monkeypatch.setattr(doctor, '_OQS_AVAILABLE', False)
+    assert doctor.run('server', tmp_path / 'missing.toml') == 1
+    assert 'FAIL Privileged systemd code ownership' in capsys.readouterr().out
+
+
+def test_deployment_documents_preserve_systemd_boundary():
+    unit = Path('deploy/pqvpn-server.service').read_text()
+    for directive in ('User=pqvpn', 'Group=pqvpn', 'CapabilityBoundingSet=CAP_NET_ADMIN',
+                      'ExecStartPre=+/opt/pqvpn/scripts/server-network.sh setup',
+                      'ExecStopPost=+/opt/pqvpn/scripts/server-network.sh cleanup'):
+        assert directive in unit
+    for name in ('deployment.md', 'deployment.md'):
+        text = Path('docs', name).read_text()
+        assert '--chown=pqvpn:pqvpn' not in text
+        assert 'sudo -u pqvpn python3.14 -m venv /opt/pqvpn' not in text
+        assert 'sudo -u pqvpn .venv/bin/python -m vpn.cli client authorize' not in text
+        assert 'sudo chmod 0640 /etc/pqvpn/authorized_clients.json' in text
+        assert 'sudo chmod 0400 /etc/pqvpn/server_identity_private.key' in text
+        assert 'sudo chown -R root:root /opt/pqvpn' in text
+    for name in ('deployment.md', 'deployment.md', 'security_audit.md'):
+        text = Path('docs', name).read_text()
+        assert 'ExecStartPre=+' in text and 'ExecStopPost=+' in text
+        assert '/opt/pqvpn/vpn/network.py' in text
+    assert 'The script takes no arguments.' not in Path('docs/deployment.md').read_text()
+
+
+def test_privileged_intermediate_symlink_is_audited(staged_privileged_tree):
+    from vpn.doctor import privileged_code_permissions
+    root, overrides = staged_privileged_tree
+    interpreter = root / '.venv/bin/python'
+    interpreter.unlink()
+    intermediate = root.parent / 'python-link'
+    target = root.parent / 'system-python'
+    target.write_text('# trusted interpreter')
+    intermediate.symlink_to(target)
+    interpreter.symlink_to(intermediate)
+    assert privileged_code_permissions(root)
+    overrides[intermediate] = {4: 1001}
+    with pytest.raises(ValueError, match='root-owned'):
+        privileged_code_permissions(root)
+"""Benchmark output coverage restored with v2 sizes and overhead."""
+from benchmarks import HandshakeBenchmark,ThroughputBenchmark,PacketOverheadAnalyzer
+def test_handshake_benchmark_output(tmp_path):
+    result=HandshakeBenchmark(iterations=1,warmup_runs=0,results_dir=tmp_path).run_all();assert "Hybrid (X25519 + ML-KEM-768)" in result;assert (tmp_path/"handshake_results.json").exists()
+def test_throughput_benchmark_frame_size(tmp_path):
+    result=ThroughputBenchmark(iterations=2,results_dir=tmp_path).benchmark_payload_size(512);assert result.frame_size_bytes==512+42 and result.throughput_mbps>0
+def test_packet_overhead_output(tmp_path):
+    analyzer=PacketOverheadAnalyzer(results_dir=tmp_path);v4=analyzer.get_layer_breakdown(False);assert v4.total_overhead_bytes==70
+    assert analyzer.analyze_payload_efficiency(1400).wire_bytes_ipv4==1470
+    assert (tmp_path/"packet_capture_results.json").exists() is False
+    analyzer.run_all();assert (tmp_path/"packet_capture_results.json").exists()

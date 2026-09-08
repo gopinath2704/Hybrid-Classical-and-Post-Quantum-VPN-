@@ -18,32 +18,19 @@ Building a **Hybrid Classical & Post-Quantum Cryptography VPN Application** comb
 
 ```text
 Hybrid-Classical-and-Post-Quantum-VPN/
-├── app/                    # Token-protected FastAPI/WebSocket dashboard
-├── crypto/                 # X25519, runtime-discovered ML-KEM-768, HKDF
-├── handshake/              # Authenticated strict v2 protocol and record layer
-├── vpn/
-│   ├── cli.py             # Provisioning, authorization, server, client
-│   ├── config.py          # Strict TOML models
-│   ├── doctor.py          # Read-only deployment diagnostics
-│   ├── firewall.py        # Scoped nftables policy renderer
-│   ├── engine.py          # Linux TUN, exact MTU, quality primitives
-│   ├── identity.py        # Static server/client identity lifecycle
-│   └── runtime.py         # One-TUN/UDP server and transactional client
-├── config/                 # Server/client TOML examples; private keys ignored
-│   └── client.docker.toml  # Docker DNS hostname and provisioned pin
-├── scripts/                # Isolated nftables setup and cleanup
-├── deploy/                 # systemd service and tested versions
-├── tests/                  # Unit, security, native-PQC, root integration markers
-│   ├── test_session_activity.py # Quiet keepalive, idle cleanup, rejected activity
-│   └── test_runtime_fixes.py # Shutdown, liveness, delayed rekey, deployment regressions
-├── benchmarks/             # Historical benchmark code/results (not security proof)
-├── docs/                   # Architecture, protocol, audit, threat/deployment/setup
-│   └── management-api.md  # Shared dashboard/telemetry contract
-├── requirements*.txt       # Server/client/management/dev roles
-├── constraints-tested.txt  # Pinned tested Python dependencies
-├── pytest.ini
-├── Dockerfile.server
-├── Dockerfile.client
+├── app/                    # FastAPI/WebSocket dashboard, HTML/inline JS and external CSS
+├── benchmarks/             # Ignored output directory created by benchmark runs
+├── config/                 # Shared server/client TOML examples; secrets ignored
+├── crypto/                 # X25519, native ML-KEM-768 and HKDF
+├── deploy/                 # systemd unit and consolidated version provenance
+├── docs/                   # design, deployment and historical security audit
+├── handshake/              # Frozen authenticated v2 protocol and record layer
+├── scripts/                # Native liboqs installer and server network lifecycle
+├── tests/                  # Six responsibility suites plus conftest/root harness
+├── vpn/                    # CLI/config/doctor/identity/network/runtime boundaries
+├── constraints-tested.txt  # Complete tested transitive version pins
+├── pyproject.toml          # Core, management and development dependency groups
+├── Dockerfile              # Shared server/development-client image
 └── docker-compose.yml
 ```
 
@@ -51,11 +38,60 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 
 ## 📝 Modification Log & Project Progress
 
+### 2026-09-08 — Minimal maintainable project layout
+
+- Continued `refactor/minimal-layout` from clean `v2-pre-vps-2`. The handed-off working tree already contained 43 meaningful files; final count remains 43, versus 73 before the whole refactor: 30 files removed (41.10%). Removed seven reproducible benchmark outputs and ignored generated results/build metadata; added a Docker context exclusion list.
+- Consolidated 19 Python test modules into six responsibility suites while retaining every prior test, markers, root namespace harness and native tests. Added one deterministic frozen-wire regression covering all four v2 handshake messages; collection is now 261 tests.
+- Consolidated seven fragmented guides into `docs/design.md` and `docs/deployment.md`; retained `docs/security_audit.md`. Replaced five requirement entry points and pytest configuration with `pyproject.toml` core/management/dev groups and markers while keeping every tested version in `constraints-tested.txt`.
+- Combined TUN/telemetry, IPv6 policy and firewall rendering into the 238-line `vpn/network.py`; kept crypto, handshake, runtime, identity, config and doctor separate. Combined setup/cleanup into `scripts/server-network.sh` with explicit subcommands and preserved privileged systemd execution. Merged version provenance, inlined the small dashboard JavaScript, retained the large CSS separately, consolidated benchmarks into `benchmarks.py` while preserving `python -m benchmarks`, and consolidated Docker/config duplication with an explicit validated client host override.
+- Frozen handshake/cryptography and runtime security semantics were not changed. The only continuation correction makes the in-memory bearer dependency async so pinned AnyIO/Python 3.14 does not thread-offload a constant-time header check; its HTTP authentication assertions remain intact. Final validation: 261 collected; both test entry points 259 passed / 2 skipped; native 2 passed from pinned commit `5a1a854b0dc9f2141bdc771c555ee60c37950183`; fresh constrained install, doctors, benchmark smoke, compile, shell, extracted JavaScript, both Compose profiles, links and diff checks pass. Root namespace is skipped at UID 1000 because passwordless sudo is unavailable; systemd/nftables/DNS/VPS runtime gates remain pending. Local tag `v2-minimal-layout`; no push.
+
+### 2026-09-08 — Harden privileged systemd deployment ownership
+
+- Continued clean validated `a09f65b948df985b97285b145faacb53ad292797` / `v2-pre-vps`. Root-owned source and production venv, administrative updates, and immutable-to-service privileged execution chain now documented in deployment, handoff and security audit. `/etc/pqvpn` is root:pqvpn 0750; config/public/policy files root:pqvpn 0640; private identity pqvpn:root 0400. Authorization/revocation run as root and restore DB ownership/mode after existing atomic replacement. Fixed optional absolute liboqs installer prefix wording.
+- Doctor audits production code/venv ownership, group/world write bits, intermediate symlinks, targets and ancestors; development profiles are explicitly out of scope. Added 15 staged ownership/deployment regressions without requiring root. Only a comment changed in the systemd unit; daemon user/capabilities and privileged helper commands remain. No handshake, crypto, runtime, firewall/replay/IPv6/rekey/DNS or dependency-pin changes.
+- Final validation: both pytest invocation styles **258 passed, 2 skipped, 260 collected**; native ML-KEM **2 passed** with mock disabled, Python **3.14.7**, binding/native **0.16.0**, clean source **5a1a854b0dc9f2141bdc771c555ee60c37950183**. Fresh temporary venv/native build and loaded-library digest recorded in security audit. Compileall, four Bash syntax checks, JavaScript syntax, both Compose profiles, pip check and diff checks PASS. Temporary server doctor exit 0 with provider-firewall WARN only; client doctor exit 0/all PASS.
+- Root namespace **SKIPPED**: host UID 1000, no passwordless sudo; TUN present and unchanged. Actual systemd, nftables enforcement, resolved restoration and VPS/client validation remain pending. No production paths were provisioned. New local commit/tag `v2-pre-vps-2`; original tag retained; no push. No repository files/directories added or removed.
+
+### 2026-09-07 — Source-review continuation and local validation release
+
+- Resumed the existing 20-file staged change on `c50dee0`; inspected the complete staged diff, configs, client networking, server helpers/service, namespace tests, dependency pins, current documentation and secret/artifact exclusions before committing. No IPv6 enforcement or frozen v2 cryptographic regression found. Full-mode block/fail/allow, split defaults, atomic owned-table cleanup and read-only doctor semantics match source. Handshake, crypto, rekey and networking behavior unchanged during continuation.
+- Corrected doctor wording: Python >=3.11 is a runtime minimum, not a tested support claim; 3.14.7 remains the tested baseline and other versions warn. Added one parametrized regression in `tests/test_management.py`. CLI revocation explicitly states that existing active sessions continue until disconnect/expiration/server restart; strengthened its existing `tests/test_networking.py` assertion. No session-kill implementation added.
+- Prior temporary environments/builds were gone. Recreated `/tmp/pqvpn-continuation.PdFUxu/venv` from unchanged requirements; all 36 constrained versions match and pip check passes. Rebuilt native ML-KEM-only liboqs 0.16.0 from verified clean source commit `5a1a854b0dc9f2141bdc771c555ee60c37950183`, using GCC 16.2.1, CMake 4.4.3 and Ninja 1.13.2. Verified the loaded library in `/proc/self/maps`; updated `deploy/versions.txt` with the current digest while retaining the prior digest.
+- Validation: focused IPv6/doctor tests **41 passed**. Both `pytest -q` and `python -m pytest -q`: **243 passed, 2 skipped, 245 collected**. Native marker: **2 passed, 243 deselected**, mock disabled, Python **3.14.7**, binding/native **0.16.0**. Compileall, four shell scripts, JS syntax, both Compose profiles and diff checks PASS. Final available validation is rerun after the last file edits before commit/tag.
+- Temporary provisioned server doctor: PASS/WARN only for external firewall, exit 0; client doctor: PASS including IPv6 block, exit 0. Before/after files, links, IPv4/IPv6 routes, IPv6 addresses, forwarding and resolver snapshots match. Shipped sample profiles correctly exit 1 for absent identities/database and absent pqvpn account; no deployment material was added to source. Host WAN is enp0s20f0u4; IPv6 snapshot sees 3 routes/addresses.
+- **ROOT NAMESPACE: SKIPPED — non-root session**, UID 1000; TUN and required tools exist, but `sudo -n true` reports a password is required. Root marker: 1 skipped, 244 deselected. Docker runtime, systemd runtime and real systemd-resolved restoration: NOT VALIDATED. Real VPS/client: NOT PERFORMED.
+- Added `docs/deployment.md`, linked from README and server deployment, with local bundle/tag transfer (no push), actual bounded namespace invocation, pinned provisioning/systemd commands and real-client gates. Updated the current audit/status counts only; historical progress entries are preserved. No tracked deployment secrets or local build artifacts found.
+- Authorized local release: `Pre-VPS PQVPN v2 validation baseline`, annotated tag `v2-pre-vps`, annotation `Validated PQVPN v2 baseline before root namespace and VPS testing`; create only after final checks, inspect staged paths, then verify clean tree and tag target. The final report records the exact commit hash. No push or remote deployment is performed.
+- Status: **Deployable research/prototype PQ-VPN. IPv4 full tunnel includes IPv6 leak prevention. Native ML-KEM validation passed. Root/TUN integration pending. Real VPS/client validation pending.** Next milestone: root namespace validation, then real VPS + real Linux client validation.
+
+### 2026-09-07 — Pre-VPS IPv6 leak protection, revocation and source baseline
+
+- Inspected current Edit-5 tree first: base `c50dee0`, only the existing GitHub push-history entry in this file was dirty; preserved it. Current v2 handshake and crypto source remain byte-for-byte unchanged.
+- Added `vpn/network.py`: transactional IPv6 block/fail/allow policy. Full mode defaults to block, split mode defaults to leaving unrelated IPv6 alone. Exclusive random ip6 table blocks non-loopback OUTPUT/FORWARD before IPv4 tunnel routes; cleanup removes only the owned table. Added config fields/examples and read-only IPv6 diagnostics. No routed IPv6 or persistent sysctl changes.
+- Added `tests/test_networking.py`: 34 cases cover policy/default validation, IPv6 route/address detection, atomic setup failure, disconnect/setup/dead-peer/control/rekey/SIGTERM cleanup, read-only doctor, new-handshake revocation and installer source mismatch. Related focused run: 95 passed. Extended root namespace script with a physical IPv6 default route, bounded ICMPv6/TCP leak checks, loopback, and IPv6 restoration after disconnect/SIGTERM/dead peer; real execution remains pending.
+- CLI revoke help/output states future authentication only; existing sessions/already-authorized handshakes continue until expiry/disconnect/restart. Server restart terminates all clients; no live reload/active-identity termination was added.
+- Pinned native liboqs 0.16.0 to source commit `5a1a854b0dc9f2141bdc771c555ee60c37950183`, verified from upstream tag and checkout. Installer fails on mismatch before build. No dependency versions upgraded. Added `deploy/versions.txt` with explicit temporary ML-KEM-only build provenance, compiler and binary digest. Prior binary source provenance was unavailable, so validation used this freshly built library, verified via loaded process mappings.
+- Native versions: Python **3.14.7**, liboqs-python **0.16.0**, liboqs **0.16.0**. Separate native marker with mock disabled: **2 passed, 242 deselected in 0.19s**. Both full suites used the verified source build: `pytest -q` **242 passed, 0 failed, 2 skipped, 38.35s**; `python -m pytest -q` **242 passed, 0 failed, 2 skipped, 38.30s**; **244 collected** each. Existing 2 skips remain root namespace and native-provider precedence over mock.
+- Compileall PASS; setup/cleanup/install-liboqs/namespace shell syntax each PASS; Node JS syntax PASS; Docker Compose config PASS; pip check PASS; diff whitespace PASS. No Docker runtime claim.
+- Server doctor **WARN, exit 0**, external firewall verification only; client doctor **PASS, exit 0**, including IPv6 block policy with 3 visible IPv6 routes/addresses. Temporary native profiles used; snapshots proved unchanged files, links, IPv4/IPv6 routes, IPv6 addresses, resolver state and forwarding. No doctor network mutations.
+- **ROOT NAMESPACE: SKIPPED** — actual host UID 1000; TUN, ip and nft present. The root marker reported SKIP; privileged IPv6 enforcement remains unexecuted. **Docker/systemd/real systemd-resolved: NOT VALIDATED. Real VPS: NOT PERFORMED.**
+- Upstream security policy/releases/advisories checked 2026-09-07: liboqs 0.16.0 remains supported/current; no published advisory requiring an upgrade was found. Sources and scope are recorded in the [pre-VPS report](docs/security_audit.md#pre-vps-hardening--2026-09-07). Python artifact hash locking was not added; existing version constraints retained.
+- Release hygiene: no tracked private-key/authorized-client DB/.env paths; environment/cache/private-profile ignores verified. Prepare the local `Pre-VPS PQVPN v2 validation baseline` commit and annotated `v2-pre-vps` tag only after successful validation; no push. The tag resolves the exact validated commit without a self-referential hash in this file. All native build/identity/test outputs stay under /tmp.
+- Documentation now defines full tunnel as supported IPv4 routing plus default IPv6 blocking, explicitly describes snapshot fail/unsafe allow modes and revocation boundaries, and retains Docker development-only, native systemd and real-client DNS gates. Status: **Deployable research/prototype PQ-VPN. IPv6 leak protection validated at unit level. Root/TUN integration pending. Real VPS/client validation pending.** Next milestone: **REAL VPS + SEPARATE REAL LINUX CLIENT**, following the privileged disposable-machine gates. No protocol redesign or optional feature expansion.
+
+### 2026-09-07 10:17 IST — Push all pending changes to GitHub
+
+- Staged all 72 changed files (31 modified, 40 new) and committed as `c50dee0` on `main`.
+- Commit: `feat: add deployment configs, security hardening, management API, comprehensive tests, and documentation`.
+- Pushed `8e6f125..c50dee0 main -> main` to `origin` (`https://github.com/gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-.git`).
+- 5,157 insertions, 6,989 deletions across deployment configs, VPN modules (config, doctor, firewall, identity, runtime), documentation (protocol, threat model, security audit, setup guides), comprehensive test suite, and updated benchmarks/crypto/handshake/engine.
+
 ### 2026-09-07 — Final handoff validation and documentation consistency
 
 - Inspected the existing dirty working tree, diffs, current implementation, tests and deployment documents before edits. Preserved all previous work and the v2 1,318 / 1,222 / 1,190 / 38-byte handshake, key schedule, separate DATA/CONTROL domains and synchronized rekey.
-- Initial handoff reruns in a fresh `/tmp/pqvpn-final-venv`: `pytest -q` **206 passed, 2 skipped in 36.32s**; `python -m pytest -q` **206 passed, 2 skipped in 36.40s**. System Python originally lacked pytest; installed the unchanged pinned `requirements-dev.txt` baseline outside the repository. All constrained versions match and `pip check` passes. Network/socket tests require execution outside the sandbox as UID 1000; a restricted ASGI-only run stalled and was terminated.
-- Fixed one verified configuration defect in `vpn/config.py`: omitted identity/database path fields now use standard filenames beside the TOML instead of resolving from the process CWD. Added its regression in `tests/test_network_transactions.py`. Added actual ASGI HTTP ticket-authentication and random-ticket rejection coverage in `tests/test_doctor_management.py`; existing atomic single-use ticket implementation preserved.
+- Initial handoff reruns in a fresh `/tmp/pqvpn-final-venv`: `pytest -q` **206 passed, 2 skipped in 36.32s**; `python -m pytest -q` **206 passed, 2 skipped in 36.40s**. System Python originally lacked pytest; installed the unchanged pinned `pyproject.toml dev extras` baseline outside the repository. All constrained versions match and `pip check` passes. Network/socket tests require execution outside the sandbox as UID 1000; a restricted ASGI-only run stalled and was terminated.
+- Fixed one verified configuration defect in `vpn/config.py`: omitted identity/database path fields now use standard filenames beside the TOML instead of resolving from the process CWD. Added its regression in `tests/test_networking.py`. Added actual ASGI HTTP ticket-authentication and random-ticket rejection coverage in `tests/test_management.py`; existing atomic single-use ticket implementation preserved.
 - Removed unused third-party Chart.js from the dashboard and corrected record integrity to AES-GCM. Corrected crypto docstrings for the single supported ML-KEM-768 suite, explicit native installation and key evolution limitations; no crypto behavior changes.
 - **Final complete regressions (210 collected each):** `pytest -q`: **208 passed, 0 failed, 2 skipped, 37.19s**; `python -m pytest -q`: **208 passed, 0 failed, 2 skipped, 36.17s**. Both ran sequentially from repository root with the environment activated and 120-second outer timeouts. Skips: root namespace and mock-only fallback with native provider present.
 - **Static checks:** Python compileall over crypto/handshake/vpn/app/benchmarks/tests PASS; setup, cleanup, namespace and native installer bash syntax each PASS; Node JS syntax PASS; Docker Compose plus development-client profile configuration PASS; `git diff --check` PASS. Compose is syntax-only, not image/runtime validation.
@@ -69,13 +105,13 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ### 2026-09-06 22:08 IST — Edit-3 idle activity and source packaging
 
 - `vpn/runtime.py`: centralized `ServerSession.touch`, count authenticated eight-byte PING and accepted DATA only, validate CONTROL before activity, serialize expiry/UDP/rekey authorization, retain endpoint binding, clear endpoint on cleanup, log idle/absolute expiry reason. Added overridable client ping timing constants with unchanged deployment defaults. No cryptographic architecture or handshake changes.
-- `tests/test_session_activity.py`: live loopback quiet keepalive and real idle expiry/cleanup regressions, plus authenticated-record rejection cases (replay/session/endpoint/epoch/tag/domain/payload/source).
+- `tests/test_runtime.py`: live loopback quiet keepalive and real idle expiry/cleanup regressions, plus authenticated-record rejection cases (replay/session/endpoint/epoch/tag/domain/payload/source).
 - `.gitignore`: explicit environment and coverage exclusions. Removed the untracked bundled `.venv/` from the source folder; no dependency or lock files removed. Validation environment lives outside the repository.
 - `deploy/pqvpn-server.service`: recreate runtime directory on boot. README and deployment/client guides specify freshly created environments; native installation excludes environments/caches and consistently uses `/opt/pqvpn/.venv` and `/etc/pqvpn/server.toml`, with no EnvironmentFile.
 - README, protocol, security audit, deployment, client setup, and threat model document authenticated liveness, rejection rules and genuine expiry cleanup. Status remains **deployable research/prototype PQ-VPN**; privileged networking and real VPS/client validation are the next milestone.
 - `tests/namespace_vpn.sh`: additionally runs quiet keepalive and genuine idle cleanup tests with real TUN in the isolated namespace; compares routes before/after. Namespace DNS mutation is disabled; unprivileged idle cleanup verifies route/DNS undo commands with mocked OS calls.
 - Validation in fresh `/tmp/pqvpn-edit3-venv` (Python 3.14.7; freshly installed test dependencies, not the old bundled environment): `python -m pytest -q`: **139 passed, 2 skipped in 16.65s**; `pytest -q`: **139 passed, 2 skipped in 16.53s**. Native ML-KEM-768 separately: **1 passed, 140 deselected**. Root namespace: **1 skipped, 140 deselected** (UID 1000; `/dev/net/tun` absent). Compileall, all three shell syntax checks, JS syntax, Compose config and diff whitespace check passed. Local socket tests require execution outside the socket-restricting sandbox.
-- Limitations: fresh installation used Python-3.14-compatible test dependencies (cryptography 50.0.1, pytest 9.1.1, FastAPI 0.141.1); installation of the older exact `requirements.txt` pins was not validated on this host. Native systemd activation, privileged namespace networking/DNS and real VPS/client end-to-end validation remain pending. No production-readiness claim.
+- Limitations: fresh installation used Python-3.14-compatible test dependencies (cryptography 50.0.1, pytest 9.1.1, FastAPI 0.141.1); installation of the older exact `pyproject.toml` pins was not validated on this host. Native systemd activation, privileged namespace networking/DNS and real VPS/client end-to-end validation remain pending. No production-readiness claim.
 
 
 ### 2026-09-06 — Edit-2 runtime and deployment repairs
@@ -89,7 +125,7 @@ FAILED through management status, and tears down networking. A separate schedule
 keeps data forwarding active during rekey waits. Teardown serializes with all
 record/epoch locks, and closed records fail explicitly.
 
-Compose identity mounts now match TOML-relative paths; client.docker.toml sets
+Compose identity mounts now match TOML-relative paths; client.toml with an explicit Docker host override sets
 vpn-server explicitly. Docker bases support tomllib and use a virtualenv.
 Systemd firewall setup reads the actual server TOML, including non-default subnet,
 TUN and outbound interface. The dashboard uses the configured profile and a
@@ -125,12 +161,12 @@ all three requested bash syntax checks, JavaScript syntax, Compose config, and
 - **[MODIFIED] `crypto/hybrid_crypto.py` / `crypto/__init__.py`** — production now supports only standardized `ML-KEM-768`, discovers enabled liboqs mechanisms, performs a native startup KEM self-test, and retains explicitly labelled mock-only development behavior.
 - **[REPLACED] `handshake/kemtls.py`** — strict exact-length v2 handshake; pinned static ML-KEM server proof; authorized Ed25519 client proof; transcript/context-bound directional key schedule; deterministic per-direction nonces; authenticated headers; 128-packet replay window; monotonic epochs and best-effort mutable-buffer wiping. Superseded in part by the concurrency/channel update above.
 - **[NEW] `vpn/identity.py`, `vpn/config.py`, `vpn/runtime.py`** — restrictive identity generation, authorized-client database, TOML configuration, one-TUN/one-UDP multi-client server, VPN IP pool, authenticated UDP endpoint binding, client/server TUN forwarding, transactional client routes/DNS, real encrypted PING/PONG telemetry, resource limits, and synchronized TCP control-channel rekey.
-- **[REPLACED] `vpn/cli.py`, `vpn/engine.py`, `vpn/__init__.py`** — provisioning/admin commands and fail-closed Linux runtime; removed legacy unsafe service/server and misleading OpenVPN compatibility surface.
+- **[REPLACED] `vpn/cli.py`, `vpn/network.py`, `vpn/__init__.py`** — provisioning/admin commands and fail-closed Linux runtime; removed legacy unsafe service/server and misleading OpenVPN compatibility surface.
 - **[REPLACED] `app/backend/api.py`** and **[MODIFIED] frontend** — bearer-protected management actions/telemetry, token-protected WebSocket, explicit CORS origins, local/custom profiles only, and browser token handling.
-- **[NEW] `scripts/server-setup.sh`, `scripts/server-cleanup.sh`, `deploy/pqvpn-server.service`** — isolated nftables forwarding/NAT/MSS rules, safe cleanup, outbound-interface detection, and a capability-limited native systemd example.
+- **[NEW] `scripts/server-network.sh setup`, `scripts/server-network.sh cleanup`, `deploy/pqvpn-server.service`** — isolated nftables forwarding/NAT/MSS rules, safe cleanup, outbound-interface detection, and a capability-limited native systemd example.
 - **[MODIFIED] Docker artifacts** — removed public management publication, corrected v2 CLI entrypoints, documented secret/config mounts, and made the bundled client an explicit development profile.
 - Docker Compose schema validation passed with `docker compose config`.
-- **[NEW/REPLACED] tests and `pytest.ini`** — security/authentication/directional-key/nonce/replay/rekey/IP-pool/MTU/API tests plus separate mock/native/integration markers. Validation: 55 unit/mock-capable tests passed (one native-precedence skip); native ML-KEM marker passed 1/1; privileged integration marker remains unexecuted in this restricted workspace.
+- **[NEW/REPLACED] tests and pytest configuration** — security/authentication/directional-key/nonce/replay/rekey/IP-pool/MTU/API tests plus separate mock/native/integration markers. Validation: 55 unit/mock-capable tests passed (one native-precedence skip); native ML-KEM marker passed 1/1; privileged integration marker remains unexecuted in this restricted workspace.
 - Final rerun after all edits: `59 passed, 2 skipped`; native marker: `1 passed`; namespace marker: skipped as non-root, and passwordless escalation was unavailable (`sudo: a password is required`). Shell syntax, Python compilation, Compose schema, and `git diff --check` passed.
 - **[REPLACED/NEW] documentation** — honest README/architecture plus protocol, threat model, deployment, and client setup guides. No formal KEMTLS, guaranteed zeroization, or completed root-integration claim is made.
 
@@ -215,7 +251,7 @@ transparent, honest, production-ready VPN implementation as audited and approved
 - Added `#detail-tun-mode` and `#detail-pqc-mode` rows in connection details panel.
 - Custom server input group (host + port) with toggle button.
 
-**[MODIFIED] `app/frontend/js/app.js`**:
+**[MODIFIED] `app/frontend/index.html`**:
 - Added `fetchCryptoStatus()` — updates topbar badges from `/api/v1/crypto/status`.
 - Updated `updateConnectionUI()` — null-safe, uses badge group, added `ERROR` state.
 - Updated `updateTelemetryUI()` — reads `pqc_mode`, `tun_mode` from telemetry frames.
@@ -232,13 +268,13 @@ transparent, honest, production-ready VPN implementation as audited and approved
 
 #### Phase 6 — Docker, Entrypoints, Dependencies
 
-**[MODIFIED] `Dockerfile.server`** — Fixed entrypoint: `python3 -m vpn.server --dashboard`; added cmake/ninja/libssl-dev for liboqs build; exposed 8000/51820.
+**[MODIFIED] `Dockerfile`** — Fixed entrypoint: `python3 -m vpn.server --dashboard`; added cmake/ninja/libssl-dev for liboqs build; exposed 8000/51820.
 
-**[MODIFIED] `Dockerfile.client`** — Fixed entrypoint: env-variable-driven `python3 -m vpn.client --server ${SERVER_HOST}`.
+**[MODIFIED] `Dockerfile`** — Fixed entrypoint: env-variable-driven `python3 -m vpn.client --server ${SERVER_HOST}`.
 
 **[MODIFIED] `docker-compose.yml`** — Added vpn-net bridge network; `NET_ADMIN` + `/dev/net/tun` for both containers; `SERVER_HOST`/`SERVER_PORT`/`VPN_IP` env wired.
 
-**[MODIFIED] `requirements.txt`** — Pinned all versions; added `liboqs-python>=0.10.0` with build note; added `pytest-asyncio`.
+**[MODIFIED] `pyproject.toml`** — Pinned all versions; added `liboqs-python>=0.10.0` with build note; added `pytest-asyncio`.
 
 ---
 
@@ -277,19 +313,19 @@ transparent, honest, production-ready VPN implementation as audited and approved
 
 - **Component 1 (Documentation)**:
   - Merged `phase.md` roadmap and milestone breakdowns into `progress.md`.
-  - Merged `docs/deployment_guide.md` setup and container workflows into `docs/architecture.md`.
+  - Merged `docs/deployment_guide.md` setup and container workflows into `docs/design.md`.
   - Deleted redundant `phase.md` and `docs/deployment_guide.md`.
 - **Component 2 (Benchmarks)**:
-  - Consolidated `handshake_bench.py`, `throughput_bench.py`, `packet_capture.py`, and `generate_charts.py` into a single high-performance `benchmarks/runner.py`.
-  - Updated `benchmarks/__init__.py` and `tests/test_benchmarks.py` to import from `runner.py`.
+  - Consolidated `handshake_bench.py`, `throughput_bench.py`, `packet_capture.py`, and `generate_charts.py` into a single high-performance `benchmarks.py`.
+  - Updated the benchmark public API and `tests/test_deployment.py` around the unified runner.
   - Removed old fragmented benchmark scripts; results generated dynamically.
 - **Component 3 (Application Backend)**:
   - Inlined `ConnectionManager`, rolling history buffers, `_build_telemetry_frame`, and `/ws/telemetry` endpoint directly into `app/backend/api.py`.
   - Updated `app/backend/__init__.py` and deleted `app/backend/websocket.py`.
 - **Component 4 (VPN Engine & CLI)**:
-  - Integrated `VPNService`, `ServiceState`, `VPNTelemetry`, and KEMTLS transport helpers from `vpn/service.py` directly into `vpn/engine.py`.
+  - Integrated `VPNService`, `ServiceState`, `VPNTelemetry`, and KEMTLS transport helpers from `vpn/service.py` directly into `vpn/network.py`.
   - Created unified CLI `vpn/cli.py` with `server` and `client` subcommands (`python -m vpn.cli server|client`).
-  - Updated `Dockerfile.server`, `Dockerfile.client`, `app/backend/api.py`, and `vpn/__init__.py`.
+  - Updated `Dockerfile`, `Dockerfile`, `app/backend/api.py`, and `vpn/__init__.py`.
   - Deleted separate `vpn/service.py`, `vpn/server.py`, and `vpn/client.py`.
 - **Remote Synchronization**:
   - Pushed consolidated commit `a88e911` to GitHub remote (`https://github.com/gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-.git`) on branch `main`.
@@ -300,7 +336,11 @@ transparent, honest, production-ready VPN implementation as audited and approved
 
 | Task / Module | Status | Description |
 | :--- | :---: | :--- |
-| **Final Handoff Validation** | ✅ Completed | 210 collected; both entrypoints 208 passed / 2 skipped; native 2 passed; doctors and static checks recorded |
+| **Systemd Ownership Boundary** | ✅ Completed | Root-owned deployment model; production doctor plus 15 regressions; both pytest styles 258 passed / 2 skipped; native 2 passed; runtime gates pending |
+| **Pre-VPS Hardening Validation** | ✅ Completed | Source review complete; 245 collected; both entrypoints 243 passed / 2 skipped; native 2 passed at pinned source; provisioned doctors/static checks PASS (external firewall WARN) |
+| **IPv6 Leak Prevention** | ✅ Completed | Unit/static policy and cleanup validated; real kernel namespace enforcement pending |
+| **Minimal Layout Refactor** | ✅ Completed | 73 to 43 meaningful files; 261 tests retained/added; fresh install and full validation pass; protocol unchanged |
+| **Local Release Baseline** | ✅ Completed | Structural baseline v2-minimal-layout; v2-pre-vps and v2-pre-vps-2 retained; exact hash and clean-tree verification in final report; no push |
 | **Dependency / Deployment Hardening** | ✅ Completed | Pinned role dependencies; explicit native install; scoped firewall, forwarding restoration, UDP dead-peer/DNS safety, strict identities/database and telemetry tickets |
 | **Edit-3 Idle Activity / Packaging** | ✅ Completed | Authenticated keepalive refresh; invalid activity rejected; fresh-environment deployment |
 | **Directory Scaffolding** | ✅ Completed | Created complete directory tree and skeleton files |
@@ -308,16 +348,16 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | **GitHub Integration** | ✅ Completed | Configured Git repo & remote `https://github.com/gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-.git` |
 | **Hybrid Cryptography (`crypto/`)** | ✅ Completed | X25519 + standardized ML-KEM-768 hybrid inputs and HKDF-SHA256 |
 | **KEMTLS-inspired Handshake (`handshake/`)** | ✅ Completed | Custom pinned-server/authorized-client protocol, transcript binding, channel-separated AES-256-GCM records |
-| **VPN Engine (`vpn/engine.py`)** | ✅ Completed | TUN and measured quality primitives; routed client/server in vpn/runtime.py |
+| **VPN Engine (`vpn/network.py`)** | ✅ Completed | TUN and measured quality primitives; routed client/server in vpn/runtime.py |
 | **Unified VPN CLI (`vpn/cli.py`)** | ✅ Completed | Unified server and client entry points with subcommands (`vpn.cli server`, `vpn.cli client`) |
 | **Application UI (`app/`)** | ✅ Completed | Browser management and consolidated REST/WebSocket backend; optional PyWebView shell outside tested dependency baseline |
-| **Benchmarks (`benchmarks/runner.py`)** | ✅ Completed | Consolidated handshake, throughput, packet capture, and chart generation |
+| **Benchmarks (`benchmarks.py`)** | ✅ Completed | Consolidated handshake, throughput, packet capture, and chart generation |
 | **PQC Fail-Closed Enforcement** | ✅ Completed | `PQCUnavailableError` + `ALLOW_MOCK_PQC` env + `_MockInsecurePQCProvider` w/ security warnings |
 | **In-Session Rekeying** | ✅ Completed | Dedicated control reader/rekey scheduler; existing epoch and record security preserved |
 | **UI Transparency Badges** | ✅ Completed | Configured-profile UI; measured telemetry; classical client-auth boundary |
-| **Docker Configuration** | ✅ Completed | Entrypoints updated to `vpn.cli`, `NET_ADMIN`, `/dev/net/tun`, bridge network |
-| **Unified Documentation** | ✅ Completed | Consolidated architecture & deployment guide in `docs/architecture.md`, merged roadmap |
-| **Automated Test Validation** | ✅ Completed | 208 passed / 2 skipped under both pytest entrypoints; current evidence in latest log |
+| **Docker Configuration** | ✅ Completed | Development/integration convenience; schema PASS, runtime routing NOT VALIDATED |
+| **Unified Documentation** | ✅ Completed | Consolidated architecture & deployment guide in `docs/design.md`, merged roadmap |
+| **Automated Test Validation** | ✅ Completed | 259 passed / 2 skipped under both pytest entrypoints; 261 collected; current evidence in latest log |
 | **Install Native liboqs** | ✅ Completed | Current environment exposes native ML-KEM-768 and passes the isolated self-test/integration marker |
 | **2026 Security Remediation** | 🔄 In Progress | Confirmed code fixes are implemented; privileged end-to-end VPS/namespace proof remains pending |
 | **Authenticated v2 Handshake/Records** | ✅ Completed | Pinned server identity, authorized clients, directional AEAD, replay/AAD/epoch controls |
@@ -338,7 +378,7 @@ This retained matrix records earlier project claims and test counts. It is not t
 | **Phase 0** | **Project Setup & Architecture** | ✅ **Completed** | Scaffolding, Docker environment, requirements, documentation | — |
 | **Phase 1** | **Hybrid Cryptography Engine** | ✅ **Completed** | `crypto/hybrid_crypto.py` (X25519 + Kyber768 + HKDF-SHA256 + Session Store) | 37 / 37 Passed |
 | **Phase 2** | **Signature-Free KEMTLS Handshake** | ✅ **Completed** | `handshake/kemtls.py` (Wire protocol, Transcript Hasher, AES-256-GCM session, Client/Server state machines) | 43 / 43 Passed |
-| **Phase 3** | **VPN Engine & Network Agility** | ✅ **Completed** | `vpn/engine.py` (TUN Interface, Tunnel Daemon, MTU Monitor, Network Quality, OpenVPN Manager, VPNService) | 71 / 71 Passed |
+| **Phase 3** | **VPN Engine & Network Agility** | ✅ **Completed** | `vpn/network.py` (TUN Interface, Tunnel Daemon, MTU Monitor, Network Quality, OpenVPN Manager, VPNService) | 71 / 71 Passed |
 | **Phase 4** | **Application GUI & Controller API** | ✅ **Completed** | `app/main.py` (Desktop launcher), `app/backend/api.py` (FastAPI REST + WS Telemetry), `app/frontend/` (Dashboard UI) | API verified |
-| **Phase 5** | **Benchmarking & Final Validation** | ✅ **Completed** | `benchmarks/runner.py` (Handshake timing, throughput, packet capture, chart generator) | 10 / 10 Passed |
+| **Phase 5** | **Benchmarking & Final Validation** | ✅ **Completed** | `benchmarks.py` (Handshake timing, throughput, packet capture, chart generator) | 10 / 10 Passed |
 | **Phase 6** | **Codebase Simplification** | ✅ **Completed** | Streamlined file reduction (~44 → 18 files) with 100% backward compatibility & tests passing | 161 / 161 Passed |

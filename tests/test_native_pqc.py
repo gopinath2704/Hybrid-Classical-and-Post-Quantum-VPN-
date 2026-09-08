@@ -8,7 +8,7 @@ def test_native_mlkem_self_test():
 @pytest.mark.native_pqc
 @pytest.mark.skipif(not _OQS_AVAILABLE, reason='native liboqs ML-KEM-768 unavailable')
 def test_native_authenticated_session_records(identities):
-    from test_security_protocol import exchange
+    from test_crypto_protocol import exchange
     from handshake.kemtls import FrameType
     assert PQCProvider().is_quantum_safe
     client, server = exchange(identities)

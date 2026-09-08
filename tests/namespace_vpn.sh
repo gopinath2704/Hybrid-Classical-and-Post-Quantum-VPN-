@@ -24,7 +24,7 @@ wait_bounded() {
 cleanup() {
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
   for pid in "${PIDS[@]:-}"; do wait_bounded "$pid" || true; done
-  PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-cleanup.sh" >/dev/null 2>&1 || true
+  PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-network.sh" cleanup "$RUN_DIR/server/server.toml" >/dev/null 2>&1 || true
   for ns in "$CLIENT1_NS" "$CLIENT2_NS" "$SERVER_NS" "$INTERNET_NS"; do
     ip netns del "$ns" 2>/dev/null || true
   done
@@ -65,6 +65,19 @@ ip -n "$INTERNET_NS" addr add 10.50.0.10/32 dev lo
 ip -n "$SERVER_NS" route add 169.254.169.254/32 via 198.51.100.2
 ip -n "$SERVER_NS" route add 10.50.0.10/32 via 198.51.100.2
 
+# A separate physical IPv6 path deliberately bypasses the IPv4-only VPN server.
+ip link add pq-c6 type veth peer name pq-i6
+ip link set pq-c6 netns "$CLIENT1_NS"
+ip link set pq-i6 netns "$INTERNET_NS"
+ip -n "$CLIENT1_NS" link set pq-c6 up
+ip -n "$INTERNET_NS" link set pq-i6 up
+ip -n "$CLIENT1_NS" -6 addr add 2001:db8:6::2/64 dev pq-c6 nodad
+ip -n "$INTERNET_NS" -6 addr add 2001:db8:6::1/64 dev pq-i6 nodad
+ip -n "$INTERNET_NS" -6 addr add 2001:db8:ffff::1/128 dev lo nodad
+ip -n "$CLIENT1_NS" -6 route add default via 2001:db8:6::1
+ip netns exec "$CLIENT1_NS" ping -6 -c 1 -W 2 2001:db8:ffff::1
+ip -n "$CLIENT1_NS" -6 route show table all >"$RUN_DIR/ipv6-before"
+
 mkdir -p "$RUN_DIR/server" "$RUN_DIR/client1" "$RUN_DIR/client2"
 cd "$ROOT_DIR"
 ALLOW_MOCK_PQC=1 python -m vpn.cli identity generate --private "$RUN_DIR/server/server.key" --public "$RUN_DIR/server/server.pub"
@@ -100,6 +113,7 @@ server_identity_fingerprint = "$FINGERPRINT"
 server_identity_public_key = "../server/server.pub"
 client_identity_private_key = "client.key"
 full_tunnel = true
+ipv6_policy = "block"
 ping_interval = 0.5
 ping_timeout = 0.5
 dead_peer_timeout = 3.0
@@ -115,9 +129,9 @@ while True:
  d,a=s.recvfrom(65535); s.sendto(d,a)' >"$RUN_DIR/udp.log" 2>&1 & PIDS+=("$!")
 ALLOW_MOCK_PQC=1 ip netns exec "$SERVER_NS" python -m vpn.cli server --config "$RUN_DIR/server/server.toml" --allow-mock-pqc >"$RUN_DIR/server.log" 2>&1 & PIDS+=("$!")
 sleep 2
-PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-setup.sh" "$RUN_DIR/server/server.toml"
+PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-network.sh" setup "$RUN_DIR/server/server.toml"
 # Repeat setup must preserve the original zero and produce one current policy.
-PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-setup.sh" "$RUN_DIR/server/server.toml"
+PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-network.sh" setup "$RUN_DIR/server/server.toml"
 test "$(cat "$RUN_DIR/fw/ip_forward.prev")" = 0
 
 start_client() {
@@ -135,6 +149,21 @@ done
 IP1=$(ip -n "$CLIENT1_NS" -o -4 addr show pqvpn1 | awk '{print $4}' | cut -d/ -f1)
 IP2=$(ip -n "$CLIENT2_NS" -o -4 addr show pqvpn2 | awk '{print $4}' | cut -d/ -f1)
 test -n "$IP1" && test -n "$IP2" && test "$IP1" != "$IP2"
+for _ in $(seq 1 40); do
+  ip netns exec "$CLIENT1_NS" nft list tables ip6 | grep -q 'pqvpn_client6_' && break
+  sleep .1
+done
+ip netns exec "$CLIENT1_NS" nft list tables ip6 | grep -q 'pqvpn_client6_'
+ip netns exec "$INTERNET_NS" python -m http.server 8086 --bind 2001:db8:ffff::1 >"$RUN_DIR/http6.log" 2>&1 & PIDS+=("$!")
+sleep .5
+ip netns exec "$INTERNET_NS" curl -6 --noproxy '*' -fsS --max-time 3 'http://[2001:db8:ffff::1]:8086/' >/dev/null
+if ip netns exec "$CLIENT1_NS" ping -6 -c 1 -W 1 2001:db8:ffff::1; then
+  echo 'IPv6 bypass while full tunnel active' >&2; exit 1
+fi
+if ip netns exec "$CLIENT1_NS" curl -6 --noproxy '*' -fsS --max-time 2 'http://[2001:db8:ffff::1]:8086/' >/dev/null 2>&1; then
+  echo 'IPv6 TCP bypass while full tunnel active' >&2; exit 1
+fi
+ip netns exec "$CLIENT1_NS" ping -6 -c 1 -W 1 ::1
 ip netns exec "$CLIENT1_NS" ping -c 2 -W 2 10.8.0.1
 ip netns exec "$CLIENT1_NS" curl --noproxy "*" -fsS --max-time 5 http://198.51.100.2:8080/ >/dev/null
 ip netns exec "$CLIENT2_NS" curl --noproxy "*" -fsS --max-time 5 http://198.51.100.2:8080/ >/dev/null
@@ -155,9 +184,9 @@ done
 # Allow only the private test service through WAN, then reconcile back to defaults.
 cp "$RUN_DIR/server/server.toml" "$RUN_DIR/server/allowed.toml"
 printf '\nallowed_forward_networks = ["10.50.0.10/32"]\n' >>"$RUN_DIR/server/allowed.toml"
-PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-setup.sh" "$RUN_DIR/server/allowed.toml"
+PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-network.sh" setup "$RUN_DIR/server/allowed.toml"
 ip netns exec "$CLIENT1_NS" curl --noproxy '*' -fsS --max-time 3 http://10.50.0.10:8080/ >/dev/null
-PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-setup.sh" "$RUN_DIR/server/server.toml"
+PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-network.sh" setup "$RUN_DIR/server/server.toml"
 if ip netns exec "$CLIENT1_NS" curl --noproxy '*' -fsS --max-time 2 http://10.50.0.10:8080/ >/dev/null 2>&1; then
   echo 'stale private allowlist survived reconciliation' >&2; exit 1
 fi
@@ -181,6 +210,13 @@ ip -n "$CLIENT1_NS" addr del "$IP2/32" dev pqvpn1
 kill "${PIDS[3]}" "${PIDS[4]}"
 wait_bounded "${PIDS[3]}"
 wait_bounded "${PIDS[4]}"
+ip netns exec "$CLIENT1_NS" ping -6 -c 1 -W 2 2001:db8:ffff::1
+ip netns exec "$CLIENT1_NS" curl -6 --noproxy '*' -fsS --max-time 3 'http://[2001:db8:ffff::1]:8086/' >/dev/null
+ip -n "$CLIENT1_NS" -6 route show table all >"$RUN_DIR/ipv6-after"
+diff -u "$RUN_DIR/ipv6-before" "$RUN_DIR/ipv6-after"
+if ip netns exec "$CLIENT1_NS" nft list tables ip6 | grep -q 'pqvpn_client6_'; then
+  echo 'IPv6 guard survived disconnect/SIGTERM' >&2; exit 1
+fi
 ip -n "$CLIENT1_NS" route show default | grep -q 'via 192.0.2.1'
 ip -n "$CLIENT2_NS" route show default | grep -q 'via 192.0.3.1'
 sleep 1
@@ -202,6 +238,10 @@ for _ in $(seq 1 100); do
 done
 if kill -0 "$BLACKHOLE_CLIENT" 2>/dev/null; then echo 'dead-peer cleanup timed out' >&2; exit 1; fi
 wait "$BLACKHOLE_CLIENT" || true
+ip netns exec "$CLIENT1_NS" ping -6 -c 1 -W 2 2001:db8:ffff::1
+if ip netns exec "$CLIENT1_NS" nft list tables ip6 | grep -q 'pqvpn_client6_'; then
+  echo 'IPv6 guard survived dead-peer cleanup' >&2; exit 1
+fi
 ip -n "$CLIENT1_NS" route show default | grep -q 'via 192.0.2.1'
 if ip -n "$CLIENT1_NS" route show | grep -q 'dev pqvpn1'; then echo 'routes not restored after UDP blackhole' >&2; exit 1; fi
 ip netns exec "$SERVER_NS" nft delete table inet pqvpn_test_blackhole
@@ -215,7 +255,7 @@ ip netns exec "$CLIENT1_NS" curl --noproxy '*' -fsS --max-time 5 http://198.51.1
 # Run the quiet/idle regressions with real TUN in an isolated existing namespace.
 # DNS is disabled here: host resolvectl must not be mutated from a netns test.
 ALLOW_MOCK_PQC=1 ip netns exec "$INTERNET_NS" env PQVPN_TEST_NATIVE_TUN=1 python -m pytest -q \
-  tests/test_session_activity.py tests/test_dead_peer.py -k 'keepalive_prevents or genuinely_idle or control_activity or udp_dead_peer or rekey_during'
-PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-cleanup.sh"
+  tests/test_runtime.py -k 'keepalive_prevents or genuinely_idle or control_activity or udp_dead_peer or rekey_during'
+PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-network.sh" cleanup "$RUN_DIR/server/server.toml"
 test "$(ip netns exec "$SERVER_NS" sysctl -n net.ipv4.ip_forward)" = 0
-echo "namespace VPN integration succeeded: client IPs $IP1 and $IP2; UDP/TCP/rekey/spoof/disconnect/reconnect verified"
+echo "namespace VPN integration succeeded: client IPs $IP1 and $IP2; UDP/TCP/rekey/spoof/disconnect/reconnect and IPv6 bypass prevention/restoration verified"

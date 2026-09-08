@@ -1,4 +1,4 @@
-# Dockerfile for Hybrid VPN Server Node
+# Shared Dockerfile for PQVPN server and development client roles.
 # Usage: docker compose up --build
 #
 # Runs only the VPN server daemon (control listener + AES-256-GCM UDP tunnel).
@@ -13,8 +13,7 @@ FROM ubuntu:24.04
 # ─── Environment ─────────────────────────────────────────────────────────────
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    MODE=server
+    PYTHONDONTWRITEBYTECODE=1
 
 # ─── System dependencies ──────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -37,20 +36,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# ─── Python dependencies ─────────────────────────────────────────────────────
-COPY requirements*.txt constraints-tested.txt ./
+# ─── Native and Python dependencies ──────────────────────────────────────────
 COPY scripts/install-liboqs.sh /tmp/install-liboqs.sh
 RUN bash /tmp/install-liboqs.sh /usr/local
+COPY . .
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --no-cache-dir -r requirements-server.txt
-
-# ─── Application source ───────────────────────────────────────────────────────
-COPY . .
+RUN pip install --no-cache-dir -c constraints-tested.txt .
 
 # ─── Ports ───────────────────────────────────────────────────────────────────
 # 51820 — KEMTLS handshake TCP port + AES-256-GCM UDP tunnel port
 EXPOSE 51820 51820/udp
 
-# Starts the VPN server daemon only
+# Compose overrides this command for the development client role.
 CMD ["python3", "-m", "vpn.cli", "server", "--config", "/etc/pqvpn/server.toml"]

@@ -1,1 +1,1 @@
-"""PQVPN package. Import concrete APIs from ``vpn.engine`` or ``vpn.identity``."""
+"""PQVPN package. Import concrete APIs from ``vpn.network`` or ``vpn.identity``."""

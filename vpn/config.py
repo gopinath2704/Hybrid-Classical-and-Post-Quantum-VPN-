@@ -32,6 +32,8 @@ class ClientConfig:
     dns_mode:str="systemd-resolved"
     dns_routing_domains:list[str]=field(default_factory=list)
     expected_vpn_subnet:str="10.8.0.0/24"
+    # Omitted: block in full mode, leave unrelated IPv6 alone in split mode.
+    ipv6_policy:str|None=None
 def _load(path, section, cls):
     config_path=Path(path).resolve()
     values=tomllib.loads(config_path.read_text(encoding="utf-8")).get(section,{})
@@ -97,6 +99,8 @@ def validate_server(cfg: ServerConfig, *, test_ports=False) -> None:
 
 
 def validate_client(cfg: ClientConfig) -> None:
+    if cfg.ipv6_policy is not None and cfg.ipv6_policy not in ('block', 'fail', 'allow'):
+        raise ValueError('ipv6_policy must be block, fail or allow')
     number(cfg.server_control_port, 'server_control_port', 1, 65535, True)
     interface_name(cfg.tun_name)
     for name in ('ping_interval', 'ping_timeout', 'dead_peer_timeout'):

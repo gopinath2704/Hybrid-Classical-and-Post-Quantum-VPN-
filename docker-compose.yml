@@ -2,7 +2,7 @@ services:
   vpn-server:
     build:
       context: .
-      dockerfile: Dockerfile.server
+      dockerfile: Dockerfile
     container_name: hybrid_vpn_server
     cap_add:
       - NET_ADMIN
@@ -17,7 +17,6 @@ services:
       - ./config/server_identity_public.key:/etc/pqvpn/server_identity_public.key:ro
       - ./config/authorized_clients.json:/etc/pqvpn/authorized_clients.json:ro
     environment:
-      - MODE=server
       - PYTHONUNBUFFERED=1
     networks:
       vpn-net:
@@ -26,7 +25,7 @@ services:
   vpn-client:
     build:
       context: .
-      dockerfile: Dockerfile.client
+      dockerfile: Dockerfile
     container_name: hybrid_vpn_client
     cap_add:
       - NET_ADMIN
@@ -36,11 +35,11 @@ services:
       - vpn-server
     profiles: ["development-client"]
     volumes:
-      - ./config/client.docker.toml:/etc/pqvpn/client.toml:ro
+      - ./config/client.toml:/etc/pqvpn/client.toml:ro
       - ./config/client_identity_private.key:/etc/pqvpn/client_identity_private.key:ro
       - ./config/server_identity_public.key:/etc/pqvpn/server_identity_public.key:ro
+    command: ["python3", "-m", "vpn.cli", "client", "connect", "--config", "/etc/pqvpn/client.toml", "--server-host", "vpn-server"]
     environment:
-      - MODE=client
       - PYTHONUNBUFFERED=1
     networks:
       vpn-net:

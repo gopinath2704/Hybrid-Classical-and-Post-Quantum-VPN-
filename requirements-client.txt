@@ -1,2 +1,0 @@
-# CLI client shares the minimal daemon dependencies.
--r requirements-server.txt

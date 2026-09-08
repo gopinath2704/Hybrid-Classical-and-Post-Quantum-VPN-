@@ -1,3 +1,0 @@
-# Compatibility entrypoint for the full tested development environment.
-# Daemon-only installations should use requirements-server.txt instead.
--r requirements-dev.txt

@@ -24,8 +24,9 @@ from crypto.hybrid_crypto import PQCUnavailableError
 from handshake.kemtls import (Channel, DATA_HEADER_FORMAT, DATA_HEADER_SIZE, DATA_MAGIC,
     FrameType, HandshakeError, HandshakeSession, KEMTLSClient, KEMTLSServer, PROTOCOL_VERSION)
 from vpn.config import ClientConfig, ServerConfig, validate_server, validate_client
-from vpn.engine import NetworkQualityMonitor, TUNInterface, TUNMode
+from vpn.network import NetworkQualityMonitor, TUNInterface, TUNMode
 from vpn.identity import AuthorizedClients, load_client_private, validate_server_identity
+from vpn.network import IPv6Guard, effective_policy, preflight as ipv6_preflight
 
 logger = logging.getLogger("pqvpn.runtime")
 MAX_CONTROL_MESSAGE = 16384
@@ -146,12 +147,14 @@ class ClientNetwork:
     """Capture exact previous routes and restore all partial route/DNS changes."""
     def __init__(self, tun: TUNInterface, server_public: str, full_tunnel: bool,
                  split: list[str], dns: list[str], kill_switch: bool = False,
-                 dns_mode: str = "systemd-resolved", dns_routing_domains: list[str] | None = None) -> None:
+                 dns_mode: str = "systemd-resolved", dns_routing_domains: list[str] | None = None,
+                 ipv6_policy: str | None = None) -> None:
         self.tun, self.server_public = tun, server_public
         self.full, self.split, self.dns, self.kill_switch = full_tunnel, split, dns, kill_switch
         self.dns_mode, self.dns_routing_domains = dns_mode, dns_routing_domains or []
         self.route_undo: list[RouteUndo] = []
         self.dns_cleanup_registered = False
+        self.ipv6 = IPv6Guard(effective_policy(full_tunnel, ipv6_policy))
 
     @staticmethod
     def _existing_routes(destination: str) -> list[list[str]]:
@@ -167,6 +170,7 @@ class ClientNetwork:
         if self.tun.mode != TUNMode.NATIVE:
             return
         try:
+            self.ipv6.apply()
             route = shlex.split(run_ip("route", "get", self.server_public).stdout.splitlines()[0])
             gateway = route[route.index("via") + 1] if "via" in route else None
             device = route[route.index("dev") + 1]
@@ -190,6 +194,13 @@ class ClientNetwork:
             raise
 
     def restore(self) -> None:
+        try:
+            self._restore_ipv4_dns()
+        finally:
+            # Remove the IPv6 guard last, including when an earlier undo fails.
+            self.ipv6.restore()
+
+    def _restore_ipv4_dns(self) -> None:
         if self.dns_cleanup_registered:
             subprocess.run(["resolvectl", "revert", self.tun.name], check=False)
             self.dns_cleanup_registered = False
@@ -533,6 +544,8 @@ class VPNClient:
         self.stop_event.clear()
         self.state, self.error = "CONNECTING", ""
         try:
+            if not self.cfg.dev_emulated_tun:
+                ipv6_preflight(effective_policy(self.cfg.full_tunnel, self.cfg.ipv6_policy))
             identity = Path(self.cfg.server_identity_public_key).read_bytes()
             private = load_client_private(Path(self.cfg.client_identity_private_key))
             self.server_ip = socket.gethostbyname(self.cfg.server_host)
@@ -554,7 +567,7 @@ class VPNClient:
             dns = self.cfg.dns_servers or self.tunnel["dns"]
             self.network = ClientNetwork(self.tun, self.server_ip,
                                          self.cfg.full_tunnel, self.cfg.split_tunnel, dns, self.cfg.kill_switch,
-                                         self.cfg.dns_mode, self.cfg.dns_routing_domains)
+                                         self.cfg.dns_mode, self.cfg.dns_routing_domains, self.cfg.ipv6_policy)
             self.network.apply()
             self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.udp.bind(("0.0.0.0", 0))

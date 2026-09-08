@@ -1,11 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+ACTION=${1:-}
+CONFIG=${2:-}
+[[ "$ACTION" = setup || "$ACTION" = cleanup ]] || {
+  echo "usage: $0 {setup|cleanup} <absolute-server-config>" >&2
+  exit 2
+}
+[[ "$CONFIG" = /* ]] || {
+  echo 'server config path must be absolute' >&2
+  exit 2
+}
+
+RUNTIME=${PQVPN_RUNTIME_DIR:-/run/pqvpn}
+install -d -m 700 "$RUNTIME"
+exec 9>"$RUNTIME/firewall.lock"
+flock -x 9
+
+if [[ "$ACTION" = cleanup ]]; then
+  nft delete table inet pqvpn 2>/dev/null || true
+  nft delete table ip pqvpn_nat 2>/dev/null || true
+  nft delete table inet pqvpn_mangle 2>/dev/null || true
+  if [[ -f "$RUNTIME/ip_forward.prev" ]]; then
+    PREVIOUS=$(cat "$RUNTIME/ip_forward.prev")
+    [[ "$PREVIOUS" = 0 || "$PREVIOUS" = 1 ]]
+    sysctl -w "net.ipv4.ip_forward=$PREVIOUS"
+    rm "$RUNTIME/ip_forward.prev"
+  fi
+  echo 'Removed PQVPN tables and restored recorded IP forwarding state'
+  exit 0
+fi
+
 PROJECT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-CONFIG=${1:-}
-[[ -z "$CONFIG" || "$CONFIG" = /* ]] || CONFIG="$PWD/$CONFIG"
 cd "$PROJECT_DIR"
 # Validate all TOML values before any network or firewall mutation.
-mapfile -t settings < <("${PQVPN_PYTHON:-python3}" -m vpn.firewall "$CONFIG" '' settings)
+mapfile -t settings < <("${PQVPN_PYTHON:-python3}" -m vpn.network "$CONFIG" '' settings)
 [[ ${#settings[@]} -eq 2 ]] || exit 1
 WAN=${settings[0]}
 MANAGE=${settings[1]}
@@ -14,11 +43,7 @@ test -n "$WAN"
 ip link show dev "$WAN" >/dev/null
 RULES=$(mktemp)
 trap 'rm -f "$RULES"' EXIT
-"${PQVPN_PYTHON:-python3}" -m vpn.firewall "$CONFIG" "$WAN" rules >"$RULES"
-RUNTIME=${PQVPN_RUNTIME_DIR:-/run/pqvpn}
-install -d -m 700 "$RUNTIME"
-exec 9>"$RUNTIME/firewall.lock"
-flock -x 9
+"${PQVPN_PYTHON:-python3}" -m vpn.network "$CONFIG" "$WAN" rules >"$RULES"
 PREVIOUS=$(sysctl -n net.ipv4.ip_forward)
 [[ "$PREVIOUS" = 0 || "$PREVIOUS" = 1 ]]
 if [[ "$MANAGE" = 0 && "$PREVIOUS" != 1 ]]; then
