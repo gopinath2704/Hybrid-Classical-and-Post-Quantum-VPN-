@@ -516,3 +516,103 @@ identity proof is classical; epoch rekey provides key evolution rather than
 post-compromise recovery; routed IPv6, dynamic authenticated PMTU and general kill
 switch remain incomplete. Root namespaces, native systemd, real client DNS and
 **REAL VPS + SEPARATE REAL LINUX CLIENT** remain the next validation gates.
+
+## Privileged systemd execution trust boundary
+
+Every executable, script, interpreter and module used directly or indirectly by
+`ExecStartPre=+` and `ExecStopPost=+` must be root-owned and not writable by
+`pqvpn`, its groups, or other users. This includes `/opt/pqvpn/scripts/server-setup.sh`,
+`/opt/pqvpn/scripts/server-cleanup.sh`, `/opt/pqvpn/vpn/firewall.py`, all application
+packages, `/opt/pqvpn/.venv/bin/python`, the entire venv/dependencies, symlink targets,
+and their containing directories. Install the system Python, standard library,
+native liboqs and helper OS commands administratively with the same trust boundary.
+Do not grant write ACLs to the service account. The `+` prefixes remain necessary
+for privileged nftables and forwarding sysctl setup/restoration; the daemon retains
+`User=pqvpn`, `Group=pqvpn` and its existing limited capabilities.
+
+`/opt/pqvpn` and its source/venv are `root:root`, directories/executables 0755 and
+ordinary files 0644 (or more restrictive while retaining service read/execute).
+Create the production venv and install dependencies as administrator, never as
+`pqvpn`. Perform future source/dependency updates administratively, while stopped,
+then restore ownership/modes and rerun production doctor before restart. For an
+existing service-owned installation, rebuild source and venv from trusted inputs;
+chown alone cannot remove previously planted code. The provisioning commands assume a
+fresh installation from the validated source.
+
+`/etc/pqvpn` is `root:pqvpn 0750`: the group may read/traverse, never write.
+`server.toml`, the public identity and `authorized_clients.json` are `root:pqvpn 0640`.
+The private identity is `pqvpn:root 0400`, compatible with the existing validator;
+the daemon cannot replace it through the directory. As its file owner, it could
+chmod its private key, so 0400 is not immutability against a compromised daemon.
+No private key or policy file is imported/executed by the privileged helpers.
+
+Run authorize/revoke as root. Each successful atomic update creates a root-owned
+0600 database; immediately restore `root:pqvpn 0640` with the documented chown/chmod
+commands, including after future updates. Between replacement and chmod daemon
+reads fail closed. The root-only lock and temporary files stay in `/etc/pqvpn`;
+locking, fsync and atomic replacement are unchanged. Never grant the service
+configuration-directory write access to support administration.
+
+Server doctor checks the complete `/opt/pqvpn` tree, symlink targets and ancestors
+when examining `/etc/pqvpn` configuration or running from `/opt/pqvpn`. It fails on
+non-root owners, any group/world write bits, missing required helpers/interpreter,
+or unreadable entries. Ordinary development profiles explicitly report this check
+as not applicable. It is a read-only filesystem snapshot, not runtime systemd
+validation or a complete audit of external system libraries/loader configuration.
+
+## Systemd ownership hardening — 2026-09-08
+
+Source parent: `a09f65b948df985b97285b145faacb53ad292797` (`v2-pre-vps`).
+The original tag is retained; this pass targets the new local annotated
+`v2-pre-vps-2` release. No push or production provisioning is performed.
+
+The deployment recipe now installs source and venv administratively, uses a
+non-writable configuration directory, and runs authorization mutations as root
+with post-replacement ownership/mode restoration. Doctor adds a production-only
+ownership check. Fifteen new regressions exercise staged files with simulated
+root/service metadata, including safe trees, service ownership, group/world
+writes, imported dependencies, missing Python, symlink chains and replacement
+parents, diagnostic FAIL output, production scope and deployment documentation.
+The fixture does not chown the development checkout or require root.
+
+Validation uses `/tmp/pqvpn-ownership-venv`, CPython 3.14.7 and unchanged constrained
+application/test packages (pip check passes). Native liboqs 0.16.0 was freshly built
+from clean source `5a1a854b0dc9f2141bdc771c555ee60c37950183`, with liboqs-python 0.16.0,
+GCC 16.2.1 20260810, CMake 4.4.3 and Ninja 1.13.2. Build options match the earlier
+ML-KEM-768-only shared Release validation, installed at `/tmp/pqvpn-ownership-native`.
+Explicit `OQS_INSTALL_PATH`/`LD_LIBRARY_PATH` and `/proc/self/maps` confirm the loaded
+library; SHA-256 is `dfc9ac670e5292f9b8b1efbfad3908cc92fda16765bfbe53d9112119c6736a31`.
+The production installer and native source pin are unchanged.
+
+Server/client doctors use temporary native identities under
+`/tmp/pqvpn-ownership-doctor`, service user `shadow`, visible WAN `wlp46s0`,
+loopback server address and client IPv6 block/managed DNS. They do not provision
+`/opt/pqvpn` or `/etc/pqvpn`. Production ownership is tested via the staged fixture;
+it is explicitly not applicable to these development doctor profiles.
+
+Handshake, cryptography, packet/firewall policy, replay/IPv6/rekey/dead-peer/DNS
+behavior, identity/database implementation and dependency pins are unchanged.
+Systemd executable directives/capabilities are unchanged; only a trust-boundary
+comment was added to the unit. Actual systemd start, root namespace, real nftables
+enforcement, real resolver restoration and VPS/client validation remain runtime
+gates. Host UID is 1000, TUN exists, and `sudo -n true` requires a password.
+
+| Ownership-pass validation | Result |
+|---|---|
+| `pytest -q` | PASS: 258 passed, 2 skipped, 260 collected; 38.42s |
+| `python -m pytest -q` | PASS: 258 passed, 2 skipped, 260 collected; 38.69s |
+| Native ML-KEM (`ALLOW_MOCK_PQC=0`) | PASS: 2 passed, 258 deselected; 0.20s |
+| Staged ownership/deployment regression | PASS: 15 passed |
+| Server doctor | Exit 0; only external provider/host firewall WARN |
+| Client doctor | Exit 0; all checks PASS |
+| Compileall | PASS: crypto handshake vpn app benchmarks tests |
+| Shell syntax | PASS: setup, cleanup, liboqs installer, namespace harness |
+| JavaScript syntax | PASS: node --check app/frontend/js/app.js |
+| Compose config | PASS: default and development-client profile; runtime unvalidated |
+| Dependency consistency / diff whitespace | PASS |
+| Root namespace | SKIPPED: UID 1000, no passwordless sudo; TUN unchanged |
+
+The initial focused sandbox run was interrupted after identifying a fixture issue
+(Python 3.14 lstat needs its own metadata patch); that fixture was corrected.
+The final full runs above used host socket visibility and passed after all code
+changes. No skipped root test is represented as a runtime pass.

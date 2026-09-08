@@ -54,6 +54,13 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 
 ## 📝 Modification Log & Project Progress
 
+### 2026-09-08 — Harden privileged systemd deployment ownership
+
+- Continued clean validated `a09f65b948df985b97285b145faacb53ad292797` / `v2-pre-vps`. Root-owned source and production venv, administrative updates, and immutable-to-service privileged execution chain now documented in deployment, handoff and security audit. `/etc/pqvpn` is root:pqvpn 0750; config/public/policy files root:pqvpn 0640; private identity pqvpn:root 0400. Authorization/revocation run as root and restore DB ownership/mode after existing atomic replacement. Fixed optional absolute liboqs installer prefix wording.
+- Doctor audits production code/venv ownership, group/world write bits, intermediate symlinks, targets and ancestors; development profiles are explicitly out of scope. Added 15 staged ownership/deployment regressions without requiring root. Only a comment changed in the systemd unit; daemon user/capabilities and privileged helper commands remain. No handshake, crypto, runtime, firewall/replay/IPv6/rekey/DNS or dependency-pin changes.
+- Final validation: both pytest invocation styles **258 passed, 2 skipped, 260 collected**; native ML-KEM **2 passed** with mock disabled, Python **3.14.7**, binding/native **0.16.0**, clean source **5a1a854b0dc9f2141bdc771c555ee60c37950183**. Fresh temporary venv/native build and loaded-library digest recorded in security audit. Compileall, four Bash syntax checks, JavaScript syntax, both Compose profiles, pip check and diff checks PASS. Temporary server doctor exit 0 with provider-firewall WARN only; client doctor exit 0/all PASS.
+- Root namespace **SKIPPED**: host UID 1000, no passwordless sudo; TUN present and unchanged. Actual systemd, nftables enforcement, resolved restoration and VPS/client validation remain pending. No production paths were provisioned. New local commit/tag `v2-pre-vps-2`; original tag retained; no push. No repository files/directories added or removed.
+
 ### 2026-09-07 — Source-review continuation and local validation release
 
 - Resumed the existing 20-file staged change on `c50dee0`; inspected the complete staged diff, configs, client networking, server helpers/service, namespace tests, dependency pins, current documentation and secret/artifact exclusions before committing. No IPv6 enforcement or frozen v2 cryptographic regression found. Full-mode block/fail/allow, split defaults, atomic owned-table cleanup and read-only doctor semantics match source. Handshake, crypto, rekey and networking behavior unchanged during continuation.
@@ -337,9 +344,10 @@ transparent, honest, production-ready VPN implementation as audited and approved
 
 | Task / Module | Status | Description |
 | :--- | :---: | :--- |
+| **Systemd Ownership Boundary** | ✅ Completed | Root-owned deployment model; production doctor plus 15 regressions; both pytest styles 258 passed / 2 skipped; native 2 passed; runtime gates pending |
 | **Pre-VPS Hardening Validation** | ✅ Completed | Source review complete; 245 collected; both entrypoints 243 passed / 2 skipped; native 2 passed at pinned source; provisioned doctors/static checks PASS (external firewall WARN) |
 | **IPv6 Leak Prevention** | ✅ Completed | Unit/static policy and cleanup validated; real kernel namespace enforcement pending |
-| **Local Release Baseline** | ✅ Completed | Validated source baseline for local commit/tag v2-pre-vps; exact hash and clean-tree verification in final handoff; no push |
+| **Local Release Baseline** | ✅ Completed | Hardened local baseline v2-pre-vps-2; original v2-pre-vps retained; exact hash and clean-tree verification in final report; no push |
 | **Dependency / Deployment Hardening** | ✅ Completed | Pinned role dependencies; explicit native install; scoped firewall, forwarding restoration, UDP dead-peer/DNS safety, strict identities/database and telemetry tickets |
 | **Edit-3 Idle Activity / Packaging** | ✅ Completed | Authenticated keepalive refresh; invalid activity rejected; fresh-environment deployment |
 | **Directory Scaffolding** | ✅ Completed | Created complete directory tree and skeleton files |

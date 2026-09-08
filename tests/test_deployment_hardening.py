@@ -204,3 +204,147 @@ def test_static_leases_are_reserved_from_dynamic_allocations():
     pool.reserved={'10.8.0.2':'static'}
     assert pool.allocate('dynamic')=='10.8.0.3'
     assert pool.allocate('static','10.8.0.2')=='10.8.0.2'
+
+
+@pytest.fixture
+def staged_privileged_tree(tmp_path, monkeypatch):
+    """Real staged files, simulated root ownership: no sudo or host changes."""
+    root = tmp_path / 'opt/pqvpn'
+    for relative in ('scripts/server-setup.sh', 'scripts/server-cleanup.sh',
+                     'vpn/firewall.py', 'handshake/__init__.py',
+                     'crypto/__init__.py', '.venv/bin/python',
+                     '.venv/lib/site-packages/dependency.py'):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('# staged deployment\n')
+        path.chmod(0o755 if relative.endswith(('.sh', 'python')) else 0o644)
+    overrides = {}
+    original = Path.stat
+    def metadata(path, *, follow_symlinks=True):
+        info = original(path, follow_symlinks=follow_symlinks)
+        values = list(info)
+        values[4] = 0
+        values[5] = 0
+        # Model production ancestors, not the shared writable /tmp fixture path.
+        if path in root.parents:
+            values[0] = stat.S_IFDIR | 0o755
+        for index, value in overrides.get(path, {}).items():
+            values[index] = value
+        return os.stat_result(values)
+    import stat
+    monkeypatch.setattr(Path, 'stat', metadata)
+    monkeypatch.setattr(Path, 'lstat', lambda path: metadata(path, follow_symlinks=False))
+    return root, overrides
+
+
+@pytest.mark.parametrize('relative,uid,gid,mode', [
+    ('scripts/server-setup.sh', 1001, 1001, 0o755),
+    ('scripts/server-cleanup.sh', 1001, 0, 0o555),
+    ('scripts/server-setup.sh', 0, 1001, 0o775),
+    ('scripts/server-cleanup.sh', 0, 0, 0o757),
+    ('vpn/firewall.py', 1001, 1001, 0o644),
+    ('.venv/bin/python', 1001, 1001, 0o755),
+    ('.venv/lib/site-packages/dependency.py', 0, 1001, 0o664),
+    ('vpn', 0, 1001, 0o775),
+])
+def test_privileged_code_rejects_unsafe_metadata(staged_privileged_tree, relative, uid, gid, mode):
+    from vpn.doctor import privileged_code_permissions
+    import stat
+    root, overrides = staged_privileged_tree
+    target = root / relative
+    kind = stat.S_IFDIR if target.is_dir() else stat.S_IFREG
+    overrides[target] = {0: kind | mode, 4: uid, 5: gid}
+    with pytest.raises(ValueError, match='root-owned|writable'):
+        privileged_code_permissions(root)
+
+
+def test_privileged_root_owned_code_and_venv_pass(staged_privileged_tree):
+    from vpn.doctor import privileged_code_permissions
+    root, _ = staged_privileged_tree
+    assert 'root-owned code/venv' in privileged_code_permissions(root)
+
+
+def test_privileged_interpreter_symlink_target_and_parent(staged_privileged_tree):
+    from vpn.doctor import privileged_code_permissions
+    import stat
+    root, overrides = staged_privileged_tree
+    interpreter = root / '.venv/bin/python'
+    interpreter.unlink()
+    target = root.parent / 'system/bin/python'
+    target.parent.mkdir(parents=True)
+    target.write_text('# system interpreter')
+    interpreter.symlink_to(target)
+    assert privileged_code_permissions(root)
+    overrides[target] = {4: 1001}
+    with pytest.raises(ValueError, match='root-owned'):
+        privileged_code_permissions(root)
+    overrides.clear()
+    overrides[target.parent] = {0: stat.S_IFDIR | 0o777}
+    with pytest.raises(ValueError, match='ancestor'):
+        privileged_code_permissions(root)
+
+
+def test_privileged_missing_interpreter_fails(staged_privileged_tree):
+    from vpn.doctor import privileged_code_permissions
+    root, _ = staged_privileged_tree
+    (root / '.venv/bin/python').unlink()
+    with pytest.raises(FileNotFoundError):
+        privileged_code_permissions(root)
+
+
+def test_doctor_production_scope(monkeypatch, tmp_path):
+    import vpn.doctor as doctor
+    monkeypatch.setattr(doctor, '__file__', str(tmp_path / 'vpn/doctor.py'))
+    monkeypatch.setattr(doctor.sys, 'executable', '/usr/bin/python')
+    assert not doctor.production_deployment(tmp_path / 'server.toml')
+    assert doctor.production_deployment('/etc/pqvpn/server.toml')
+    monkeypatch.setattr(doctor.sys, 'executable', '/opt/pqvpn/.venv/bin/python')
+    assert doctor.production_deployment(tmp_path / 'server.toml')
+
+
+def test_doctor_reports_privileged_code_failure(monkeypatch, tmp_path, capsys):
+    import vpn.doctor as doctor
+    monkeypatch.setattr(doctor, 'production_deployment', lambda _: True)
+    def unsafe():
+        raise ValueError('server-setup.sh: privileged code is group/world writable')
+    monkeypatch.setattr(doctor, 'privileged_code_permissions', unsafe)
+    monkeypatch.setattr(doctor, '_OQS_AVAILABLE', False)
+    assert doctor.run('server', tmp_path / 'missing.toml') == 1
+    assert 'FAIL Privileged systemd code ownership' in capsys.readouterr().out
+
+
+def test_deployment_documents_preserve_systemd_boundary():
+    unit = Path('deploy/pqvpn-server.service').read_text()
+    for directive in ('User=pqvpn', 'Group=pqvpn', 'CapabilityBoundingSet=CAP_NET_ADMIN',
+                      'ExecStartPre=+/opt/pqvpn/scripts/server-setup.sh',
+                      'ExecStopPost=+/opt/pqvpn/scripts/server-cleanup.sh'):
+        assert directive in unit
+    for name in ('server_deployment.md', 'pre_vps_handoff.md'):
+        text = Path('docs', name).read_text()
+        assert '--chown=pqvpn:pqvpn' not in text
+        assert 'sudo -u pqvpn python3.14 -m venv /opt/pqvpn' not in text
+        assert 'sudo -u pqvpn .venv/bin/python -m vpn.cli client authorize' not in text
+        assert 'sudo chmod 0640 /etc/pqvpn/authorized_clients.json' in text
+        assert 'sudo chmod 0400 /etc/pqvpn/server_identity_private.key' in text
+        assert 'sudo chown -R root:root /opt/pqvpn' in text
+    for name in ('server_deployment.md', 'pre_vps_handoff.md', 'security_audit.md'):
+        text = Path('docs', name).read_text()
+        assert 'ExecStartPre=+' in text and 'ExecStopPost=+' in text
+        assert '/opt/pqvpn/vpn/firewall.py' in text
+    assert 'The script takes no arguments.' not in Path('docs/pre_vps_handoff.md').read_text()
+
+
+def test_privileged_intermediate_symlink_is_audited(staged_privileged_tree):
+    from vpn.doctor import privileged_code_permissions
+    root, overrides = staged_privileged_tree
+    interpreter = root / '.venv/bin/python'
+    interpreter.unlink()
+    intermediate = root.parent / 'python-link'
+    target = root.parent / 'system-python'
+    target.write_text('# trusted interpreter')
+    intermediate.symlink_to(target)
+    interpreter.symlink_to(intermediate)
+    assert privileged_code_permissions(root)
+    overrides[intermediate] = {4: 1001}
+    with pytest.raises(ValueError, match='root-owned'):
+        privileged_code_permissions(root)

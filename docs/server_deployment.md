@@ -44,16 +44,25 @@ alongside test results; version pins alone do not reproduce an operating-system 
 
 ```bash
 sudo useradd --system --home /opt/pqvpn --shell /usr/sbin/nologin pqvpn
-sudo install -d -o pqvpn -g pqvpn -m 0750 /opt/pqvpn /etc/pqvpn
-sudo rsync -a --chown=pqvpn:pqvpn --exclude=.git --exclude=.venv --exclude=venv --exclude=env --exclude=ENV --exclude=__pycache__ --exclude=.pytest_cache ./ /opt/pqvpn/
-sudo -u pqvpn python3.14 -m venv /opt/pqvpn/.venv
-sudo -u pqvpn /opt/pqvpn/.venv/bin/python -m pip install -r /opt/pqvpn/requirements-server.txt
+sudo install -d -o root -g root -m 0755 /opt/pqvpn
+sudo install -d -o root -g pqvpn -m 0750 /etc/pqvpn
+sudo rsync -a --chown=root:root --exclude=.git --exclude=.venv --exclude=venv --exclude=env --exclude=ENV --exclude=__pycache__ --exclude=.pytest_cache ./ /opt/pqvpn/
+sudo python3.14 -m venv /opt/pqvpn/.venv
+sudo /opt/pqvpn/.venv/bin/python -m pip install -r /opt/pqvpn/requirements-server.txt
+sudo chown -R root:root /opt/pqvpn
+sudo chmod -R u=rwX,go=rX /opt/pqvpn
 cd /opt/pqvpn
-sudo -u pqvpn .venv/bin/python -m vpn.cli identity generate --private /etc/pqvpn/server_identity_private.key --public /etc/pqvpn/server_identity_public.key
-sudo install -o pqvpn -g pqvpn -m 0640 config/server.toml /etc/pqvpn/server.toml
+sudo .venv/bin/python -m vpn.cli identity generate --private /etc/pqvpn/server_identity_private.key --public /etc/pqvpn/server_identity_public.key
+sudo chown pqvpn:root /etc/pqvpn/server_identity_private.key
+sudo chmod 0400 /etc/pqvpn/server_identity_private.key
+sudo chown root:pqvpn /etc/pqvpn/server_identity_public.key
+sudo chmod 0640 /etc/pqvpn/server_identity_public.key
+sudo install -o root -g pqvpn -m 0640 config/server.toml /etc/pqvpn/server.toml
 sudo editor /etc/pqvpn/server.toml
 # Obtain only the client's public key through authenticated provisioning.
-sudo -u pqvpn .venv/bin/python -m vpn.cli client authorize /tmp/alice_public.key --database /etc/pqvpn/authorized_clients.json --client-id alice
+sudo .venv/bin/python -m vpn.cli client authorize /tmp/alice_public.key --database /etc/pqvpn/authorized_clients.json --client-id alice
+sudo chown root:pqvpn /etc/pqvpn/authorized_clients.json
+sudo chmod 0640 /etc/pqvpn/authorized_clients.json
 ```
 
 Private identity files must be regular, non-symlink files with mode 0600 or 0400.
@@ -209,7 +218,9 @@ this prototype baseline.
 ## Revocation semantics
 
 ```bash
-sudo -u pqvpn /opt/pqvpn/.venv/bin/python -m vpn.cli client revoke FINGERPRINT --database /etc/pqvpn/authorized_clients.json
+sudo /opt/pqvpn/.venv/bin/python -m vpn.cli client revoke FINGERPRINT --database /etc/pqvpn/authorized_clients.json
+sudo chown root:pqvpn /etc/pqvpn/authorized_clients.json
+sudo chmod 0640 /etc/pqvpn/authorized_clients.json
 ```
 
 Revocation disables future authentication: a new ClientHello reads the updated
@@ -221,8 +232,8 @@ revoked identities cannot establish a new session afterward.
 
 ## Reproducible pre-VPS source
 
-Use the local annotated `v2-pre-vps` tag, resolve it with
-`git rev-parse 'v2-pre-vps^{commit}'`, and deploy that exact commit after the disposable
+Use the local annotated `v2-pre-vps-2` tag, resolve it with
+`git rev-parse 'v2-pre-vps-2^{commit}'`, and deploy that exact commit after the disposable
 root namespace gate. The hardening pass creates no automatic push. Never archive or
 copy private keys, the authorized-client DB, tokens, virtual environments or build
 outputs as part of source distribution. Provision secrets separately.
@@ -235,3 +246,46 @@ gate. IPv6 leak unit tests do not replace the expanded privileged namespace test
 
 See the [exact next-phase handoff](pre_vps_handoff.md) for local-tag transfer,
 disposable root namespace execution, provisioning and separate real-runtime gates.
+
+## Privileged systemd execution trust boundary
+
+Every executable, script, interpreter and module used directly or indirectly by
+`ExecStartPre=+` and `ExecStopPost=+` must be root-owned and not writable by
+`pqvpn`, its groups, or other users. This includes `/opt/pqvpn/scripts/server-setup.sh`,
+`/opt/pqvpn/scripts/server-cleanup.sh`, `/opt/pqvpn/vpn/firewall.py`, all application
+packages, `/opt/pqvpn/.venv/bin/python`, the entire venv/dependencies, symlink targets,
+and their containing directories. Install the system Python, standard library,
+native liboqs and helper OS commands administratively with the same trust boundary.
+Do not grant write ACLs to the service account. The `+` prefixes remain necessary
+for privileged nftables and forwarding sysctl setup/restoration; the daemon retains
+`User=pqvpn`, `Group=pqvpn` and its existing limited capabilities.
+
+`/opt/pqvpn` and its source/venv are `root:root`, directories/executables 0755 and
+ordinary files 0644 (or more restrictive while retaining service read/execute).
+Create the production venv and install dependencies as administrator, never as
+`pqvpn`. Perform future source/dependency updates administratively, while stopped,
+then restore ownership/modes and rerun production doctor before restart. For an
+existing service-owned installation, rebuild source and venv from trusted inputs;
+chown alone cannot remove previously planted code. The provisioning commands assume a
+fresh installation from the validated source.
+
+`/etc/pqvpn` is `root:pqvpn 0750`: the group may read/traverse, never write.
+`server.toml`, the public identity and `authorized_clients.json` are `root:pqvpn 0640`.
+The private identity is `pqvpn:root 0400`, compatible with the existing validator;
+the daemon cannot replace it through the directory. As its file owner, it could
+chmod its private key, so 0400 is not immutability against a compromised daemon.
+No private key or policy file is imported/executed by the privileged helpers.
+
+Run authorize/revoke as root. Each successful atomic update creates a root-owned
+0600 database; immediately restore `root:pqvpn 0640` with the documented chown/chmod
+commands, including after future updates. Between replacement and chmod daemon
+reads fail closed. The root-only lock and temporary files stay in `/etc/pqvpn`;
+locking, fsync and atomic replacement are unchanged. Never grant the service
+configuration-directory write access to support administration.
+
+Server doctor checks the complete `/opt/pqvpn` tree, symlink targets and ancestors
+when examining `/etc/pqvpn` configuration or running from `/opt/pqvpn`. It fails on
+non-root owners, any group/world write bits, missing required helpers/interpreter,
+or unreadable entries. Ordinary development profiles explicitly report this check
+as not applicable. It is a read-only filesystem snapshot, not runtime systemd
+validation or a complete audit of external system libraries/loader configuration.

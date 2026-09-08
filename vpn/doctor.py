@@ -47,6 +47,91 @@ def readable_as(path, username):
     return True
 
 
+PRODUCTION_ROOT = Path('/opt/pqvpn')
+
+
+def production_deployment(config_path):
+    """Apply the packaged systemd layout only to production diagnostics."""
+    return (Path(config_path).absolute().is_relative_to('/etc/pqvpn') or
+            Path(__file__).resolve().is_relative_to(PRODUCTION_ROOT) or
+            Path(sys.executable).absolute().is_relative_to(PRODUCTION_ROOT))
+
+
+def privileged_code_permissions(root=PRODUCTION_ROOT):
+    """Audit the code/venv tree, symlink targets and replacement-capable parents.
+
+    Reject all non-root owners and group/other write bits (also the POSIX ACL
+    mask), even if that group is not currently assigned to the service account.
+    This is a read-only snapshot, not a substitute for administrative updates.
+    """
+    root = Path(root).absolute()
+    for required in ('scripts/server-setup.sh', 'scripts/server-cleanup.sh',
+                     'vpn/firewall.py', 'handshake', 'crypto', '.venv/bin/python'):
+        (root / required).stat()  # Missing/dangling deployment components fail.
+    seen = set()
+
+    def inspect(path):
+        info = path.lstat()
+        if info.st_uid != 0:
+            raise ValueError(f'{path}: privileged code must be root-owned')
+        # Symlink mode bits do not grant writes; audit its parent and target.
+        if not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022:
+            raise ValueError(f'{path}: privileged code is group/world writable')
+        if stat.S_ISLNK(info.st_mode):
+            visit(resolve_trusted_link(path))
+        elif stat.S_ISDIR(info.st_mode):
+            for child in sorted(path.iterdir()):
+                visit(child)
+        elif not stat.S_ISREG(info.st_mode):
+            raise ValueError(f'{path}: unexpected privileged code file type')
+
+    def resolve_trusted_link(path):
+        # Audit intermediate links too: resolve() alone would hide a writable
+        # link pointing onward to an otherwise safe system interpreter.
+        pending = list(path.parts[1:])
+        current = Path(path.anchor)
+        links = 0
+        while pending:
+            part = pending.pop(0)
+            if part == '..':
+                current = current.parent
+                continue
+            candidate = current / part
+            info = candidate.lstat()
+            if info.st_uid != 0:
+                raise ValueError(f'{candidate}: privileged code must be root-owned')
+            if stat.S_ISLNK(info.st_mode):
+                links += 1
+                if links > 40:
+                    raise ValueError(f'{path}: excessive or cyclic symlinks')
+                target = Path(os.readlink(candidate))
+                if target.is_absolute():
+                    current = Path(target.anchor)
+                    pending = list(target.parts[1:]) + pending
+                else:
+                    pending = list(target.parts) + pending
+            else:
+                inspect_metadata(candidate)
+                current = candidate
+        return current
+
+    def inspect_metadata(path):
+        info = path.stat()
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError(f'{path}: privileged code ancestor must be root-owned and not group/world writable')
+
+    def visit(path):
+        if path in seen:
+            return
+        seen.add(path)
+        inspect(path)
+
+    for parent in reversed(root.parents):
+        inspect_metadata(parent)
+    visit(root)
+    return f'{root}: root-owned code/venv, no group/world writes; symlink targets and ancestors checked'
+
+
 def run(role, config_path):
     rows = []
     def report(level, label, detail=''):
@@ -58,6 +143,12 @@ def run(role, config_path):
             report('PASS', label, '' if detail is None or detail is True else str(detail))
         except Exception as exc:
             report('FAIL', label, str(exc))
+    if role == 'server':
+        if production_deployment(config_path):
+            check('Privileged systemd code ownership', privileged_code_permissions)
+        else:
+            report('PASS', 'Privileged systemd code ownership',
+                   'not applicable: development paths; production /opt/pqvpn not audited')
     check('Python minimum runtime version (3.11)', lambda: sys.version_info >= (3, 11))
     report('PASS' if sys.version_info[:3] == (3, 14, 7) else 'WARN',
            'Python tested baseline', '3.14.7; other versions require fresh validation')
