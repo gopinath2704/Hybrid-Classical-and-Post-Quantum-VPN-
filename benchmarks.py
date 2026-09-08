@@ -14,6 +14,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
@@ -25,7 +26,7 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 
 # Ensure root is on path
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT = Path(__file__).resolve().parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
@@ -41,7 +42,7 @@ from handshake.kemtls import (
     ServerFinished,
     HandshakeSession,
 )
-from vpn.engine import (
+from vpn.network import (
     FRAME_OVERHEAD_TOTAL,
     IPV4_HEADER_SIZE,
     IPV6_HEADER_SIZE,
@@ -715,3 +716,57 @@ class ChartGenerator:
 Unified Performance Benchmarking Runner.
 Consolidates handshake, throughput, packet capture, and chart generation.
 """
+def run_full_suite(iterations: int = 50) -> None:
+    """Run full benchmark suite and generate chart figures."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s │ %(levelname)s │ %(message)s")
+
+    print("\n" + "=" * 70)
+    print(f"  HYBRID PQC-VPN PERFORMANCE BENCHMARK SUITE ({iterations} iterations)")
+    print("=" * 70 + "\n")
+
+    # Step 1: Handshake Benchmark
+    print("> [1/4] Running KEMTLS Handshake Latency & Size Benchmark...")
+    hb = HandshakeBenchmark(iterations=iterations)
+    hb.run_all()
+
+    # Step 2: Throughput Benchmark
+    print("\n> [2/4] Running Encrypted Tunnel Throughput & Payload Scaling Benchmark...")
+    tb = ThroughputBenchmark(iterations=iterations * 10)
+    tb.run_all()
+
+    # Step 3: Packet Capture Overhead Analysis
+    print("\n> [3/4] Running Wire Packet Overhead Analysis...")
+    pca = PacketOverheadAnalyzer()
+    pca.run_all()
+
+    # Step 4: Chart Figure Generation
+    print("\n> [4/4] Generating Publication Chart Figures...")
+    cg = ChartGenerator()
+    cg.generate_all()
+
+    print("\n" + "=" * 70)
+    print("  ALL BENCHMARKS COMPLETED SUCCESSFULLY!")
+    print("  Results saved to benchmarks/results/")
+    print("=" * 70 + "\n")
+
+
+def main() -> None:
+    """Parse CLI arguments and run benchmark suite."""
+    parser = argparse.ArgumentParser(
+        description="Hybrid PQC-VPN Benchmark Suite",
+    )
+    parser.add_argument(
+        "--all", action="store_true", default=True,
+        help="Run all benchmarks and generate chart figures (default)",
+    )
+    parser.add_argument(
+        "--iterations", type=int, default=50,
+        help="Number of iterations for handshake benchmark (default: 50)",
+    )
+    args = parser.parse_args()
+
+    run_full_suite(iterations=args.iterations)
+
+
+if __name__ == "__main__":
+    main()

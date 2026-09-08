@@ -1,4 +1,0 @@
-# Tested baseline: CPython 3.14.7; native liboqs 0.16.0 installed separately.
--c constraints-tested.txt
-cryptography==50.0.1
-liboqs-python==0.16.0

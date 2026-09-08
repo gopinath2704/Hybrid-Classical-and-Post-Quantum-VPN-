@@ -19,9 +19,9 @@ _tickets = {}
 app=FastAPI(title="PQVPN Management API",version="2.0")
 app.add_middleware(CORSMiddleware,allow_origins=ORIGINS,allow_credentials=True,allow_methods=["GET","POST"],allow_headers=["Authorization","Content-Type"])
 frontend=Path(__file__).resolve().parent.parent/"frontend"
-app.mount("/css",StaticFiles(directory=frontend/"css"),name="css");app.mount("/js",StaticFiles(directory=frontend/"js"),name="js")
+app.mount("/css",StaticFiles(directory=frontend/"css"),name="css")
 service:VPNClient|None=None; state={"connection_state":"DISCONNECTED","error":"","connected_at":None}
-def require_token(authorization:str|None=Header(default=None)):
+async def require_token(authorization:str|None=Header(default=None)):
     if not TOKEN:raise HTTPException(503,"management token is not configured")
     if not authorization or not authorization.startswith("Bearer ") or not hmac.compare_digest(authorization[7:],TOKEN):raise HTTPException(401,"invalid management bearer token")
 @app.get("/",include_in_schema=False)

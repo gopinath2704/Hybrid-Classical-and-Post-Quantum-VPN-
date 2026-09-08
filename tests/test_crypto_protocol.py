@@ -9,7 +9,7 @@ Tests cover:
     - HybridKEM: Full end-to-end hybrid key exchange simulation
 
 Run with:
-    python -m pytest tests/test_crypto.py -v
+    python -m pytest tests/test_crypto_protocol.py -v
 """
 
 import pytest
@@ -391,3 +391,199 @@ class TestHybridKEM:
         # Clean up
         store.revoke_session("vpn-session-001")
         assert store.count == 0
+import os,struct
+import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from crypto.hybrid_crypto import PQCProvider,get_crypto_status,_OQS_AVAILABLE
+from handshake.kemtls import *
+from handshake.kemtls import _unpack_header
+from vpn.identity import fingerprint
+
+@pytest.fixture
+def identities():
+    kem=PQCProvider(allow_mock=True); server_sk,server_pk=kem.generate_keypair(); client_sk=Ed25519PrivateKey.generate(); client_pk=client_sk.public_key().public_bytes_raw()
+    return server_sk,server_pk,client_sk,client_pk
+def exchange(ids,authorized=True):
+    sk,pk,csk,cpk=ids
+    c=KEMTLSClient(pk,fingerprint(pk),csk,True);s=KEMTLSServer(sk,pk,lambda key:{"client_id":"alice"} if authorized and key==cpk else None,True)
+    ch=c.initiate_handshake();sh=s.process_client_hello(ch);cke=c.process_server_hello(sh);sf,ss=s.process_client_key_exchange(cke);cs=c.process_server_finished(sf);return cs,ss
+
+@pytest.mark.mock_pqc
+def test_authenticated_handshake_and_directional_keys(identities):
+    c,s=exchange(identities);assert c.session_id==s.session_id
+    assert c.secrets.client_to_server_key!=c.secrets.server_to_client_key
+    typ,p=s.decrypt_frame(c.encrypt_frame(b"request"));assert typ==FrameType.DATA and p==b"request"
+    typ,p=c.decrypt_frame(s.encrypt_frame(b"response"));assert p==b"response"
+def test_wrong_server_fingerprint_rejected(identities):
+    _,pk,csk,_=identities
+    with pytest.raises(HandshakeError,match="fingerprint"):KEMTLSClient(pk,"00"*32,csk,True)
+def test_mitm_identity_substitution_rejected(identities):
+    sk,pk,csk,cpk=identities;other=PQCProvider(allow_mock=True).generate_keypair()[1]
+    c=KEMTLSClient(pk,fingerprint(pk),csk,True);s=KEMTLSServer(sk,other,lambda _: {"client_id":"alice"},True)
+    with pytest.raises(HandshakeError,match="substitution"):c.process_server_hello(s.process_client_hello(c.initiate_handshake()))
+def test_unauthorized_client_rejected(identities):
+    sk,pk,csk,_=identities;c=KEMTLSClient(pk,fingerprint(pk),csk,True);s=KEMTLSServer(sk,pk,lambda _:None,True)
+    with pytest.raises(HandshakeError,match="unauthorized"):s.process_client_hello(c.initiate_handshake())
+def test_transcript_tampering_rejected(identities):
+    sk,pk,csk,cpk=identities;c=KEMTLSClient(pk,fingerprint(pk),csk,True);s=KEMTLSServer(sk,pk,lambda _:{"client_id":"a"},True)
+    ch=c.initiate_handshake();sh=s.process_client_hello(ch);cke=bytearray(c.process_server_hello(sh));cke[-40]^=1
+    with pytest.raises(HandshakeError):s.process_client_key_exchange(bytes(cke))
+@pytest.mark.parametrize("message",[
+    lambda: ClientHello(os.urandom(32),os.urandom(32),os.urandom(32),os.urandom(1184),os.urandom(32)).pack(),
+    lambda: ServerFinished(os.urandom(32)).pack()])
+def test_trailing_and_header_mismatch_rejected(message):
+    wire=message()
+    with pytest.raises(HandshakeError):_unpack_header(wire+b"x")
+    bad=bytearray(wire);bad[4:6]=struct.pack("!H",struct.unpack("!H",bad[4:6])[0]-1)
+    with pytest.raises(HandshakeError):_unpack_header(bytes(bad))
+def test_replay_and_out_of_order_window(identities):
+    c,s=exchange(identities);frames=[c.encrypt_frame(str(i).encode()) for i in range(4)]
+    assert s.decrypt_frame(frames[3])[1]==b"3";assert s.decrypt_frame(frames[1])[1]==b"1"
+    with pytest.raises(HandshakeError,match="replayed"):s.decrypt_frame(frames[1])
+def test_wrong_session_direction_and_epoch_rejected(identities):
+    c,s=exchange(identities);frame=bytearray(c.encrypt_frame(b"x"))
+    frame[6]^=1
+    with pytest.raises(HandshakeError):s.decrypt_frame(bytes(frame))
+    frame=bytearray(c.encrypt_frame(b"x"));frame[5]=Direction.SERVER_TO_CLIENT
+    with pytest.raises(HandshakeError):s.decrypt_frame(bytes(frame))
+    frame=bytearray(c.encrypt_frame(b"x"));frame[14:18]=struct.pack("!I",1)
+    with pytest.raises(HandshakeError):s.decrypt_frame(bytes(frame))
+def test_nonce_uniqueness(identities):
+    c,_=exchange(identities);frames=[c.encrypt_frame(b"x") for _ in range(100)];assert len(set(x[:DATA_HEADER_SIZE] for x in frames))==100
+def test_synchronized_rekey_and_old_epoch_rejection(identities):
+    c,s=exchange(identities);old=c.encrypt_frame(b"old");nonce=os.urandom(32);cn=c.derive_next_epoch(1,nonce);sn=s.derive_next_epoch(1,nonce);c.activate_epoch(1,cn);s.activate_epoch(1,sn)
+    assert s.decrypt_frame(c.encrypt_frame(b"new"))[1]==b"new"
+    with pytest.raises(HandshakeError):s.decrypt_frame(old)
+    with pytest.raises(HandshakeError):s.derive_next_epoch(1,nonce)
+def test_cross_direction_ciphertext_rejected(identities):
+    c,s=exchange(identities)
+    with pytest.raises(HandshakeError):c.decrypt_frame(c.encrypt_frame(b"reflection"))
+def test_server_identity_key_omitted_but_fingerprint_bound(identities):
+    sk,pk,csk,_=identities;c=KEMTLSClient(pk,fingerprint(pk),csk,True);s=KEMTLSServer(sk,pk,lambda _:{"client_id":"a"},True)
+    hello=ServerHello.unpack(s.process_client_hello(c.initiate_handshake()))
+    assert hello.identity_id==bytes.fromhex(fingerprint(pk))
+    assert pk not in hello.pack()
+def test_exact_reduced_handshake_sizes(identities):
+    sk,pk,csk,_=identities;c=KEMTLSClient(pk,fingerprint(pk),csk,True);s=KEMTLSServer(sk,pk,lambda _:{"client_id":"a"},True)
+    ch=c.initiate_handshake();sh=s.process_client_hello(ch);cke=c.process_server_hello(sh);sf,_=s.process_client_key_exchange(cke)
+    assert [len(ch),len(sh),len(cke),len(sf)]==[1318,1222,1190,38]
+    assert sum(map(len,(ch,sh,cke,sf)))==3768
+@pytest.mark.skipif(_OQS_AVAILABLE,reason="native provider takes precedence over mock opt-in")
+def test_mock_never_quantum_safe():assert get_crypto_status()["is_quantum_safe"] is False
+"""Still-relevant v1 coverage restored and adapted to authenticated v2."""
+import hashlib,os,struct
+import pytest
+from handshake.kemtls import *
+from handshake.kemtls import _pack_header,_unpack_header,_compute_finished_mac,_verify_finished_mac,_CLIENT_FINISHED_LABEL,_SERVER_FINISHED_LABEL
+
+def test_header_roundtrip_and_errors():
+    raw=_pack_header(MessageType.CLIENT_HELLO,ClientHello.SIZE);assert _unpack_header(raw+b"\0"*ClientHello.SIZE)[3]==ClientHello.SIZE
+    with pytest.raises(HandshakeError):_unpack_header(b"x")
+    bad=bytearray(raw+b"\0"*ClientHello.SIZE);bad[:2]=b"xx"
+    with pytest.raises(HandshakeError):_unpack_header(bytes(bad))
+def test_message_pack_unpack_roundtrips():
+    messages=[ClientHello(os.urandom(32),os.urandom(32),os.urandom(32),os.urandom(1184),os.urandom(32)),ServerHello(os.urandom(32),os.urandom(32),os.urandom(32),os.urandom(1088),os.urandom(32)),ClientKeyExchange(os.urandom(1088),os.urandom(64),os.urandom(32)),ServerFinished(os.urandom(32))]
+    for message in messages:assert type(message).unpack(message.pack())==message
+def test_message_fixed_sizes():
+    assert ClientHello.SIZE==1312 and ServerHello.SIZE==1216 and ClientKeyExchange.SIZE==1184
+
+
+def test_frozen_v2_handshake_serialization():
+    """Refactors must not change message headers, field order, or wire bytes."""
+    messages = [
+        ClientHello(bytes([1])*32, bytes([2])*32, bytes([3])*32, bytes([4])*1184, bytes([5])*32),
+        ServerHello(bytes([6])*32, bytes([7])*32, bytes([8])*32, bytes([9])*1088, bytes([10])*32),
+        ClientKeyExchange(bytes([11])*1088, bytes([12])*64, bytes([13])*32),
+        ServerFinished(bytes([14])*32),
+    ]
+    expected = [
+        (1318, '485620010520', '5cb01f9aa02ff578a960569d57c98eab1509b100e0ebf8c3a9d0db345b599a1a'),
+        (1222, '4856200204c0', '3c3679256f04ee03a54f92eefd77074fe70347d727b54b46268cd6a7bc55b80f'),
+        (1190, '4856200304a0', 'b9a86d625f7354371b8c9219cbb8c4836346d25dccd2bdd1ab5901feb78785e5'),
+        (38, '485620040020', 'ffee0af94d03c49c9711872d9146d8bd2f0f8488d31e4c3a42ce6c4c2073dc0f'),
+    ]
+    for message, (length, header, digest) in zip(messages, expected):
+        wire = message.pack()
+        assert len(wire) == length
+        assert wire[:6].hex() == header
+        assert hashlib.sha256(wire).hexdigest() == digest
+def test_transcript_hash_copy_and_count():
+    transcript=TranscriptHasher();assert transcript.digest()==hashlib.sha256(b"").digest();transcript.update(b"a");copy=transcript.copy();transcript.update(b"b")
+    assert transcript.digest()==hashlib.sha256(b"ab").digest() and copy.digest()==hashlib.sha256(b"a").digest() and transcript.message_count==2
+def test_finished_mac_labels_and_tampering():
+    digest,key=os.urandom(32),os.urandom(32);mac=_compute_finished_mac(digest,key,_CLIENT_FINISHED_LABEL)
+    assert _verify_finished_mac(digest,key,_CLIENT_FINISHED_LABEL,mac)
+    assert not _verify_finished_mac(digest,key,_SERVER_FINISHED_LABEL,mac)
+def test_data_roundtrip_empty_large_tamper(identities):
+    client,server=exchange(identities)
+    for payload in (b"",os.urandom(65536)):assert server.decrypt_frame(client.encrypt_frame(payload))[1]==payload
+    frame=bytearray(client.encrypt_frame(b"secret"));frame[-1]^=1
+    with pytest.raises(HandshakeError):server.decrypt_frame(bytes(frame))
+def test_handshake_state_transitions(identities):
+    sk,pk,csk,_=identities
+    from vpn.identity import fingerprint
+    client=KEMTLSClient(pk,fingerprint(pk),csk,True);server=KEMTLSServer(sk,pk,lambda _:{"client_id":"a"},True)
+    with pytest.raises(HandshakeError):client.process_server_hello(b"x")
+    hello=client.initiate_handshake()
+    with pytest.raises(HandshakeError):client.initiate_handshake()
+    server.process_client_hello(hello)
+    with pytest.raises(HandshakeError):server.process_client_hello(hello)
+def test_session_info_and_cross_session_isolation(identities):
+    client,server=exchange(identities);assert client.get_info()["role"]=="client"
+    other_client,_=exchange(identities)
+    with pytest.raises(HandshakeError):server.decrypt_frame(other_client.encrypt_frame(b"wrong"))
+import concurrent.futures
+import struct
+import threading
+import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from crypto.hybrid_crypto import PQCProvider
+from handshake.kemtls import DATA_HEADER_FORMAT,DATA_HEADER_SIZE,Channel,FrameType,HandshakeError
+
+@pytest.fixture
+def identities():
+    kem=PQCProvider(allow_mock=True);server_sk,server_pk=kem.generate_keypair();client_sk=Ed25519PrivateKey.generate()
+    return server_sk,server_pk,client_sk,client_sk.public_key().public_bytes_raw()
+
+def header(frame):return struct.unpack(DATA_HEADER_FORMAT,frame[:DATA_HEADER_SIZE])
+
+def test_concurrent_encrypt_sequence_and_nonce_uniqueness(identities):
+    client,server=exchange(identities)
+    def produce(i):return client.encrypt_frame(struct.pack("!I",i))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=24) as pool:
+        frames=list(pool.map(produce,range(4000)))
+    sequences=[header(frame)[-1] for frame in frames]
+    nonces=[client._nonce(client._data_send_nonce_base,seq) for seq in sequences]
+    assert len(sequences)==len(set(sequences))==4000
+    assert len(nonces)==len(set(nonces))==4000
+    for frame in sorted(frames,key=lambda value:header(value)[-1]):
+        assert server.decrypt_frame(frame)[0]==FrameType.DATA
+
+def test_concurrent_duplicate_replay_exactly_one_success(identities):
+    client,server=exchange(identities);frame=client.encrypt_frame(b"once");barrier=threading.Barrier(2)
+    def consume():
+        barrier.wait()
+        try:return server.decrypt_frame(frame)[1]
+        except HandshakeError as exc:return str(exc)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:results=list(pool.map(lambda _:consume(),range(2)))
+    assert results.count(b"once")==1
+    assert sum("replayed" in str(value) for value in results)==1
+
+def test_control_and_data_sequence_domains_are_independent(identities):
+    client,server=exchange(identities)
+    control=client.encrypt_control(b"cfg",FrameType.CONFIG)
+    data=client.encrypt_frame(b"packet")
+    assert header(control)[2]==Channel.CONTROL and header(control)[-1]==0
+    assert header(data)[2]==Channel.DATA and header(data)[-1]==0
+    assert server.decrypt_frame(data)[1]==b"packet"
+    assert server.decrypt_control(control)[1]==b"cfg"
+
+def test_delayed_control_survives_more_than_replay_window_data(identities):
+    client,server=exchange(identities);control=client.encrypt_control(b"delayed",FrameType.CONFIG)
+    for _ in range(300):server.decrypt_frame(client.encrypt_frame(b"udp"))
+    assert server.decrypt_control(control)[1]==b"delayed"
+
+def test_cross_channel_ciphertext_rejected(identities):
+    client,server=exchange(identities)
+    with pytest.raises(HandshakeError,match="channel"):server.decrypt_control(client.encrypt_frame(b"data"))
+    with pytest.raises(HandshakeError,match="channel"):server.decrypt_frame(client.encrypt_control(b"control",FrameType.CONFIG))

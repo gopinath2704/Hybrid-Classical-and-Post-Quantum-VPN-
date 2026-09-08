@@ -24,9 +24,9 @@ from crypto.hybrid_crypto import PQCUnavailableError
 from handshake.kemtls import (Channel, DATA_HEADER_FORMAT, DATA_HEADER_SIZE, DATA_MAGIC,
     FrameType, HandshakeError, HandshakeSession, KEMTLSClient, KEMTLSServer, PROTOCOL_VERSION)
 from vpn.config import ClientConfig, ServerConfig, validate_server, validate_client
-from vpn.engine import NetworkQualityMonitor, TUNInterface, TUNMode
+from vpn.network import NetworkQualityMonitor, TUNInterface, TUNMode
 from vpn.identity import AuthorizedClients, load_client_private, validate_server_identity
-from vpn.ipv6 import IPv6Guard, effective_policy, preflight as ipv6_preflight
+from vpn.network import IPv6Guard, effective_policy, preflight as ipv6_preflight
 
 logger = logging.getLogger("pqvpn.runtime")
 MAX_CONTROL_MESSAGE = 16384

@@ -32,4 +32,7 @@ config/authorized_clients.json
 .coverage
 htmlcov/
 
+# Reproducible benchmark outputs
+benchmarks/results/
+
 config/*.lock

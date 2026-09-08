@@ -1,0 +1,14 @@
+.git/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+benchmarks/results/
+config/*private.key
+config/authorized_clients.json

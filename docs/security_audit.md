@@ -22,7 +22,7 @@ Status: Confirmed; remediation in progress.
 
 Severity: Critical  
 Component: Access control  
-File/function: `handshake/kemtls.py`; `vpn/engine.py:VPNServerDaemon._handle_client`  
+File/function: `handshake/kemtls.py`; `vpn/runtime.py:VPNServer._client`
 Problem: The server accepts any syntactically valid handshake.  
 Impact: Any network user can obtain tunnel access and consume server resources.  
 Attack/failure scenario: An unaffiliated client completes an ephemeral handshake and receives usable data-plane keys.  
@@ -70,7 +70,7 @@ Status: Confirmed; remediation in progress.
 
 Severity: High  
 Component: Control protocol  
-File/function: `handshake/kemtls.py:HandshakeSession.rekey`; `vpn/engine.py:VPNService.rotate_keys`  
+File/function: `handshake/kemtls.py:HandshakeSession`; `vpn/runtime.py:VPNClient.rekey`, `VPNServer._rekey_server`
 Problem: A locally random nonce derives and activates new keys without being transmitted. Declared rekey message constants are unused.  
 Impact: The initiating peer immediately loses interoperability with its peer.  
 Attack/failure scenario: Scheduled client rekey causes all subsequent packets to fail authentication.  
@@ -82,7 +82,7 @@ Status: Confirmed; remediation in progress.
 
 Severity: Critical  
 Component: UDP data-plane establishment  
-File/function: `vpn/engine.py:VPNService.connect`, `VPNServerDaemon._handle_client`  
+File/function: `vpn/runtime.py:VPNClient.connect`, `VPNServer._client`, `VPNServer._handle_datagram`
 Problem: Client sends UDP to the TCP destination port; server sends UDP to the client's TCP source address and binds an unrelated ephemeral UDP socket. TCP and UDP source ports are unrelated.  
 Impact: Real data-plane traffic does not reliably reach either endpoint and NAT cannot work.  
 Attack/failure scenario: A normal NAT assigns a distinct UDP mapping; server ciphertext is sent to the TCP source port and discarded.  
@@ -94,7 +94,7 @@ Status: Confirmed; remediation in progress.
 
 Severity: Critical  
 Component: Server tunnel architecture  
-File/function: `vpn/engine.py:VPNServerDaemon._handle_client`  
+File/function: `vpn/runtime.py:VPNServer`, `SessionManager`, `IPPool`
 Problem: Every connection opens the same TUN name and a separate UDP socket; no session demultiplexer, destination-IP routing map, endpoint map, or IP pool exists.  
 Impact: The second native client conflicts; server return packets cannot be assigned to sessions; all clients default to 10.8.0.2.  
 Attack/failure scenario: Concurrent users collide on device/IP resources and cannot receive routed responses.  
@@ -106,7 +106,7 @@ Status: Confirmed; remediation in progress.
 
 Severity: Critical  
 Component: Linux networking  
-File/function: `vpn/engine.py:VPNService`, `VPNServerDaemon`; deployment files  
+File/function: `vpn/runtime.py:ClientNetwork`, `VPNClient`, `VPNServer`; `vpn/network.py:render`; deployment files
 Problem: Server forwarding/NAT is absent; client default/split routes, transport bypass, DNS setup/restoration, transactional rollback, kill switch, and applied MSS clamp are absent. TUN IP setup errors are ignored.  
 Impact: A UI may say CONNECTED while Internet traffic does not traverse the server.  
 Attack/failure scenario: Client traffic continues over its original default route; server cannot forward decrypted packets to WAN.  
@@ -118,7 +118,7 @@ Status: Confirmed; remediation in progress.
 
 Severity: High  
 Component: TUN lifecycle  
-File/function: `vpn/engine.py:VPNService._allocate_tun`; `VPNServerDaemon._handle_client`  
+File/function: `vpn/network.py:TUNInterface`; `vpn/runtime.py:open_tun`, `VPNServer.start`
 Problem: Missing `/dev/net/tun` or permissions silently select a socket pair, yet connection state becomes CONNECTED.  
 Impact: Operators can believe traffic is protected when no traffic can leave the host.  
 Attack/failure scenario: A container missing `NET_ADMIN` appears connected but leaks traffic via the normal route.  
@@ -130,7 +130,7 @@ Status: Confirmed; remediation in progress.
 
 Severity: Medium  
 Component: MTU/fragmentation  
-File/function: `vpn/engine.py:MTUMonitor`; `benchmarks/runner.py:PacketOverheadAnalyzer`  
+File/function: `vpn/network.py:MTUMonitor`; `benchmarks.py:PacketOverheadAnalyzer`
 Problem: Calculations include a nonexistent two-byte UDP length prefix, omit the future authenticated header, do not set the chosen TUN MTU, and only calculate (not apply) MSS values.  
 Impact: Inner packets can exceed PMTU and fragment/drop; published overhead is false.  
 Attack/failure scenario: Full-size TCP packets exceed the outer path MTU and black-hole on DF paths.  
@@ -142,7 +142,7 @@ Status: Confirmed; remediation in progress.
 
 Severity: Medium  
 Component: Quality telemetry  
-File/function: `vpn/engine.py:VPNService.connect/get_telemetry`; `NetworkQualityMonitor.probe`  
+File/function: `vpn/runtime.py:VPNClient`; `vpn/network.py:NetworkQualityMonitor`
 Problem: The monitor is constructed but never fed. Its standalone probe targets arbitrary UDP/33434 and is not authenticated tunnel measurement.  
 Impact: Latency, jitter, and loss remain zero and mislead operators.  
 Attack/failure scenario: A degraded tunnel is reported as zero-latency/zero-loss.  
@@ -154,7 +154,7 @@ Status: Confirmed; remediation in progress.
 
 Severity: High  
 Component: Wire parsing  
-File/function: `handshake/kemtls.py`, all `unpack` methods and `_unpack_header`; `vpn/engine.py:_recv_message`  
+File/function: `handshake/kemtls.py`, all `unpack` methods and `_unpack_header`; `vpn/runtime.py:recv_message`
 Problem: Parsers check `len(payload) < expected`, ignore declared inner length, accept trailing bytes, and permit zero outer lengths.  
 Impact: Transcript/parser differentials and resource abuse become possible.  
 Attack/failure scenario: A peer appends ignored bytes that remain transcript-visible or sends malformed nested lengths.  
@@ -202,7 +202,7 @@ Status: Confirmed; remediation in progress.
 
 Severity: High  
 Component: Server availability  
-File/function: `vpn/engine.py:VPNServerDaemon.start/_handle_client`  
+File/function: `vpn/runtime.py:VPNServer.start`, `VPNServer._client`, `SourceRateLimiter`
 Problem: No maximum clients, source rate limiting, session/idle timeout, bounded thread cleanup, or production startup self-test. Listener backlog is five but accepted connections spawn indefinitely.  
 Impact: Remote clients can consume threads, sockets, ML-KEM work, and tunnel resources.  
 Attack/failure scenario: Repeated slow handshakes or idle control sockets exhaust the server.  
@@ -214,7 +214,7 @@ Status: Confirmed; remediation in progress.
 
 Severity: High  
 Component: Docker/VPS deployment  
-File/function: `Dockerfile.server`, `Dockerfile.client`, `docker-compose.yml`; absent setup/service files  
+File/function: `Dockerfile`, `docker-compose.yml`, `deploy/pqvpn-server.service`, `scripts/server-network.sh`
 Problem: Host forwarding/NAT is not configured, management is publicly mapped, source is bind-mounted over the image, static client IP is injected, and no systemd/native deployment exists.  
 Impact: `docker compose up` does not satisfy Internet-routing requirements and exposes an unsafe controller.  
 Attack/failure scenario: Operator deploys advertised configuration and obtains neither safe routing nor a protected management plane.  
@@ -313,7 +313,7 @@ Real VPS/client validation pending.** This pass preserved the current v2 handsha
 directional DATA/CONTROL cryptography, replay locks and synchronized epoch rekey.
 
 Validation used a newly created `/tmp/pqvpn-final-venv` with CPython **3.14.7** and
-an unchanged `requirements-dev.txt` / `constraints-tested.txt` installation.
+an unchanged `pyproject.toml` / `constraints-tested.txt` installation.
 `pip check` passed; every installed constrained package matched its pin.
 Native **liboqs-python 0.16.0** loaded the existing **liboqs 0.16.0** installation.
 No dependency upgrades, native library build or remote deployment were performed.
@@ -323,11 +323,11 @@ No dependency upgrades, native library build or remote deployment were performed
 | `pytest -q` | PASS | 210 collected; 208 passed, 0 failed, 2 skipped; 37.19s |
 | `python -m pytest -q` | PASS | 210 collected; 208 passed, 0 failed, 2 skipped; 36.17s |
 | Python compileall | PASS | `python -m compileall -q crypto handshake vpn app benchmarks tests` |
-| Server setup shell syntax | PASS | `bash -n scripts/server-setup.sh` |
-| Server cleanup shell syntax | PASS | `bash -n scripts/server-cleanup.sh` |
+| Server setup shell syntax | PASS | `bash -n scripts/server-network.sh` |
+| Server cleanup shell syntax | PASS | `bash -n scripts/server-network.sh` |
 | Namespace shell syntax | PASS | `bash -n tests/namespace_vpn.sh` |
 | Native installer shell syntax | PASS | `bash -n scripts/install-liboqs.sh` |
-| JavaScript syntax | PASS | `node --check app/frontend/js/app.js` |
+| JavaScript syntax | PASS | Extracted inline script parsed by Node's `Function` constructor |
 | Docker Compose | PASS | `docker compose config`; development-client profile also validated; images/runtime not tested |
 | `git diff --check` | PASS | No whitespace errors |
 | Server doctor | WARN, exit 0 | No blocking findings for temporary native profile; external provider/host firewall requires operator verification |
@@ -399,7 +399,7 @@ retained. No changes were made to `handshake/kemtls.py` or `crypto/hybrid_crypto
 
 ### Changes and boundaries
 
-- Added `vpn/ipv6.py` and the optional client `ipv6_policy` field: omitted policy
+- Added `vpn/network.py` and the optional client `ipv6_policy` field: omitted policy
   blocks in full mode and permits out-of-scope IPv6 in split mode; explicit values
   are `block`, `fail`, `allow`. Shipped full-mode profiles explicitly select block.
 - Blocking uses one exclusively created random `ip6 pqvpn_client6_<random>` table.
@@ -431,13 +431,13 @@ retained. No changes were made to `handshake/kemtls.py` or `crypto/hybrid_crypto
 | Native ML-KEM marker, separately | PASS: 2 passed, 243 deselected; `ALLOW_MOCK_PQC=0` |
 | Python / liboqs-python / native liboqs | 3.14.7 / 0.16.0 / 0.16.0 |
 | Native source commit | `5a1a854b0dc9f2141bdc771c555ee60c37950183` |
-| Native provenance | PASS: exact upstream tag/checkout verified, ML-KEM-only shared library built; loaded path verified in `/proc/self/maps`; options/digest in `deploy/native-build.txt` |
+| Native provenance | PASS: exact upstream tag/checkout verified, ML-KEM-only shared library built; loaded path verified in `/proc/self/maps`; options/digest in `deploy/versions.txt` |
 | Compileall | PASS: crypto, handshake, vpn, app, benchmarks, tests |
 | Setup shell syntax | PASS |
 | Cleanup shell syntax | PASS |
 | liboqs installer shell syntax | PASS |
 | Namespace shell syntax | PASS |
-| JavaScript syntax | PASS: `node --check app/frontend/js/app.js` |
+| JavaScript syntax | PASS: extracted inline script parsed by Node's `Function` constructor |
 | Docker Compose config | PASS: schema only |
 | Dependency consistency | PASS: `pip check`; production pins unchanged |
 | `git diff --check` | PASS |
@@ -506,7 +506,7 @@ explicitly says existing active sessions continue until disconnect/expiration/se
 restart; its existing regression checks that sentence. No session-kill mechanism,
 handshake, rekey, route or firewall behavior changed during continuation.
 
-The [next-phase handoff](pre_vps_handoff.md) records local-tag transfer without pushing,
+The [next-phase handoff](deployment.md) records local-tag transfer without pushing,
 the actual bounded namespace invocation and the VPS/client sequence. Full available
 tests, native validation, static checks and doctors are rerun after the final file
 edits before the local commit/tag. Historical counts in progress.md remain intact.
@@ -521,8 +521,8 @@ switch remain incomplete. Root namespaces, native systemd, real client DNS and
 
 Every executable, script, interpreter and module used directly or indirectly by
 `ExecStartPre=+` and `ExecStopPost=+` must be root-owned and not writable by
-`pqvpn`, its groups, or other users. This includes `/opt/pqvpn/scripts/server-setup.sh`,
-`/opt/pqvpn/scripts/server-cleanup.sh`, `/opt/pqvpn/vpn/firewall.py`, all application
+`pqvpn`, its groups, or other users. This includes `/opt/pqvpn/scripts/server-network.sh`,
+`/opt/pqvpn/scripts/server-network.sh`, `/opt/pqvpn/vpn/network.py`, all application
 packages, `/opt/pqvpn/.venv/bin/python`, the entire venv/dependencies, symlink targets,
 and their containing directories. Install the system Python, standard library,
 native liboqs and helper OS commands administratively with the same trust boundary.
@@ -607,7 +607,7 @@ gates. Host UID is 1000, TUN exists, and `sudo -n true` requires a password.
 | Client doctor | Exit 0; all checks PASS |
 | Compileall | PASS: crypto handshake vpn app benchmarks tests |
 | Shell syntax | PASS: setup, cleanup, liboqs installer, namespace harness |
-| JavaScript syntax | PASS: node --check app/frontend/js/app.js |
+| JavaScript syntax | PASS: extracted inline script parsed by Node's `Function` constructor |
 | Compose config | PASS: default and development-client profile; runtime unvalidated |
 | Dependency consistency / diff whitespace | PASS |
 | Root namespace | SKIPPED: UID 1000, no passwordless sudo; TUN unchanged |
@@ -616,3 +616,47 @@ The initial focused sandbox run was interrupted after identifying a fixture issu
 (Python 3.14 lstat needs its own metadata patch); that fixture was corrected.
 The final full runs above used host socket visibility and passed after all code
 changes. No skipped root test is represented as a runtime pass.
+
+## Minimal-layout structural refactor — 2026-09-08
+
+This refactor starts from clean commit `3e072a1e995a318cdd28f2816da9a67c3262a52c`
+(`v2-pre-vps-2`) on branch `refactor/minimal-layout`. Meaningful files are counted
+with Git metadata, Python caches/environments and generated benchmark results excluded.
+The tree moved from 73 to 43 files, a reduction of 30 files (41.10%).
+
+All 19 prior Python test modules were mechanically consolidated into six responsibility
+suites while retaining their cases and markers. One deterministic regression now pins
+the exact length, six-byte header and SHA-256 digest of each frozen ClientHello,
+ServerHello, ClientKeyExchange and ServerFinished serialization. Final collection is
+261 tests: both `pytest -q` and `python -m pytest -q` pass 259 with 2 root/environment
+skips. The isolated native marker passes 2 tests with 259 deselected.
+
+The fresh install uses `python -m pip install -c constraints-tested.txt '.[dev]'` from
+`pyproject.toml`. Pip dependency consistency, imports from outside the checkout,
+packaged GUI assets, `vpn.cli --help`, and `python -m benchmarks --help` pass. No
+dependency version changed. The native tests load liboqs-python 0.16.0 and liboqs
+0.16.0 built from source commit `5a1a854b0dc9f2141bdc771c555ee60c37950183`
+under Python 3.14.7; mock PQC is disabled.
+
+The continuation rebuilt the pinned ML-KEM-only library from that exact commit and
+verified `/proc/self/maps`; SHA-256 is
+`accf52d6e4e6b277aa3fa80e0fdee171fa95bd21b40f6888294c5fa8557abc4d`.
+Its temporary source, build, and install prefix was removed after validation. The
+management bearer dependency is async so this constant-time in-memory check does not
+depend on AnyIO worker-thread offload under Python 3.14; HTTP 401/200 coverage remains.
+
+Server doctor exits 0 with only the expected external provider/host-firewall warning;
+client doctor exits 0 with all checks passing. The development doctor correctly marks
+production `/opt/pqvpn` ownership as not applicable; staged production ownership tests
+remain active. Compileall, both shell scripts, extracted inline JavaScript, both Compose
+profiles, local documentation links, stale-path search and `git diff --check` pass.
+A one-iteration native benchmark run produces all metrics and four charts successfully;
+generated results are removed and ignored afterward.
+
+Handshake and cryptographic implementation files are unchanged except for a documentation
+link in the crypto module. Runtime changes are import-path-only. The explicit Docker
+`--server-host` override is validated through the existing client config validator.
+Wire bytes, algorithms, authentication, key schedule, records, replay, rekey, dead-peer,
+IPv6, DNS and firewall policy are unchanged. UID remains 1000, TUN is present, and
+passwordless sudo is unavailable, so root namespace/systemd/VPS validation remains
+skipped rather than passed.

@@ -15,7 +15,7 @@ import sys
 from vpn.config import load_client_config, load_server_config
 from vpn.identity import AuthorizedClients, fingerprint, load_client_private, validate_server_identity
 from crypto.hybrid_crypto import PQCProvider, _OQS_AVAILABLE, _oqs_module
-from vpn.ipv6 import connectivity, effective_policy
+from vpn.network import connectivity, effective_policy
 
 
 def command(*args):
@@ -65,8 +65,8 @@ def privileged_code_permissions(root=PRODUCTION_ROOT):
     This is a read-only snapshot, not a substitute for administrative updates.
     """
     root = Path(root).absolute()
-    for required in ('scripts/server-setup.sh', 'scripts/server-cleanup.sh',
-                     'vpn/firewall.py', 'handshake', 'crypto', '.venv/bin/python'):
+    for required in ('scripts/server-network.sh',
+                     'vpn/network.py', 'handshake', 'crypto', '.venv/bin/python'):
         (root / required).stat()  # Missing/dangling deployment components fail.
     seen = set()
 

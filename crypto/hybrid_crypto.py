@@ -22,7 +22,7 @@ Fail-closed PQC policy:
 
 Installing native crypto:
     Install native liboqs explicitly before the pinned Python binding.
-    See docs/server_deployment.md; imports never initiate a native build.
+    See docs/deployment.md; imports never initiate a native build.
 """
 
 from __future__ import annotations

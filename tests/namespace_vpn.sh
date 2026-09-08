@@ -24,7 +24,7 @@ wait_bounded() {
 cleanup() {
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
   for pid in "${PIDS[@]:-}"; do wait_bounded "$pid" || true; done
-  PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-cleanup.sh" >/dev/null 2>&1 || true
+  PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-network.sh" cleanup "$RUN_DIR/server/server.toml" >/dev/null 2>&1 || true
   for ns in "$CLIENT1_NS" "$CLIENT2_NS" "$SERVER_NS" "$INTERNET_NS"; do
     ip netns del "$ns" 2>/dev/null || true
   done
@@ -129,9 +129,9 @@ while True:
  d,a=s.recvfrom(65535); s.sendto(d,a)' >"$RUN_DIR/udp.log" 2>&1 & PIDS+=("$!")
 ALLOW_MOCK_PQC=1 ip netns exec "$SERVER_NS" python -m vpn.cli server --config "$RUN_DIR/server/server.toml" --allow-mock-pqc >"$RUN_DIR/server.log" 2>&1 & PIDS+=("$!")
 sleep 2
-PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-setup.sh" "$RUN_DIR/server/server.toml"
+PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-network.sh" setup "$RUN_DIR/server/server.toml"
 # Repeat setup must preserve the original zero and produce one current policy.
-PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-setup.sh" "$RUN_DIR/server/server.toml"
+PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-network.sh" setup "$RUN_DIR/server/server.toml"
 test "$(cat "$RUN_DIR/fw/ip_forward.prev")" = 0
 
 start_client() {
@@ -184,9 +184,9 @@ done
 # Allow only the private test service through WAN, then reconcile back to defaults.
 cp "$RUN_DIR/server/server.toml" "$RUN_DIR/server/allowed.toml"
 printf '\nallowed_forward_networks = ["10.50.0.10/32"]\n' >>"$RUN_DIR/server/allowed.toml"
-PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-setup.sh" "$RUN_DIR/server/allowed.toml"
+PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-network.sh" setup "$RUN_DIR/server/allowed.toml"
 ip netns exec "$CLIENT1_NS" curl --noproxy '*' -fsS --max-time 3 http://10.50.0.10:8080/ >/dev/null
-PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-setup.sh" "$RUN_DIR/server/server.toml"
+PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-network.sh" setup "$RUN_DIR/server/server.toml"
 if ip netns exec "$CLIENT1_NS" curl --noproxy '*' -fsS --max-time 2 http://10.50.0.10:8080/ >/dev/null 2>&1; then
   echo 'stale private allowlist survived reconciliation' >&2; exit 1
 fi
@@ -255,7 +255,7 @@ ip netns exec "$CLIENT1_NS" curl --noproxy '*' -fsS --max-time 5 http://198.51.1
 # Run the quiet/idle regressions with real TUN in an isolated existing namespace.
 # DNS is disabled here: host resolvectl must not be mutated from a netns test.
 ALLOW_MOCK_PQC=1 ip netns exec "$INTERNET_NS" env PQVPN_TEST_NATIVE_TUN=1 python -m pytest -q \
-  tests/test_session_activity.py tests/test_dead_peer.py -k 'keepalive_prevents or genuinely_idle or control_activity or udp_dead_peer or rekey_during'
-PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-cleanup.sh"
+  tests/test_runtime.py -k 'keepalive_prevents or genuinely_idle or control_activity or udp_dead_peer or rekey_during'
+PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-network.sh" cleanup "$RUN_DIR/server/server.toml"
 test "$(ip netns exec "$SERVER_NS" sysctl -n net.ipv4.ip_forward)" = 0
 echo "namespace VPN integration succeeded: client IPs $IP1 and $IP2; UDP/TCP/rekey/spoof/disconnect/reconnect and IPv6 bypass prevention/restoration verified"

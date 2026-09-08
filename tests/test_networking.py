@@ -11,17 +11,15 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-import vpn.ipv6 as ipv6
+import vpn.network as ipv6
 import vpn.runtime as runtime
 import vpn.doctor as doctor
 from vpn.config import ClientConfig
 from vpn.config import validate_client, load_client_config
-from vpn.engine import TUNMode
+from vpn.network import TUNMode
 from handshake.kemtls import HandshakeError, KEMTLSClient, KEMTLSServer
 from vpn.identity import AuthorizedClients, fingerprint
-from test_session_activity import connected
-from test_dead_peer import PongFilter
-from test_runtime_fixes import until
+from test_runtime import connected, PongFilter, until
 
 
 class NativeTun:
@@ -181,7 +179,7 @@ from unittest.mock import patch
 import vpn.cli as cli
 from vpn.runtime import VPNClient, ClientNetwork
 from vpn.config import ClientConfig
-from vpn.engine import TUNMode
+from vpn.network import TUNMode
 tables=set()
 def process(args,**kwargs):
     if args==['nft','-f','-']:tables.add(kwargs['input'].splitlines()[0].split()[-1])
@@ -194,7 +192,7 @@ class Client(VPNClient):
         self.network=ClientNetwork(SimpleNamespace(mode=TUNMode.NATIVE),'8.8.8.8',False,[],[],ipv6_policy='block')
         self.network.apply();assert tables
         return {'client_vpn_ip':'10.8.0.2','udp_port':51820}
-with patch.object(cli,'VPNClient',Client),patch.object(cli,'load_client_config',return_value=ClientConfig()),patch.object(cli,'get_crypto_status',return_value={'is_quantum_safe':True}),patch('vpn.ipv6.subprocess.run',process),patch('vpn.runtime.run_ip',ip):
+with patch.object(cli,'VPNClient',Client),patch.object(cli,'load_client_config',return_value=ClientConfig()),patch.object(cli,'get_crypto_status',return_value={'is_quantum_safe':True}),patch('vpn.network.subprocess.run',process),patch('vpn.runtime.run_ip',ip):
     cli.main()
 assert not tables
 '''
@@ -263,7 +261,7 @@ def test_native_installer_verifies_commit_before_build(tmp_path,match):
     import re
     source=Path('scripts/install-liboqs.sh').read_text()
     commit=re.search(r'^LIBOQS_COMMIT=([0-9a-f]{40})$',source,re.M)[1]
-    assert f'liboqs-source-commit={commit}' in Path('deploy/tested-versions.txt').read_text()
+    assert f'liboqs-source-commit={commit}' in Path('deploy/versions.txt').read_text()
     bin=tmp_path/'bin';bin.mkdir()
     script='''#!/usr/bin/env python3
 import os,sys,pathlib
@@ -280,3 +278,164 @@ if name=='git' and 'rev-parse' in sys.argv:print(os.environ['TEST_COMMIT'])
     assert (r.returncode==0)==match
     assert ('cmake ' in log.read_text())==match
     if not match:assert 'source mismatch' in r.stderr
+import socket,subprocess,threading,time
+from pathlib import Path
+from types import SimpleNamespace
+import pytest
+import vpn.runtime as runtime
+from vpn.config import ClientConfig,ServerConfig,load_client_config,load_server_config
+from vpn.network import TUNMode
+
+class Tun:
+    name="pqvpn0";mode=TUNMode.NATIVE;mtu=1380
+    def __init__(self):self.closed=False
+    def close(self):self.closed=True
+
+def test_exact_previous_route_restoration(monkeypatch):
+    calls=[]
+    def ip(*args,check=True):
+        calls.append(args)
+        if args[:2]==("route","get"):return SimpleNamespace(stdout="8.8.8.8 via 192.0.2.1 dev eth0\n")
+        if args[:4]==("route","show","exact","8.8.8.8/32"):return SimpleNamespace(stdout="8.8.8.8 via 192.0.2.254 dev eth9 metric 77\n")
+        if args[:3]==("route","show","exact"):return SimpleNamespace(stdout="")
+        return SimpleNamespace(stdout="")
+    monkeypatch.setattr(runtime,"run_ip",ip);monkeypatch.setattr(runtime.subprocess,"run",lambda *a,**k:SimpleNamespace(returncode=1))
+    network=runtime.ClientNetwork(Tun(),"8.8.8.8",True,[],[]);network.apply();network.restore()
+    assert ("route","replace","8.8.8.8","via","192.0.2.254","dev","eth9","metric","77") in calls
+
+def test_route_apply_failure_rolls_back(monkeypatch):
+    calls=[]
+    def ip(*args,check=True):
+        calls.append(args)
+        if args[:2]==("route","get"):return SimpleNamespace(stdout="8.8.8.8 via 192.0.2.1 dev eth0\n")
+        if args[:3]==("route","show","exact"):return SimpleNamespace(stdout="")
+        if args[:3]==("route","replace","0.0.0.0/1"):raise subprocess.CalledProcessError(2,args)
+        return SimpleNamespace(stdout="")
+    monkeypatch.setattr(runtime,"run_ip",ip);monkeypatch.setattr(runtime.subprocess,"run",lambda *a,**k:SimpleNamespace(returncode=1))
+    with pytest.raises(subprocess.CalledProcessError):runtime.ClientNetwork(Tun(),"8.8.8.8",True,[],[]).apply()
+    assert any(call[:3]==("route","del","8.8.8.8/32") for call in calls)
+
+def test_partial_dns_failure_always_reverts(monkeypatch):
+    commands=[]
+    def ip(*args,check=True):
+        if args[:2]==("route","get"):return SimpleNamespace(stdout="8.8.8.8 via 192.0.2.1 dev eth0\n")
+        return SimpleNamespace(stdout="")
+    def process(command,**kwargs):
+        commands.append(command)
+        if command[:2]==["resolvectl","domain"]:raise subprocess.CalledProcessError(1,command)
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(runtime,"run_ip",ip);monkeypatch.setattr(runtime.subprocess,"run",process)
+    with pytest.raises(subprocess.CalledProcessError):runtime.ClientNetwork(Tun(),"8.8.8.8",True,[],["1.1.1.1"]).apply()
+    assert ["resolvectl","revert","pqvpn0"] in commands
+
+def test_udp_bind_failure_cleans_every_resource(monkeypatch,tmp_path):
+    class Session:
+        def __init__(self):self.wiped=False
+        def decrypt_control(self,*_):return None,b'{"server_vpn_ip":"10.8.0.1","client_vpn_ip":"10.8.0.2","prefix":24,"mtu":1380,"dns":[],"udp_port":51820}'
+        def encrypt_frame(self,*_):return b"bind"
+        def secure_wipe(self):self.wiped=True
+    session=Session();tun=Tun()
+    class Handshake:
+        def __init__(self,*_):pass
+        def initiate_handshake(self):return b"ch"
+        def process_server_hello(self,_):return b"cke"
+        def process_server_finished(self,_):return session
+    class Control:
+        closed=False
+        def settimeout(self,_):pass
+        def close(self):self.closed=True
+    control=Control()
+    class UDP:
+        closed=False
+        def bind(self,_):pass
+        def settimeout(self,_):pass
+        def sendto(self,*_):pass
+        def recvfrom(self,_):raise socket.timeout()
+        def close(self):self.closed=True
+    udp=UDP()
+    class Network:
+        restored=False
+        def apply(self):pass
+        def restore(self):self.restored=True
+    network=Network()
+    monkeypatch.setattr(Path,"read_bytes",lambda _:b"x"*1184);monkeypatch.setattr(runtime,"load_client_private",lambda _:object())
+    monkeypatch.setattr(runtime,"KEMTLSClient",Handshake);monkeypatch.setattr(runtime.socket,"create_connection",lambda *_args,**_kwargs:control)
+    monkeypatch.setattr(runtime,"send_message",lambda *_:None);monkeypatch.setattr(runtime,"recv_message",lambda _:b"record")
+    monkeypatch.setattr(runtime,"open_tun",lambda *_:tun);monkeypatch.setattr(runtime,"configure_tun",lambda *_:None)
+    monkeypatch.setattr(runtime,"ClientNetwork",lambda *_:network);monkeypatch.setattr(runtime.socket,"socket",lambda *_:udp);monkeypatch.setattr(runtime.socket,"gethostbyname",lambda _:"192.0.2.1")
+    client=runtime.VPNClient(ClientConfig())
+    with pytest.raises(socket.timeout):client.connect()
+    assert tun.closed and udp.closed and control.closed and network.restored and session.wiped
+    assert client.tun is client.udp is client.control is client.session is None
+
+def test_config_paths_resolve_from_toml_not_cwd(monkeypatch,tmp_path):
+    server_file=tmp_path/"server.toml";server_file.write_text('[server]\nserver_identity_private_key="server.key"\nserver_identity_public_key="server.pub"\nauthorized_clients_file="clients.json"\n')
+    client_file=tmp_path/"client.toml";client_file.write_text('[client]\nserver_identity_public_key="server.pub"\nclient_identity_private_key="client.key"\n')
+    monkeypatch.chdir("/");server=load_server_config(server_file);client=load_client_config(client_file)
+    assert server.server_identity_private_key==str(tmp_path/"server.key")
+    assert server.authorized_clients_file==str(tmp_path/"clients.json")
+    assert client.server_identity_public_key==str(tmp_path/"server.pub")
+    assert client.client_identity_private_key==str(tmp_path/"client.key")
+
+def test_omitted_identity_paths_resolve_beside_toml(monkeypatch,tmp_path):
+    server_file=tmp_path/'server.toml';server_file.write_text('[server]\n')
+    client_file=tmp_path/'client.toml';client_file.write_text('[client]\n')
+    monkeypatch.chdir('/')
+    server=load_server_config(server_file);client=load_client_config(client_file)
+    assert server.server_identity_private_key==str(tmp_path/'server_identity_private.key')
+    assert server.server_identity_public_key==str(tmp_path/'server_identity_public.key')
+    assert server.authorized_clients_file==str(tmp_path/'authorized_clients.json')
+    assert client.server_identity_public_key==str(tmp_path/'server_identity_public.key')
+    assert client.client_identity_private_key==str(tmp_path/'client_identity_private.key')
+import os,shutil,subprocess
+from pathlib import Path
+import pytest
+@pytest.mark.integration
+@pytest.mark.requires_root
+@pytest.mark.skipif(os.geteuid()!=0 or not os.path.exists("/dev/net/tun") or not shutil.which("ip") or not shutil.which("nft"),reason="requires root, TUN, iproute2 and nftables")
+def test_real_namespace_tunnel():
+    """Real TUN, two clients, ICMP/TCP/UDP, spoof rejection, rekey and reconnect."""
+    script=Path(__file__).with_name("namespace_vpn.sh")
+    subprocess.run([str(script)],check=True,timeout=180)
+"""Relevant TUN, MTU and authenticated-path quality tests restored for v2."""
+import os,time
+import pytest
+from vpn.network import *
+
+def open_pipe():
+    tun=TUNInterface(name="test0",mode=TUNMode.SOCKET_PIPE)
+    try:tun.open()
+    except PermissionError:pytest.skip("sandbox denies AF_UNIX socketpair")
+    return tun
+def test_tun_defaults_and_metadata():
+    tun=TUNInterface();assert tun.name=="pqvpn0" and not tun.is_open
+    custom=TUNInterface("x",1400,TUNMode.SOCKET_PIPE);assert custom.get_info()["mtu"]==1400
+def test_tun_lifecycle_and_roundtrip():
+    tun=open_pipe()
+    try:
+        with pytest.raises(RuntimeError):tun.open()
+        packet=os.urandom(64)
+        try:tun.inject(packet)
+        except PermissionError:pytest.skip("sandbox denies socketpair traffic")
+        assert tun.read()==packet;tun.write(packet);assert tun.drain()==packet
+    finally:tun.close();tun.close()
+def test_closed_tun_errors():
+    tun=TUNInterface(mode=TUNMode.SOCKET_PIPE)
+    with pytest.raises(RuntimeError):tun.read()
+    with pytest.raises(RuntimeError):tun.write(b"x")
+    with pytest.raises(RuntimeError):tun.fileno()
+@pytest.mark.parametrize("path,ipv6,expected",[(1500,False,1430),(1400,False,1330),(1280,False,1210),(1500,True,1410)])
+def test_exact_mtu_calculation(path,ipv6,expected):assert MTUMonitor(path).max_payload_size(ipv6)==expected
+def test_mtu_update_history_and_minimum():
+    monitor=MTUMonitor();monitor.update_mtu(1400);assert monitor.path_mtu==1400 and len(monitor.mtu_history)==2
+    with pytest.raises(ValueError):monitor.update_mtu(1200)
+def test_quality_metrics_jitter_loss_reset():
+    monitor=NetworkQualityMonitor(10)
+    for value in (10.,20.,10.):monitor.record_probe_sent();monitor.record_rtt(value)
+    monitor.record_probe_sent();monitor.record_loss();snapshot=monitor.snapshot()
+    assert snapshot.rtt_ms>0 and snapshot.jitter_ms>0 and snapshot.loss_rate==.25
+    monitor.reset();assert monitor.avg_rtt==monitor.loss_rate==0
+def test_quality_rolling_window():
+    monitor=NetworkQualityMonitor(3)
+    for i in range(5):monitor.record_rtt(float(i))
+    assert monitor.rtt_samples==[2.,3.,4.]

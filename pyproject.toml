@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pqvpn"
+version = "2.0.0"
+description = "Hybrid X25519 and ML-KEM-768 research VPN"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "cryptography==50.0.1",
+  "liboqs-python==0.16.0",
+]
+
+[project.optional-dependencies]
+management = [
+  "fastapi==0.141.1",
+  "uvicorn==0.52.4",
+  "websockets==17.1",
+]
+dev = [
+  "fastapi==0.141.1",
+  "uvicorn==0.52.4",
+  "websockets==17.1",
+  "pytest==9.1.1",
+  "scapy==2.7.0",
+  "psutil==7.2.2",
+  "matplotlib==3.11.1",
+  "pandas==3.0.5",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*", "crypto*", "handshake*", "vpn*"]
+namespaces = true
+
+[tool.setuptools]
+py-modules = ["benchmarks"]
+
+[tool.setuptools.package-data]
+"app" = ["frontend/index.html", "frontend/css/style.css"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+markers = [
+  "mock_pqc: uses the explicitly enabled insecure PQC test provider",
+  "native_pqc: requires native liboqs ML-KEM-768",
+  "integration: exercises Linux network integration",
+  "requires_root: requires CAP_NET_ADMIN/root",
+]
