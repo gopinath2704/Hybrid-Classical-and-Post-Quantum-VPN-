@@ -229,6 +229,32 @@ def test_doctor_ipv6_is_read_only(tmp_path,monkeypatch,capsys,policy,connected6,
     assert list(tmp_path.iterdir())==[p]
 
 
+def test_namespace_route_snapshot_ignores_only_async_kernel_link_local_routes():
+    """Ubuntu 26.04 can add veth fe80:: routes after the initial snapshot."""
+    routes='''default via 2001:db8:6::1 dev pq-c6 metric 1024 pref medium
+default via fe80::1 dev pq-c6 proto kernel metric 2048 pref medium
+2001:db8:6::/64 dev pq-c6 proto kernel metric 256 pref medium
+local 2001:db8:6::2 dev pq-c6 table local proto kernel metric 0 pref medium
+fe80::/64 dev pq-c1 proto kernel metric 256 pref medium
+local fe80::1234 dev pq-c6 table local proto kernel metric 0 pref medium
+anycast fe80:: dev pq-c6 table local proto kernel metric 0 pref medium
+fe80::/64 via fe80::1 dev pq-c6 proto static metric 77 pref medium
+local fe80::beef dev pq-c6 table local proto static metric 9 pref medium
+multicast ff00::/8 dev pq-c6 table local proto kernel metric 256 pref medium
+'''
+    filter_path=Path(__file__).with_name('meaningful_ipv6_routes.awk')
+    result=subprocess.run(['awk','-f',str(filter_path)],input=routes,text=True,
+                          capture_output=True,check=True)
+    assert result.stdout == '''default via 2001:db8:6::1 dev pq-c6 metric 1024 pref medium
+default via fe80::1 dev pq-c6 proto kernel metric 2048 pref medium
+2001:db8:6::/64 dev pq-c6 proto kernel metric 256 pref medium
+local 2001:db8:6::2 dev pq-c6 table local proto kernel metric 0 pref medium
+fe80::/64 via fe80::1 dev pq-c6 proto static metric 77 pref medium
+local fe80::beef dev pq-c6 table local proto static metric 9 pref medium
+multicast ff00::/8 dev pq-c6 table local proto kernel metric 256 pref medium
+'''
+
+
 def test_revoked_client_cannot_start_new_handshake(identities,tmp_path):
     sk,pk,csk,cpk=identities
     db=AuthorizedClients(tmp_path/'clients.json');fp=db.authorize(cpk,'alice')

@@ -21,6 +21,14 @@ wait_bounded() {
   return 1
 }
 
+snapshot_meaningful_ipv6_routes() {
+  # Ubuntu 26.04 installs kernel-generated fe80:: routes for temporary veths
+  # asynchronously. Compare all stable routing state without racing those entries.
+  ip -n "$1" -6 route show table all |
+    awk -f "$ROOT_DIR/tests/meaningful_ipv6_routes.awk" |
+    LC_ALL=C sort
+}
+
 cleanup() {
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
   for pid in "${PIDS[@]:-}"; do wait_bounded "$pid" || true; done
@@ -76,7 +84,7 @@ ip -n "$INTERNET_NS" -6 addr add 2001:db8:6::1/64 dev pq-i6 nodad
 ip -n "$INTERNET_NS" -6 addr add 2001:db8:ffff::1/128 dev lo nodad
 ip -n "$CLIENT1_NS" -6 route add default via 2001:db8:6::1
 ip netns exec "$CLIENT1_NS" ping -6 -c 1 -W 2 2001:db8:ffff::1
-ip -n "$CLIENT1_NS" -6 route show table all >"$RUN_DIR/ipv6-before"
+snapshot_meaningful_ipv6_routes "$CLIENT1_NS" >"$RUN_DIR/ipv6-before"
 
 mkdir -p "$RUN_DIR/server" "$RUN_DIR/client1" "$RUN_DIR/client2"
 cd "$ROOT_DIR"
@@ -212,7 +220,7 @@ wait_bounded "${PIDS[3]}"
 wait_bounded "${PIDS[4]}"
 ip netns exec "$CLIENT1_NS" ping -6 -c 1 -W 2 2001:db8:ffff::1
 ip netns exec "$CLIENT1_NS" curl -6 --noproxy '*' -fsS --max-time 3 'http://[2001:db8:ffff::1]:8086/' >/dev/null
-ip -n "$CLIENT1_NS" -6 route show table all >"$RUN_DIR/ipv6-after"
+snapshot_meaningful_ipv6_routes "$CLIENT1_NS" >"$RUN_DIR/ipv6-after"
 diff -u "$RUN_DIR/ipv6-before" "$RUN_DIR/ipv6-after"
 if ip netns exec "$CLIENT1_NS" nft list tables ip6 | grep -q 'pqvpn_client6_'; then
   echo 'IPv6 guard survived disconnect/SIGTERM' >&2; exit 1
