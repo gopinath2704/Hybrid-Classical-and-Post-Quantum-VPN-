@@ -348,6 +348,13 @@ def test_privileged_intermediate_symlink_is_audited(staged_privileged_tree):
     overrides[intermediate] = {4: 1001}
     with pytest.raises(ValueError, match='root-owned'):
         privileged_code_permissions(root)
+def test_client_service_unit_exists():
+    unit = Path('deploy/pqvpn-client.service').read_text()
+    assert 'app.client --service' in unit
+    assert 'CAP_NET_ADMIN' in unit
+    assert 'RuntimeDirectory=pqvpn' in unit
+
+
 """Benchmark output coverage restored with v2 sizes and overhead."""
 from benchmarks import HandshakeBenchmark,ThroughputBenchmark,PacketOverheadAnalyzer
 def test_handshake_benchmark_output(tmp_path):
@@ -359,3 +366,50 @@ def test_packet_overhead_output(tmp_path):
     assert analyzer.analyze_payload_efficiency(1400).wire_bytes_ipv4==1470
     assert (tmp_path/"packet_capture_results.json").exists() is False
     analyzer.run_all();assert (tmp_path/"packet_capture_results.json").exists()
+
+
+import vpn.doctor as doctor
+
+@pytest.mark.parametrize('version,baseline_level', [((3, 14, 7), 'PASS'), ((3, 11, 0), 'WARN')])
+def test_doctor_is_read_only_and_reports_failures(monkeypatch, tmp_path, capsys, version, baseline_level):
+    config=tmp_path/'server.toml';config.write_text('[server]\n')
+    calls=[]
+    def command(*args):
+        calls.append(args)
+        if args[0]=='sysctl':return '0'
+        if args[:3]==('ip','-j','-4'):
+            if 'default' in args:return '[{"dev":"eth0"}]'
+            return '[]'
+        return ''
+    monkeypatch.setattr(doctor,'command',command)
+    monkeypatch.setattr(doctor,'_OQS_AVAILABLE',False)
+    monkeypatch.setattr(doctor.sys,'version_info',version)
+    assert doctor.run('server',config)==1
+    output=capsys.readouterr().out
+    assert 'FAIL Native ML-KEM' in output and 'External provider/host firewall' in output
+    assert 'PASS Python minimum runtime version (3.11)' in output
+    assert f'{baseline_level} Python tested baseline: 3.14.7; other versions require fresh validation' in output
+    assert config.read_text()=='[server]\n' and list(tmp_path.iterdir())==[config]
+    assert all(not any(word in ('add','replace','delete','-w','set') for word in call) for call in calls)
+
+
+def test_missing_native_library_never_imports_downloading_binding():
+    script='''
+import ctypes,ctypes.util,builtins
+ctypes.util.find_library=lambda _:None
+def missing(*args,**kwargs):raise OSError('absent')
+ctypes.CDLL=missing
+original=builtins.__import__
+def guarded(name,*args,**kwargs):
+ if name=='oqs':raise AssertionError('binding import attempted')
+ return original(name,*args,**kwargs)
+builtins.__import__=guarded
+import crypto.hybrid_crypto as crypto
+assert not crypto._OQS_AVAILABLE
+assert 'automatic download/build is disabled' in crypto._OQS_LOAD_ERROR
+try:crypto.PQCProvider()
+except crypto.PQCUnavailableError:pass
+else:raise AssertionError('native absence did not fail closed')
+'''
+    env={**os.environ,'ALLOW_MOCK_PQC':'0'}
+    subprocess.run([sys.executable,'-c',script],env=env,check=True,capture_output=True,timeout=10)

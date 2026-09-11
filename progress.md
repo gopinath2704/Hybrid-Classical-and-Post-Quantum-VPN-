@@ -18,18 +18,18 @@ Building a **Hybrid Classical & Post-Quantum Cryptography VPN Application** comb
 
 ```text
 Hybrid-Classical-and-Post-Quantum-VPN/
-├── app/                    # FastAPI/WebSocket dashboard, HTML/inline JS and external CSS
+├── app/                    # PySide6 desktop GUI, privileged client service, and Unix domain socket IPC
 ├── benchmarks/             # Ignored output directory created by benchmark runs
 ├── config/                 # Shared server/client TOML examples; secrets ignored
 ├── crypto/                 # X25519, native ML-KEM-768 and HKDF
-├── deploy/                 # systemd unit and consolidated version provenance
+├── deploy/                 # Server/client systemd units and consolidated version provenance
 ├── docs/                   # design, deployment and historical security audit
 ├── handshake/              # Frozen authenticated v2 protocol and record layer
 ├── scripts/                # Native liboqs installer and server network lifecycle
 ├── tests/                  # Six responsibility suites plus conftest/root harness
 ├── vpn/                    # CLI/config/doctor/identity/network/runtime boundaries
 ├── constraints-tested.txt  # Complete tested transitive version pins
-├── pyproject.toml          # Core, management and development dependency groups
+├── pyproject.toml          # Core, desktop and development dependency groups
 ├── Dockerfile              # Shared server/development-client image
 └── docker-compose.yml
 ```
@@ -37,6 +37,33 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ---
 
 ## 📝 Modification Log & Project Progress
+
+### 2026-09-11 — Desktop Client Milestone 1, File Reduction & README Rewrite
+
+- **Branch**: `client/home-gui` from latest `main`.
+- **Desktop Client Milestone 1 (`app/client.py`)**:
+  - Implemented a unified desktop client architecture providing:
+    1. Unprivileged PySide6 GUI running as normal desktop user (`app.client --gui`).
+    2. Privileged background service running with `CAP_NET_ADMIN` via systemd (`app.client --service`).
+    3. Secure Unix domain socket IPC (`/run/pqvpn/client.sock`) using length-prefixed JSON framing (`<I`), peer credential authentication via `SO_PEERCRED` (limiting command access to the authorized user or root), strict message size bounds (16 KB max), concurrent command rejection, and error sanitization.
+  - GUI Home Screen displays live connection state (DISCONNECTED, CONNECTING, CONNECTED, RECONNECTING, DISCONNECTING, FAILED), real VPN IP, endpoint, latency, TX/RX byte counters, protocol transparency pills (X25519, ML-KEM-768, AES-256-GCM, Ed25519 client auth), human-readable error messages, missing configuration notices with exact paths, and single-click Connect/Disconnect actions.
+  - Privileged service manages `VPNClient` lifecycle (`vpn.runtime`), TUN allocation, route table configuration, and IPv6 leak prevention policies.
+  - Added `deploy/pqvpn-client.service` systemd unit file with security sandbox and `RuntimeDirectory=pqvpn`.
+- **Repository Simplification & File Reduction**:
+  - Removed obsolete web stack: `app/main.py`, `app/backend/api.py`, `app/backend/__init__.py`, `app/frontend/index.html`, `app/frontend/css/style.css`, and `tests/test_management.py`.
+  - Migrated non-FastAPI tests (doctor checks, native library verification) into `tests/test_deployment.py`.
+  - Replaced API-dependent runtime schema test in `tests/test_runtime.py` with `test_client_status_serialization_and_real_schema`.
+  - Added comprehensive test suite `tests/test_client_app.py` (12 test cases covering IPC framing, authorization, state transitions, missing config, and headless GUI widgets).
+  - Updated `pyproject.toml` removing FastAPI, Uvicorn, and WebSockets dependencies; added `desktop` extra for `PySide6`.
+  - Net file reduction: deleted 6 files, added 4 files (`app/client.py`, `deploy/pqvpn-client.service`, `tests/test_client_app.py`, `app/__main__.py`), keeping the repository compact and purposeful.
+- **Documentation & README Rewrite**:
+  - Rewrote `README.md` into a clean, accurate, single-source project landing page (~150 lines) detailing current capabilities, architecture, hybrid crypto primitives, quickstart, GUI usage, testing, and limitations.
+  - Updated `docs/design.md` to reflect desktop client architecture and Unix domain socket IPC.
+- **Validation**:
+  - Full test suite: **270 passed, 3 skipped** (273 collected).
+  - Native PQC marker (`-m native_pqc` with `ALLOW_MOCK_PQC=0`): **2 passed**.
+  - Shell syntax verification: all shell scripts pass `bash -n`.
+  - Python byte-compilation: all packages compile cleanly.
 
 ### 2026-09-08 — Minimal maintainable project layout
 
@@ -350,14 +377,14 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | **KEMTLS-inspired Handshake (`handshake/`)** | ✅ Completed | Custom pinned-server/authorized-client protocol, transcript binding, channel-separated AES-256-GCM records |
 | **VPN Engine (`vpn/network.py`)** | ✅ Completed | TUN and measured quality primitives; routed client/server in vpn/runtime.py |
 | **Unified VPN CLI (`vpn/cli.py`)** | ✅ Completed | Unified server and client entry points with subcommands (`vpn.cli server`, `vpn.cli client`) |
-| **Application UI (`app/`)** | ✅ Completed | Browser management and consolidated REST/WebSocket backend; optional PyWebView shell outside tested dependency baseline |
+| **Application UI (`app/`)** | ✅ Completed | Unprivileged PySide6 desktop GUI with live status/controls; privileged background service over Unix socket IPC |
 | **Benchmarks (`benchmarks.py`)** | ✅ Completed | Consolidated handshake, throughput, packet capture, and chart generation |
 | **PQC Fail-Closed Enforcement** | ✅ Completed | `PQCUnavailableError` + `ALLOW_MOCK_PQC` env + `_MockInsecurePQCProvider` w/ security warnings |
 | **In-Session Rekeying** | ✅ Completed | Dedicated control reader/rekey scheduler; existing epoch and record security preserved |
 | **UI Transparency Badges** | ✅ Completed | Configured-profile UI; measured telemetry; classical client-auth boundary |
 | **Docker Configuration** | ✅ Completed | Development/integration convenience; schema PASS, runtime routing NOT VALIDATED |
 | **Unified Documentation** | ✅ Completed | Consolidated architecture & deployment guide in `docs/design.md`, merged roadmap |
-| **Automated Test Validation** | ✅ Completed | 259 passed / 2 skipped under both pytest entrypoints; 261 collected; current evidence in latest log |
+| **Automated Test Validation** | ✅ Completed | 270 passed / 3 skipped; 273 collected; native PQC 2 passed; desktop client IPC & GUI suite |
 | **Install Native liboqs** | ✅ Completed | Current environment exposes native ML-KEM-768 and passes the isolated self-test/integration marker |
 | **2026 Security Remediation** | 🔄 In Progress | Confirmed code fixes are implemented; privileged end-to-end VPS/namespace proof remains pending |
 | **Authenticated v2 Handshake/Records** | ✅ Completed | Pinned server identity, authorized clients, directional AEAD, replay/AAD/epoch controls |

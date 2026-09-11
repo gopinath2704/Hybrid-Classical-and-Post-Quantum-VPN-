@@ -1,3 +1,4 @@
+import json
 import pytest
 from vpn.runtime import IPPool,validate_client_packet
 from vpn.config import ServerConfig,ClientConfig
@@ -264,22 +265,29 @@ def test_server_session_timeout_disconnects_client(tmp_path):
     assert not worker.is_alive()
 
 
-def test_api_exposes_runtime_failure_and_real_schema(monkeypatch):
-    import asyncio
-    from test_management import load_api
-    api = load_api(monkeypatch)
-    api.service = runtime.VPNClient(ClientConfig())
-    api.service.state, api.service.error = 'FAILED', 'control channel lost'
-    api.state.update(connection_state='CONNECTED',connected_at=time.time())
-    result = asyncio.run(api.status())
-    assert result['connection_state'] == 'FAILED'
-    assert result['error'] == 'control channel lost'
-    assert {'client_vpn_ip','epoch','network','tun_mtu','pqc_mode','tun_mode','rekey_countdown'} <= result.keys()
-    assert {'rtt_ms','jitter_ms','loss_rate'} <= result['network'].keys()
-    assert 'download_mbps' not in result and 'bytes_sent' not in result
-    page = Path('app/frontend/index.html').read_text()
-    js = page.split('<script>', 1)[1].split('</script>', 1)[0]
-    assert '/logs' not in js and 'server_id:' not in js and 'server.flag' not in js
+def test_client_status_serialization_and_real_schema():
+    from app.client import ClientStatus, ConnectionState
+    status = ClientStatus(
+        state=ConnectionState.FAILED.value,
+        error='control channel lost',
+        client_vpn_ip='10.8.0.2',
+        epoch=5,
+        rtt_ms=1.5,
+        jitter_ms=0.3,
+        loss_rate=0.01,
+        mtu=1380,
+        pqc_mode='native',
+        tun_mode='NATIVE',
+        rekey_countdown=3500.0,
+    )
+    data = json.loads(status.to_json())
+    assert data['state'] == 'FAILED'
+    assert data['error'] == 'control channel lost'
+    assert {'client_vpn_ip','epoch','rtt_ms','jitter_ms','loss_rate','mtu','pqc_mode','tun_mode','rekey_countdown'} <= data.keys()
+    # Round-trip
+    restored = ClientStatus.from_json(status.to_json())
+    assert restored.state == 'FAILED' and restored.error == 'control channel lost'
+    assert restored.epoch == 5
 
 
 def test_rate_limiter_caps_unique_sources():

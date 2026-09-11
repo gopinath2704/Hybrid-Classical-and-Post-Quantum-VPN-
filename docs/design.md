@@ -46,9 +46,10 @@ keep the client alive without PONG. Managed DNS setup is transactional and split
 only installs configured routing domains. Source rate-limit state is capped and stale
 entries are pruned on subsequent traffic.
 
-The optional browser management API has pinned dependencies separate from the daemon.
-HTTP bearer authentication issues bounded single-use telemetry tickets; the dashboard
-currently polls HTTP. See [management API](deployment.md) and the
+The desktop client (`app/client.py`) replaces the prior browser management API. A normal-user
+PySide6 GUI communicates with a privileged client service over a Unix domain socket.
+The service manages VPNClient lifecycle, TUN, routes, DNS, and IPv6 policy. The prior
+FastAPI/PyWebView management stack was removed. See the
 [validation matrix](security_audit.md#pre-vps-hardening--2026-09-07).
 
 ## Unsupported IPv6 and revocation
