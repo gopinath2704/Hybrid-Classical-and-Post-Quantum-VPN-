@@ -83,6 +83,40 @@ python3 -m venv .venv
 
 See [docs/deployment.md](docs/deployment.md) for the full server deployment guide.
 
+## Running the server
+
+### Option 1: Systemd service (Recommended for background / VM deployment)
+Install and manage the server with systemd (unit template at `deploy/pqvpn-server.service`):
+
+```bash
+# Start the server service
+sudo systemctl start pqvpn-server.service
+
+# Stop or restart the server
+sudo systemctl stop pqvpn-server.service
+sudo systemctl restart pqvpn-server.service
+
+# Check status and live logs
+systemctl status pqvpn-server.service
+journalctl -u pqvpn-server.service -f
+```
+
+### Option 2: Direct CLI execution (Foreground / Debugging)
+To run the server interactively in a terminal:
+
+```bash
+# 1. Configure firewall and NAT forwarding rules (run once per boot)
+sudo bash scripts/server-network.sh setup $(pwd)/config/server.toml
+
+# 2. Start the server daemon
+sudo .venv/bin/python -m vpn.cli server --config config/server.toml
+```
+
+To verify that the server is actively listening on TCP & UDP port `51820`:
+```bash
+ss -tulpn | grep 51820
+```
+
 ## Desktop client
 
 The GUI runs as a normal user; a privileged client service manages the VPN connection.

@@ -38,6 +38,17 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 
 ## 📝 Modification Log & Project Progress
 
+### 2026-09-12 — Ubuntu VM Server Startup & Server Management Documentation
+
+- Started and verified Ubuntu VM server instance (`192.168.8.43:51820`):
+  - Setup and enabled persistent systemd service `pqvpn-server.service` in `/etc/systemd/system/` to ensure the server automatically resumes across VM reboots.
+  - Reconciled firewall and NAT forwarding via `scripts/server-network.sh setup /home/shadowuser/pqvpn/config/server.toml`.
+  - Verified server listening on TCP and UDP `51820` and tested probe from Omarchy host.
+- Updated `README.md` with `Running the server` instructions:
+  - Added systemd management commands (`start`, `stop`, `restart`, `status`, `journalctl`).
+  - Added direct CLI execution commands (`server-network.sh setup` + `vpn.cli server`).
+  - Added port verification command (`ss -tulpn | grep 51820`).
+
 ### 2026-09-12 — Desktop GUI Milestone 2
 
 - Redesigned `app/client.py` as a premium dark desktop VPN interface with a large painted connection control, restrained state colors, live metric cards, responsive scrolling, and real Home, Servers, Security, Settings, Logs, and About navigation.
