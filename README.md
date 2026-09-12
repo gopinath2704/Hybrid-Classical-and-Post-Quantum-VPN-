@@ -16,13 +16,11 @@ A deployable research/prototype PQ-VPN implementing a KEMTLS-inspired custom pro
 | Native liboqs | 0.16.0 (source commit `5a1a854b`) |
 | Native ML-KEM marker | 2 passed |
 | Root namespace gate (Ubuntu 26.04.1) | PASS (1 passed, 261 deselected on `784419e`) |
-| Unit suite | 259 passed, 2 skipped (root/env) |
+| Desktop GUI | Milestone 2: six-page native PySide6 client |
+| Unit suite | 286 passed, 2 skipped (root/env) |
 
 **Not yet validated / pending:**
 
-- Real end-user GUI connection through the desktop client
-- Full Omarchy client → VM server validation
-- Systemd client service live testing
 - Production VPS deployment
 - Independent protocol/security review
 - Routed IPv6, kill switch, post-compromise recovery
@@ -88,6 +86,8 @@ See [docs/deployment.md](docs/deployment.md) for the full server deployment guid
 ## Desktop client
 
 The GUI runs as a normal user; a privileged client service manages the VPN connection.
+Milestone 2 provides Home, Servers, Security, read-only Settings, bounded sanitized
+Logs, and About pages while retaining the validated Unix-socket privilege boundary.
 
 ```bash
 # Install GUI dependencies

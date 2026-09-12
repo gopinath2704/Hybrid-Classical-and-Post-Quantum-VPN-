@@ -38,6 +38,16 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 
 ## 📝 Modification Log & Project Progress
 
+### 2026-09-12 — Desktop GUI Milestone 2
+
+- Redesigned `app/client.py` as a premium dark desktop VPN interface with a large painted connection control, restrained state colors, live metric cards, responsive scrolling, and real Home, Servers, Security, Settings, Logs, and About navigation.
+- Expanded the existing `STATUS` response with service-owned, read-only, non-secret profile metadata. Added only one command, `LOGS`, returning a sanitized 300-entry service event ring; framing, 16 KB bounds, `SO_PEERCRED`, socket permissions, and serialized Connect/Disconnect behavior are unchanged.
+- Added a single serialized background IPC worker so one-second status polling and actions never block the Qt GUI thread or create unbounded threads. No navigation action can connect or disconnect the VPN.
+- Security wording now distinguishes active sessions from configured capability and explicitly identifies ML-KEM-768 + X25519 server/session protection, classical Ed25519 client authentication, AES-256-GCM traffic protection, and the custom KEMTLS-inspired protocol boundary.
+- No TX/RX counters were added because the runtime does not expose trustworthy VPN-only byte telemetry. No protocol, cryptography, runtime, routing, DNS, nftables, IPv6 guard, TUN, or server behavior changed.
+- Validation: client suite **32 passed**; full suite **286 passed, 2 skipped**; native PQC marker **2 passed, 286 deselected**.
+- Static compilation, shell syntax, and whitespace checks passed. The finished application opened in the live Hyprland session as native Wayland (`xwayland: false`); no real Connect or Disconnect action was triggered during this GUI-only launch check.
+
 ### 2026-09-12 — Live End-to-End VPN Connection, GUI Wayland Validation & Clean Teardown
 
 - **Branch**: `client/home-gui`.
@@ -423,7 +433,7 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | **KEMTLS-inspired Handshake (`handshake/`)** | ✅ Completed | Custom pinned-server/authorized-client protocol, transcript binding, channel-separated AES-256-GCM records |
 | **VPN Engine (`vpn/network.py`)** | ✅ Completed | TUN and measured quality primitives; routed client/server in vpn/runtime.py |
 | **Unified VPN CLI (`vpn/cli.py`)** | ✅ Completed | Unified server and client entry points with subcommands (`vpn.cli server`, `vpn.cli client`) |
-| **Application UI (`app/`)** | ✅ Completed | Unprivileged PySide6 desktop GUI with live status/controls; privileged background service over Unix socket IPC (verified under Omarchy + Hyprland/Wayland) |
+| **Application UI (`app/`)** | ✅ Completed | Milestone 2 six-page PySide6 GUI; live state/metrics, read-only profile/security/settings, bounded logs; privileged service retained |
 | **Omarchy Desktop & Dev Modules** | ✅ Completed | PySide6 6.11.2, liboqs-python 0.16.0, scapy 2.7.0, psutil 7.2.2, matplotlib 3.11.1, pandas 3.0.5, paramiko 5.0.0 |
 | **Ubuntu VM Server Deployment** | ✅ Completed | Pinned ML-KEM-768 server keys, client authorization, firewall/forwarding setup, listening on 192.168.8.43:51820 |
 | **Benchmarks (`benchmarks.py`)** | ✅ Completed | Consolidated handshake, throughput, packet capture, and chart generation |
@@ -432,7 +442,7 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | **UI Transparency Badges** | ✅ Completed | Configured-profile UI; measured telemetry; classical client-auth boundary |
 | **Docker Configuration** | ✅ Completed | Development/integration convenience; schema PASS, runtime routing NOT VALIDATED |
 | **Unified Documentation** | ✅ Completed | Consolidated architecture & deployment guide in `docs/design.md`, merged roadmap |
-| **Automated Test Validation** | ✅ Completed | 271 passed / 2 skipped; 273 collected; native PQC 2 passed; desktop client IPC & GUI suite |
+| **Automated Test Validation** | ✅ Completed | 286 passed / 2 skipped; native PQC 2 passed; expanded desktop client IPC, state, navigation, and privacy coverage |
 | **Install Native liboqs** | ✅ Completed | Current environment exposes native ML-KEM-768 and passes the isolated self-test/integration marker |
 | **2026 Security Remediation** | ✅ Completed | Code fixes implemented, privilege boundaries enforced via SO_PEERCRED, end-to-end VM/host validation verified |
 | **Authenticated v2 Handshake/Records** | ✅ Completed | Pinned server identity, authorized clients, directional AEAD, replay/AAD/epoch controls |
