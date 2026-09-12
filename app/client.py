@@ -216,15 +216,18 @@ class ClientService:
         self._server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server_sock.bind(str(sock_path))
 
-        # Restrict socket permissions: owner read/write only
-        os.chmod(str(sock_path), 0o660)
+        # Allow local clients to connect; authorization is enforced via SO_PEERCRED
+        os.chmod(str(sock_path), 0o666)
 
         self._server_sock.listen(4)
         self._server_sock.settimeout(1.0)
 
         logger.info("Client service listening on %s", sock_path)
 
-        signal.signal(signal.SIGTERM, lambda *_: self.stop())
+        try:
+            signal.signal(signal.SIGTERM, lambda *_: self.stop())
+        except ValueError:
+            pass
 
         try:
             while self._running:
@@ -365,6 +368,8 @@ class ClientService:
                 if state in ("CONNECTING", "CONNECTED"):
                     return {"error": "already connected"}
 
+            if not self._config_valid:
+                self._validate_config()
             if not self._config_valid:
                 return {"error": self._config_error or "configuration invalid"}
 
@@ -1117,7 +1122,7 @@ def _launch_gui() -> None:
 
     # ── Application entry ──────────────────────────────────────────────
 
-    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+    os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
     app = QApplication(sys.argv)
     app.setApplicationName("PQ-VPN")
     app.setApplicationVersion(APP_VERSION)

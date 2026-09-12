@@ -23,9 +23,7 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
-config/*private.key
-config/server_identity_private.key
-config/client_identity_private.key
+config/*.key
 config/authorized_clients.json
 *.env
 
