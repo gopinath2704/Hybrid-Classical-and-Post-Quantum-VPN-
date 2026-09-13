@@ -38,6 +38,17 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 
 ## 📝 Modification Log & Project Progress
 
+### 2026-09-13 — VM Server Systemd Background Service Automation & Self-Healing
+
+- **Hardened `/etc/systemd/system/pqvpn-server.service` on Ubuntu VM (`192.168.8.43`)**:
+  - Integrated automated firewall & NAT setup directly into unit lifecycle:
+    - `ExecStartPre=+/bin/bash /home/shadowuser/pqvpn/scripts/server-network.sh setup /home/shadowuser/pqvpn/config/server.toml` (ensures nftables rules and `net.ipv4.ip_forward = 1` are automatically reconciled across VM reboots).
+    - `ExecStopPost=+/bin/bash /home/shadowuser/pqvpn/scripts/server-network.sh cleanup /home/shadowuser/pqvpn/config/server.toml` (ensures clean rule restoration upon stopping).
+  - Configured network synchronization: `After=network-online.target Wants=network-online.target`.
+  - Added self-healing restart policy: `Restart=always`, `RestartSec=3`.
+  - Enabled service to start automatically on system boot (`systemctl enable pqvpn-server.service`).
+  - Verified daemon status: `active (running)`, listening on TCP and UDP `51820`. Probed reachability from Omarchy host (`192.168.8.43:51820`).
+
 ### 2026-09-12 — Ubuntu VM Server Startup & Server Management Documentation
 
 - Started and verified Ubuntu VM server instance (`192.168.8.43:51820`):
