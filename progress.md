@@ -38,6 +38,15 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 
 ## 📝 Modification Log & Project Progress
 
+### 2026-09-13 — GUI Milestone 2 Merged to Main & Published
+
+- **Restored server config**: `rekey_interval` restored from `60` back to `3600` on Ubuntu VM (`192.168.8.43`), server restarted and verified `active (running)`.
+- **Reconnected from Omarchy client**: Confirmed `State: CONNECTED`, `Epoch: 0`, `rekey_interval: 3600` via IPC before network change.
+- **Branch `client/gui-milestone-2` merged into `main`** via `git merge --ff-only` (fast-forward, no merge commit):
+  - Files changed: `app/client.py`, `tests/test_client_app.py`, `README.md`, `progress.md` (4 files, +1707/−704 lines).
+- **Final regression**: `pytest -q` — **286 passed, 2 skipped** in 38.72s.
+- **Pushed to GitHub**: `e70de38..c2638e8  main → main`.
+
 ### 2026-09-13 — Ubuntu VM Server Rekey Interval Accelerated for Testing
 
 - **Updated Server Config (`/home/shadowuser/pqvpn/config/server.toml`) on Ubuntu VM (`192.168.8.43`)**:
