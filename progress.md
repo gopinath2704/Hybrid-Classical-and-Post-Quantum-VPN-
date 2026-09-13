@@ -38,6 +38,13 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 
 ## 📝 Modification Log & Project Progress
 
+### 2026-09-13 — Ubuntu VM Server Rekey Interval Accelerated for Testing
+
+- **Updated Server Config (`/home/shadowuser/pqvpn/config/server.toml`) on Ubuntu VM (`192.168.8.43`)**:
+  - Temporarily changed `rekey_interval` from `3600` to `60` seconds to enable observation of automated in-session rekeying within ~1 minute rather than waiting an hour.
+  - Restarted systemd service: `sudo systemctl restart pqvpn-server`.
+  - Verified daemon status: `active (running)`, listening on UDP and TCP `51820`, nftables/NAT rules reconciled.
+
 ### 2026-09-13 — VM Server Systemd Background Service Automation & Self-Healing
 
 - **Hardened `/etc/systemd/system/pqvpn-server.service` on Ubuntu VM (`192.168.8.43`)**:
