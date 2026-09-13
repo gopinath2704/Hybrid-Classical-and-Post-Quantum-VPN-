@@ -16,8 +16,8 @@ A deployable research/prototype PQ-VPN implementing a KEMTLS-inspired custom pro
 | Native liboqs | 0.16.0 (source commit `5a1a854b`) |
 | Native ML-KEM marker | 2 passed |
 | Root namespace gate (Ubuntu 26.04.1) | PASS (1 passed, 261 deselected on `784419e`) |
-| Desktop GUI | Milestone 2: six-page native PySide6 client |
-| Unit suite | 286 passed, 2 skipped (root/env) |
+| Desktop GUI | Milestone 3: managed identity, public profiles, offline enrollment |
+| Unit suite | 342 passed, 2 skipped |
 
 **Not yet validated / pending:**
 
@@ -53,6 +53,38 @@ A deployable research/prototype PQ-VPN implementing a KEMTLS-inspired custom pro
 │  hybrid handshake│
 └─────────────────┘
 ```
+
+## Normal-user onboarding
+
+```text
+Install
+  ↓
+Launch PQ-VPN
+  ↓
+Device Ed25519 identity created once by the privileged service
+  ↓
+Import server.pqvpn (public server configuration only)
+  ↓
+Export device.pqenroll (public client identity only)
+  ↓
+Administrator authorizes the request offline
+  ↓
+Select the profile and Connect
+```
+
+The GUI remains unprivileged. The service stores managed state under
+`/var/lib/pqvpn`, generates the device identity idempotently, and owns the only
+`VPNClient`. Exporting an enrollment request does **not** prove that a server has
+authorized it; authorization is confirmed only by a successful authenticated
+connection.
+
+A `.pqvpn` profile contains a version, profile ID/name, IPv4 server endpoint,
+pinned public ML-KEM-768 server identity, matching SHA-256 fingerprint, and expected
+IPv4 VPN subnet. A `.pqenroll` request contains a version, client ID, raw Ed25519
+public key encoded as Base64, matching SHA-256 fingerprint, and UTC creation time.
+Neither format permits private keys, passwords, tokens, commands, or arbitrary key
+paths. There is no URL import, server discovery, TOFU, automatic invite service, or
+Internet-facing enrollment API.
 
 ## Cryptography
 
@@ -120,21 +152,50 @@ ss -tulpn | grep 51820
 ## Desktop client
 
 The GUI runs as a normal user; a privileged client service manages the VPN connection.
-Milestone 2 provides Home, Servers, Security, read-only Settings, bounded sanitized
-Logs, and About pages while retaining the validated Unix-socket privilege boundary.
+Milestone 3 adds first-run setup, real multi-profile server management, and public
+offline enrollment while retaining Home, Servers, Security, read-only Settings,
+bounded sanitized Logs, About, and the validated Unix-socket privilege boundary.
 
 ```bash
 # Install GUI dependencies
 .venv/bin/python -m pip install 'pqvpn[desktop]'
 
-# Start the privileged client service (requires root / CAP_NET_ADMIN)
-sudo .venv/bin/python -m app.client --service --config config/client.toml
+# Start managed mode (service-owned identity/profile state)
+sudo .venv/bin/python -m app.client --service
 
 # In another terminal, launch the GUI
 .venv/bin/python -m app.client
 ```
 
 For production, use the systemd unit: `deploy/pqvpn-client.service`.
+
+The installed desktop workflow uses managed state. Development remains compatible
+through an explicit, unambiguous legacy configuration:
+
+```bash
+sudo .venv/bin/python -m app.client --service --config config/client.toml
+# or the foreground runtime
+sudo .venv/bin/python -m vpn.cli client connect --config config/client.toml
+```
+
+An explicit `--config` always selects legacy TOML mode. Omitting `--config` always
+selects managed profile/identity mode; the two sources are never merged.
+
+Create and authorize a public enrollment artifact from the CLI when needed:
+
+```bash
+python -m vpn.cli client enrollment-request \
+  --output shadow-laptop.pqenroll \
+  --client-id shadow-laptop \
+  --public-key /path/to/client_identity_public.key
+
+sudo python -m vpn.cli client authorize-request shadow-laptop.pqenroll \
+  --database /etc/pqvpn/authorized_clients.json \
+  --vpn-ip 10.8.0.9
+```
+
+See [packaging/README.md](packaging/README.md) for the Arch/Omarchy and Debian
+packaging foundation. Package builds and installation have not yet been live-validated.
 
 ## Testing
 
@@ -158,13 +219,16 @@ vpn/
   cli.py              Provisioning and runtime CLI
   config.py           TOML configuration with validation
   doctor.py           Read-only deployment diagnostics
+  enrollment.py       Strict public .pqenroll artifacts
   identity.py         Server/client identity management
   network.py          TUN, nftables, MTU, IPv6 guard
+  profiles.py         Strict .pqvpn profiles and atomic profile store
   runtime.py          VPNClient and VPNServer runtimes
 config/               Default client/server TOML
 deploy/               Systemd units, version provenance
 tests/                Pytest suite
 docs/                 Design, deployment, security audit
+packaging/            Arch, Debian, desktop entry, icon, and package service
 ```
 
 ## Documentation
@@ -181,5 +245,7 @@ docs/                 Design, deployment, security audit
 - Ed25519 client authentication is classical (not post-quantum)
 - No server enrollment API or invite codes
 - Custom protocol without independent formal review
-- Single server profile (no multi-server discovery)
+- Up to five explicitly imported profiles; no public server discovery
+- Offline administrator-approved enrollment only
+- Packaging is an initial foundation, not an installation-validation claim
 - Python cannot guarantee complete cryptographic key zeroization

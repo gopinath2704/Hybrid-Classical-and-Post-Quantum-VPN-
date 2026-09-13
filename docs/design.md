@@ -52,6 +52,72 @@ The service manages VPNClient lifecycle, TUN, routes, DNS, and IPv6 policy. The 
 FastAPI/PyWebView management stack was removed. See the
 [validation matrix](security_audit.md#pre-vps-hardening--2026-09-07).
 
+## Managed desktop onboarding
+
+Desktop Milestone 3 has two deliberately separate configuration sources:
+
+- `app.client --service --config PATH` is legacy/development mode and loads only
+  that explicit TOML file.
+- `app.client --service` is installed managed mode and loads only a selected public
+  profile plus the service-owned device identity under `/var/lib/pqvpn`.
+
+No values are merged and managed state never changes the explicit TOML workflow.
+Managed mode creates the Ed25519 device identity once under
+`/var/lib/pqvpn/identity`: the directory is mode `0700`, the private raw key is
+`0600`, and the public raw key is `0644`. Existing identities are opened without
+following symlinks, validated for type/mode/length/keypair consistency, and never
+rotated by `ensure_client_identity()`.
+
+Profiles are stored atomically and deterministically in
+`/var/lib/pqvpn/profiles/profiles.json` mode `0600`; extracted server public keys
+are mode `0644` below a mode-`0700` service directory. The store contains only
+version, exact active profile ID, and up to five public profiles. Five keeps a full
+profile list within the unchanged 16 KiB IPC frame. Duplicate IDs are rejected
+unless replacement is explicitly requested. Removing the active profile selects
+none. Import/select/remove are refused while a connection is active or changing,
+so the live `VPNClient` is never silently retargeted.
+
+### `.pqvpn` schema
+
+JSON is UTF-8, at most 8,192 bytes, rejects duplicate properties, and contains
+exactly these fields:
+
+| Field | Validation |
+|---|---|
+| `version` | integer `1` |
+| `profile_id` | 1–64 ASCII letters/digits/`.`, `_`, `-`; starts alphanumeric; no `..` |
+| `name` | 1–80 non-control characters |
+| `server_host` | IPv4 address or strict ASCII hostname, not a URL/path |
+| `server_control_port` | integer `1..65535` |
+| `server_identity_public_key` | canonical Base64 of exactly 1,184 ML-KEM-768 public-key bytes |
+| `server_identity_fingerprint` | lowercase SHA-256 hex matching those bytes |
+| `expected_vpn_subnet` | canonical IPv4 network with usable client addresses |
+
+Unknown fields—including secret, command, token, and arbitrary-path fields—are
+rejected. Parsing performs no interpolation, command execution, URL retrieval, or
+trust-on-first-use.
+
+### `.pqenroll` schema
+
+JSON is UTF-8, at most 4,096 bytes, rejects duplicate properties, and contains
+exactly `version` (`1`), a strict 1–64 character `client_id`, canonical Base64 of
+the 32-byte raw Ed25519 public key, its matching lowercase SHA-256 fingerprint,
+and a UTC `created_at` timestamp (`YYYY-MM-DDTHH:MM:SSZ`). It is public enrollment
+data only. The administrator validates it and feeds the public key to the existing
+locked, atomic `AuthorizedClients` store. Enrollment remains offline and
+administrator-approved; generating/exporting a request does not assert approval.
+
+### IPC boundary
+
+Milestone 3 adds `SETUP_STATUS`, `ENSURE_IDENTITY`, `LIST_PROFILES`,
+`IMPORT_PROFILE`, `SELECT_PROFILE`, `DELETE_PROFILE`, and
+`EXPORT_ENROLLMENT_REQUEST`. The four-byte length prefix, 16 KiB maximum,
+`SO_PEERCRED` authorization, one service-owned `VPNClient`, serialized mutations,
+and error sanitization remain. Import sends bounded profile JSON rather than a
+root-readable path. Enrollment export returns public JSON for the normal-user GUI
+to save; IPC has no generic file-write, TOML-write, command-execution, restart, or
+private-key operation.
+
 ## Unsupported IPv6 and revocation
 
 `vpn/network.py` implements client-local IPv6 policy without altering the v2 protocol.
@@ -119,8 +185,8 @@ PQVPN KEMTLS-inspired v2 is a custom protocol, not standardized KEMTLS.
 Static ML-KEM-768 authenticates the server; X25519 + ML-KEM-768 establish
 hybrid session keys. Ed25519 authenticates clients and is classical, not
 post-quantum. This is not fully post-quantum mutual authentication.
-Status: deployable research/prototype PQ-VPN. Root namespace validation and
-a real VPS/client deployment must both succeed before revising that status.
+Status: deployable research/prototype PQ-VPN. Passing automated and live validation
+does not revise the custom-protocol or assurance limitations.
 
 ## Session liveness
 
@@ -172,8 +238,8 @@ PQVPN KEMTLS-inspired v2 is a custom protocol, not standardized KEMTLS.
 Static ML-KEM-768 authenticates the server; X25519 + ML-KEM-768 establish
 hybrid session keys. Ed25519 authenticates clients and is classical, not
 post-quantum. This is not fully post-quantum mutual authentication.
-Status: deployable research/prototype PQ-VPN. Root namespace validation and
-a real VPS/client deployment must both succeed before revising that status.
+Status: deployable research/prototype PQ-VPN. Existing root and VM/client evidence
+does not revise the custom-protocol or assurance limitations.
 
 ## Session liveness
 
@@ -207,12 +273,12 @@ not a kill switch. Managed full-tunnel DNS fails setup when its resolver manager
 unavailable; `dns_mode="none"` explicitly accepts DNS leakage risk. Routed IPv6 and
 dynamic authenticated PMTU discovery remain unsupported/incomplete.
 
-Management HTTP uses a bearer; WebSocket telemetry uses bounded, 30-second,
-single-use tickets. Local configuration, private identities, and the service's
-CAP_NET_ADMIN privilege are trusted. Private keys require mode 0600/0400 and server
+The removed browser management stack is not part of the current runtime. The desktop
+GUI uses bounded local Unix-socket IPC with `SO_PEERCRED`; local configuration,
+private identities, and the service's CAP_NET_ADMIN privilege are trusted. Private
+keys require mode 0600/0400 and server
 ML-KEM keypairs are tested for consistency. These checks and passing regression/native
-tests do not substitute for independent protocol review, root namespace execution,
-or real VPS/client validation.
+and live tests do not substitute for independent protocol review or production assurance.
 
 ## IPv6 leakage and revocation boundaries
 

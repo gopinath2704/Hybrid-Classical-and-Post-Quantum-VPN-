@@ -1,0 +1,29 @@
+# Maintainer: PQ-VPN research project
+pkgname=pqvpn
+pkgver=2.0.0
+pkgrel=1
+pkgdesc='Hybrid classical and post-quantum research VPN client for Linux'
+arch=('x86_64')
+url='https://github.com/gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-'
+license=('custom')
+depends=('python>=3.14' 'python-cryptography' 'python-pyside6' 'python-liboqs=0.16.0' 'liboqs=0.16.0' 'iproute2' 'nftables')
+makedepends=('python-build' 'python-installer' 'python-wheel')
+source=("${pkgname}-${pkgver}.tar.gz")
+# Replace with the SHA-256 of the reviewed release archive before building.
+sha256sums=('REPLACE_WITH_RELEASE_ARCHIVE_SHA256')
+
+build() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  python -m installer --destdir="${pkgdir}" dist/*.whl
+  install -Dm644 packaging/common/pqvpn.desktop "${pkgdir}/usr/share/applications/pqvpn.desktop"
+  install -Dm644 packaging/common/pqvpn.svg "${pkgdir}/usr/share/icons/hicolor/scalable/apps/pqvpn.svg"
+  install -Dm644 packaging/common/pqvpn-client.service "${pkgdir}/usr/lib/systemd/system/pqvpn-client.service"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 docs/design.md "${pkgdir}/usr/share/doc/${pkgname}/design.md"
+  install -Dm644 docs/deployment.md "${pkgdir}/usr/share/doc/${pkgname}/deployment.md"
+}

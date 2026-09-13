@@ -34,3 +34,7 @@ htmlcov/
 benchmarks/results/
 
 config/*.lock
+
+# Local provisioning artifacts (public but deployment-specific trust material)
+*.pqvpn
+*.pqenroll

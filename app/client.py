@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import enum
 import json
 import logging
@@ -37,7 +38,7 @@ from pathlib import Path
 APP_VERSION = "2.0.0"
 MAX_IPC_MESSAGE = 16384
 DEFAULT_CONFIG = "/etc/pqvpn/client.toml"
-FALLBACK_CONFIG = "config/client.toml"
+DEFAULT_STATE_DIR = "/var/lib/pqvpn"
 
 # Socket paths: /run/pqvpn is created by RuntimeDirectory= in the systemd unit.
 # For development without systemd, fall back to /tmp.
@@ -112,6 +113,17 @@ class ClientStatus:
     dns_servers: list[str] = field(default_factory=list)
     configured_tun_name: str | None = None
     rekey_interval: int | None = None
+    managed_mode: bool = False
+    setup_complete: bool = True
+    identity_ready: bool = False
+    identity_fingerprint: str | None = None
+    active_profile_id: str | None = None
+    active_profile_name: str | None = None
+    connected_profile_id: str | None = None
+    connected_profile_name: str | None = None
+    profile_store_path: str | None = None
+    identity_path: str | None = None
+    profiles: list[dict] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), default=str)
@@ -179,15 +191,26 @@ class ClientService:
     """
     Privileged daemon managing VPNClient via local IPC.
 
-    Listens on a Unix domain socket and accepts STATUS / CONNECT /
-    DISCONNECT / LOGS commands from the desktop GUI.  Only one VPN
-    connection is active at a time; conflicting operations are serialized.
+    Listens on a Unix domain socket and accepts bounded lifecycle and onboarding
+    commands from the desktop GUI. Only one VPN connection is active at a time;
+    conflicting operations are serialized.
     """
 
     ALLOWED_UIDS: set[int] | None = None  # None = any local user (dev mode)
 
-    def __init__(self, config_path: str) -> None:
+    def __init__(self, config_path: str | None = None, state_dir: Path | None = None) -> None:
+        self.managed_mode = config_path is None
         self.config_path = config_path
+        self.state_dir = Path(
+            state_dir or os.environ.get("PQVPN_STATE_DIR", DEFAULT_STATE_DIR)
+        )
+        self.identity_dir = self.state_dir / "identity"
+        self.client_private_path = self.identity_dir / "client_identity_private.key"
+        self.client_public_path = self.identity_dir / "client_identity_public.key"
+        self.profile_store = None
+        if self.managed_mode:
+            from vpn.profiles import ProfileStore
+            self.profile_store = ProfileStore(self.state_dir / "profiles")
         self._vpn: object | None = None  # VPNClient instance
         self._config: object | None = None
         self._connected_at: float | None = None
@@ -201,7 +224,24 @@ class ClientService:
         self._last_failure = ""
         self._last_observed_state: str | None = None
         self._last_observed_epoch: int | None = None
+        self._identity_fingerprint: str | None = None
+        self._connected_profile_id: str | None = None
+        self._connected_profile_name: str | None = None
+        if self.managed_mode:
+            self._ensure_identity_startup()
         self._validate_config()
+
+    def _ensure_identity_startup(self) -> None:
+        try:
+            from vpn.identity import ensure_client_identity
+            self._identity_fingerprint = ensure_client_identity(
+                self.client_private_path, self.client_public_path
+            )
+            self._record_event("info", "Device identity ready")
+        except Exception as exc:
+            self._identity_fingerprint = None
+            self._config_error = sanitize_error(exc)
+            self._record_event("error", f"Device identity unavailable: {self._config_error}")
 
     def _validate_config(self) -> None:
         """Pre-validate configuration at service startup."""
@@ -209,6 +249,22 @@ class ClientService:
         self._config_error = ""
         self._config = None
         try:
+            if self.managed_mode:
+                if not self._identity_fingerprint:
+                    self._ensure_identity_startup()
+                if not self._identity_fingerprint:
+                    self._config_error = "Device identity is unavailable"
+                    return
+                profile = self.profile_store.active()
+                if profile is None:
+                    self._config_error = "Import and select a server profile"
+                    return
+                self._config = self.profile_store.client_config(
+                    profile, self.client_private_path
+                )
+                self._config_valid = True
+                self._record_event("info", f"Managed profile ready: {profile.name}")
+                return
             path = Path(self.config_path)
             if not path.exists():
                 self._config_error = f"Configuration not found: {self.config_path}"
@@ -235,6 +291,191 @@ class ClientService:
     def _get_logs(self) -> list[dict[str, str]]:
         with self._event_lock:
             return list(self._events)
+
+    @staticmethod
+    def _require_fields(msg: object, allowed: set[str], required: set[str] | None = None) -> dict:
+        if not isinstance(msg, dict):
+            raise ValueError("IPC request must be an object")
+        if set(msg) - allowed:
+            raise ValueError("IPC request contains unknown fields")
+        if required and not required.issubset(msg):
+            raise ValueError("IPC request is missing required fields")
+        if not isinstance(msg.get("command"), str) or not msg["command"]:
+            raise ValueError("IPC command must be a nonempty string")
+        return msg
+
+    def _public_profiles(self) -> tuple[list[dict], str | None]:
+        if not self.managed_mode:
+            return [], None
+        profiles = [profile.to_dict() for profile in self.profile_store.list()]
+        active = self.profile_store.active_id()
+        for item in profiles:
+            item["active"] = item["profile_id"] == active
+        return profiles, active
+
+    def _setup_status(self) -> dict:
+        if not self.managed_mode:
+            return {
+                "managed_mode": False,
+                "setup_complete": self._config_valid,
+                "identity_ready": False,
+                "profiles": [],
+                "active_profile_id": None,
+                "config_source": self.config_path,
+            }
+        from vpn.identity import client_public_identity
+        profiles, active = self._public_profiles()
+        public_key = None
+        identity_fingerprint = None
+        try:
+            public, identity_fingerprint = client_public_identity(
+                self.client_private_path, self.client_public_path
+            )
+            public_key = base64.b64encode(public).decode("ascii")
+        except Exception:
+            pass
+        return {
+            "managed_mode": True,
+            "setup_complete": bool(identity_fingerprint and active and self._config_valid),
+            "identity_ready": bool(identity_fingerprint),
+            "identity_public_key": public_key,
+            "identity_fingerprint": identity_fingerprint,
+            "profiles": profiles,
+            "active_profile_id": active,
+            "profile_store_path": str(self.profile_store.path),
+            "identity_path": str(self.identity_dir),
+        }
+
+    def _require_managed(self) -> None:
+        if not self.managed_mode:
+            raise ValueError("onboarding commands are unavailable in explicit --config mode")
+
+    def _require_profile_mutation_state(self) -> None:
+        state = getattr(self._vpn, "state", "") if self._vpn is not None else ""
+        if state in {"CONNECTING", "CONNECTED", "DISCONNECTING"}:
+            raise ValueError("disconnect before changing server profiles")
+
+    def _ensure_identity(self) -> dict:
+        self._require_managed()
+        if not self._lock.acquire(blocking=False):
+            return {"error": "operation in progress"}
+        try:
+            self._require_profile_mutation_state()
+            from vpn.identity import ensure_client_identity
+            self._identity_fingerprint = ensure_client_identity(
+                self.client_private_path, self.client_public_path
+            )
+            self._validate_config()
+            self._record_event("info", "Device identity ensured without rotation")
+            return {"identity": self._setup_status()}
+        finally:
+            self._lock.release()
+
+    def _import_profile(self, content: object, replace: object = False) -> dict:
+        self._require_managed()
+        if not isinstance(content, str):
+            raise ValueError("profile must be JSON text")
+        if type(replace) is not bool:
+            raise ValueError("replace must be boolean")
+        if not self._lock.acquire(blocking=False):
+            return {"error": "operation in progress"}
+        try:
+            self._require_profile_mutation_state()
+            from vpn.profiles import parse_profile
+            profile = parse_profile(content)
+            self.profile_store.import_profile(profile, replace=replace)
+            self._validate_config()
+            self._record_event("info", f"Server profile imported: {profile.name}")
+            return {"profile": profile.to_dict()}
+        finally:
+            self._lock.release()
+
+    def _select_profile(self, profile_id: object) -> dict:
+        self._require_managed()
+        if not isinstance(profile_id, str):
+            raise ValueError("profile_id must be a string")
+        if not self._lock.acquire(blocking=False):
+            return {"error": "operation in progress"}
+        try:
+            self._require_profile_mutation_state()
+            self.profile_store.select(profile_id)
+            self._validate_config()
+            selected = self.profile_store.get(profile_id)
+            self._last_failure = ""
+            self._record_event("info", f"Server profile selected: {selected.name}")
+            return {"selected_profile_id": profile_id}
+        finally:
+            self._lock.release()
+
+    def _delete_profile(self, profile_id: object) -> dict:
+        self._require_managed()
+        if not isinstance(profile_id, str):
+            raise ValueError("profile_id must be a string")
+        if not self._lock.acquire(blocking=False):
+            return {"error": "operation in progress"}
+        try:
+            self._require_profile_mutation_state()
+            self.profile_store.remove(profile_id)
+            self._validate_config()
+            self._last_failure = ""
+            self._record_event("info", f"Server profile removed: {profile_id}")
+            return {"removed_profile_id": profile_id}
+        finally:
+            self._lock.release()
+
+    def _export_enrollment_request(self, client_id: object) -> dict:
+        self._require_managed()
+        if not isinstance(client_id, str):
+            raise ValueError("client_id must be a string")
+        from vpn.enrollment import EnrollmentRequest
+        from vpn.identity import client_public_identity
+        public, _ = client_public_identity(self.client_private_path, self.client_public_path)
+        request = EnrollmentRequest.create(client_id, public)
+        self._record_event("info", f"Public enrollment request created for {client_id}")
+        return {"enrollment": request.to_dict(), "content": request.to_json()}
+
+    def _dispatch(self, msg: object) -> dict:
+        if not isinstance(msg, dict) or not isinstance(msg.get("command"), str):
+            raise ValueError("IPC command must be a nonempty string")
+        command = msg["command"].upper()
+        if command == "STATUS":
+            self._require_fields(msg, {"command"})
+            return {"status": asdict(self._get_status())}
+        if command == "CONNECT":
+            self._require_fields(msg, {"command"})
+            return self._do_connect()
+        if command == "DISCONNECT":
+            self._require_fields(msg, {"command"})
+            return self._do_disconnect()
+        if command == "LOGS":
+            self._require_fields(msg, {"command"})
+            return {"logs": self._get_logs()}
+        if command == "SETUP_STATUS":
+            self._require_fields(msg, {"command"})
+            return {"setup": self._setup_status()}
+        if command == "ENSURE_IDENTITY":
+            self._require_fields(msg, {"command"})
+            return self._ensure_identity()
+        if command == "LIST_PROFILES":
+            self._require_fields(msg, {"command"})
+            self._require_managed()
+            profiles, active = self._public_profiles()
+            return {"profiles": profiles, "active_profile_id": active}
+        if command == "IMPORT_PROFILE":
+            request = self._require_fields(
+                msg, {"command", "profile", "replace"}, {"profile"}
+            )
+            return self._import_profile(request["profile"], request.get("replace", False))
+        if command == "SELECT_PROFILE":
+            request = self._require_fields(msg, {"command", "profile_id"}, {"profile_id"})
+            return self._select_profile(request["profile_id"])
+        if command == "DELETE_PROFILE":
+            request = self._require_fields(msg, {"command", "profile_id"}, {"profile_id"})
+            return self._delete_profile(request["profile_id"])
+        if command == "EXPORT_ENROLLMENT_REQUEST":
+            request = self._require_fields(msg, {"command", "client_id"}, {"client_id"})
+            return self._export_enrollment_request(request["client_id"])
+        raise ValueError(f"unknown command: {command}")
 
     def _authorize_peer(self, conn: socket.socket) -> bool:
         """Check that the connecting peer is authorized."""
@@ -315,6 +556,8 @@ class ClientService:
                     pass
                 self._vpn = None
                 self._connected_at = None
+                self._connected_profile_id = None
+                self._connected_profile_name = None
         if self._server_sock:
             try:
                 self._server_sock.close()
@@ -332,22 +575,12 @@ class ClientService:
                 ipc_send(conn, {"error": "unauthorized"})
                 return
 
-            msg = ipc_recv(conn)
-            command = msg.get("command", "").upper()
-
-            if command == "STATUS":
-                ipc_send(conn, {"status": asdict(self._get_status())})
-            elif command == "CONNECT":
-                result = self._do_connect()
-                ipc_send(conn, result)
-            elif command == "DISCONNECT":
-                result = self._do_disconnect()
-                ipc_send(conn, result)
-            elif command == "LOGS":
-                ipc_send(conn, {"logs": self._get_logs()})
-            else:
-                ipc_send(conn, {"error": f"unknown command: {command}"})
-        except (ConnectionError, ValueError, json.JSONDecodeError) as exc:
+            try:
+                ipc_send(conn, self._dispatch(ipc_recv(conn)))
+            except (ValueError, json.JSONDecodeError, TypeError) as exc:
+                logger.debug("IPC request rejected: %s", exc)
+                ipc_send(conn, {"error": sanitize_error(exc) or "invalid request"})
+        except ConnectionError as exc:
             logger.debug("IPC handler error: %s", exc)
         except Exception:
             logger.exception("Unexpected IPC handler error")
@@ -360,8 +593,20 @@ class ClientService:
     def _get_status(self) -> ClientStatus:
         """Build a ClientStatus snapshot from real VPN state."""
         cfg = self._config
+        profiles: list[dict] = []
+        active_profile_id = None
+        active_profile_name = None
+        if self.managed_mode:
+            try:
+                profiles, active_profile_id = self._public_profiles()
+                active = self.profile_store.get(active_profile_id) if active_profile_id else None
+                active_profile_name = active.name if active else None
+            except Exception as exc:
+                self._config_valid = False
+                self._config_error = sanitize_error(exc)
         base = {
-            "config_path": self.config_path,
+            "config_path": (str(self.profile_store.path) if self.managed_mode
+                            else self.config_path),
             "server_host": getattr(cfg, "server_host", None),
             "server_control_port": getattr(cfg, "server_control_port", None),
             "expected_vpn_subnet": getattr(cfg, "expected_vpn_subnet", None),
@@ -372,6 +617,18 @@ class ClientService:
             "dns_mode": getattr(cfg, "dns_mode", None),
             "dns_servers": list(getattr(cfg, "dns_servers", []) or []),
             "configured_tun_name": getattr(cfg, "tun_name", None),
+            "managed_mode": self.managed_mode,
+            "setup_complete": self._config_valid,
+            "identity_ready": bool(self._identity_fingerprint) if self.managed_mode else False,
+            "identity_fingerprint": self._identity_fingerprint if self.managed_mode else None,
+            "active_profile_id": active_profile_id,
+            "active_profile_name": active_profile_name,
+            "connected_profile_id": self._connected_profile_id,
+            "connected_profile_name": self._connected_profile_name,
+            "profile_store_path": (str(self.profile_store.path)
+                                   if self.managed_mode else None),
+            "identity_path": str(self.identity_dir) if self.managed_mode else None,
+            "profiles": profiles,
         }
         if not self._config_valid:
             status = ClientStatus(
@@ -480,10 +737,20 @@ class ClientService:
             if not self._config_valid:
                 return {"error": self._config_error or "configuration invalid"}
 
-            from vpn.config import load_client_config
             from vpn.runtime import VPNClient
-
-            cfg = load_client_config(self.config_path)
+            if self.managed_mode:
+                profile = self.profile_store.active()
+                if profile is None:
+                    return {"error": "Import and select a server profile"}
+                cfg = self.profile_store.client_config(profile, self.client_private_path)
+                self._connected_profile_id = profile.profile_id
+                self._connected_profile_name = profile.name
+            else:
+                from vpn.config import load_client_config
+                cfg = load_client_config(self.config_path)
+                self._connected_profile_id = None
+                self._connected_profile_name = None
+            self._config = cfg
             self._vpn = VPNClient(cfg)
             info = self._vpn.connect()
             self._connected_at = time.monotonic()
@@ -492,7 +759,18 @@ class ClientService:
         except Exception as exc:
             self._vpn = None
             self._connected_at = None
-            self._last_failure = sanitize_error(exc)
+            raw_error = sanitize_error(exc)
+            if self.managed_mode and any(
+                phrase in raw_error.lower()
+                for phrase in ("connection closed", "connection reset", "broken pipe")
+            ):
+                raw_error = (
+                    "The selected server closed authentication. This device may not yet "
+                    "be authorized; ask its administrator to import your enrollment request."
+                )
+            self._last_failure = raw_error
+            self._connected_profile_id = None
+            self._connected_profile_name = None
             self._record_event("error", f"Connection failed: {self._last_failure}")
             return {"error": self._last_failure}
         finally:
@@ -509,6 +787,8 @@ class ClientService:
             self._vpn.disconnect()
             self._vpn = None
             self._connected_at = None
+            self._connected_profile_id = None
+            self._connected_profile_name = None
             self._last_failure = ""
             self._record_event("info", "Network restored; tunnel disconnected")
             return {"status": "disconnected"}
@@ -527,17 +807,17 @@ class ClientService:
 class IPCClient:
     """Non-privileged IPC client for communicating with the service."""
 
-    def send_command(self, command: str) -> dict:
+    def send_command(self, command: str, **fields: object) -> dict:
         """Send a single command and return the response."""
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.connect(str(_socket_path()))
-            ipc_send(sock, {"command": command})
+            ipc_send(sock, {"command": command, **fields})
             return ipc_recv(sock)
         except (ConnectionRefusedError, FileNotFoundError):
             return {"error": "Service not running. Start with: python -m app.client --service"}
         except Exception as exc:
-            return {"error": str(exc)}
+            return {"error": sanitize_error(exc)}
         finally:
             try:
                 sock.close()
@@ -569,9 +849,30 @@ class IPCClient:
             }]
         return list(resp.get("logs", []))[-300:]
 
+    def setup_status(self) -> dict:
+        return self.send_command("SETUP_STATUS")
+
+    def ensure_identity(self) -> dict:
+        return self.send_command("ENSURE_IDENTITY")
+
+    def list_profiles(self) -> dict:
+        return self.send_command("LIST_PROFILES")
+
+    def import_profile(self, content: str, *, replace: bool = False) -> dict:
+        return self.send_command("IMPORT_PROFILE", profile=content, replace=replace)
+
+    def select_profile(self, profile_id: str) -> dict:
+        return self.send_command("SELECT_PROFILE", profile_id=profile_id)
+
+    def delete_profile(self, profile_id: str) -> dict:
+        return self.send_command("DELETE_PROFILE", profile_id=profile_id)
+
+    def enrollment_request(self, client_id: str) -> dict:
+        return self.send_command("EXPORT_ENROLLMENT_REQUEST", client_id=client_id)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PYSIDE6 GUI — DESKTOP MILESTONE 2
+# PYSIDE6 GUI — DESKTOP MILESTONE 3
 # ═══════════════════════════════════════════════════════════════════════════
 
 # PySide6 remains optional for service-only deployments.  Keeping these imports
@@ -581,11 +882,14 @@ try:
     from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen
     from PySide6.QtWidgets import (
         QApplication,
+        QFileDialog,
         QFrame,
         QGridLayout,
         QHBoxLayout,
         QLabel,
+        QInputDialog,
         QMainWindow,
+        QMessageBox,
         QPlainTextEdit,
         QProgressBar,
         QPushButton,
@@ -1018,8 +1322,8 @@ if PYSIDE6_AVAILABLE:
                 self._status_pending = True
             self._queue.put(("status", None))
 
-        def request_action(self, action: str) -> None:
-            self._queue.put((action, None))
+        def request_action(self, action: str, payload: object | None = None) -> None:
+            self._queue.put((action, payload))
 
         def request_logs(self) -> None:
             self._queue.put(("logs", None))
@@ -1030,7 +1334,7 @@ if PYSIDE6_AVAILABLE:
 
         def _run(self) -> None:
             while not self._stop_event.is_set():
-                command, _ = self._queue.get()
+                command, payload = self._queue.get()
                 if command == "stop":
                     return
                 try:
@@ -1040,6 +1344,28 @@ if PYSIDE6_AVAILABLE:
                         self.logs_ready.emit(self.ipc.logs())
                     elif command in {"connect", "disconnect"}:
                         result = getattr(self.ipc, command)()
+                        self.action_finished.emit(command, result)
+                    elif command == "ensure_identity":
+                        self.action_finished.emit(command, self.ipc.ensure_identity())
+                    elif command == "import_profile":
+                        from vpn.profiles import load_profile
+                        content = load_profile(Path(str(payload))).to_json()
+                        self.action_finished.emit(command, self.ipc.import_profile(content))
+                    elif command == "select_profile":
+                        self.action_finished.emit(command, self.ipc.select_profile(str(payload)))
+                    elif command == "delete_profile":
+                        self.action_finished.emit(command, self.ipc.delete_profile(str(payload)))
+                    elif command in {"copy_enrollment", "export_enrollment"}:
+                        if command == "export_enrollment":
+                            client_id, output = payload
+                        else:
+                            client_id, output = str(payload), None
+                        result = self.ipc.enrollment_request(client_id)
+                        if output is not None and "error" not in result:
+                            from vpn.enrollment import parse_enrollment, write_enrollment
+                            request = parse_enrollment(result.get("content", ""))
+                            write_enrollment(Path(output), request)
+                            result["output"] = str(output)
                         self.action_finished.emit(command, result)
                 except Exception as exc:
                     error = {"error": sanitize_error(exc)}
@@ -1074,7 +1400,7 @@ if PYSIDE6_AVAILABLE:
     class MainWindow(QMainWindow):
         PAGE_TITLES = (
             ("Home", "Connection overview and live tunnel health"),
-            ("Servers", "Current pre-provisioned server profile"),
+            ("Servers", "Imported public server profiles"),
             ("Security", "Cryptography, network protection, and identity"),
             ("Settings", "Validated service-owned configuration (read-only)"),
             ("Logs", "Bounded, sanitized client service events"),
@@ -1091,6 +1417,7 @@ if PYSIDE6_AVAILABLE:
             self._busy = False
             self._last_status = ClientStatus()
             self._gui_events: deque[dict[str, str]] = deque(maxlen=80)
+            self._profile_signature: tuple = ()
 
             root = QWidget()
             root.setObjectName("root")
@@ -1171,6 +1498,38 @@ if PYSIDE6_AVAILABLE:
             layout = QVBoxLayout(page)
             layout.setContentsMargins(0, 2, 0, 10)
             layout.setSpacing(10)
+
+            self.onboarding_card = Card(
+                "Finish device setup",
+                "The privileged service owns identity and profiles; only public enrollment data leaves it.",
+            )
+            self.onboarding_identity = StatusRow("1. Device identity")
+            self.onboarding_profile = StatusRow("2. Server profile")
+            self.onboarding_authorization = StatusRow("3. Administrator authorization")
+            for row in (self.onboarding_identity, self.onboarding_profile,
+                        self.onboarding_authorization):
+                self.onboarding_card.body.addWidget(row)
+            onboarding_actions = QHBoxLayout()
+            self.onboarding_identity_btn = QPushButton("Ensure identity")
+            self.onboarding_identity_btn.clicked.connect(self._ensure_identity)
+            self.onboarding_import_btn = QPushButton("Import .pqvpn")
+            self.onboarding_import_btn.clicked.connect(self._choose_profile)
+            self.onboarding_copy_btn = QPushButton("Copy enrollment request")
+            self.onboarding_copy_btn.clicked.connect(self._copy_enrollment_request)
+            self.onboarding_export_btn = QPushButton("Export .pqenroll")
+            self.onboarding_export_btn.clicked.connect(self._export_enrollment_request)
+            for button in (self.onboarding_identity_btn, self.onboarding_import_btn,
+                           self.onboarding_copy_btn, self.onboarding_export_btn):
+                onboarding_actions.addWidget(button)
+            onboarding_actions.addStretch(1)
+            self.onboarding_card.body.addLayout(onboarding_actions)
+            self.onboarding_note = gui_label(
+                "Exporting a request does not mean the server has authorized this device.",
+                10, GUI_COLORS["amber"], 550,
+            )
+            self.onboarding_note.setWordWrap(True)
+            self.onboarding_card.body.addWidget(self.onboarding_note)
+            layout.addWidget(self.onboarding_card)
 
             hero = Card()
             hero.body.setContentsMargins(26, 13, 26, 14)
@@ -1268,7 +1627,27 @@ if PYSIDE6_AVAILABLE:
             layout = QVBoxLayout(page)
             layout.setContentsMargins(0, 2, 0, 10)
             layout.setSpacing(14)
-            card = Card("Configured Server", "This profile is provisioned and owned by the client service.")
+            actions = QHBoxLayout()
+            self.server_import_btn = QPushButton("Import Profile")
+            self.server_import_btn.clicked.connect(self._choose_profile)
+            self.server_refresh_btn = QPushButton("Refresh profiles")
+            self.server_refresh_btn.clicked.connect(self._poll_status)
+            actions.addWidget(self.server_import_btn)
+            actions.addWidget(self.server_refresh_btn)
+            actions.addStretch(1)
+            layout.addLayout(actions)
+
+            self.server_profiles_card = Card(
+                "Imported profiles", "Only public, strictly validated .pqvpn profiles are shown."
+            )
+            self.server_profiles_empty = gui_label(
+                "No server profiles imported.", 11, GUI_COLORS["secondary"]
+            )
+            self.server_profiles_card.body.addWidget(self.server_profiles_empty)
+            self.server_profile_widgets: list[QWidget] = []
+            layout.addWidget(self.server_profiles_card)
+
+            card = Card("Selected Server", "Profile selected for the next connection.")
             self.server_host_row = DataRow("Server host")
             self.server_port_row = DataRow("Control port")
             self.server_subnet_row = DataRow("Expected VPN subnet")
@@ -1278,11 +1657,8 @@ if PYSIDE6_AVAILABLE:
                         self.server_route_row, self.server_fp_row):
                 card.body.addWidget(row)
             buttons = QHBoxLayout()
-            self.server_refresh_btn = QPushButton("Refresh profile")
-            self.server_refresh_btn.clicked.connect(self._poll_status)
             self.server_copy_btn = QPushButton("Copy fingerprint")
             self.server_copy_btn.clicked.connect(self._copy_fingerprint)
-            buttons.addWidget(self.server_refresh_btn)
             buttons.addWidget(self.server_copy_btn)
             buttons.addStretch(1)
             card.body.addLayout(buttons)
@@ -1291,10 +1667,10 @@ if PYSIDE6_AVAILABLE:
             self.servers_setup_label.setWordWrap(True)
             self.servers_setup_label.hide()
             layout.addWidget(self.servers_setup_label)
-            note = Card("Milestone 2 scope")
+            note = Card("Selection policy")
             note.body.addWidget(gui_label(
-                "One pre-provisioned profile is shown. No discovery, geolocation, load, "
-                "enrollment, or fabricated latency data is used.",
+                "Profiles cannot be imported, selected, or removed while connected. "
+                "No discovery, geolocation, load, or fabricated latency data is used.",
                 11, GUI_COLORS["secondary"]
             ))
             layout.addWidget(note)
@@ -1329,13 +1705,27 @@ if PYSIDE6_AVAILABLE:
             layout.addWidget(network)
 
             identity = Card("Identity")
+            self.sec_client_fingerprint = DataRow("Device public fingerprint")
             self.sec_fingerprint = DataRow("Pinned server fingerprint")
             self.sec_identity_note = gui_label(
                 "Private client key material is never returned over IPC or displayed.",
                 10, GUI_COLORS["secondary"]
             )
+            identity.body.addWidget(self.sec_client_fingerprint)
             identity.body.addWidget(self.sec_fingerprint)
             identity.body.addWidget(self.sec_identity_note)
+            identity_actions = QHBoxLayout()
+            self.sec_copy_client_fp_btn = QPushButton("Copy device fingerprint")
+            self.sec_copy_client_fp_btn.clicked.connect(self._copy_client_fingerprint)
+            self.sec_copy_enrollment_btn = QPushButton("Copy enrollment request")
+            self.sec_copy_enrollment_btn.clicked.connect(self._copy_enrollment_request)
+            self.sec_export_enrollment_btn = QPushButton("Export .pqenroll")
+            self.sec_export_enrollment_btn.clicked.connect(self._export_enrollment_request)
+            for button in (self.sec_copy_client_fp_btn, self.sec_copy_enrollment_btn,
+                           self.sec_export_enrollment_btn):
+                identity_actions.addWidget(button)
+            identity_actions.addStretch(1)
+            identity.body.addLayout(identity_actions)
             layout.addWidget(identity)
             layout.addStretch(1)
             return page
@@ -1356,10 +1746,13 @@ if PYSIDE6_AVAILABLE:
             self.settings_tun = DataRow("TUN name")
             self.settings_server = DataRow("Configured server")
             self.settings_rekey = DataRow("Rekey interval")
-            self.settings_path = DataRow("Configuration path")
+            self.settings_path = DataRow("Configuration / profile store")
+            self.settings_state_path = DataRow("Identity state directory")
+            self.settings_identity = DataRow("Device public fingerprint")
             for row in (self.settings_tunnel, self.settings_ipv6, self.settings_dns_mode,
                         self.settings_dns_servers, self.settings_tun, self.settings_server,
-                        self.settings_rekey, self.settings_path):
+                        self.settings_rekey, self.settings_path, self.settings_state_path,
+                        self.settings_identity):
                 card.body.addWidget(row)
             layout.addWidget(card)
             layout.addWidget(gui_label(
@@ -1459,16 +1852,86 @@ if PYSIDE6_AVAILABLE:
             self._add_gui_event("info", f"{action.title()} requested from desktop")
             self._worker.request_action(action)
 
+        def _queue_onboarding_action(self, action: str, payload: object | None = None) -> None:
+            if self._busy:
+                return
+            self._busy = True
+            self._worker.request_action(action, payload)
+
+        def _ensure_identity(self) -> None:
+            self._queue_onboarding_action("ensure_identity")
+
+        def _choose_profile(self) -> None:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Import PQ-VPN server profile", "", "PQ-VPN Profiles (*.pqvpn)"
+            )
+            if path:
+                self._queue_onboarding_action("import_profile", path)
+
+        def _select_profile(self, profile_id: str) -> None:
+            self._queue_onboarding_action("select_profile", profile_id)
+
+        def _remove_profile(self, profile_id: str) -> None:
+            answer = QMessageBox.question(
+                self,
+                "Remove server profile",
+                f"Remove the exact profile '{profile_id}'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer == QMessageBox.Yes:
+                self._queue_onboarding_action("delete_profile", profile_id)
+
+        @staticmethod
+        def _default_client_id() -> str:
+            value = re.sub(r"[^A-Za-z0-9._-]+", "-", socket.gethostname()).strip(".-_")
+            return (value or "linux-device")[:64]
+
+        def _request_client_id(self) -> str | None:
+            value, accepted = QInputDialog.getText(
+                self, "Client enrollment", "Public client ID:",
+                text=self._default_client_id(),
+            )
+            return value if accepted else None
+
+        def _copy_enrollment_request(self) -> None:
+            client_id = self._request_client_id()
+            if client_id is not None:
+                self._queue_onboarding_action("copy_enrollment", client_id)
+
+        def _export_enrollment_request(self) -> None:
+            client_id = self._request_client_id()
+            if client_id is None:
+                return
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Export public enrollment request",
+                f"{client_id}.pqenroll", "PQ-VPN Enrollment (*.pqenroll)",
+            )
+            if path:
+                if not path.endswith(".pqenroll"):
+                    path += ".pqenroll"
+                self._queue_onboarding_action("export_enrollment", (client_id, path))
+
         def _action_finished(self, action: str, result: object) -> None:
             self._busy = False
             result = result if isinstance(result, dict) else {"error": "Invalid service response"}
             if "error" in result:
                 error = sanitize_error(result["error"])
-                values = asdict(self._last_status)
-                values.update(state=ConnectionState.FAILED.value, error=error)
-                self._render(ClientStatus(**values))
                 self._add_gui_event("error", f"{action.title()} failed: {error}")
+                if action in {"connect", "disconnect"}:
+                    values = asdict(self._last_status)
+                    values.update(state=ConnectionState.FAILED.value, error=error)
+                    self._render(ClientStatus(**values))
+                else:
+                    self.error_label.setText(error)
+                    self.error_label.show()
             else:
+                if action == "copy_enrollment":
+                    QGuiApplication.clipboard().setText(str(result.get("content", "")))
+                elif action == "export_enrollment":
+                    self._add_gui_event(
+                        "info", f"Public enrollment request exported: {result.get('output', 'selected file')}"
+                    )
                 self._add_gui_event("info", f"{action.title()} completed")
             self._worker.request_status()
             if self.pages.currentIndex() == 4:
@@ -1513,9 +1976,10 @@ if PYSIDE6_AVAILABLE:
             self.error_label.setText(error)
             self.error_label.setVisible(bool(error))
 
-            server_display = status.server_host or "—"
+            server_display = (status.connected_profile_name if connected else status.active_profile_name)
+            server_display = server_display or status.server_host or "—"
             if connected and status.connected_endpoint and status.connected_endpoint != status.server_host:
-                server_display = f"{status.server_host or 'Configured Server'} · {status.connected_endpoint}"
+                server_display = f"{server_display} · {status.connected_endpoint}"
             self.detail_server.set_value(server_display)
             self.detail_vpn_ip.set_value(status.client_vpn_ip if connected else "—")
             self.detail_uptime.set_value(format_duration(status.uptime_seconds) if connected else "—")
@@ -1538,9 +2002,36 @@ if PYSIDE6_AVAILABLE:
             )
 
             self._render_pq(status, connected)
+            self._render_onboarding(status, connected)
             self._render_servers(status)
             self._render_security(status, connected)
             self._render_settings(status, connected)
+
+        def _render_onboarding(self, status: ClientStatus, connected: bool) -> None:
+            self.onboarding_card.setVisible(status.managed_mode and not status.setup_complete)
+            self.onboarding_identity.set_status(
+                "Ready" if status.identity_ready else "Needs service setup",
+                active=status.identity_ready,
+                warning=not status.identity_ready,
+            )
+            profile_ready = bool(status.active_profile_id)
+            profile_text = (f"Selected: {status.active_profile_name or status.active_profile_id}"
+                            if profile_ready else
+                            f"{len(status.profiles)} imported · select one" if status.profiles
+                            else "Import a public .pqvpn profile")
+            self.onboarding_profile.set_status(
+                profile_text, active=profile_ready, warning=not profile_ready
+            )
+            self.onboarding_authorization.set_status(
+                "Offline administrator approval required",
+                warning=True,
+            )
+            mutations_enabled = status.managed_mode and not connected and not self._busy
+            self.onboarding_identity_btn.setEnabled(mutations_enabled and not status.identity_ready)
+            self.onboarding_import_btn.setEnabled(mutations_enabled)
+            enrollment_enabled = status.managed_mode and status.identity_ready and not self._busy
+            self.onboarding_copy_btn.setEnabled(enrollment_enabled)
+            self.onboarding_export_btn.setEnabled(enrollment_enabled)
 
         def _render_pq(self, status: ClientStatus, connected: bool) -> None:
             if connected and status.is_quantum_safe:
@@ -1597,11 +2088,85 @@ if PYSIDE6_AVAILABLE:
             self.server_route_row.set_value(routing)
             self.server_fp_row.set_value(truncate_fingerprint(status.server_fingerprint))
             self.server_copy_btn.setEnabled(bool(status.server_fingerprint))
+            signature = (status.state,) + tuple(
+                (item.get("profile_id"), item.get("name"), item.get("server_host"),
+                 item.get("server_control_port"), item.get("active"))
+                for item in status.profiles if isinstance(item, dict)
+            )
+            if signature != self._profile_signature:
+                self._profile_signature = signature
+                self._rebuild_profile_list(status.profiles, status.state)
+            mutable = status.managed_mode and status.state not in {
+                ConnectionState.CONNECTED.value,
+                ConnectionState.CONNECTING.value,
+                ConnectionState.DISCONNECTING.value,
+            }
+            self.server_import_btn.setEnabled(mutable and not self._busy)
             setup = (status.state == ConnectionState.SETUP_REQUIRED.value)
             self.servers_setup_label.setText(
                 status.error or f"Configuration required: {status.config_path or DEFAULT_CONFIG}"
             )
             self.servers_setup_label.setVisible(setup)
+
+        def _rebuild_profile_list(self, profiles: list[dict], state: str) -> None:
+            for widget in self.server_profile_widgets:
+                self.server_profiles_card.body.removeWidget(widget)
+                widget.setParent(None)
+                widget.deleteLater()
+            self.server_profile_widgets.clear()
+            valid = [item for item in profiles if isinstance(item, dict)]
+            self.server_profiles_empty.setVisible(not valid)
+            mutable = state not in {
+                ConnectionState.CONNECTED.value,
+                ConnectionState.CONNECTING.value,
+                ConnectionState.DISCONNECTING.value,
+            }
+            for item in valid:
+                profile_id = str(item.get("profile_id", ""))
+                name = sanitize_error(item.get("name", "Unnamed profile"), 80)
+                host = sanitize_error(item.get("server_host", "—"), 253)
+                port = item.get("server_control_port", "—")
+                subnet = sanitize_error(item.get("expected_vpn_subnet", "—"), 32)
+                fingerprint = sanitize_error(item.get("server_identity_fingerprint", ""), 64)
+                active = item.get("active") is True
+                block = QFrame()
+                block.setObjectName("summaryBlock")
+                body = QVBoxLayout(block)
+                body.setContentsMargins(14, 12, 14, 12)
+                title = QHBoxLayout()
+                title.addWidget(gui_label(name, 13, weight=650))
+                if active:
+                    title.addWidget(gui_label("SELECTED", 9, GUI_COLORS["green"], 700))
+                title.addStretch(1)
+                body.addLayout(title)
+                body.addWidget(gui_label(f"{host}:{port}  ·  {subnet}", 10,
+                                         GUI_COLORS["secondary"]))
+                body.addWidget(gui_label(
+                    f"Server identity: {truncate_fingerprint(fingerprint)}",
+                    10, GUI_COLORS["muted"]
+                ))
+                actions = QHBoxLayout()
+                select = QPushButton("Selected" if active else "Select")
+                select.setEnabled(mutable and not active)
+                select.clicked.connect(
+                    lambda checked=False, value=profile_id: self._select_profile(value)
+                )
+                remove = QPushButton("Remove")
+                remove.setEnabled(mutable)
+                remove.clicked.connect(
+                    lambda checked=False, value=profile_id: self._remove_profile(value)
+                )
+                copy = QPushButton("Copy profile info")
+                copy.clicked.connect(
+                    lambda checked=False, value=dict(item): self._copy_profile_info(value)
+                )
+                actions.addWidget(select)
+                actions.addWidget(remove)
+                actions.addWidget(copy)
+                actions.addStretch(1)
+                body.addLayout(actions)
+                self.server_profiles_card.body.addWidget(block)
+                self.server_profile_widgets.append(block)
 
         def _render_security(self, status: ClientStatus, connected: bool) -> None:
             if connected and status.is_quantum_safe:
@@ -1655,7 +2220,14 @@ if PYSIDE6_AVAILABLE:
                 )
             self.sec_tun.set_value(status.tun_mode if connected else "Idle")
             self.sec_mtu.set_value(status.mtu if connected and status.mtu is not None else "—")
+            self.sec_client_fingerprint.set_value(
+                truncate_fingerprint(status.identity_fingerprint)
+            )
             self.sec_fingerprint.set_value(truncate_fingerprint(status.server_fingerprint))
+            enrollment_enabled = status.managed_mode and status.identity_ready and not self._busy
+            self.sec_copy_client_fp_btn.setEnabled(bool(status.identity_fingerprint))
+            self.sec_copy_enrollment_btn.setEnabled(enrollment_enabled)
+            self.sec_export_enrollment_btn.setEnabled(enrollment_enabled)
 
         def _render_settings(self, status: ClientStatus, connected: bool) -> None:
             if status.full_tunnel is True:
@@ -1688,6 +2260,11 @@ if PYSIDE6_AVAILABLE:
                 else "Not reported"
             )
             self.settings_path.set_value(status.config_path or DEFAULT_CONFIG)
+            self.settings_state_path.set_value(status.identity_path or "Legacy explicit config")
+            self.settings_identity.set_value(
+                truncate_fingerprint(status.identity_fingerprint)
+                if status.managed_mode else "Managed identity not in use"
+            )
 
         def _set_visual_state(self, state: str) -> None:
             color = GUI_STATE_COLORS.get(state, GUI_COLORS["muted"])
@@ -1757,6 +2334,23 @@ if PYSIDE6_AVAILABLE:
             if fingerprint:
                 QGuiApplication.clipboard().setText(fingerprint)
 
+        def _copy_client_fingerprint(self) -> None:
+            value = self._last_status.identity_fingerprint
+            if value:
+                QGuiApplication.clipboard().setText(value)
+
+        def _copy_profile_info(self, profile: dict) -> None:
+            fields = (
+                ("Name", profile.get("name")),
+                ("Endpoint", f"{profile.get('server_host')}:{profile.get('server_control_port')}"),
+                ("Server fingerprint", profile.get("server_identity_fingerprint")),
+                ("Expected VPN subnet", profile.get("expected_vpn_subnet")),
+                ("Profile ID", profile.get("profile_id")),
+            )
+            QGuiApplication.clipboard().setText(
+                "\n".join(f"{name}: {sanitize_error(value, 280)}" for name, value in fields)
+            )
+
         def _render_logs(self, entries: object) -> None:
             safe_entries: list[dict[str, str]] = []
             if isinstance(entries, list):
@@ -1788,7 +2382,9 @@ if PYSIDE6_AVAILABLE:
 
 
     def _launch_gui() -> None:
-        """Launch the normal-user Milestone 2 desktop client."""
+        """Launch the normal-user desktop client."""
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            raise SystemExit("Refusing to run the PQ-VPN desktop GUI as root")
         os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
         app = QApplication(sys.argv)
         app.setApplicationName("PQ-VPN")
@@ -1825,7 +2421,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--config", type=str, default=None,
-        help=f"Client configuration path (default: {DEFAULT_CONFIG})",
+        help="Explicit legacy client TOML path; omitting it selects managed onboarding mode",
+    )
+    parser.add_argument(
+        "--state-dir", type=Path, default=None,
+        help=f"Managed service state directory (default: {DEFAULT_STATE_DIR})",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true",
@@ -1840,11 +2440,9 @@ def main() -> None:
     )
 
     if args.service:
-        config = args.config or DEFAULT_CONFIG
-        if not Path(config).exists():
-            config = FALLBACK_CONFIG
-        logger.info("Starting PQ-VPN client service (config: %s)", config)
-        service = ClientService(config)
+        source = args.config or f"managed state in {args.state_dir or DEFAULT_STATE_DIR}"
+        logger.info("Starting PQ-VPN client service (%s)", source)
+        service = ClientService(args.config, state_dir=args.state_dir)
         service.start()
     else:
         _launch_gui()

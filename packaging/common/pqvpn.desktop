@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PQ-VPN
+Comment=Hybrid classical and post-quantum research VPN client
+Exec=pqvpn-gui
+Icon=pqvpn
+Terminal=false
+Categories=Network;
+Keywords=VPN;ML-KEM;Post-Quantum;
+StartupNotify=true

@@ -1,0 +1,9 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: pqvpn
+Source: https://github.com/gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-
+
+Files: *
+Copyright: 2026 PQ-VPN contributors
+License: NOASSERTION
+ This repository does not yet contain a declared upstream license. Packaging
+ for redistribution must stop until the project owner supplies one.

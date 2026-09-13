@@ -64,6 +64,106 @@ def generate_client_identity(private_path: Path, public_path: Path) -> str:
     return fingerprint(public_raw)
 
 
+def _safe_identity_parent(path: Path) -> None:
+    path = Path(path).absolute()
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            current.mkdir(mode=0o700)
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ValueError("client identity path contains an unsafe component")
+    os.chmod(path, 0o700)
+
+
+def _atomic_new(path: Path, data: bytes, mode: int) -> None:
+    """Atomically create a file and refuse replacement of any existing entry."""
+    _safe_identity_parent(path.parent)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, path, follow_symlinks=False)
+        os.unlink(temporary)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _read_client_public(path: Path) -> bytes:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise ValueError("unable to read client public identity") from exc
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("client public identity must be a regular file")
+        raw = handle.read(33)
+    if len(raw) != 32:
+        raise ValueError("client public identity must be exactly 32 bytes")
+    return raw
+
+
+def client_public_identity(private_path: Path, public_path: Path) -> tuple[bytes, str]:
+    """Validate a client keypair and return public information only."""
+    private = load_client_private(Path(private_path))
+    expected = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    public = _read_client_public(Path(public_path))
+    if not hmac.compare_digest(expected, public):
+        raise ValueError("client public identity does not match the private identity")
+    return public, fingerprint(public)
+
+
+def ensure_client_identity(private_path: Path, public_path: Path) -> str:
+    """Create one Ed25519 identity if absent; otherwise validate without rotation."""
+    private_path, public_path = Path(private_path), Path(public_path)
+    _safe_identity_parent(private_path.parent)
+    _safe_identity_parent(public_path.parent)
+    lock_path = private_path.parent / ".client-identity.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        private_exists = private_path.exists()
+        public_exists = public_path.exists()
+        if not private_exists and public_exists:
+            raise ValueError("client identity is incomplete; private identity is missing")
+        if private_exists:
+            private = load_client_private(private_path)
+            derived = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            if not public_exists:
+                _atomic_new(public_path, derived, 0o644)
+            public, result = client_public_identity(private_path, public_path)
+            if not hmac.compare_digest(derived, public):  # defensive; helper already checks
+                raise ValueError("client identity keypair mismatch")
+            return result
+
+        private = Ed25519PrivateKey.generate()
+        private_raw = private.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+        public_raw = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        _atomic_new(private_path, private_raw, 0o600)
+        try:
+            _atomic_new(public_path, public_raw, 0o644)
+        except FileExistsError as exc:
+            raise ValueError("client identity appeared concurrently; refusing replacement") from exc
+        return fingerprint(public_raw)
+
+
 def load_client_private(path: Path) -> Ed25519PrivateKey:
     raw = read_private(path)
     if len(raw) != 32:

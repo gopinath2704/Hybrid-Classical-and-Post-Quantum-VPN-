@@ -25,9 +25,10 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ├── deploy/                 # Server/client systemd units and consolidated version provenance
 ├── docs/                   # design, deployment and historical security audit
 ├── handshake/              # Frozen authenticated v2 protocol and record layer
+├── packaging/              # Arch/Debian foundations plus shared desktop, icon, and service assets
 ├── scripts/                # Native liboqs installer and server network lifecycle
-├── tests/                  # Six responsibility suites plus conftest/root harness
-├── vpn/                    # CLI/config/doctor/identity/network/runtime boundaries
+├── tests/                  # Seven responsibility suites plus conftest/root harness
+├── vpn/                    # CLI/config/doctor/identity/profiles/enrollment/network/runtime boundaries
 ├── constraints-tested.txt  # Complete tested transitive version pins
 ├── pyproject.toml          # Core, desktop and development dependency groups
 ├── Dockerfile              # Shared server/development-client image
@@ -37,6 +38,47 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ---
 
 ## 📝 Modification Log & Project Progress
+
+### 2026-09-13 — Desktop Client Milestone 3: Secure Onboarding Foundation
+
+- **Branch/pre-flight**: created `client/onboarding-milestone-3` from clean verified
+  `main` commit `50b86e2a630cd28a3580b06bb4d1781b9b703519`; unchanged baseline
+  passed **286 passed, 2 skipped** outside the environment's local-socket sandbox.
+- **Public provisioning formats**: added strict, duplicate-property-rejecting,
+  bounded JSON `.pqvpn` server profiles and `.pqenroll` client enrollment requests.
+  Both verify key lengths and SHA-256 fingerprints and reject unknown fields; neither
+  format accepts secrets, commands, URLs, interpolation, or private-key paths.
+- **Managed identity/profile state**: added idempotent service-owned Ed25519 identity
+  creation/validation without rotation, no-follow private reads, `0600` private and
+  `0644` public modes, deterministic atomic profile storage, explicit replacement,
+  exact-ID deletion, active selection, and a five-profile bound compatible with the
+  unchanged 16 KiB IPC maximum.
+- **Narrow IPC/GUI**: extended the existing service with setup, identity, profile, and
+  public enrollment commands. Profile content crosses IPC as bounded JSON rather than
+  a privileged file path; no generic file/TOML write or private-key response exists.
+  The existing six-page GUI now has first-run setup, real imported profiles, offline
+  enrollment copy/export, public identity display, and disconnect-before-profile-change
+  policy. The normal-user GUI refuses root execution.
+- **CLI/admin flow**: added `client enrollment-request` and `client authorize-request`;
+  authorization continues through the existing locked/atomic `AuthorizedClients`
+  abstraction and does not change revocation/session semantics.
+- **Compatibility**: explicit `--config PATH` remains legacy TOML mode; omitting
+  `--config` selects managed state. Sources never merge. The frozen protocol,
+  cryptography, records, rekey, TUN, routing, firewall, DNS, IPv6, and server session
+  semantics were not modified.
+- **Packaging/docs/tests**: added conservative Arch/Omarchy and Debian foundations,
+  desktop entry/icon, managed package service, safe state directories, README/design/
+  deployment updates, exact live-validation instructions, and focused onboarding
+  regressions.
+- **Final validation**: `pytest -q` — **342 passed, 2 skipped in 39.05s**;
+  `ALLOW_MOCK_PQC=0 pytest -q -m native_pqc` — **2 passed, 342 deselected in
+  0.16s**. Compileall, all project Bash syntax plus PKGBUILD syntax, `git diff
+  --check`, `pip check`, desktop-entry validation, package systemd-unit validation,
+  and Arch `.SRCINFO` generation passed. The deploy unit parsed but its configured
+  `/opt/pqvpn/.venv/bin/python` is not installed on this source host. Wheel build
+  was unavailable because system Python lacks `setuptools.build_meta`; Debian
+  package tools are absent. Package build/install and Milestone 3 Omarchy↔Ubuntu
+  live validation remain unperformed.
 
 ### 2026-09-13 — GUI Milestone 2 Merged to Main & Published
 
@@ -457,6 +499,7 @@ transparent, honest, production-ready VPN implementation as audited and approved
 
 | Task / Module | Status | Description |
 | :--- | :---: | :--- |
+| **Desktop Client Milestone 3** | ✅ Completed | Managed identity, strict public profiles/enrollment, narrow IPC, GUI onboarding, packaging foundation, tests/docs; automated gates pass, package/live installation pending |
 | **Systemd Ownership Boundary** | ✅ Completed | Root-owned deployment model; production doctor plus 15 regressions; both pytest styles 258 passed / 2 skipped; native 2 passed; runtime gates pending |
 | **Pre-VPS Hardening Validation** | ✅ Completed | Source review complete; 245 collected; both entrypoints 243 passed / 2 skipped; native 2 passed at pinned source; provisioned doctors/static checks PASS (external firewall WARN) |
 | **IPv6 Leak Prevention** | ✅ Completed | Unit/static policy and cleanup validated; real kernel namespace enforcement pending |
@@ -471,7 +514,7 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | **KEMTLS-inspired Handshake (`handshake/`)** | ✅ Completed | Custom pinned-server/authorized-client protocol, transcript binding, channel-separated AES-256-GCM records |
 | **VPN Engine (`vpn/network.py`)** | ✅ Completed | TUN and measured quality primitives; routed client/server in vpn/runtime.py |
 | **Unified VPN CLI (`vpn/cli.py`)** | ✅ Completed | Unified server and client entry points with subcommands (`vpn.cli server`, `vpn.cli client`) |
-| **Application UI (`app/`)** | ✅ Completed | Milestone 2 six-page PySide6 GUI; live state/metrics, read-only profile/security/settings, bounded logs; privileged service retained |
+| **Application UI (`app/`)** | ✅ Completed | Milestone 3 six-page PySide6 GUI; first-run setup, real profiles, offline enrollment, live state/metrics, read-only settings, bounded logs; privileged service retained |
 | **Omarchy Desktop & Dev Modules** | ✅ Completed | PySide6 6.11.2, liboqs-python 0.16.0, scapy 2.7.0, psutil 7.2.2, matplotlib 3.11.1, pandas 3.0.5, paramiko 5.0.0 |
 | **Ubuntu VM Server Deployment** | ✅ Completed | Pinned ML-KEM-768 server keys, client authorization, firewall/forwarding setup, listening on 192.168.8.43:51820 |
 | **Benchmarks (`benchmarks.py`)** | ✅ Completed | Consolidated handshake, throughput, packet capture, and chart generation |
@@ -480,7 +523,7 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | **UI Transparency Badges** | ✅ Completed | Configured-profile UI; measured telemetry; classical client-auth boundary |
 | **Docker Configuration** | ✅ Completed | Development/integration convenience; schema PASS, runtime routing NOT VALIDATED |
 | **Unified Documentation** | ✅ Completed | Consolidated architecture & deployment guide in `docs/design.md`, merged roadmap |
-| **Automated Test Validation** | ✅ Completed | 286 passed / 2 skipped; native PQC 2 passed; expanded desktop client IPC, state, navigation, and privacy coverage |
+| **Automated Test Validation** | ✅ Completed | 342 passed / 2 skipped; native PQC 2 passed / 342 deselected; onboarding/profile/identity/enrollment/packaging regressions added |
 | **Install Native liboqs** | ✅ Completed | Current environment exposes native ML-KEM-768 and passes the isolated self-test/integration marker |
 | **2026 Security Remediation** | ✅ Completed | Code fixes implemented, privilege boundaries enforced via SO_PEERCRED, end-to-end VM/host validation verified |
 | **Authenticated v2 Handshake/Records** | ✅ Completed | Pinned server identity, authorized clients, directional AEAD, replay/AAD/epoch controls |

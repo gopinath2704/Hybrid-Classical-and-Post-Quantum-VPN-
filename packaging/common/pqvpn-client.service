@@ -1,11 +1,11 @@
 [Unit]
-Description=PQ-VPN client service (privileged backend for desktop GUI)
+Description=PQ-VPN managed client service
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/pqvpn/.venv/bin/python -m app.client --service
+ExecStart=/usr/bin/python3 -m app.client --service
 Restart=on-failure
 RestartSec=3
 AmbientCapabilities=CAP_NET_ADMIN

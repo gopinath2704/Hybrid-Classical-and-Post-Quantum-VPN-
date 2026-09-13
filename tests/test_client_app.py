@@ -492,3 +492,78 @@ class TestGUIHeadless:
         gui._on_toggle()
         gui._on_toggle()
         gui._worker.request_action.assert_called_once_with("connect")
+
+    def test_first_run_managed_onboarding_is_visible(self, window):
+        gui, _ = window
+        gui._render(ClientStatus(
+            state="SETUP_REQUIRED", managed_mode=True, setup_complete=False,
+            identity_ready=True, identity_fingerprint="a" * 64, profiles=[],
+            error="Import and select a server profile",
+        ))
+        assert not gui.onboarding_card.isHidden()
+        assert gui.onboarding_identity.status_label.text() == "Ready"
+        assert "Import" in gui.onboarding_profile.status_label.text()
+        assert not gui.action_btn.isEnabled()
+        assert gui.onboarding_copy_btn.isEnabled()
+
+    def test_completed_or_legacy_setup_hides_onboarding(self, window):
+        gui, _ = window
+        gui._render(ClientStatus(state="DISCONNECTED", managed_mode=False))
+        assert gui.onboarding_card.isHidden()
+        gui._render(ClientStatus(
+            state="DISCONNECTED", managed_mode=True, setup_complete=True,
+            identity_ready=True, active_profile_id="lab", active_profile_name="Lab",
+        ))
+        assert gui.onboarding_card.isHidden()
+        assert gui.action_btn.isEnabled()
+
+    def test_imported_and_active_profile_display_real_values(self, window, qapp):
+        from PySide6.QtWidgets import QLabel
+        gui, _ = window
+        profile = {
+            "version": 1, "profile_id": "ubuntu-lab", "name": "Ubuntu Lab",
+            "server_host": "192.168.8.43", "server_control_port": 51820,
+            "server_identity_public_key": "public-value-not-rendered",
+            "server_identity_fingerprint": "b" * 64,
+            "expected_vpn_subnet": "10.8.0.0/24", "active": True,
+        }
+        gui._render(ClientStatus(
+            state="DISCONNECTED", managed_mode=True, setup_complete=True,
+            identity_ready=True, active_profile_id="ubuntu-lab",
+            active_profile_name="Ubuntu Lab", profiles=[profile],
+            server_host="192.168.8.43", server_control_port=51820,
+            server_fingerprint="b" * 64, expected_vpn_subnet="10.8.0.0/24",
+        ))
+        qapp.processEvents()
+        visible = " ".join(
+            label.text() for label in gui.server_profiles_card.findChildren(QLabel)
+        )
+        assert "Ubuntu Lab" in visible
+        assert "192.168.8.43:51820" in visible
+        assert "SELECTED" in visible
+        assert "public-value-not-rendered" not in visible
+
+    def test_connected_profile_is_named_and_mutation_disabled(self, window):
+        gui, _ = window
+        gui._render(ClientStatus(
+            state="CONNECTED", managed_mode=True, setup_complete=True,
+            active_profile_id="lab", active_profile_name="Lab",
+            connected_profile_id="lab", connected_profile_name="Lab",
+            server_host="vpn.example", profiles=[],
+        ))
+        assert gui.detail_server.value_label.text().startswith("Lab")
+        assert not gui.server_import_btn.isEnabled()
+
+    def test_settings_and_security_show_public_identity_only(self, window):
+        gui, _ = window
+        gui._render(ClientStatus(
+            state="DISCONNECTED", managed_mode=True, setup_complete=True,
+            identity_ready=True, identity_fingerprint="c" * 64,
+            identity_path="/var/lib/pqvpn/identity",
+            profile_store_path="/var/lib/pqvpn/profiles/profiles.json",
+            config_path="/var/lib/pqvpn/profiles/profiles.json",
+        ))
+        assert "…" in gui.sec_client_fingerprint.value_label.text()
+        assert gui.settings_state_path.value_label.text() == "/var/lib/pqvpn/identity"
+        assert "private" not in gui.settings_state_path.value_label.text().lower()
+        assert gui._worker._thread.is_alive()

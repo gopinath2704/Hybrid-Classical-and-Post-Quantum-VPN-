@@ -12,8 +12,8 @@ client. Privileged namespace, systemd, and VPS results must be recorded separate
 The recorded baseline is CPython **3.14.7**, **liboqs-python 0.16.0**, native
 **liboqs 0.16.0**, Linux x86_64. `deploy/versions.txt` records the versions;
 `constraints-tested.txt` pins every Python dependency in the test environment.
-Install `.` for the daemon or CLI, `.[management]` for the optional management API,
-and `.[dev]` for validation and benchmarks. Always pass `-c constraints-tested.txt`
+Install `.` for the daemon or CLI, `.[desktop]` for the PySide6 GUI, and `.[dev]`
+for validation and benchmarks. Always pass `-c constraints-tested.txt`
 to reproduce all transitive pins. IPv6 leak blocking additionally needs nftables
 on the client. The core install excludes management, benchmark, and test packages.
 No environment is shipped. Other Python versions/platforms require fresh validation.
@@ -41,6 +41,111 @@ native liboqs fails closed without triggering its automatic download/build path.
 For a custom prefix set `OQS_INSTALL_PATH` and configure the dynamic loader before
 launch. Do not use mock PQC in deployment. Save the native build/compiler provenance
 alongside test results; version pins alone do not reproduce an operating-system image.
+
+## Desktop Milestone 3 managed installation
+
+The installed desktop client uses service-owned managed state. Install the updated
+unit, start it separately, and launch the GUI only as the normal desktop user:
+
+```bash
+sudo install -o root -g root -m 0644 deploy/pqvpn-client.service /etc/systemd/system/pqvpn-client.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now pqvpn-client.service
+systemctl status pqvpn-client.service
+
+# Run this as the logged-in user, never through sudo:
+.venv/bin/python -m app.client
+```
+
+The service creates `/var/lib/pqvpn` mode `0700`. Its raw Ed25519 private identity
+is atomically created once at mode `0600`; the public identity is `0644`. Imported
+public profiles live in a `0600` deterministic JSON store with `0644` extracted
+server public keys below service-only directories. The GUI receives only identity
+existence, the public key/fingerprint, public profiles, and public enrollment data.
+
+No trusted profile is installed by a package. Import is local-only: the normal-user
+GUI reads a chosen `.pqvpn` file with an 8 KiB bound, sends its text over the existing
+16 KiB local IPC frame, and the privileged service independently validates it. The
+application does not retrieve profiles from URLs. Profile import, selection, and
+removal are refused while connecting, connected, or disconnecting. To change server,
+disconnect first.
+
+An explicit TOML is still supported for development:
+
+```bash
+sudo .venv/bin/python -m app.client --service --config config/client.toml
+sudo .venv/bin/python -m vpn.cli client connect --config config/client.toml
+```
+
+Precedence is exact: `--config PATH` means legacy TOML only; no `--config` means
+managed identity/profile state only. The sources are not merged and the GUI cannot
+write arbitrary TOML. Full-tunnel, IPv6, and DNS policy remain read-only managed
+defaults in this milestone because adding general privileged policy mutation would
+unnecessarily broaden IPC.
+
+### Create a public server profile on the Ubuntu administrator host
+
+After independently authenticating the server public identity and endpoint, create
+the profile from the existing **public** key. This example writes no secret:
+
+```bash
+sudo /opt/pqvpn/.venv/bin/python - <<'PY'
+import base64, hashlib, json
+from pathlib import Path
+
+public = Path("/etc/pqvpn/server_identity_public.key").read_bytes()
+if len(public) != 1184:
+    raise SystemExit("expected a 1,184-byte ML-KEM-768 public key")
+profile = {
+    "version": 1,
+    "profile_id": "ubuntu-lab",
+    "name": "Ubuntu Lab Server",
+    "server_host": "192.168.8.43",
+    "server_control_port": 51820,
+    "server_identity_public_key": base64.b64encode(public).decode("ascii"),
+    "server_identity_fingerprint": hashlib.sha256(public).hexdigest(),
+    "expected_vpn_subnet": "10.8.0.0/24",
+}
+Path("/tmp/ubuntu-lab.pqvpn").write_text(
+    json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+```
+
+Transfer `/tmp/ubuntu-lab.pqvpn` over an authenticated channel. It contains the
+pinned public server identity but no private key, password, token, invite secret,
+or session material.
+
+### Offline enrollment administration
+
+The GUI can copy or export a `.pqenroll` request. Export is not authorization.
+Transfer it to the administrator over an authenticated channel, inspect its public
+client ID/fingerprint, and authorize it through the existing database abstraction:
+
+```bash
+sudo /opt/pqvpn/.venv/bin/python -m vpn.cli client authorize-request \
+  /tmp/shadow-laptop.pqenroll \
+  --database /etc/pqvpn/authorized_clients.json
+sudo chown root:pqvpn /etc/pqvpn/authorized_clients.json
+sudo chmod 0640 /etc/pqvpn/authorized_clients.json
+```
+
+The parser rejects malformed/oversized JSON, duplicate properties, non-Ed25519 key
+lengths, fingerprint mismatches, unknown fields, and invalid client IDs. No HTTP
+enrollment listener or automatic invite flow exists. Revocation semantics are
+unchanged: it applies to new sessions; active sessions continue until ordinary
+termination or server restart.
+
+### Packaging foundation
+
+`packaging/` contains an Arch/Omarchy `PKGBUILD`, Debian metadata, desktop entry,
+SVG icon, and package-oriented systemd unit. The Arch source digest is deliberately
+a blocking placeholder until a reviewed release archive exists. Debian/Ubuntu and
+Arch repositories must supply exact native liboqs/liboqs-python `0.16.0`; the app
+does not download or switch to mock PQC at runtime. Neither package has been built,
+installed, or live-validated as part of this milestone unless the final validation
+record explicitly says otherwise. The missing upstream license also blocks package
+redistribution until the owner supplies one.
 
 ## Install and provision, then diagnose
 
@@ -292,8 +397,8 @@ or unreadable entries. Ordinary development profiles explicitly report this chec
 as not applicable. It is a read-only filesystem snapshot, not runtime systemd
 validation or a complete audit of external system libraries/loader configuration.
 
-## Client Setup
-### Linux client setup
+## Legacy explicit-TOML client setup
+### Linux development client setup
 
 Status: **Deployable research/prototype PQ-VPN**. Use a separate Linux client after
 native and root-namespace validation on a disposable VM. Routed IPv6, a kill switch,
@@ -404,10 +509,10 @@ Then block UDP temporarily or restart the server: the client must fail and resto
 its prior routes and resolver state. Verify reconnect. Native DNS restoration is
 still a real-systemd-client validation gate; namespace tests do not mutate host DNS.
 
-The management API owns its own client; it cannot control a separately launched CLI
-client. Use the optional API package and [management guide](deployment.md) only
-when needed. Server authentication is ML-KEM-based; client authentication is classical
-Ed25519, with hybrid X25519 + ML-KEM session establishment.
+The desktop service owns the one GUI-controlled client; the explicit foreground CLI
+is a separate development workflow and must not run concurrently with it. Server
+authentication is ML-KEM-based; client authentication is classical Ed25519, with
+hybrid X25519 + ML-KEM session establishment.
 
 ## Current validation record
 
@@ -419,61 +524,124 @@ hostname and provisioned subnet before connecting. Omitted identity path fields 
 the standard filenames beside the TOML, just like the explicit example paths.
 
 The CLI dependencies are declared in `pyproject.toml` and pinned by the tested
-constraints. Browser management is optional (`.[management]`); the
-PyWebView desktop shell is separately installed and is not part of the validated
-baseline. The Docker development profile lacks a running DNS manager by default;
+constraints. The removed browser management/PyWebView stack is not part of the
+current application. The Docker development profile lacks a running DNS manager by default;
 its full-tunnel managed DNS must fail safely until the operator supplies one or
 explicitly opts into unmanaged DNS. Root/TUN integration and real Linux-client DNS
 restoration remain pending.
 
-## Management API
-### Management API v2
+## Removed browser management stack
 
-Bearer-authenticated POST `/api/v1/vpn/connect?config=config/client.toml` connects
-using an operator-provisioned profile (including its identity pin and client key).
-The dashboard uses the default profile. It does not create a VPN server or accept
-host/port overrides. GET `/api/v1/vpn/servers` lists that configured profile with
-`id`, `name`, `host`, `port`; there are no location or flag fields.
+FastAPI, WebSocket telemetry tickets, PyWebView, and the browser dashboard were
+removed before Desktop Milestone 2. They are not supported installation options and
+must not be reintroduced for enrollment. Current management is the bounded local
+Unix-socket desktop IPC described in `docs/design.md`.
 
-Connect returns `status: connected` plus the same telemetry object as GET
-`/api/v1/vpn/status` and `/ws/telemetry`:
+## Milestone 3 live validation: Omarchy client + Ubuntu VM
 
-- `connection_state`: DISCONNECTED, CONNECTING, CONNECTED, FAILED (ERROR on API setup failure)
-- `error`: operational failure text, without handshake payloads
-- `client_vpn_ip`, `epoch`, `tun_mtu`, `tun_mode`: null when inactive
-- `pqc_mode`, `is_quantum_safe`: provider posture; this does not assert PQ client authentication
-- `uptime_seconds`, `rekey_countdown` (seconds, null when disabled/inactive)
-- `network`: measured `rtt_ms`, `jitter_ms`, `loss_rate` (0–1), probe counts and timestamp
+This is an operator-run plan, not a completed result. It intentionally preserves
+the previous managed state as a timestamped backup and does not change protocol,
+firewall, DNS, or server policy automatically.
 
-RTT/jitter are unavailable until a probe returns. Loss measures expired probes.
-No bandwidth or byte counters are exposed because they are not measured.
-The dashboard polls status, displays permanent runtime failures, and permits retry.
-There is no `/logs` endpoint or activity-log UI.
+On the Ubuntu VM, first create `/tmp/ubuntu-lab.pqvpn` with the public-only profile
+command above. On the Omarchy client, install the reviewed source/venv and updated
+unit, then begin from no managed identity or profiles:
 
-## Installation and telemetry tickets
+```bash
+sudo systemctl stop pqvpn-client.service
+if sudo test -e /var/lib/pqvpn; then
+  sudo mv /var/lib/pqvpn "/var/lib/pqvpn.m3-backup.$(date +%Y%m%d%H%M%S)"
+fi
+sudo systemctl daemon-reload
+sudo systemctl start pqvpn-client.service
+sudo systemctl status --no-pager pqvpn-client.service
+```
 
-Install `.[management]` with the tested constraints after native liboqs.
-Run `python -m app.main --cli` from the repository root with a configured
-`PQVPN_MANAGEMENT_TOKEN`. The supported browser dashboard polls authenticated HTTP;
-PyWebView is an optional, separately installed and unvalidated desktop dependency.
-The WebSocket implementation is consolidated in `app/backend/api.py`.
+Launch `PQ-VPN` from the desktop launcher as the normal user. Confirm the setup
+card reports `Device identity: Ready`; copy and record the displayed public
+fingerprint. Stop and start the service once and confirm that fingerprint is
+unchanged before continuing.
 
-To use WebSocket telemetry:
+Transfer and import the profile:
 
-1. Send an authenticated HTTP `POST /api/v1/ws-ticket` with `Authorization: Bearer ...`.
-2. Read `{ "ticket": "...", "expires_in": 30 }` and connect to `/ws/telemetry?ticket=...`
-   with an allowed browser Origin. Use `wss` behind the configured TLS proxy remotely.
-3. Obtain a fresh ticket for every connection attempt; reuse, expiry, random tickets,
-   and long-lived bearer URL tokens are rejected with close code 4401.
+```bash
+mkdir -p "$HOME/Downloads"
+scp shadowuser@192.168.8.43:/tmp/ubuntu-lab.pqvpn "$HOME/Downloads/"
+```
 
-Tickets contain 32 cryptographically random bytes encoded with URL-safe base64.
-Consumption pops the entry before the first await, so it is single-use within the
-ASGI event loop. Expiration uses monotonic time; issuance removes expired entries
-and limits outstanding tickets to 256 (HTTP 429 when full). Storage is process-local:
-use one management worker, or route issuance and upgrade to the same worker. A ticket
-opens read-only telemetry and cannot authorize HTTP connect/disconnect/rekey actions.
-Do not log ticket query strings. Remote management requires explicit HTTPS CORS
-origins, a strong random bearer token and a TLS reverse proxy; Uvicorn stays loopback.
+In the GUI choose **Servers → Import Profile**, select
+`$HOME/Downloads/ubuntu-lab.pqvpn`, verify the exact endpoint, server fingerprint,
+and subnet, then select `Ubuntu Lab Server`. Copy/export an enrollment request with
+client ID `shadow-laptop`; do not interpret export as authorization.
+
+Transfer the public request to the VM and authorize it there:
+
+```bash
+scp "$HOME/Downloads/shadow-laptop.pqenroll" shadowuser@192.168.8.43:/tmp/
+ssh -t shadowuser@192.168.8.43 \
+  'sudo /opt/pqvpn/.venv/bin/python -m vpn.cli client authorize-request /tmp/shadow-laptop.pqenroll --database /etc/pqvpn/authorized_clients.json && sudo chown root:pqvpn /etc/pqvpn/authorized_clients.json && sudo chmod 0640 /etc/pqvpn/authorized_clients.json'
+```
+
+Before clicking Connect, capture the client baseline:
+
+```bash
+ip -4 route show
+ip -6 route show table all
+resolvectl status
+```
+
+Click Connect and verify the GUI reports `CONNECTED`. Then run:
+
+```bash
+python - <<'PY'
+from dataclasses import asdict
+from pprint import pprint
+from app.client import IPCClient
+pprint(asdict(IPCClient().status()))
+PY
+ip -details link show pqvpn0
+ip -4 address show dev pqvpn0
+ping -c 4 10.8.0.1
+ip -4 route show
+resolvectl status pqvpn0
+sudo nft list tables | grep pqvpn_client6
+timeout 5 ping -6 -c 1 2606:4700:4700::1111 && echo 'UNEXPECTED: IPv6 escaped' || echo 'Expected: IPv6 blocked'
+```
+
+The status evidence must show the expected client VPN IP/subnet, selected server
+fingerprint, `pqc_mode: native_liboqs`, `is_quantum_safe: true`, epoch, and live
+profile name. The GUI Security page must identify active ML-KEM-768 + X25519
+server/session protection, classical Ed25519 client authentication, and
+AES-256-GCM. Routes must include `0.0.0.0/1` and `128.0.0.0/1` through `pqvpn0` plus
+the physical bypass to the server. DNS must be attached to `pqvpn0` with routing
+domain `~.`, and the owned IPv6 guard must exist.
+
+Click Disconnect and verify cleanup:
+
+```bash
+ip link show pqvpn0 && echo 'UNEXPECTED: pqvpn0 remains' || echo 'Expected: TUN removed'
+ip -4 route show
+ip -6 route show table all
+resolvectl status
+sudo nft list tables | grep pqvpn_client6 && echo 'UNEXPECTED: IPv6 guard remains' || echo 'Expected: guard removed'
+```
+
+Reconnect from the GUI, confirm `CONNECTED`, and confirm the device fingerprint is
+identical to the one recorded before the service restart. For automatic rekey,
+keep gateway traffic running across the normal 3,600-second countdown and poll
+status until epoch advances; do not silently shorten deployment policy:
+
+```bash
+ping 10.8.0.1
+# In another terminal, poll without changing service state:
+watch -n 5 'python -c "from app.client import IPCClient; s=IPCClient().status(); print(s.state, s.epoch, s.rekey_countdown, s.pqc_mode)"'
+```
+
+Record uninterrupted ping plus the epoch transition (for example `0 → 1`). Then
+disconnect and repeat the cleanup checks. If an administrator explicitly chooses
+an accelerated rekey test, restore `rekey_interval = 3600` and restart the server
+afterward. Until this whole sequence is performed and recorded, Milestone 3 live
+validation remains **not performed**.
 
 ## Pre-VPS Validation Handoff
 ### Pre-VPS validation handoff

@@ -25,6 +25,10 @@ dev = [
   "pandas==3.0.5",
 ]
 
+[project.scripts]
+pqvpn = "vpn.cli:main"
+pqvpn-gui = "app.client:main"
+
 [tool.setuptools.packages.find]
 include = ["app*", "crypto*", "handshake*", "vpn*"]
 namespaces = true
