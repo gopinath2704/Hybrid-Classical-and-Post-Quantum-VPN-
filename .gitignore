@@ -18,6 +18,16 @@ build/
 dist/
 *.egg-info/
 
+# Local Arch makepkg outputs
+packaging/arch/*.pkg.tar.*
+packaging/arch/*.tar.gz
+packaging/arch/src/
+packaging/arch/pkg/
+packaging/arch/*/*.pkg.tar.*
+packaging/arch/*/*.tar.gz
+packaging/arch/*/src/
+packaging/arch/*/pkg/
+
 # IDE & OS
 .vscode/
 .idea/

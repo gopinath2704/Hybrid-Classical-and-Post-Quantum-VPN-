@@ -431,6 +431,7 @@ def test_packaging_foundation_has_safe_launcher_and_managed_service():
     root = Path(__file__).parents[1]
     desktop = (root / "packaging/common/pqvpn.desktop").read_text()
     service = (root / "packaging/common/pqvpn-client.service").read_text()
+    deploy_service = (root / "deploy/pqvpn-client.service").read_text()
     arch = (root / "packaging/arch/PKGBUILD").read_text()
     liboqs_arch = (root / "packaging/arch/liboqs-pqvpn/PKGBUILD").read_text()
     python_oqs_arch = (
@@ -443,6 +444,11 @@ def test_packaging_foundation_has_safe_launcher_and_managed_service():
     debian = (root / "packaging/deb/debian/control").read_text()
     assert "Exec=pqvpn-gui" in desktop and "sudo" not in desktop.lower()
     assert "--service" in service and "--config" not in service
+    assert "ExecStart=/usr/bin/python3 -s -m app.client --service" in service
+    assert (
+        "ExecStart=/opt/pqvpn/.venv/bin/python -s -m app.client --service"
+        in deploy_service
+    )
     assert "StateDirectory=pqvpn" in service and "/var/lib/pqvpn" in service
     for metadata in (arch, debian):
         assert "0.16.0" in metadata
@@ -496,7 +502,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
         check=True,
     )
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    assert digest == "9af81d16968225f507df2e429155376214c66259b19c0b9728b741d629d7a711"
+    assert digest == "d791b49894214253bba52395e06b2745ce946bab80418f46148c13768d69ba1a"
     assert digest in (root / "packaging/arch/PKGBUILD").read_text()
 
     with tarfile.open(archive, "r:gz") as source:

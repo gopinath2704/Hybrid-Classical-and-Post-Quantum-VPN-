@@ -72,7 +72,7 @@ git archive --format=tar.gz --mtime=2026-09-14T00:00:00Z \
   app benchmarks.py crypto handshake vpn pyproject.toml README.md \
   docs/design.md docs/deployment.md packaging/common
 printf '%s  %s\n' \
-  9af81d16968225f507df2e429155376214c66259b19c0b9728b741d629d7a711 \
+  d791b49894214253bba52395e06b2745ce946bab80418f46148c13768d69ba1a \
   packaging/arch/pqvpn-2.0.0.tar.gz | sha256sum --check -
 (cd packaging/arch && makepkg --cleanbuild --syncdeps)
 ```
@@ -84,8 +84,9 @@ only committed objects and produces the required
 untracked keys, or user/system state. If a later commit changes any allowlisted
 input, recreate the archive, run `(cd packaging/arch && updpkgsums)`, and review
 and commit the resulting real checksum before building. Never substitute `SKIP`.
-The packaged command launchers use Python's `-s` mode, so an invoking user's
-`~/.local` site-packages cannot shadow the Pacman-managed wrapper.
+The packaged command launchers and privileged client service use Python's `-s`
+mode, so an invoking user's `~/.local` site-packages cannot shadow the
+Pacman-managed wrapper.
 
 ## Debian / Ubuntu 26.04-class
 

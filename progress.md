@@ -42,6 +42,22 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 
 ## 📝 Modification Log & Project Progress
 
+### 2026-09-14 — Milestone 3 Privileged Client User-Site Isolation
+
+- **Systemd launch hardening**: added Python's `-s` flag to both maintained
+  privileged client units while preserving their interpreter paths, privileges,
+  capabilities, sandboxing, IPC, and VPN behavior. Packaging regressions now
+  assert the exact hardened command in each unit.
+- **Deterministic source update**: regenerated the allowlisted committed-source
+  archive after the packaged service change and recorded SHA-256
+  `d791b49894214253bba52395e06b2745ce946bab80418f46148c13768d69ba1a`.
+  Added narrow ignores for local makepkg archives and `src/`/`pkg/` trees so
+  live-validation artifacts remain untracked and are never packaged.
+- **Validation**: full suite **343 passed, 2 skipped in 39.01s** outside the
+  local-socket sandbox; native marker **2 passed, 343 deselected in 0.16s**.
+  The PKGBUILD syntax, deterministic archive checksum, and Git whitespace gates
+  passed without installing or removing any package.
+
 ### 2026-09-14 — Milestone 3 Arch/Omarchy Packaging Reproducibility Fix
 
 - **Package-managed PQC dependencies**: added `liboqs-pqvpn` and
@@ -534,7 +550,7 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | Task / Module | Status | Description |
 | :--- | :---: | :--- |
 | **Desktop Client Milestone 3** | ✅ Completed | Managed identity, strict public profiles/enrollment, narrow IPC, GUI onboarding, package-managed Arch dependency definitions, tests/docs; automated gates pass, manual package/live installation pending |
-| **Arch / Omarchy Packaging** | ✅ Completed | Pinned checksum-verified liboqs/Python packages and deterministic app archive; native package build and staged wrapper import pass; manual Pacman install chain pending |
+| **Arch / Omarchy Packaging** | ✅ Completed | Pinned checksum-verified liboqs/Python packages, deterministic app archive, and Python `-s` isolation in both client units; manual Pacman install chain pending |
 | **Systemd Ownership Boundary** | ✅ Completed | Root-owned deployment model; production doctor plus 15 regressions; both pytest styles 258 passed / 2 skipped; native 2 passed; runtime gates pending |
 | **Pre-VPS Hardening Validation** | ✅ Completed | Source review complete; 245 collected; both entrypoints 243 passed / 2 skipped; native 2 passed at pinned source; provisioned doctors/static checks PASS (external firewall WARN) |
 | **IPv6 Leak Prevention** | ✅ Completed | Unit/static policy and cleanup validated; real kernel namespace enforcement pending |

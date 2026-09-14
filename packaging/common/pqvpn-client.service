@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -m app.client --service
+ExecStart=/usr/bin/python3 -s -m app.client --service
 Restart=on-failure
 RestartSec=3
 AmbientCapabilities=CAP_NET_ADMIN

@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/pqvpn/.venv/bin/python -m app.client --service
+ExecStart=/opt/pqvpn/.venv/bin/python -s -m app.client --service
 Restart=on-failure
 RestartSec=3
 AmbientCapabilities=CAP_NET_ADMIN
