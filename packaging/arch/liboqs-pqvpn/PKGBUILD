@@ -1,0 +1,40 @@
+# Maintainer: PQ-VPN research project
+pkgname=liboqs-pqvpn
+pkgver=0.16.0
+pkgrel=1
+pkgdesc='Pinned Open Quantum Safe post-quantum cryptography library for PQ-VPN'
+arch=('x86_64')
+url='https://github.com/open-quantum-safe/liboqs'
+license=('MIT')
+depends=('glibc' 'gcc-libs' 'openssl')
+makedepends=('cmake' 'ninja')
+_commit=5a1a854b0dc9f2141bdc771c555ee60c37950183
+source=("liboqs-${pkgver}-${_commit}.tar.gz::https://github.com/open-quantum-safe/liboqs/archive/${_commit}.tar.gz")
+sha256sums=('83c6e6cff490638312e1e20ed5de593fb5d7bfab162235f6238f519d6a1feafb')
+
+build() {
+  cmake \
+    -S "liboqs-${_commit}" \
+    -B build \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=None \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DBUILD_SHARED_LIBS=ON \
+    -DOQS_BUILD_ONLY_LIB=ON \
+    -DOQS_DIST_BUILD=ON
+  cmake --build build
+}
+
+check() {
+  test -L build/lib/liboqs.so
+  test -L build/lib/liboqs.so.9
+  test -f build/lib/liboqs.so.0.16.0
+  readelf -d build/lib/liboqs.so.0.16.0 | grep -Fq 'Library soname: [liboqs.so.9]'
+}
+
+package() {
+  DESTDIR="${pkgdir}" cmake --install build
+  install -Dm644 "liboqs-${_commit}/LICENSE.txt" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE.txt"
+}

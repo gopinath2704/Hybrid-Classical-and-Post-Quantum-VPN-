@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
+import re
 import socket
 import stat
+import subprocess
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -428,6 +432,14 @@ def test_packaging_foundation_has_safe_launcher_and_managed_service():
     desktop = (root / "packaging/common/pqvpn.desktop").read_text()
     service = (root / "packaging/common/pqvpn-client.service").read_text()
     arch = (root / "packaging/arch/PKGBUILD").read_text()
+    liboqs_arch = (root / "packaging/arch/liboqs-pqvpn/PKGBUILD").read_text()
+    python_oqs_arch = (
+        root / "packaging/arch/python-liboqs-pqvpn/PKGBUILD"
+    ).read_text()
+    no_download_patch = (
+        root
+        / "packaging/arch/python-liboqs-pqvpn/disable-runtime-liboqs-download.patch"
+    ).read_text()
     debian = (root / "packaging/deb/debian/control").read_text()
     assert "Exec=pqvpn-gui" in desktop and "sudo" not in desktop.lower()
     assert "--service" in service and "--config" not in service
@@ -435,16 +447,89 @@ def test_packaging_foundation_has_safe_launcher_and_managed_service():
     for metadata in (arch, debian):
         assert "0.16.0" in metadata
         assert "mock" not in metadata.lower()
-    assert "REPLACE_WITH_RELEASE_ARCHIVE_SHA256" in arch
+    assert "'pyside6'" in arch
+    assert "python-pyside6" not in arch
+    assert "'python-liboqs=0.16.0'" not in arch
+    assert "'liboqs=0.16.0'" not in arch
+    assert "'python-liboqs-pqvpn=0.16.0'" in arch
+    assert "'liboqs-pqvpn=0.16.0'" in arch
+    assert "'python-setuptools'" in arch
+    assert "PYTHONNOUSERSITE=1" in arch
+    assert "#!/usr/bin/python -s" in arch
+    assert "5a1a854b0dc9f2141bdc771c555ee60c37950183" in liboqs_arch
+    assert "_commit=c6378cd5c8db74c0adf34ddcfbb96ee9c99f8061" in python_oqs_arch
+    assert "'liboqs-pqvpn=0.16.0'" in python_oqs_arch
+    assert "-DBUILD_SHARED_LIBS=ON" in liboqs_arch
+    assert "-DCMAKE_INSTALL_PREFIX=/usr" in liboqs_arch
+    assert "OQS_INSTALL_PATH=/usr" in python_oqs_arch
+    assert "PYTHONNOUSERSITE=1" in python_oqs_arch
+    assert "/usr/local" not in liboqs_arch + python_oqs_arch
+    assert "-def _install_liboqs(" in no_download_patch
+    assert "+    oqs_install_dir = Path(environ.get(\"OQS_INSTALL_PATH\", \"/usr\"))" in no_download_patch
+    assert "+        raise SystemExit(msg) from None" in no_download_patch
+    for pkgbuild in (liboqs_arch, python_oqs_arch):
+        assert "git clone" not in pkgbuild
+        assert "curl " not in pkgbuild
+        assert "wget " not in pkgbuild
+
+    all_arch_sources = arch + liboqs_arch + python_oqs_arch
+    assert "SKIP" not in all_arch_sources
+    assert "REPLACE_WITH" not in all_arch_sources
+    checksums = re.findall(r"'([0-9a-f]{64})'", all_arch_sources)
+    assert len(checksums) == 4
+
+
+def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path):
+    root = Path(__file__).parents[1]
+    archive = tmp_path / "pqvpn-2.0.0.tar.gz"
+    included = (
+        "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
+        "README.md", "docs/design.md", "docs/deployment.md", "packaging/common",
+    )
+    subprocess.run(
+        [
+            "git", "archive", "--format=tar.gz", "--mtime=2026-09-14T00:00:00Z",
+            "--prefix=pqvpn-2.0.0/",
+            f"--output={archive}", "HEAD^{tree}", "--", *included,
+        ],
+        cwd=root,
+        check=True,
+    )
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    assert digest == "9af81d16968225f507df2e429155376214c66259b19c0b9728b741d629d7a711"
+    assert digest in (root / "packaging/arch/PKGBUILD").read_text()
+
+    with tarfile.open(archive, "r:gz") as source:
+        names = source.getnames()
+    assert names
+    assert all(name == "pqvpn-2.0.0" or name.startswith("pqvpn-2.0.0/") for name in names)
+    forbidden_parts = {
+        ".git", "__pycache__", ".pytest_cache", ".venv", "venv",
+        "authorized_clients.json", "client.toml",
+        "client_identity_private.key", "server_identity_private.key",
+    }
+    assert not any(forbidden_parts.intersection(Path(name).parts) for name in names)
 
 
 def test_packages_do_not_include_deployment_identity_or_config():
     root = Path(__file__).parents[1]
-    packaging_text = "\n".join(
-        path.read_text(errors="replace")
-        for path in (root / "packaging").rglob("*") if path.is_file()
+    arch = (root / "packaging/arch/PKGBUILD").read_text()
+    archive_command = (root / "packaging/README.md").read_text()
+    installed_sources = "\n".join(
+        line for line in arch.splitlines()
+        if "installer" in line or line.lstrip().startswith("install ")
     )
-    assert "192.168.8.43" not in packaging_text
-    assert "authorized_clients.json" not in packaging_text
-    assert "client_identity_private.key" not in packaging_text
-    assert "server_identity_private.key" not in packaging_text
+    for forbidden in (
+        "192.168.8.43",
+        "authorized_clients.json",
+        "client_identity_private.key",
+        "server_identity_private.key",
+        "client.toml",
+        "/var/lib/pqvpn",
+        "/usr/local",
+        "/.local",
+    ):
+        assert forbidden not in installed_sources
+    assert "config/client.toml" not in archive_command.split("git archive", 1)[1].split(
+        "printf", 1
+    )[0]

@@ -25,7 +25,10 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ├── deploy/                 # Server/client systemd units and consolidated version provenance
 ├── docs/                   # design, deployment and historical security audit
 ├── handshake/              # Frozen authenticated v2 protocol and record layer
-├── packaging/              # Arch/Debian foundations plus shared desktop, icon, and service assets
+├── packaging/
+│   ├── arch/               # Main PQ-VPN plus pinned native/Python liboqs Pacman packages
+│   ├── common/             # Shared desktop, icon, and managed service assets
+│   └── deb/                # Debian packaging foundation
 ├── scripts/                # Native liboqs installer and server network lifecycle
 ├── tests/                  # Seven responsibility suites plus conftest/root harness
 ├── vpn/                    # CLI/config/doctor/identity/profiles/enrollment/network/runtime boundaries
@@ -38,6 +41,37 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ---
 
 ## 📝 Modification Log & Project Progress
+
+### 2026-09-14 — Milestone 3 Arch/Omarchy Packaging Reproducibility Fix
+
+- **Package-managed PQC dependencies**: added `liboqs-pqvpn` and
+  `python-liboqs-pqvpn` Arch package definitions at `0.16.0`. Native liboqs is
+  pinned to validated commit `5a1a854b0dc9f2141bdc771c555ee60c37950183`,
+  builds a shared library with CMake/Ninja, installs the normal SONAME chain
+  under `/usr/lib`, and declares its observed glibc/gcc-libs/OpenSSL runtime
+  dependencies. The Python wrapper is pinned to tag commit
+  `c6378cd5c8db74c0adf34ddcfbb96ee9c99f8061`, installs system-wide through
+  `python-installer`, and depends on the native Pacman package.
+- **Fail-closed wrapper packaging**: added a checksum-verified downstream patch
+  that removes liboqs-python's upstream runtime Git/CMake downloader, defaults
+  discovery to `/usr`, and prioritizes the explicit `/usr/lib` path. It neither
+  bundles liboqs nor uses pip, home-directory state, `/usr/local`, or mock PQC.
+- **Main package/source**: replaced `python-pyside6`, `python-liboqs`, and
+  `liboqs` with `pyside6`, `python-liboqs-pqvpn=0.16.0`, and
+  `liboqs-pqvpn=0.16.0`; added the setuptools build backend dependency. Replaced
+  the checksum placeholder with a real deterministic `git archive` hash. The
+  documented allowlist contains only committed package inputs and excludes the
+  deployment-specific client configuration, identities, state, caches, `.git`,
+  untracked files, and the PKGBUILD itself.
+- **Validation**: all three source sets passed makepkg SHA-256 verification and
+  all PKGBUILDs passed syntax and `.SRCINFO` generation. `liboqs-pqvpn` completed
+  a full makepkg build; its package contains `/usr/lib/liboqs.so.0.16.0` with
+  SONAME `liboqs.so.9` and correct links. The patched wrapper imported against
+  that staged library, reported wrapper/native `0.16.0`, enabled ML-KEM-768, and
+  mapped the staged library rather than `/usr/local`. Full suite: **343 passed,
+  2 skipped in 38.88s** outside the local-socket sandbox; native marker:
+  **2 passed, 343 deselected in 0.16s**. No system package was installed or
+  removed; final manual dependency/main installation validation remains pending.
 
 ### 2026-09-13 — Desktop Client Milestone 3: Secure Onboarding Foundation
 
@@ -499,7 +533,8 @@ transparent, honest, production-ready VPN implementation as audited and approved
 
 | Task / Module | Status | Description |
 | :--- | :---: | :--- |
-| **Desktop Client Milestone 3** | ✅ Completed | Managed identity, strict public profiles/enrollment, narrow IPC, GUI onboarding, packaging foundation, tests/docs; automated gates pass, package/live installation pending |
+| **Desktop Client Milestone 3** | ✅ Completed | Managed identity, strict public profiles/enrollment, narrow IPC, GUI onboarding, package-managed Arch dependency definitions, tests/docs; automated gates pass, manual package/live installation pending |
+| **Arch / Omarchy Packaging** | ✅ Completed | Pinned checksum-verified liboqs/Python packages and deterministic app archive; native package build and staged wrapper import pass; manual Pacman install chain pending |
 | **Systemd Ownership Boundary** | ✅ Completed | Root-owned deployment model; production doctor plus 15 regressions; both pytest styles 258 passed / 2 skipped; native 2 passed; runtime gates pending |
 | **Pre-VPS Hardening Validation** | ✅ Completed | Source review complete; 245 collected; both entrypoints 243 passed / 2 skipped; native 2 passed at pinned source; provisioned doctors/static checks PASS (external firewall WARN) |
 | **IPv6 Leak Prevention** | ✅ Completed | Unit/static policy and cleanup validated; real kernel namespace enforcement pending |
@@ -523,7 +558,7 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | **UI Transparency Badges** | ✅ Completed | Configured-profile UI; measured telemetry; classical client-auth boundary |
 | **Docker Configuration** | ✅ Completed | Development/integration convenience; schema PASS, runtime routing NOT VALIDATED |
 | **Unified Documentation** | ✅ Completed | Consolidated architecture & deployment guide in `docs/design.md`, merged roadmap |
-| **Automated Test Validation** | ✅ Completed | 342 passed / 2 skipped; native PQC 2 passed / 342 deselected; onboarding/profile/identity/enrollment/packaging regressions added |
+| **Automated Test Validation** | ✅ Completed | 343 passed / 2 skipped; native PQC 2 passed / 343 deselected; deterministic Arch packaging regressions added |
 | **Install Native liboqs** | ✅ Completed | Current environment exposes native ML-KEM-768 and passes the isolated self-test/integration marker |
 | **2026 Security Remediation** | ✅ Completed | Code fixes implemented, privilege boundaries enforced via SO_PEERCRED, end-to-end VM/host validation verified |
 | **Authenticated v2 Handshake/Records** | ✅ Completed | Pinned server identity, authorized clients, directional AEAD, replay/AAD/epoch controls |

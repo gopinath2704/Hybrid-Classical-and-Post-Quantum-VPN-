@@ -1,0 +1,64 @@
+# Maintainer: PQ-VPN research project
+pkgname=python-liboqs-pqvpn
+pkgver=0.16.0
+pkgrel=1
+pkgdesc='Pinned Python wrapper for the package-managed PQ-VPN liboqs build'
+arch=('any')
+url='https://github.com/open-quantum-safe/liboqs-python'
+license=('MIT')
+depends=('python' 'liboqs-pqvpn=0.16.0')
+makedepends=('python-build' 'python-hatchling' 'python-installer' 'python-wheel')
+_commit=c6378cd5c8db74c0adf34ddcfbb96ee9c99f8061
+source=(
+  "liboqs-python-${pkgver}-${_commit}.tar.gz::https://github.com/open-quantum-safe/liboqs-python/archive/${_commit}.tar.gz"
+  'disable-runtime-liboqs-download.patch'
+)
+sha256sums=(
+  '3de72cde836a72e4584dad6415a41610f980f924cae95a3848011fcb4f3a3b05'
+  '0693b70ffa0a6475f018be369e614df99661b6643a2e6ffc6830b9f2087333b1'
+)
+
+prepare() {
+  cd "liboqs-python-${_commit}"
+  patch --forward --strip=1 --input="${srcdir}/disable-runtime-liboqs-download.patch"
+}
+
+build() {
+  cd "liboqs-python-${_commit}"
+  PYTHONNOUSERSITE=1 OQS_INSTALL_PATH=/usr \
+    python -m build --wheel --no-isolation
+}
+
+check() {
+  local check_root="${srcdir}/check-root"
+  local site_packages
+  site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib", vars={"base": "/usr", "platbase": "/usr"}))')"
+
+  cd "liboqs-python-${_commit}"
+  PYTHONNOUSERSITE=1 python -m installer --destdir="${check_root}" dist/*.whl
+  PYTHONNOUSERSITE=1 \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONPATH="${check_root}${site_packages}" \
+  OQS_INSTALL_PATH=/usr \
+    python - <<'PY'
+from pathlib import Path
+
+import oqs
+
+assert oqs.oqs_python_version() == "0.16.0"
+assert oqs.oqs_version() == "0.16.0"
+assert "ML-KEM-768" in oqs.get_enabled_kem_mechanisms()
+mapped = {
+    line.split()[-1]
+    for line in Path("/proc/self/maps").read_text().splitlines()
+    if "/liboqs.so" in line
+}
+assert mapped
+assert all(path.startswith("/usr/lib/liboqs.so") for path in mapped), mapped
+PY
+}
+
+package() {
+  cd "liboqs-python-${_commit}"
+  PYTHONNOUSERSITE=1 python -m installer --destdir="${pkgdir}" dist/*.whl
+}
