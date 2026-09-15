@@ -84,11 +84,15 @@ Hybrid-Classical-and-Post-Quantum-VPN/
   archive has SHA-256
   `c8042bb8d576c5ffca0c762b1972899bd05b82848fbdab52cbb80f382e9ad043`.
   Redistribution remains license-blocked.
-- **Validation hygiene**: removed the temporary VM SSH key, both temporary sudoers
+- **Validation and hygiene**: removed the temporary VM SSH key, both temporary sudoers
   grants, the accidentally targeted alternate authorization database, enrollment
   transfer, deployment staging files, and GUI drivers after confirming the real
-  configured authorization record remained enabled. Final regression gates are in
-  progress before merge and publication.
+  configured authorization record remained enabled. The committed release
+  candidate passed the full suite (**343 passed, 2 skipped in 39.30s**) and native
+  no-mock marker (**2 passed, 343 deselected in 0.28s**). Compileall, every project
+  Bash/PKGBUILD and Debian rules syntax check, Debian patch dry-run, identical
+  wrapper-patch comparison, deterministic archive checksum, native backend/version,
+  `pip check`, and Git whitespace/clean-tree checks passed.
 
 ### 2026-09-14 — Milestone 3 Privileged Client User-Site Isolation
 
@@ -600,7 +604,7 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | **Desktop Client Milestone 3** | ✅ Completed | Managed identity/onboarding plus live GUI enrollment, connect, disconnect, identity persistence, rekey, cleanup, and native PQC validation passed against Ubuntu 26.04 |
 | **Arch / Omarchy Packaging** | ✅ Completed | Pinned checksum-verified liboqs/Python packages, deterministic app archive, and Python `-s` isolation in both client units; manual Pacman install chain pending |
 | **Debian / Ubuntu Packaging** | ✅ Completed | Exact pinned liboqs 0.16.0 native/Python packages and main app built, inspected, and clean-installed on Ubuntu 26.04 with native backend and GUI imports verified |
-| **Milestone 3 Release Gate** | 🔄 In progress | Final full pytest, native-no-mock, compile/syntax, whitespace, clean-tree, merge, and push remain |
+| **Milestone 3 Release Gate** | ✅ Completed | Full pytest 343 passed / 2 skipped; native no-mock 2 passed; compile/syntax, package patch/archive, dependency, whitespace, and clean-tree gates pass |
 | **Systemd Ownership Boundary** | ✅ Completed | Root-owned deployment model; production doctor plus 15 regressions; both pytest styles 258 passed / 2 skipped; native 2 passed; runtime gates pending |
 | **Pre-VPS Hardening Validation** | ✅ Completed | Source review complete; 245 collected; both entrypoints 243 passed / 2 skipped; native 2 passed at pinned source; provisioned doctors/static checks PASS (external firewall WARN) |
 | **IPv6 Leak Prevention** | ✅ Completed | Unit/static policy and cleanup validated; real kernel namespace enforcement pending |
