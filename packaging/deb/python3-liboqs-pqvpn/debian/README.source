@@ -1,0 +1,9 @@
+PQ-VPN builds this package only from the official commit archive:
+
+  liboqs-python version: 0.16.0
+  commit: c6378cd5c8db74c0adf34ddcfbb96ee9c99f8061
+  archive SHA-256: 3de72cde836a72e4584dad6415a41610f980f924cae95a3848011fcb4f3a3b05
+  downstream patch SHA-256: 0693b70ffa0a6475f018be369e614df99661b6643a2e6ffc6830b9f2087333b1
+
+No Git checkout, runtime downloader, or network fetch is permitted during the
+package build. Verify the archive and patch before building.

@@ -1,0 +1,21 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@ --buildsystem=cmake+ninja
+
+override_dh_auto_configure:
+	dh_auto_configure --buildsystem=cmake+ninja -- \
+		-DCMAKE_BUILD_TYPE=None \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_INSTALL_LIBDIR=lib/$$(dpkg-architecture -qDEB_HOST_MULTIARCH) \
+		-DBUILD_SHARED_LIBS=ON \
+		-DOQS_BUILD_ONLY_LIB=ON \
+		-DOQS_DIST_BUILD=ON
+
+override_dh_auto_test:
+	test -L obj-*/lib/liboqs.so
+	test -L obj-*/lib/liboqs.so.9
+	test -f obj-*/lib/liboqs.so.0.16.0
+	readelf -d obj-*/lib/liboqs.so.0.16.0 | grep -Fq 'Library soname: [liboqs.so.9]'

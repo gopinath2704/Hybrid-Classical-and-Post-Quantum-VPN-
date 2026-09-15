@@ -28,7 +28,7 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ├── packaging/
 │   ├── arch/               # Main PQ-VPN plus pinned native/Python liboqs Pacman packages
 │   ├── common/             # Shared desktop, icon, and managed service assets
-│   └── deb/                # Debian packaging foundation
+│   └── deb/                # Debian app plus pinned native/Python liboqs package recipes
 ├── scripts/                # Native liboqs installer and server network lifecycle
 ├── tests/                  # Seven responsibility suites plus conftest/root harness
 ├── vpn/                    # CLI/config/doctor/identity/profiles/enrollment/network/runtime boundaries
@@ -41,6 +41,54 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ---
 
 ## 📝 Modification Log & Project Progress
+
+### 2026-09-15 — Milestone 3 Live Acceptance and Ubuntu 26.04 Packaging
+
+- **Minimal server enrollment update**: deployed only `vpn/cli.py` and
+  `vpn/enrollment.py` to the Ubuntu server. Local/remote SHA-256 values matched
+  (`b48ffa0812cdc55c8943dfe70c2094a5024be3d8f04b7e98c770a9eb23c94ccb`
+  and `44cc80fc55f0b423c7c2a006d64f3b217aac7350ff86a8939b14b395cefeb594`),
+  `authorize-request` appeared, and the daemon PID remained unchanged. Authorized
+  `shadow-laptop.pqenroll` in the configured database with fingerprint
+  `71a07a73d1b4acc332db2f6083cedf34bd0a67ed887d910fdb1c313cde614fb1`.
+- **Real GUI connection lifecycle**: the normal-user GUI connected the managed
+  `ubuntu-lab` profile through native `pqvpn0` at `10.8.0.2/24`, reached
+  `10.8.0.1`, installed both full-tunnel `/1` routes and the endpoint bypass,
+  attached working `1.1.1.1`/`9.9.9.9` routing DNS, blocked IPv6 in an owned nft
+  table, loaded native liboqs 0.16.0, verified server fingerprint
+  `caa34de32b573b511bde3f5a85b738ecc7cf7aa44b22fdc37e128d00016cf439`,
+  and exposed changing real RTT/jitter/uptime metrics. GUI disconnect restored
+  the baseline routes/DNS and removed the TUN and firewall table without residue.
+  Reconnect preserved the client fingerprint and the exact identity-file inodes,
+  sizes, modes, and timestamps, proving no identity regeneration.
+- **Automatic rekey**: temporarily set the server interval to 60 seconds, observed
+  epoch `0 → 1` with all **223/223** continuous gateway pings received, then
+  disconnected, restored `3600`, restarted for the configuration change, and
+  verified a short reconnect negotiated the restored interval. The final client
+  teardown is clean and the server remains active at the normal policy.
+- **Ubuntu 26.04 Debian packages**: replaced unavailable `python3-liboqs`/`liboqs0`
+  dependencies with exact `python3-liboqs-pqvpn=0.16.0-1` and
+  `liboqs-pqvpn=0.16.0-1` recipes pinned to the same commits/checksums as Arch.
+  The wrapper shares the checksum-identical no-runtime-download patch. A
+  Debian-only metadata patch delegates PyPI version requirements to explicit
+  Ubuntu package dependencies, while the app build requires native PQC.
+  `liboqs-pqvpn`, `python3-liboqs-pqvpn`, and `pqvpn` all built on Ubuntu 26.04;
+  their binary SHA-256 values are respectively
+  `a1cbbcf1291e330d8ce1b4389019d5f71d927c85c819f83db512937289e037d3`,
+  `84d9ad981d01218e532986c268fb9b433b117684af79bee76418c40011375dbd`,
+  and `050413c25a64de53cd83c901de332e6c5c7db8f7b03f27edae560370c890a736`.
+  A clean Ubuntu 26.04 install resolved every dependency, imported the GUI,
+  reported wrapper/native 0.16.0 with ML-KEM-768 and `native_liboqs`, mapped only
+  `/usr/lib/x86_64-linux-gnu/liboqs.so.0.16.0`, exposed `authorize-request`, and
+  passed packaged-unit verification. The regenerated allowlisted Arch application
+  archive has SHA-256
+  `c8042bb8d576c5ffca0c762b1972899bd05b82848fbdab52cbb80f382e9ad043`.
+  Redistribution remains license-blocked.
+- **Validation hygiene**: removed the temporary VM SSH key, both temporary sudoers
+  grants, the accidentally targeted alternate authorization database, enrollment
+  transfer, deployment staging files, and GUI drivers after confirming the real
+  configured authorization record remained enabled. Final regression gates are in
+  progress before merge and publication.
 
 ### 2026-09-14 — Milestone 3 Privileged Client User-Site Isolation
 
@@ -549,8 +597,10 @@ transparent, honest, production-ready VPN implementation as audited and approved
 
 | Task / Module | Status | Description |
 | :--- | :---: | :--- |
-| **Desktop Client Milestone 3** | ✅ Completed | Managed identity, strict public profiles/enrollment, narrow IPC, GUI onboarding, package-managed Arch dependency definitions, tests/docs; automated gates pass, manual package/live installation pending |
+| **Desktop Client Milestone 3** | ✅ Completed | Managed identity/onboarding plus live GUI enrollment, connect, disconnect, identity persistence, rekey, cleanup, and native PQC validation passed against Ubuntu 26.04 |
 | **Arch / Omarchy Packaging** | ✅ Completed | Pinned checksum-verified liboqs/Python packages, deterministic app archive, and Python `-s` isolation in both client units; manual Pacman install chain pending |
+| **Debian / Ubuntu Packaging** | ✅ Completed | Exact pinned liboqs 0.16.0 native/Python packages and main app built, inspected, and clean-installed on Ubuntu 26.04 with native backend and GUI imports verified |
+| **Milestone 3 Release Gate** | 🔄 In progress | Final full pytest, native-no-mock, compile/syntax, whitespace, clean-tree, merge, and push remain |
 | **Systemd Ownership Boundary** | ✅ Completed | Root-owned deployment model; production doctor plus 15 regressions; both pytest styles 258 passed / 2 skipped; native 2 passed; runtime gates pending |
 | **Pre-VPS Hardening Validation** | ✅ Completed | Source review complete; 245 collected; both entrypoints 243 passed / 2 skipped; native 2 passed at pinned source; provisioned doctors/static checks PASS (external firewall WARN) |
 | **IPv6 Leak Prevention** | ✅ Completed | Unit/static policy and cleanup validated; real kernel namespace enforcement pending |

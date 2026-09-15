@@ -1,0 +1,12 @@
+#!/usr/bin/make -f
+
+export PYBUILD_NAME = liboqs-python
+export PYBUILD_SYSTEM = pyproject
+
+%:
+	OQS_INSTALL_PATH=/usr PYTHONNOUSERSITE=1 dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_auto_test:
+	OQS_INSTALL_PATH=/usr PYTHONNOUSERSITE=1 \
+	PYTHONPATH=$$(find .pybuild -type d -name build -print -quit) \
+	python3 -c 'import oqs; assert oqs.oqs_python_version() == "0.16.0"; assert oqs.oqs_version() == "0.16.0"; assert "ML-KEM-768" in oqs.get_enabled_kem_mechanisms()'

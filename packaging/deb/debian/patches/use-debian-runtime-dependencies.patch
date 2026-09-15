@@ -1,0 +1,17 @@
+Description: Let debian/control own distribution runtime dependencies
+ The upstream Python project pins PyPI release versions. Ubuntu 26.04 supplies
+ compatible cryptography and the PQ-VPN-specific pinned liboqs packages under
+ distribution package names, so retaining the PyPI requirements would make
+ dh_python3 emit an unsatisfiable cryptography version dependency.
+Author: PQ-VPN research project <noreply@example.invalid>
+Forwarded: not-needed
+Last-Update: 2026-09-15
+---
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -11,4 +11 @@
+-dependencies = [
+-  "cryptography==50.0.1",
+-  "liboqs-python==0.16.0",
+-]
++dependencies = []

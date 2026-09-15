@@ -1,5 +1,7 @@
 pqvpn (2.0.0-1) experimental; urgency=medium
 
-  * Add the Desktop Client Milestone 3 packaging foundation.
+  * Add the Desktop Client Milestone 3 package.
+  * Depend on pinned liboqs-pqvpn 0.16.0-1 packages for Ubuntu 26.04.
+  * Use distribution runtime dependencies and require native PQC during build.
 
  -- PQ-VPN research project <noreply@example.invalid>  Sun, 13 Sep 2026 00:00:00 +0530

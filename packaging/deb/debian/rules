@@ -2,3 +2,8 @@
 
 %:
 	dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_auto_test:
+	OQS_INSTALL_PATH=/usr PYTHONNOUSERSITE=1 \
+	PYTHONPATH=$$(find .pybuild -type d -name build -print -quit) \
+	python3 -c 'from crypto.hybrid_crypto import get_crypto_status; status = get_crypto_status(); assert status["pqc_mode"] == "native_liboqs"; assert status["is_quantum_safe"] is True'

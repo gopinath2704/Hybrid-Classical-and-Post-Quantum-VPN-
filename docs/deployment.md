@@ -139,13 +139,14 @@ termination or server restart.
 ### Packaging foundation
 
 `packaging/` contains an Arch/Omarchy `PKGBUILD`, Debian metadata, desktop entry,
-SVG icon, and package-oriented systemd unit. The Arch source digest is deliberately
-a blocking placeholder until a reviewed release archive exists. Debian/Ubuntu and
-Arch repositories must supply exact native liboqs/liboqs-python `0.16.0`; the app
-does not download or switch to mock PQC at runtime. Neither package has been built,
-installed, or live-validated as part of this milestone unless the final validation
-record explicitly says otherwise. The missing upstream license also blocks package
-redistribution until the owner supplies one.
+SVG icon, and package-oriented systemd unit. The Arch source archive has a real,
+deterministic SHA-256 digest. Ubuntu 26.04 does not supply the required liboqs
+package names, so `packaging/deb/` also carries recipes for project-owned
+`liboqs-pqvpn=0.16.0-1` and `python3-liboqs-pqvpn=0.16.0-1` packages pinned to the
+same reviewed commits as Arch. The wrapper patch removes its runtime downloader;
+the app neither downloads liboqs nor switches to mock PQC. See `packaging/README.md`
+for exact source checksums and build order. The missing upstream PQ-VPN license
+still blocks redistribution until the owner supplies one.
 
 ## Install and provision, then diagnose
 
@@ -539,9 +540,8 @@ Unix-socket desktop IPC described in `docs/design.md`.
 
 ## Milestone 3 live validation: Omarchy client + Ubuntu VM
 
-This is an operator-run plan, not a completed result. It intentionally preserves
-the previous managed state as a timestamped backup and does not change protocol,
-firewall, DNS, or server policy automatically.
+This section retains the reusable operator procedure. A completed validation record
+for 2026-09-15 follows the procedure.
 
 On the Ubuntu VM, first create `/tmp/ubuntu-lab.pqvpn` with the public-only profile
 command above. On the Omarchy client, install the reviewed source/venv and updated
@@ -640,8 +640,35 @@ watch -n 5 'python -c "from app.client import IPCClient; s=IPCClient().status();
 Record uninterrupted ping plus the epoch transition (for example `0 → 1`). Then
 disconnect and repeat the cleanup checks. If an administrator explicitly chooses
 an accelerated rekey test, restore `rekey_interval = 3600` and restart the server
-afterward. Until this whole sequence is performed and recorded, Milestone 3 live
-validation remains **not performed**.
+afterward.
+
+### Completed validation record — 2026-09-15
+
+The Omarchy host completed this sequence against the Ubuntu 26.04 VM at its
+then-current bridged address `192.168.200.43`. Only `vpn/cli.py` and
+`vpn/enrollment.py` were deployed for enrollment support; their SHA-256 values
+matched locally/remotely, `authorize-request` appeared, and the running server PID
+did not change. The public `shadow-laptop.pqenroll` request was authorized with
+client fingerprint
+`71a07a73d1b4acc332db2f6083cedf34bd0a67ed887d910fdb1c313cde614fb1`.
+
+The real GUI reached `CONNECTED` on `pqvpn0` with `10.8.0.2/24`, reached
+`10.8.0.1`, installed both IPv4 `/1` routes and the endpoint bypass, attached
+`1.1.1.1` and `9.9.9.9` plus `~.` to the VPN link, and blocked IPv6 through its
+owned nftables table. Status and mapped-library evidence showed native liboqs
+0.16.0, `is_quantum_safe: true`, the pinned server fingerprint
+`caa34de32b573b511bde3f5a85b738ecc7cf7aa44b22fdc37e128d00016cf439`,
+and changing RTT/jitter/uptime metrics. GUI disconnect removed the TUN, `/1` and
+bypass routes, link DNS, and owned IPv6 table, restoring the baseline route and DNS
+state. Reconnection reused the same profile and the same private/public identity
+inodes, sizes, modes, timestamps, and fingerprint, proving no identity regeneration.
+
+For accelerated rekey validation, the administrator temporarily changed the server
+interval from 3,600 to 60 seconds and restarted for that policy change. Epoch
+advanced `0 → 1` while all 223 transmitted gateway pings were received. After the
+final GUI disconnect, the interval was restored to 3,600 seconds, the server was
+restarted and verified active, a short reconnect negotiated 3,600, and final route,
+DNS, interface, and firewall cleanup passed.
 
 ## Pre-VPS Validation Handoff
 ### Pre-VPS validation handoff

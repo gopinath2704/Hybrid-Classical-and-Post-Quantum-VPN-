@@ -72,7 +72,7 @@ git archive --format=tar.gz --mtime=2026-09-14T00:00:00Z \
   app benchmarks.py crypto handshake vpn pyproject.toml README.md \
   docs/design.md docs/deployment.md packaging/common
 printf '%s  %s\n' \
-  d791b49894214253bba52395e06b2745ce946bab80418f46148c13768d69ba1a \
+  c8042bb8d576c5ffca0c762b1972899bd05b82848fbdab52cbb80f382e9ad043 \
   packaging/arch/pqvpn-2.0.0.tar.gz | sha256sum --check -
 (cd packaging/arch && makepkg --cleanbuild --syncdeps)
 ```
@@ -90,8 +90,40 @@ Pacman-managed wrapper.
 
 ## Debian / Ubuntu 26.04-class
 
-Copy `deb/debian` to the source archive as `debian`, verify that the exact liboqs
-0.16.0 packages are available from the chosen trusted repository, and run
-`dpkg-buildpackage --build=binary --no-sign`. The upstream repository currently
-lacks a declared license, so redistribution must remain blocked until the owner
-adds one.
+Ubuntu 26.04 does not provide the `python3-liboqs` and `liboqs0` dependency names
+previously referenced by the main package. Build the two project-owned, exact-
+version packages first; their metadata lives under `deb/liboqs-pqvpn` and
+`deb/python3-liboqs-pqvpn`. They deliberately do not fetch source or native
+libraries at build or run time.
+
+Download the official commit archives separately and verify them before adding
+the matching `debian` directory:
+
+| package | pinned commit | archive SHA-256 |
+| --- | --- | --- |
+| liboqs 0.16.0 | `5a1a854b0dc9f2141bdc771c555ee60c37950183` | `83c6e6cff490638312e1e20ed5de593fb5d7bfab162235f6238f519d6a1feafb` |
+| liboqs-python 0.16.0 | `c6378cd5c8db74c0adf34ddcfbb96ee9c99f8061` | `3de72cde836a72e4584dad6415a41610f980f924cae95a3848011fcb4f3a3b05` |
+
+The Python wrapper also applies
+`deb/python3-liboqs-pqvpn/debian/patches/disable-runtime-liboqs-download.patch`
+with SHA-256
+`0693b70ffa0a6475f018be369e614df99661b6643a2e6ffc6830b9f2087333b1`.
+Build in this order with `dpkg-buildpackage --build=binary --no-sign`:
+
+1. `liboqs-pqvpn_0.16.0-1_amd64.deb`
+2. `python3-liboqs-pqvpn_0.16.0-1_all.deb`
+3. `pqvpn_2.0.0-1_amd64.deb`
+
+Install the first package before building the second, and both before building
+the main package. The main build runs an explicit import check that requires
+`native_liboqs`, so a mock or missing backend cannot produce a successful build.
+Its Debian-only `use-debian-runtime-dependencies.patch` prevents upstream PyPI
+pins from producing dependencies unavailable in Ubuntu; the complete runtime
+set remains explicit in `deb/debian/control`.
+Inspect the results with `dpkg-deb --info`, `dpkg-deb --contents`, and
+`dpkg-deb --field`; then install all three together in a clean Ubuntu 26.04
+environment and confirm `oqs.oqs_version()` and `oqs.oqs_python_version()` both
+return `0.16.0` and `ML-KEM-768` is enabled.
+
+The upstream PQ-VPN repository currently lacks a declared license, so
+redistribution of these packages must remain blocked until the owner adds one.

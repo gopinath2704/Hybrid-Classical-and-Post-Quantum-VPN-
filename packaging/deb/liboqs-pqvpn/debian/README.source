@@ -1,0 +1,8 @@
+PQ-VPN builds this package only from the official commit archive:
+
+  liboqs version: 0.16.0
+  commit: 5a1a854b0dc9f2141bdc771c555ee60c37950183
+  archive SHA-256: 83c6e6cff490638312e1e20ed5de593fb5d7bfab162235f6238f519d6a1feafb
+
+No Git checkout, moving tag, or network fetch is permitted during the package
+build. Verify the archive before extracting it into the Debian source tree.
