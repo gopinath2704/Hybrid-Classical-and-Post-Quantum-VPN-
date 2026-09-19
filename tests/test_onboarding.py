@@ -552,7 +552,8 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
     archive = tmp_path / "pqvpn-2.0.0.tar.gz"
     included = (
         "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
-        "README.md", "docs/design.md", "docs/deployment.md", "packaging/common",
+        "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
+        "packaging/common",
     )
     subprocess.run(
         [
@@ -564,7 +565,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
         check=True,
     )
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    assert digest == "c8042bb8d576c5ffca0c762b1972899bd05b82848fbdab52cbb80f382e9ad043"
+    assert digest == "49d6f478ea78e69e478b66cc4d235401759cae4ed3202d21134c17903a5cba21"
     assert digest in (root / "packaging/arch/PKGBUILD").read_text()
 
     with tarfile.open(archive, "r:gz") as source:
