@@ -70,7 +70,7 @@ git archive --format=tar.gz --mtime=2026-09-14T00:00:00Z \
   --prefix=pqvpn-2.0.0/ \
   --output=packaging/arch/pqvpn-2.0.0.tar.gz 'HEAD^{tree}' -- \
   app benchmarks.py crypto handshake vpn pyproject.toml README.md \
-  docs/design.md docs/deployment.md packaging/common
+  docs/design.md docs/deployment.md docs/accounts.md packaging/common
 printf '%s  %s\n' \
   c8042bb8d576c5ffca0c762b1972899bd05b82848fbdab52cbb80f382e9ad043 \
   packaging/arch/pqvpn-2.0.0.tar.gz | sha256sum --check -

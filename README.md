@@ -216,6 +216,7 @@ crypto/
 handshake/
   kemtls.py           KEMTLS-inspired v2 protocol state machine
 vpn/
+  accounts.py         Server-side account/device/session SQLite store
   cli.py              Provisioning and runtime CLI
   config.py           TOML configuration with validation
   doctor.py           Read-only deployment diagnostics
@@ -234,6 +235,7 @@ packaging/            Arch, Debian, desktop entry, icon, and package service
 ## Documentation
 
 - [Protocol and design](docs/design.md)
+- [Account database and authorization separation](docs/accounts.md)
 - [Server deployment guide](docs/deployment.md)
 - [Security audit and validation records](docs/security_audit.md)
 

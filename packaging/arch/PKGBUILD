@@ -6,7 +6,7 @@ pkgdesc='Hybrid classical and post-quantum research VPN client for Linux'
 arch=('x86_64')
 url='https://github.com/gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-'
 license=('custom')
-depends=('python>=3.14' 'python-cryptography' 'pyside6' 'python-liboqs-pqvpn=0.16.0' 'liboqs-pqvpn=0.16.0' 'iproute2' 'nftables')
+depends=('python>=3.14' 'python-argon2-cffi' 'python-cryptography' 'pyside6' 'python-liboqs-pqvpn=0.16.0' 'liboqs-pqvpn=0.16.0' 'iproute2' 'nftables')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 source=("${pkgname}-${pkgver}.tar.gz")
 sha256sums=('c8042bb8d576c5ffca0c762b1972899bd05b82848fbdab52cbb80f382e9ad043')
@@ -27,4 +27,5 @@ package() {
   install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
   install -Dm644 docs/design.md "${pkgdir}/usr/share/doc/${pkgname}/design.md"
   install -Dm644 docs/deployment.md "${pkgdir}/usr/share/doc/${pkgname}/deployment.md"
+  install -Dm644 docs/accounts.md "${pkgdir}/usr/share/doc/${pkgname}/accounts.md"
 }

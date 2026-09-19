@@ -42,6 +42,22 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 
 ## 📝 Modification Log & Project Progress
 
+### 2026-09-19 — Milestone 4.1: Secure Account and Device Store Implementation
+
+- **Secure SQLite Account & Device Store (`vpn/accounts.py`)**:
+  - Implemented standalone `AccountStore` and `DeviceStore` backed by SQLite with WAL journal mode, `foreign_keys=ON`, and isolated schema migrations.
+  - Implemented Argon2id password hashing via `argon2-cffi` (memory cost 64 MB, time cost 3 iterations, parallelism 4, 16-byte secure random salt) with parameter verification and rehash detection.
+  - Implemented strict RBAC (`user`, `admin`), active/inactive account flags, device public key tracking, device revocation, session token generation with SHA-256 hash storage, constant-time token validation, and expiry management.
+  - Preserved strict security separation: accounts, sessions, and devices in SQLite do NOT automatically grant VPN tunnel authorization or mutate `authorized_clients.json`.
+- **Packaging and Dependencies**:
+  - Pinned `argon2-cffi==25.1.0` and `argon2-cffi-bindings==25.1.0` in `pyproject.toml` and `constraints-tested.txt`.
+  - Added `python-argon2-cffi` to Arch `packaging/arch/PKGBUILD`.
+  - Added `python3-argon2` to Debian/Ubuntu `packaging/deb/debian/control` and refreshed runtime dependencies patch.
+  - Updated `README.md`, `packaging/README.md`, and `packaging/deb/debian/install`.
+- **Documentation & Testing**:
+  - Created `docs/accounts.md` detailing database schema, password hashing specifications, session token security, and authorization boundaries.
+  - Created comprehensive test suite `tests/test_accounts.py` with 42 unit/integration tests; full test suite passes (385 passed, 2 skipped).
+
 ### 2026-09-15 — Milestone 3 Live Acceptance and Ubuntu 26.04 Packaging
 
 - **Minimal server enrollment update**: deployed only `vpn/cli.py` and
@@ -601,6 +617,8 @@ transparent, honest, production-ready VPN implementation as audited and approved
 
 | Task / Module | Status | Description |
 | :--- | :---: | :--- |
+| **Milestone 4.1 (Account/Device Store)** | ✅ Completed | SQLite AccountStore/DeviceStore with WAL mode, Argon2id hashing, strict RBAC, device management, session tokens; cleanly separated from VPN core (385 passed / 2 skipped) |
+| **Milestone 4.2 (Register/Login HTTPS API)** | ⏳ Pending | Standalone HTTPS API with POST /auth/register, POST /auth/login, POST /auth/logout, authenticated session tokens, rate limiting, AccountStore integration |
 | **Desktop Client Milestone 3** | ✅ Completed | Managed identity/onboarding plus live GUI enrollment, connect, disconnect, identity persistence, rekey, cleanup, and native PQC validation passed against Ubuntu 26.04 |
 | **Arch / Omarchy Packaging** | ✅ Completed | Pinned checksum-verified liboqs/Python packages, deterministic app archive, and Python `-s` isolation in both client units; manual Pacman install chain pending |
 | **Debian / Ubuntu Packaging** | ✅ Completed | Exact pinned liboqs 0.16.0 native/Python packages and main app built, inspected, and clean-installed on Ubuntu 26.04 with native backend and GUI imports verified |

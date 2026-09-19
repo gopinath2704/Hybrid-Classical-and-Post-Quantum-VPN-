@@ -9,6 +9,7 @@ description = "Hybrid X25519 and ML-KEM-768 research VPN"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "argon2-cffi==25.1.0",
   "cryptography==50.0.1",
   "liboqs-python==0.16.0",
 ]
