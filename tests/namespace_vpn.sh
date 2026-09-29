@@ -1,6 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+filter_meaningful_ipv6_routes() {
+  # Ubuntu 26.04 can add kernel-generated fe80:: routes for temporary veths
+  # asynchronously. Keep manually managed link-local and all other routes.
+  awk '
+  {
+      destination = $1
+      if (destination !~ /:/ && $2 ~ /:/) {
+          destination = $2
+      }
+      kernel_generated = 0
+      for (field = 1; field < NF; field++) {
+          if ($field == "proto" && $(field + 1) == "kernel") {
+              kernel_generated = 1
+              break
+          }
+      }
+      if (destination ~ /^fe80:/ && kernel_generated) {
+          next
+      }
+      print
+  }'
+}
+
+# Keep the embedded route filter directly testable without creating namespaces.
+if [[ ${1:-} == "--filter-meaningful-ipv6-routes" ]]; then
+  filter_meaningful_ipv6_routes
+  exit 0
+fi
+
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RUN_DIR=$(mktemp -d /tmp/pqvpn-ns.XXXXXX)
 SERVER_NS=pqvpn-server-$$
@@ -25,7 +54,7 @@ snapshot_meaningful_ipv6_routes() {
   # Ubuntu 26.04 installs kernel-generated fe80:: routes for temporary veths
   # asynchronously. Compare all stable routing state without racing those entries.
   ip -n "$1" -6 route show table all |
-    awk -f "$ROOT_DIR/tests/meaningful_ipv6_routes.awk" |
+    filter_meaningful_ipv6_routes |
     LC_ALL=C sort
 }
 

@@ -12,7 +12,7 @@ import stat
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -33,6 +33,13 @@ MAX_DEVICE_NAME_LENGTH = 100
 _USERNAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
 _PASSWORD_HASHER = PasswordHasher()
+# Generated once with the same Argon2id policy. It gives unknown login
+# identifiers the same expensive verification path as a wrong password without
+# representing a usable account credential.
+_DUMMY_PASSWORD_HASH = (
+    "$argon2id$v=19$m=65536,t=3,p=4$B5CsoZZWdy3XY8OhPPm6pA$"
+    "1RvMzjIkQCKYsB9zqTKCN2tljKBW7UQgQ+YkHvRWvGY"
+)
 
 
 class AccountError(Exception):
@@ -218,6 +225,28 @@ def _validate_public_identity(client_fingerprint: object, client_public_key: obj
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _utc_timestamp(value: datetime, description: str) -> str:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise InvalidAccountInput(f"{description} must be a timezone-aware datetime")
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _parse_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as exc:
+        raise AccountDatabaseError("account database contains an invalid timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise AccountDatabaseError("account database contains a non-UTC timestamp")
+    return parsed.astimezone(timezone.utc)
+
+
+def _validate_token_hash(token_hash: object) -> bytes:
+    if not isinstance(token_hash, bytes) or len(token_hash) != 32:
+        raise InvalidAccountInput("session token hash must be exactly 32 bytes")
+    return token_hash
 
 
 def _safe_database_parent(path: Path) -> None:
@@ -492,6 +521,16 @@ class AccountStore:
             created_at=row["created_at"], updated_at=row["updated_at"]
         )
 
+    @staticmethod
+    def _session(row: sqlite3.Row | None) -> SessionRecord | None:
+        if row is None:
+            return None
+        return SessionRecord(
+            id=row["id"], user_id=row["user_id"], token_hash=bytes(row["token_hash"]),
+            created_at=row["created_at"], expires_at=row["expires_at"],
+            revoked_at=row["revoked_at"], last_used_at=row["last_used_at"],
+        )
+
     def create_user(self, username: str, email: str, password: str, *, enabled: bool = True) -> UserRecord:
         normalized_username = normalize_username(username)
         normalized_email = normalize_email(email)
@@ -570,6 +609,72 @@ class AccountStore:
         if row is None or not bool(row["enabled"]):
             return False
         return verify_password(row["password_hash"], password)
+
+    def authenticate_user(self, identifier: str, password: str) -> UserRecord | None:
+        """Authenticate by normalized username or email with a generic failure path.
+
+        Unknown and syntactically invalid identifiers are checked against a
+        precomputed dummy Argon2id hash. A successful check transparently
+        upgrades an old Argon2id hash with a compare-and-update transaction.
+        """
+        normalized: str | None
+        try:
+            normalized = normalize_email(identifier) if "@" in identifier else normalize_username(identifier)
+        except (InvalidAccountInput, TypeError):
+            normalized = None
+        with self._connection() as connection:
+            if normalized is None:
+                row = None
+            elif "@" in normalized:
+                row = connection.execute(
+                    """
+                    SELECT id, username, email, password_hash, enabled, created_at, updated_at
+                    FROM users WHERE email = ?
+                    """,
+                    (normalized,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT id, username, email, password_hash, enabled, created_at, updated_at
+                    FROM users WHERE username = ?
+                    """,
+                    (normalized,),
+                ).fetchone()
+
+        candidate_hash = _DUMMY_PASSWORD_HASH if row is None else row["password_hash"]
+        password_matches = verify_password(candidate_hash, password)
+        if row is None or not password_matches or not bool(row["enabled"]):
+            return None
+
+        user = self._user(row)
+        assert user is not None
+        if needs_rehash(candidate_hash):
+            replacement = hash_password(password)
+            now = _utc_now()
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    """
+                    UPDATE users SET password_hash = ?, updated_at = ?
+                    WHERE id = ? AND password_hash = ?
+                    """,
+                    (replacement, now, user.id, candidate_hash),
+                )
+                current = connection.execute(
+                    """
+                    SELECT id, username, email, enabled, created_at, updated_at
+                    FROM users WHERE id = ?
+                    """,
+                    (user.id,),
+                ).fetchone()
+                connection.commit()
+            if cursor.rowcount != 1:
+                return None
+            user = self._user(current)
+            if user is None or not user.enabled:
+                return None
+        return user
 
     def set_user_enabled(self, user_id: int, enabled: bool) -> UserRecord:
         validated_id = _validate_id(user_id, "user ID")
@@ -710,3 +815,189 @@ class AccountStore:
         result = self._device(row)
         assert result is not None
         return result
+
+    def create_session(
+        self,
+        user_id: int,
+        token_hash: bytes,
+        expires_at: datetime,
+        *,
+        now: datetime | None = None,
+    ) -> SessionRecord:
+        """Atomically create a hash-only session for an enabled user."""
+        validated_user_id = _validate_id(user_id, "user ID")
+        validated_hash = _validate_token_hash(token_hash)
+        current = now or datetime.now(timezone.utc)
+        created_text = _utc_timestamp(current, "session creation time")
+        expiry_text = _utc_timestamp(expires_at, "session expiry")
+        if expires_at.astimezone(timezone.utc) <= current.astimezone(timezone.utc):
+            raise InvalidAccountInput("session expiry must be in the future")
+        with self._connection() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                owner = connection.execute(
+                    "SELECT enabled FROM users WHERE id = ?", (validated_user_id,)
+                ).fetchone()
+                if owner is None:
+                    raise AccountNotFound("user does not exist")
+                if not bool(owner["enabled"]):
+                    raise InvalidAccountInput("disabled user cannot own a new session")
+                cursor = connection.execute(
+                    """
+                    INSERT INTO sessions (user_id, token_hash, created_at, expires_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (validated_user_id, validated_hash, created_text, expiry_text),
+                )
+                row = connection.execute(
+                    """
+                    SELECT id, user_id, token_hash, created_at, expires_at, revoked_at, last_used_at
+                    FROM sessions WHERE id = ?
+                    """,
+                    (cursor.lastrowid,),
+                ).fetchone()
+                connection.commit()
+            except AccountError:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+            except sqlite3.IntegrityError as exc:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise AccountAlreadyExists("session token hash already exists") from exc
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+        result = self._session(row)
+        assert result is not None
+        return result
+
+    def get_session_by_token_hash(self, token_hash: bytes) -> SessionRecord | None:
+        validated_hash = _validate_token_hash(token_hash)
+        with self._connection() as connection:
+            return self._session(connection.execute(
+                """
+                SELECT id, user_id, token_hash, created_at, expires_at, revoked_at, last_used_at
+                FROM sessions WHERE token_hash = ?
+                """,
+                (validated_hash,),
+            ).fetchone())
+
+    def validate_session(
+        self,
+        token_hash: bytes,
+        *,
+        now: datetime | None = None,
+        touch_interval_seconds: int = 60,
+    ) -> tuple[UserRecord, SessionRecord] | None:
+        """Return an enabled user and live session, touching use at a bounded rate."""
+        validated_hash = _validate_token_hash(token_hash)
+        if type(touch_interval_seconds) is not int or touch_interval_seconds < 0:
+            raise InvalidAccountInput("session touch interval must be a non-negative integer")
+        current = now or datetime.now(timezone.utc)
+        current_text = _utc_timestamp(current, "session validation time")
+        current = current.astimezone(timezone.utc)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT s.id, s.user_id, s.token_hash, s.created_at, s.expires_at,
+                       s.revoked_at, s.last_used_at,
+                       u.username, u.email, u.enabled, u.created_at AS user_created_at,
+                       u.updated_at AS user_updated_at
+                FROM sessions AS s JOIN users AS u ON u.id = s.user_id
+                WHERE s.token_hash = ?
+                """,
+                (validated_hash,),
+            ).fetchone()
+            if (
+                row is None
+                or row["revoked_at"] is not None
+                or not bool(row["enabled"])
+                or _parse_timestamp(row["expires_at"]) <= current
+            ):
+                connection.commit()
+                return None
+            last_used = row["last_used_at"]
+            should_touch = (
+                last_used is None
+                or _parse_timestamp(last_used) <= current - timedelta(seconds=touch_interval_seconds)
+            )
+            if should_touch:
+                connection.execute(
+                    "UPDATE sessions SET last_used_at = ? WHERE id = ?", (current_text, row["id"])
+                )
+                row = connection.execute(
+                    """
+                    SELECT s.id, s.user_id, s.token_hash, s.created_at, s.expires_at,
+                           s.revoked_at, s.last_used_at,
+                           u.username, u.email, u.enabled, u.created_at AS user_created_at,
+                           u.updated_at AS user_updated_at
+                    FROM sessions AS s JOIN users AS u ON u.id = s.user_id
+                    WHERE s.id = ?
+                    """,
+                    (row["id"],),
+                ).fetchone()
+            connection.commit()
+        assert row is not None
+        user = UserRecord(
+            id=row["user_id"], username=row["username"], email=row["email"],
+            enabled=bool(row["enabled"]), created_at=row["user_created_at"],
+            updated_at=row["user_updated_at"],
+        )
+        session = self._session(row)
+        assert session is not None
+        return user, session
+
+    def touch_session(
+        self, token_hash: bytes, *, now: datetime | None = None
+    ) -> SessionRecord | None:
+        validated_hash = _validate_token_hash(token_hash)
+        timestamp = _utc_timestamp(now or datetime.now(timezone.utc), "session use time")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "UPDATE sessions SET last_used_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+                (timestamp, validated_hash),
+            )
+            row = connection.execute(
+                """
+                SELECT id, user_id, token_hash, created_at, expires_at, revoked_at, last_used_at
+                FROM sessions WHERE token_hash = ?
+                """,
+                (validated_hash,),
+            ).fetchone() if cursor.rowcount else None
+            connection.commit()
+        return self._session(row)
+
+    def revoke_session(self, token_hash: bytes, *, now: datetime | None = None) -> bool:
+        validated_hash = _validate_token_hash(token_hash)
+        timestamp = _utc_timestamp(now or datetime.now(timezone.utc), "session revocation time")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "UPDATE sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+                (timestamp, validated_hash),
+            )
+            connection.commit()
+        return cursor.rowcount == 1
+
+    def revoke_all_user_sessions(
+        self, user_id: int, *, now: datetime | None = None
+    ) -> int:
+        validated_id = _validate_id(user_id, "user ID")
+        timestamp = _utc_timestamp(now or datetime.now(timezone.utc), "session revocation time")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if not connection.execute(
+                "SELECT 1 FROM users WHERE id = ?", (validated_id,)
+            ).fetchone():
+                connection.rollback()
+                raise AccountNotFound("user does not exist")
+            cursor = connection.execute(
+                "UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+                (timestamp, validated_id),
+            )
+            connection.commit()
+        return int(cursor.rowcount)

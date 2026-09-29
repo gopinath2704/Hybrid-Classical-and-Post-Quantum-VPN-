@@ -1,0 +1,32 @@
+[Unit]
+Description=PQ-VPN account authentication HTTPS API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pqvpn-account
+Group=pqvpn-account
+ExecStart=/usr/bin/python3 -s -m vpn.account_api --config /etc/pqvpn/account-api.toml
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+StateDirectory=pqvpn/accounts
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/pqvpn/accounts
+InaccessiblePaths=-/etc/pqvpn/server_identity_private.key -/var/lib/pqvpn/client_identity_private.key
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

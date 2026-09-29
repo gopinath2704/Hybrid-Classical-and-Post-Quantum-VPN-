@@ -6,7 +6,7 @@ pkgdesc='Hybrid classical and post-quantum research VPN client for Linux'
 arch=('x86_64')
 url='https://github.com/gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-'
 license=('custom')
-depends=('python>=3.14' 'python-argon2-cffi' 'python-cryptography' 'pyside6' 'python-liboqs-pqvpn=0.16.0' 'liboqs-pqvpn=0.16.0' 'iproute2' 'nftables')
+depends=('python>=3.14' 'python-argon2-cffi' 'python-cryptography' 'python-fastapi' 'uvicorn' 'pyside6' 'python-liboqs-pqvpn=0.16.0' 'liboqs-pqvpn=0.16.0' 'iproute2' 'nftables')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 source=("${pkgname}-${pkgver}.tar.gz")
 sha256sums=('49d6f478ea78e69e478b66cc4d235401759cae4ed3202d21134c17903a5cba21')
@@ -20,10 +20,13 @@ package() {
   cd "${srcdir}/${pkgname}-${pkgver}"
   PYTHONNOUSERSITE=1 python -m installer --destdir="${pkgdir}" dist/*.whl
   # Pacman-managed launchers must not import packages from the invoking user's ~/.local.
-  sed -i '1c #!/usr/bin/python -s' "${pkgdir}/usr/bin/pqvpn" "${pkgdir}/usr/bin/pqvpn-gui"
+  sed -i '1c #!/usr/bin/python -s' "${pkgdir}/usr/bin/pqvpn" "${pkgdir}/usr/bin/pqvpn-gui" "${pkgdir}/usr/bin/pqvpn-account-api"
   install -Dm644 packaging/common/pqvpn.desktop "${pkgdir}/usr/share/applications/pqvpn.desktop"
   install -Dm644 packaging/common/pqvpn.svg "${pkgdir}/usr/share/icons/hicolor/scalable/apps/pqvpn.svg"
   install -Dm644 packaging/common/pqvpn-client.service "${pkgdir}/usr/lib/systemd/system/pqvpn-client.service"
+  install -Dm644 packaging/common/pqvpn-account-api.service "${pkgdir}/usr/lib/systemd/system/pqvpn-account-api.service"
+  install -Dm644 packaging/common/pqvpn.conf "${pkgdir}/usr/lib/sysusers.d/pqvpn-account.conf"
+  install -Dm644 config/account-api.toml "${pkgdir}/etc/pqvpn/account-api.toml"
   install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
   install -Dm644 docs/design.md "${pkgdir}/usr/share/doc/${pkgname}/design.md"
   install -Dm644 docs/deployment.md "${pkgdir}/usr/share/doc/${pkgname}/deployment.md"

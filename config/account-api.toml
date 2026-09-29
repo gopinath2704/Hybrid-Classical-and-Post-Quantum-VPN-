@@ -1,0 +1,17 @@
+[account_api]
+database_path = "/var/lib/pqvpn/accounts/accounts.db"
+bind_host = "0.0.0.0"
+bind_port = 8443
+tls_cert = "/etc/pqvpn/tls/account-api.crt"
+tls_key = "/etc/pqvpn/tls/account-api.key"
+allow_insecure_loopback = false
+session_lifetime_seconds = 43200
+login_rate_limit = 5
+login_rate_window_seconds = 60
+login_cooldown_seconds = 60
+registration_rate_limit = 3
+registration_rate_window_seconds = 60
+registration_cooldown_seconds = 60
+login_rate_limit_entries = 4096
+registration_rate_limit_entries = 2048
+body_limit_bytes = 16384

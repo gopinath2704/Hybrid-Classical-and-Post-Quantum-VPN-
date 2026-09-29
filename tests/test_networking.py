@@ -242,8 +242,8 @@ fe80::/64 via fe80::1 dev pq-c6 proto static metric 77 pref medium
 local fe80::beef dev pq-c6 table local proto static metric 9 pref medium
 multicast ff00::/8 dev pq-c6 table local proto kernel metric 256 pref medium
 '''
-    filter_path=Path(__file__).with_name('meaningful_ipv6_routes.awk')
-    result=subprocess.run(['awk','-f',str(filter_path)],input=routes,text=True,
+    script=Path(__file__).with_name('namespace_vpn.sh')
+    result=subprocess.run(['bash',str(script),'--filter-meaningful-ipv6-routes'],input=routes,text=True,
                           capture_output=True,check=True)
     assert result.stdout == '''default via 2001:db8:6::1 dev pq-c6 metric 1024 pref medium
 default via fe80::1 dev pq-c6 proto kernel metric 2048 pref medium

@@ -30,7 +30,7 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 │   ├── common/             # Shared desktop, icon, and managed service assets
 │   └── deb/                # Debian app plus pinned native/Python liboqs package recipes
 ├── scripts/                # Native liboqs installer and server network lifecycle
-├── tests/                  # Seven responsibility suites plus conftest/root harness
+├── tests/                  # Responsibility suites plus shared fixtures and root harness
 ├── vpn/                    # CLI/config/doctor/identity/profiles/enrollment/network/runtime boundaries
 ├── constraints-tested.txt  # Complete tested transitive version pins
 ├── pyproject.toml          # Core, desktop and development dependency groups
@@ -41,6 +41,21 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ---
 
 ## 📝 Modification Log & Project Progress
+
+### 2026-09-19 — Project File Consolidation
+
+- Merged the distribution packaging guide into canonical `docs/deployment.md` and
+  updated its README/test references.
+- Embedded the sole-use IPv6 route filter in the root namespace harness while
+  preserving its isolated regression test, and removed the redundant GUI launch
+  wrapper because `pqvpn-gui` and `python -m app.client` use `app.client:main`.
+- Removed duplicate cryptographic test fixtures in favor of `tests/conftest.py`.
+  No frozen crypto, handshake, runtime, network, onboarding, account, or account
+  API implementation was changed.
+- Validation passed: 429 tests with 2 privileged skips, native ML-KEM 2/2,
+  account/API 86/86, lifecycle reuse rejection, compileall, shell syntax,
+  systemd/sysusers, Arch metadata, Debian patch dry-runs, clean wheel entry points,
+  dependency consistency, frozen-core diff, and whitespace checks.
 
 ### 2026-09-19 — Milestone 4.1: Secure Account and Device Store Implementation
 
@@ -53,7 +68,7 @@ Hybrid-Classical-and-Post-Quantum-VPN/
   - Pinned `argon2-cffi==25.1.0` and `argon2-cffi-bindings==25.1.0` in `pyproject.toml` and `constraints-tested.txt`.
   - Added `python-argon2-cffi` to Arch `packaging/arch/PKGBUILD`.
   - Added `python3-argon2` to Debian/Ubuntu `packaging/deb/debian/control` and refreshed runtime dependencies patch.
-  - Updated `README.md`, `packaging/README.md`, and `packaging/deb/debian/install`.
+  - Updated `README.md`, the packaging guide now in `docs/deployment.md`, and `packaging/deb/debian/install`.
 - **Documentation & Testing**:
   - Created `docs/accounts.md` detailing database schema, password hashing specifications, session token security, and authorization boundaries.
   - Created comprehensive test suite `tests/test_accounts.py` with 42 unit/integration tests; full test suite passes (385 passed, 2 skipped).
@@ -309,7 +324,9 @@ Hybrid-Classical-and-Post-Quantum-VPN/
   - Replaced API-dependent runtime schema test in `tests/test_runtime.py` with `test_client_status_serialization_and_real_schema`.
   - Added comprehensive test suite `tests/test_client_app.py` (12 test cases covering IPC framing, authorization, state transitions, missing config, and headless GUI widgets).
   - Updated `pyproject.toml` removing FastAPI, Uvicorn, and WebSockets dependencies; added `desktop` extra for `PySide6`.
-  - Net file reduction: deleted 6 files, added 4 files (`app/client.py`, `deploy/pqvpn-client.service`, `tests/test_client_app.py`, `app/__main__.py`), keeping the repository compact and purposeful.
+  - Net file reduction: deleted 6 files and added the canonical client, service,
+    and test files; the temporary package launcher was later removed in favor of
+    the installed `pqvpn-gui` entry point and `python -m app.client`.
 - **Documentation & README Rewrite**:
   - Rewrote `README.md` into a clean, accurate, single-source project landing page (~150 lines) detailing current capabilities, architecture, hybrid crypto primitives, quickstart, GUI usage, testing, and limitations.
   - Updated `docs/design.md` to reflect desktop client architecture and Unix domain socket IPC.
@@ -618,7 +635,7 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | Task / Module | Status | Description |
 | :--- | :---: | :--- |
 | **Milestone 4.1 (Account/Device Store)** | ✅ Completed | SQLite AccountStore/DeviceStore with WAL mode, Argon2id hashing, strict RBAC, device management, session tokens; cleanly separated from VPN core (385 passed / 2 skipped) |
-| **Milestone 4.2 (Register/Login HTTPS API)** | ⏳ Pending | Standalone HTTPS API with POST /auth/register, POST /auth/login, POST /auth/logout, authenticated session tokens, rate limiting, AccountStore integration |
+| **Milestone 4.2 (Register/Login HTTPS API)** | ✅ Completed | Standalone HTTPS API with register/login/me/logout, hashed session tokens, TLS enforcement, bounded rate limiting, and AccountStore integration (429 passed / 2 skipped baseline) |
 | **Desktop Client Milestone 3** | ✅ Completed | Managed identity/onboarding plus live GUI enrollment, connect, disconnect, identity persistence, rekey, cleanup, and native PQC validation passed against Ubuntu 26.04 |
 | **Arch / Omarchy Packaging** | ✅ Completed | Pinned checksum-verified liboqs/Python packages, deterministic app archive, and Python `-s` isolation in both client units; manual Pacman install chain pending |
 | **Debian / Ubuntu Packaging** | ✅ Completed | Exact pinned liboqs 0.16.0 native/Python packages and main app built, inspected, and clean-installed on Ubuntu 26.04 with native backend and GUI imports verified |

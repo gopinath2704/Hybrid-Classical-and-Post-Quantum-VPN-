@@ -17,7 +17,8 @@ A deployable research/prototype PQ-VPN implementing a KEMTLS-inspired custom pro
 | Native ML-KEM marker | 2 passed |
 | Root namespace gate (Ubuntu 26.04.1) | PASS (1 passed, 261 deselected on `784419e`) |
 | Desktop GUI | Milestone 3: managed identity, public profiles, offline enrollment |
-| Unit suite | 342 passed, 2 skipped |
+| Account authentication | Milestone 4.2: dedicated HTTPS API and bearer sessions |
+| Unit suite | 429 passed, 2 skipped |
 
 **Not yet validated / pending:**
 
@@ -194,7 +195,7 @@ sudo python -m vpn.cli client authorize-request shadow-laptop.pqenroll \
   --vpn-ip 10.8.0.9
 ```
 
-See [packaging/README.md](packaging/README.md) for the Arch/Omarchy and Debian
+See [docs/deployment.md](docs/deployment.md#packaging-foundation) for the Arch/Omarchy and Debian
 packaging foundation. Package builds and installation have not yet been live-validated.
 
 ## Testing
@@ -216,6 +217,7 @@ crypto/
 handshake/
   kemtls.py           KEMTLS-inspired v2 protocol state machine
 vpn/
+  account_api.py       Dedicated account registration/login/session API
   accounts.py         Server-side account/device/session SQLite store
   cli.py              Provisioning and runtime CLI
   config.py           TOML configuration with validation

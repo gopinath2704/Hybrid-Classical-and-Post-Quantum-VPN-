@@ -1,6 +1,9 @@
 packaging/common/pqvpn.desktop usr/share/applications/
 packaging/common/pqvpn.svg usr/share/icons/hicolor/scalable/apps/
 packaging/common/pqvpn-client.service usr/lib/systemd/system/
+packaging/common/pqvpn-account-api.service usr/lib/systemd/system/
+packaging/common/pqvpn.conf usr/lib/sysusers.d/
+config/account-api.toml etc/pqvpn/
 README.md usr/share/doc/pqvpn/
 docs/design.md usr/share/doc/pqvpn/
 docs/deployment.md usr/share/doc/pqvpn/

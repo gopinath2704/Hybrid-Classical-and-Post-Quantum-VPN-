@@ -393,16 +393,11 @@ class TestHybridKEM:
         assert store.count == 0
 import os,struct
 import pytest
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from crypto.hybrid_crypto import PQCProvider,get_crypto_status,_OQS_AVAILABLE
 from handshake.kemtls import *
 from handshake.kemtls import _unpack_header
 from vpn.identity import fingerprint
 
-@pytest.fixture
-def identities():
-    kem=PQCProvider(allow_mock=True); server_sk,server_pk=kem.generate_keypair(); client_sk=Ed25519PrivateKey.generate(); client_pk=client_sk.public_key().public_bytes_raw()
-    return server_sk,server_pk,client_sk,client_pk
 def exchange(ids,authorized=True):
     sk,pk,csk,cpk=ids
     c=KEMTLSClient(pk,fingerprint(pk),csk,True);s=KEMTLSServer(sk,pk,lambda key:{"client_id":"alice"} if authorized and key==cpk else None,True)
@@ -536,14 +531,7 @@ import concurrent.futures
 import struct
 import threading
 import pytest
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from crypto.hybrid_crypto import PQCProvider
 from handshake.kemtls import DATA_HEADER_FORMAT,DATA_HEADER_SIZE,Channel,FrameType,HandshakeError
-
-@pytest.fixture
-def identities():
-    kem=PQCProvider(allow_mock=True);server_sk,server_pk=kem.generate_keypair();client_sk=Ed25519PrivateKey.generate()
-    return server_sk,server_pk,client_sk,client_sk.public_key().public_bytes_raw()
 
 def header(frame):return struct.unpack(DATA_HEADER_FORMAT,frame[:DATA_HEADER_SIZE])
 

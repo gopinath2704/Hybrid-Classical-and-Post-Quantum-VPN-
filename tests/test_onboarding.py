@@ -583,7 +583,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
 def test_packages_do_not_include_deployment_identity_or_config():
     root = Path(__file__).parents[1]
     arch = (root / "packaging/arch/PKGBUILD").read_text()
-    archive_command = (root / "packaging/README.md").read_text()
+    archive_command = (root / "docs/deployment.md").read_text()
     installed_sources = "\n".join(
         line for line in arch.splitlines()
         if "installer" in line or line.lstrip().startswith("install ")
