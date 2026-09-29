@@ -547,9 +547,7 @@ def test_packaging_foundation_has_safe_launcher_and_managed_service():
         assert "wget " not in metadata
 
 
-def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path):
-    root = Path(__file__).parents[1]
-    archive = tmp_path / "pqvpn-2.0.0.tar.gz"
+def _make_arch_source_archive(root: Path, archive: Path) -> None:
     included = (
         "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
         "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
@@ -564,6 +562,12 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
         cwd=root,
         check=True,
     )
+
+
+def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path):
+    root = Path(__file__).parents[1]
+    archive = tmp_path / "pqvpn-2.0.0.tar.gz"
+    _make_arch_source_archive(root, archive)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     assert digest == "667ecfe52954a9fafa136f15940d9382a580f34dc8a228e349d14e164817ac87"
     assert digest in (root / "packaging/arch/PKGBUILD").read_text()
@@ -580,14 +584,45 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
     assert not any(forbidden_parts.intersection(Path(name).parts) for name in names)
 
 
-def test_packages_do_not_include_deployment_identity_or_config():
+def test_packages_do_not_include_deployment_identity_or_config(tmp_path):
     root = Path(__file__).parents[1]
     arch = (root / "packaging/arch/PKGBUILD").read_text()
-    archive_command = (root / "docs/deployment.md").read_text()
+    debian_install = (root / "packaging/deb/debian/install").read_text()
+    archive = tmp_path / "pqvpn-2.0.0.tar.gz"
+    _make_arch_source_archive(root, archive)
+
+    with tarfile.open(archive, "r:gz") as source:
+        names = [member.name for member in source.getmembers()]
+    assert names
+    forbidden_names = {
+        "authorized_clients.json", "client_identity_private.key",
+        "server_identity_private.key", "client.toml", "server.toml",
+        ".env", "accounts.db", "account.db",
+    }
+    forbidden_directories = {
+        ".git", "__pycache__", ".pytest_cache", ".venv", "venv",
+        "build", "dist", "pkg", "src",
+    }
+    forbidden_suffixes = (
+        ".key", ".pem", ".p12", ".pfx", ".crt", ".db",
+        ".db-wal", ".db-shm", ".sqlite", ".sqlite3",
+    )
+    for name in names:
+        path = Path(name)
+        parts = {part.lower() for part in path.parts}
+        filename = path.name.lower()
+        assert not parts.intersection(forbidden_directories), name
+        assert filename not in forbidden_names, name
+        assert not filename.endswith(forbidden_suffixes), name
+        assert ".pqenroll" not in filename, name
+        assert not re.search(r"(^|[._-])(secret|credential|private_key)([._-]|$)", filename), name
+        assert "var/lib/pqvpn" not in name.lower(), name
+
     installed_sources = "\n".join(
         line for line in arch.splitlines()
         if "installer" in line or line.lstrip().startswith("install ")
     )
+    installed_sources += "\n" + debian_install
     for forbidden in (
         "192.168.8.43",
         "authorized_clients.json",
@@ -599,6 +634,3 @@ def test_packages_do_not_include_deployment_identity_or_config():
         "/.local",
     ):
         assert forbidden not in installed_sources
-    assert "config/client.toml" not in archive_command.split("git archive", 1)[1].split(
-        "printf", 1
-    )[0]
