@@ -212,9 +212,7 @@ git archive --format=tar.gz --mtime=2026-09-14T00:00:00Z \
   app benchmarks.py crypto handshake vpn pyproject.toml README.md \
   docs/design.md docs/deployment.md docs/accounts.md packaging/common \
   config/account-api.toml
-printf '%s  %s\n' \
-  49d6f478ea78e69e478b66cc4d235401759cae4ed3202d21134c17903a5cba21 \
-  packaging/arch/pqvpn-2.0.0.tar.gz | sha256sum --check -
+(cd packaging/arch && makepkg --verifysource)
 (cd packaging/arch && makepkg --cleanbuild --syncdeps)
 ```
 
@@ -224,9 +222,8 @@ only committed objects and produces the required `pqvpn-2.0.0/` top-level
 directory; it never copies `.git`, the working tree's untracked keys, or user/system
 state. If a later commit changes any allowlisted input, recreate the archive, run
 `(cd packaging/arch && updpkgsums)`, and review and commit the resulting real
-checksum before building. Never substitute `SKIP`. The M4.2 implementation is
-intentionally uncommitted, so the main package source checksum remains the M4.1
-value until the implementation commit exists; refresh it after that commit.
+checksum before building. Never substitute `SKIP`. Refresh the main package source
+checksum in a follow-up checksum-only commit after the implementation commit exists.
 The packaged command launchers and privileged client service use Python's `-s`
 mode, so an invoking user's `~/.local` site-packages cannot shadow the
 Pacman-managed wrapper.

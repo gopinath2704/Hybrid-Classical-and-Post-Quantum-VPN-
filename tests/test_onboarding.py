@@ -553,7 +553,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
     included = (
         "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
         "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
-        "packaging/common",
+        "packaging/common", "config/account-api.toml",
     )
     subprocess.run(
         [
@@ -565,7 +565,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
         check=True,
     )
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    assert digest == "49d6f478ea78e69e478b66cc4d235401759cae4ed3202d21134c17903a5cba21"
+    assert digest == "667ecfe52954a9fafa136f15940d9382a580f34dc8a228e349d14e164817ac87"
     assert digest in (root / "packaging/arch/PKGBUILD").read_text()
 
     with tarfile.open(archive, "r:gz") as source:
