@@ -569,7 +569,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
     archive = tmp_path / "pqvpn-2.0.0.tar.gz"
     _make_arch_source_archive(root, archive)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    assert digest == "667ecfe52954a9fafa136f15940d9382a580f34dc8a228e349d14e164817ac87"
+    assert digest == "a750247da7bd5164f92f9f6a398acdb915b4505f66bd25a5d0458b3bb06111c8"
     assert digest in (root / "packaging/arch/PKGBUILD").read_text()
 
     with tarfile.open(archive, "r:gz") as source:
