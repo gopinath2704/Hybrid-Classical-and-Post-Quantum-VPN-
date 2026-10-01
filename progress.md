@@ -42,6 +42,18 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 
 ## 📝 Modification Log & Project Progress
 
+### 2026-10-01 — Milestone 4.6: Account-Aware Desktop UX
+
+- `account_ux_state()` in `app/client.py` combines session, account-server reachability,
+  device binding/review status, and the service-reported VPN state into one of the
+  planned states (signed out, no device, pending, rejected, revoked, disabled,
+  approved/disconnected, connecting, connected, session expired, server unavailable).
+- New Home "Account & Device" card (state, account, this device, Open Account) and a
+  "Session expires" row on the Account profile; the 60-second session check also
+  refreshes device status, so an administrator approval appears without re-login.
+- Account state never gates Connect; the VPN state always takes precedence.
+- Fixed Account page horizontal clipping caused by an unwrapped notice label.
+
 ### 2026-10-01 — Milestone 4.5: Device Enrollment and Administrator Approval
 
 - **Account schema version 2** (`vpn/accounts.py`): devices gain an administrator review
@@ -683,8 +695,8 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | **Milestone 4.3 (Desktop Auth UX)** | ✅ Completed | PySide6 Login/Register/Logout UI, memory-only session, standard-library HTTPS account client in `app/client.py`, sanitized errors (472 passed / 2 skipped) |
 | **Milestone 4.4 (Account-Device Binding)** | ✅ Completed | Authenticated `/devices` API and desktop "This Device" binding of the managed public Ed25519 identity; private keys remain local; no `AuthorizedClients` change |
 | **Milestone 4.5 (Admin Enrollment Approval)** | ✅ Completed | Schema v2 device review status with v1 migration; root-only `vpn.cli account` approve/reject/revoke is the sole path into `AuthorizedClients` |
-| **Milestone 4.6 (Account-Aware Desktop UX)** | ⏳ Next | 10-state comprehensive desktop UX visualizing account, device approval, and live VPN telemetry/metrics |
-| **Milestone 4.7 (E2E Multi-Node Validation)** | ⏳ Planned | Full live system validation on Omarchy desktop ↔ Ubuntu server VM (KEMTLS v2, TUN, routes, DNS, rekeying, disconnect/logout) |
+| **Milestone 4.6 (Account-Aware Desktop UX)** | ✅ Completed | Home "Account & Device" card driven by `account_ux_state()` across account, device review, and VPN states; never gates Connect |
+| **Milestone 4.7 (E2E Multi-Node Validation)** | ⏳ Next | Full live system validation on Omarchy desktop ↔ Ubuntu server VM (KEMTLS v2, TUN, routes, DNS, rekeying, disconnect/logout) |
 | **Desktop Client Milestone 3** | ✅ Completed | Managed identity/onboarding plus live GUI enrollment, connect, disconnect, identity persistence, rekey, cleanup, and native PQC validation passed against Ubuntu 26.04 |
 | **Arch / Omarchy Packaging** | ✅ Completed | Pinned checksum-verified liboqs/Python packages, deterministic app archive, and Python `-s` isolation in both client units; manual Pacman install chain pending |
 | **Debian / Ubuntu Packaging** | ✅ Completed | Exact pinned liboqs 0.16.0 native/Python packages and main app built, inspected, and clean-installed on Ubuntu 26.04 with native backend and GUI imports verified |

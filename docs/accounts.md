@@ -225,6 +225,13 @@ written to disk, sent over the service IPC socket, shown, or logged. A 60-second
 `/auth/me` check returns an expired, revoked, or disabled-account session to the
 Login view, and Sign Out clears the local token even if remote revocation fails.
 
+The Home page "Account & Device" card combines the three layers into one
+state: signed out, device not registered, pending approval, rejected, revoked,
+disabled, approved (disconnected), VPN connecting, VPN connected, session
+expired, or account server unavailable. The tunnel state always comes from the
+privileged service, and the account state is informational only: it never
+enables or blocks Connect, because `AuthorizedClients` alone authorizes tunnels.
+
 "Register This Device" asks the local service for the managed public identity
 (`SETUP_STATUS`), re-checks that the fingerprint matches the public key, and sends
 only those public values to `POST /devices`. The private key never leaves the

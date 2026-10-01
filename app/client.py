@@ -1102,6 +1102,52 @@ class AccountClient:
         return device
 
 
+def account_ux_state(
+    session_state: SessionState,
+    *,
+    api_available: bool,
+    identity_ready: bool,
+    device: dict | None,
+    vpn_state: str,
+) -> tuple[str, str, str, str]:
+    """Combine account, device, and VPN state into one (key, title, detail, tone).
+
+    Purely informational: the tunnel is authorized only by ``AuthorizedClients``
+    on the server, so the account state never gates Connect.
+    """
+    if vpn_state == ConnectionState.CONNECTED.value:
+        return "vpn_connected", "VPN connected", "Encrypted tunnel is active.", "green"
+    if vpn_state in {ConnectionState.CONNECTING.value, ConnectionState.DISCONNECTING.value}:
+        return "vpn_connecting", "VPN connecting", "Tunnel state is changing.", "amber"
+    if session_state == SessionState.SESSION_EXPIRED:
+        return ("session_expired", "Session expired",
+                "Sign in again to see your account and device status.", "amber")
+    if session_state != SessionState.AUTHENTICATED:
+        return ("logged_out", "Signed out",
+                "Sign in on the Account page to register and track this device.", "muted")
+    if not api_available:
+        return ("server_unavailable", "Account server unavailable",
+                "Account and device status may be out of date.", "amber")
+    if device is None:
+        detail = ("Register this device on the Account page." if identity_ready
+                  else "Create the device identity first, then register it.")
+        return "no_device", "Device not registered", detail, "cyan"
+    if device.get("enabled") is False:
+        return ("device_disabled", "Device disabled",
+                "An administrator disabled this device.", "red")
+    status = device.get("status")
+    if status == "approved":
+        return ("approved_disconnected", "Device approved",
+                "Ready to connect when a server profile is selected.", "green")
+    if status == "rejected":
+        return "device_rejected", "Device rejected", "An administrator rejected this device.", "red"
+    if status == "revoked":
+        return ("device_revoked", "Device revoked",
+                "VPN access for this device was revoked by an administrator.", "red")
+    return ("device_pending", "Pending approval",
+            "An administrator must approve this device before it can connect.", "amber")
+
+
 def public_device_identity(setup: object) -> tuple[str, str]:
     """Extract and verify the managed public identity from a SETUP_STATUS reply.
 
@@ -1888,6 +1934,8 @@ if PYSIDE6_AVAILABLE:
             self._account_session = AccountSession()
             self._account_client: AccountClient | None = None
             self._account_devices: list[dict] = []
+            self._account_api_available = True
+            self.account_ux_key = "logged_out"
             self._account_worker = _AccountWorker()
             self._account_worker.finished.connect(self._account_finished)
             self._session_timer = QTimer(self)
@@ -2004,6 +2052,24 @@ if PYSIDE6_AVAILABLE:
             self.action_btn.clicked.connect(self._on_toggle)
             hero.body.addWidget(self.action_btn, alignment=Qt.AlignHCenter)
             layout.addWidget(hero)
+
+            account_card = Card("Account & Device")
+            account_header = QHBoxLayout()
+            self.home_account_title = gui_label("Signed out", 13, GUI_COLORS["muted"], 700)
+            self.home_account_open_btn = QPushButton("Open Account")
+            self.home_account_open_btn.clicked.connect(lambda: self.switch_page(3))
+            account_header.addWidget(self.home_account_title)
+            account_header.addStretch(1)
+            account_header.addWidget(self.home_account_open_btn)
+            account_card.body.addLayout(account_header)
+            self.home_account_detail = gui_label("", 10, GUI_COLORS["secondary"])
+            self.home_account_detail.setWordWrap(True)
+            account_card.body.addWidget(self.home_account_detail)
+            self.home_account_user = DataRow("Account")
+            self.home_account_device = DataRow("This device")
+            for row in (self.home_account_user, self.home_account_device):
+                account_card.body.addWidget(row)
+            layout.addWidget(account_card)
 
             metrics = QGridLayout()
             metrics.setContentsMargins(0, 0, 0, 0)
@@ -2372,7 +2438,9 @@ if PYSIDE6_AVAILABLE:
             self.profile_id_row = DataRow("User ID")
             self.profile_status_row = DataRow("Account status")
             self.profile_created_row = DataRow("Created")
-            for row in (self.profile_id_row, self.profile_status_row, self.profile_created_row):
+            self.profile_expires_row = DataRow("Session expires")
+            for row in (self.profile_id_row, self.profile_status_row, self.profile_created_row,
+                        self.profile_expires_row):
                 profile_card.body.addWidget(row)
 
             signout_row = QHBoxLayout()
@@ -2429,12 +2497,14 @@ if PYSIDE6_AVAILABLE:
 
             # Security separation callout
             separation_card = Card("VPN Authorization Notice")
-            separation_card.body.addWidget(gui_label(
+            separation_notice = gui_label(
                 "⚠️  Account login authenticates user identity only. "
                 "Device enrollment and administrator authorization are required "
                 "for VPN tunnel access. Signing in does not grant VPN permission.",
                 11, GUI_COLORS["amber"], 550,
-            ))
+            )
+            separation_notice.setWordWrap(True)
+            separation_card.body.addWidget(separation_notice)
             profile_layout.addWidget(separation_card)
             profile_layout.addStretch(1)
 
@@ -2629,6 +2699,7 @@ if PYSIDE6_AVAILABLE:
             if ok and isinstance(data, dict):
                 user = UserProfile.from_dict(data["user"])
                 self._account_session.set_session(data["token"], user, data["expires_at"])
+                self._set_account_api_available(True)
                 self._session_timer.start()
                 self._add_gui_event("info", f"Signed in as {user.username}")
                 self._refresh_account_view()
@@ -2666,9 +2737,13 @@ if PYSIDE6_AVAILABLE:
                 return
             if ok and isinstance(data, list):
                 self._account_devices = data
+                self._set_account_api_available(True)
                 self._render_account_device()
             elif status_code == 401:
                 self._end_account_session(expired=True)
+            else:
+                self._set_account_api_available(False)
+                self._render_account_device()
 
         def _account_bind_finished(self, ok, data, message, status_code, retry_after) -> None:
             self.device_bind_btn.setText("Register This Device")
@@ -2705,6 +2780,8 @@ if PYSIDE6_AVAILABLE:
                 binding = "Not registered"
             else:
                 status = DEVICE_STATUS_LABELS.get(device.get("status"), "Unknown status")
+                if device.get("enabled") is False:
+                    status = "Disabled"
                 binding = (
                     f"Registered as {sanitize_error(device.get('device_name', ''), 100)} · {status}"
                 )
@@ -2713,6 +2790,7 @@ if PYSIDE6_AVAILABLE:
             self.device_bind_btn.setEnabled(
                 bool(fingerprint) and device is None and self._account_session.is_authenticated
             )
+            self._render_account_state()
 
         def _account_logout_finished(self, ok, data, message, status_code, retry_after) -> None:
             if not ok and status_code != 401:
@@ -2731,6 +2809,7 @@ if PYSIDE6_AVAILABLE:
                 self._set_account_api_available(False)
 
         def _set_account_api_available(self, available: bool) -> None:
+            self._account_api_available = available
             if available:
                 self.profile_session_badge.setText("SESSION ACTIVE")
                 self.profile_session_badge.setStyleSheet(self._badge_style(GUI_COLORS["green"]))
@@ -2768,6 +2847,7 @@ if PYSIDE6_AVAILABLE:
                     self.profile_id_row.set_value(user.id)
                     self.profile_status_row.set_value("Active" if user.enabled else "Disabled")
                     self.profile_created_row.set_value(user.created_at or "—")
+                self.profile_expires_row.set_value(self._account_session.get_expires_at() or "—")
                 self._show_profile_view()
             elif state == SessionState.SESSION_EXPIRED:
                 self._show_login_view()
@@ -2775,6 +2855,37 @@ if PYSIDE6_AVAILABLE:
                 self.login_error.show()
             else:
                 self._show_login_view()
+            self._render_account_device()
+
+        def _render_account_state(self) -> None:
+            """Show the combined account / device / VPN state on Home (M4.6)."""
+            fingerprint = self._last_status.identity_fingerprint
+            device = self._current_account_device()
+            key, title, detail, tone = account_ux_state(
+                self._account_session.state,
+                api_available=self._account_api_available,
+                identity_ready=bool(fingerprint),
+                device=device,
+                vpn_state=self._last_status.state,
+            )
+            self.account_ux_key = key
+            color = GUI_COLORS[tone]
+            self.home_account_title.setText(title)
+            self.home_account_title.setStyleSheet(f"font-size: 13px; color: {color}; font-weight: 700;")
+            self.home_account_detail.setText(detail)
+            user = self._account_session.get_user()
+            self.home_account_user.set_value(
+                f"{user.username} · {user.email}" if user and self._account_session.is_authenticated
+                else "Signed out"
+            )
+            if device is not None:
+                status = DEVICE_STATUS_LABELS.get(device.get("status"), "Unknown status")
+                if device.get("enabled") is False:
+                    status = "Disabled"
+                device_text = f"{sanitize_error(device.get('device_name', ''), 100)} · {status}"
+            else:
+                device_text = f"{truncate_fingerprint(fingerprint)} · not registered" if fingerprint else "Identity not ready"
+            self.home_account_device.set_value(device_text)
 
         def _build_settings_page(self) -> QWidget:
             page = QWidget()

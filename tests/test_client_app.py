@@ -1049,3 +1049,104 @@ class TestDeviceBindingGUI:
         gui._on_bind_device_clicked()
         TestAccountGUI.wait_for(qapp, lambda: gui.device_error.isVisible() or not gui.device_error.isHidden())
         assert "identity" in gui.device_error.text().lower()
+
+
+# ─── Milestone 4.6: account-aware desktop UX ──────────────────────────────
+
+class TestAccountUXState:
+    AUTH = SessionState.AUTHENTICATED
+
+    @pytest.mark.parametrize("session,api,identity,device,vpn,expected", [
+        (SessionState.LOGGED_OUT, True, True, None, "DISCONNECTED", "logged_out"),
+        (AUTH, True, True, None, "DISCONNECTED", "no_device"),
+        (AUTH, True, True, {"status": "pending", "enabled": True}, "DISCONNECTED", "device_pending"),
+        (AUTH, True, True, {"status": "rejected", "enabled": True}, "DISCONNECTED", "device_rejected"),
+        (AUTH, True, True, {"status": "approved", "enabled": False}, "DISCONNECTED", "device_disabled"),
+        (AUTH, True, True, {"status": "approved", "enabled": True}, "DISCONNECTED", "approved_disconnected"),
+        (AUTH, True, True, {"status": "approved", "enabled": True}, "CONNECTING", "vpn_connecting"),
+        (AUTH, True, True, {"status": "approved", "enabled": True}, "CONNECTED", "vpn_connected"),
+        (SessionState.SESSION_EXPIRED, True, True, None, "DISCONNECTED", "session_expired"),
+        (AUTH, False, True, None, "DISCONNECTED", "server_unavailable"),
+        (AUTH, True, True, {"status": "revoked", "enabled": True}, "DISCONNECTED", "device_revoked"),
+    ])
+    def test_state_matrix(self, session, api, identity, device, vpn, expected):
+        from app.client import account_ux_state
+        key, title, detail, tone = account_ux_state(
+            session, api_available=api, identity_ready=identity, device=device, vpn_state=vpn
+        )
+        assert key == expected and title and detail
+        assert tone in {"green", "amber", "red", "muted", "cyan"}
+
+    def test_vpn_state_is_independent_of_login(self):
+        """A logged-out user with an authorized device still sees the real tunnel state."""
+        from app.client import account_ux_state
+        key, *_ = account_ux_state(
+            SessionState.LOGGED_OUT, api_available=True, identity_ready=True,
+            device=None, vpn_state="CONNECTED",
+        )
+        assert key == "vpn_connected"
+
+
+@pytest.mark.skipif(not _pyside6_available(), reason="PySide6 not installed")
+class TestAccountAwareHome:
+    @pytest.fixture
+    def gui(self, qapp):
+        from app.client import MainWindow
+        window = MainWindow(TestDeviceBindingGUI.IdentityIPC(), start_polling=False)
+        window._render(ClientStatus(
+            state="DISCONNECTED", managed_mode=True, identity_ready=True,
+            identity_fingerprint=_device_setup()["setup"]["identity_fingerprint"],
+        ))
+        yield window
+        window.close()
+        qapp.processEvents()
+
+    def test_home_tracks_full_account_device_lifecycle(self, gui, qapp, live_account_api, tmp_path):
+        url, store, _app = live_account_api
+        assert gui.account_ux_key == "logged_out"
+        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
+        TestAccountGUI().sign_in(gui, qapp, url)
+        TestAccountGUI.wait_for(qapp, lambda: gui.account_ux_key == "no_device")
+        assert gui.home_account_user.value_label.text() == "alice · alice@example.com"
+
+        gui._on_bind_device_clicked()
+        TestAccountGUI.wait_for(qapp, lambda: gui.account_ux_key == "device_pending")
+        assert "Pending" in gui.home_account_device.value_label.text()
+
+        # Administrator approves on the server; the next session check picks it up.
+        from vpn.cli import main as cli
+        device = store.get_device_by_fingerprint(_device_setup()["setup"]["identity_fingerprint"])
+        cli(["account", "approve", str(device.id), "--accounts-db", str(store.path),
+             "--database", str(tmp_path / "authorized_clients.json")])
+        gui._validate_account_session()
+        TestAccountGUI.wait_for(qapp, lambda: gui.account_ux_key == "approved_disconnected")
+
+        store.set_device_enabled(device.id, False)
+        gui._validate_account_session()
+        TestAccountGUI.wait_for(qapp, lambda: gui.account_ux_key == "device_disabled")
+
+        gui._on_logout_clicked()
+        assert gui.account_ux_key == "logged_out"
+        assert gui.home_account_user.value_label.text() == "Signed out"
+
+    def test_unavailable_account_server_is_shown(self, gui):
+        gui._account_session.set_session("tok", TestAccountSession.USER, "")
+        gui._account_devices_finished(False, "connection_error", "x", 0, 0)
+        assert gui.account_ux_key == "server_unavailable"
+
+    def test_expired_session_and_vpn_states(self, gui):
+        gui._account_session.set_session("tok", TestAccountSession.USER, "")
+        gui._account_validate_finished(False, "invalid_session", "x", 401, 0)
+        assert gui.account_ux_key == "session_expired"
+        gui._render(ClientStatus(state="CONNECTED"))
+        assert gui.account_ux_key == "vpn_connected"
+
+    def test_open_account_button_switches_page(self, gui):
+        gui.home_account_open_btn.click()
+        assert gui.pages.currentIndex() == 3
+        assert gui.page_title.text() == "Account"
+
+    def test_account_state_never_blocks_connect(self, gui):
+        gui._render(ClientStatus(state="DISCONNECTED", managed_mode=False))
+        assert gui.account_ux_key == "logged_out"
+        assert gui.action_btn.isEnabled()
