@@ -542,7 +542,8 @@ def test_bind_device_records_public_identity_only(client, app):
     response = bind(client, headers)
     assert response.status_code == 201
     device = response.json()["device"]
-    assert set(device) == {"id", "device_name", "fingerprint", "enabled", "created_at"}
+    assert set(device) == {"id", "device_name", "fingerprint", "enabled", "status", "created_at"}
+    assert device["status"] == "pending"
     assert device["fingerprint"] == fp and device["device_name"] == "laptop"
     assert public_key not in response.text
     stored = app.state.account_store.get_device_by_fingerprint(fp)

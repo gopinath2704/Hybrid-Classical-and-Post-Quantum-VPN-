@@ -42,6 +42,19 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 
 ## 📝 Modification Log & Project Progress
 
+### 2026-10-01 — Milestone 4.5: Device Enrollment and Administrator Approval
+
+- **Account schema version 2** (`vpn/accounts.py`): devices gain an administrator review
+  `status` (`pending` / `approved` / `rejected` / `revoked`, SQLite `CHECK`-enforced).
+  `initialize()` migrates a verified version 1 database in one transaction; existing
+  bindings start `pending`. Status changes are compare-and-set.
+- **Administrator CLI** (`python -m vpn.cli account devices|approve|reject|revoke`):
+  the only path from an account device into `AuthorizedClients`. `approve` refuses
+  disabled accounts/devices and rolls back the authorization if recording the status
+  fails; `revoke` disables tunnel authorization before recording the status.
+- The account API exposes `status` read-only and still cannot modify `AuthorizedClients`;
+  the desktop binding row shows the review state.
+
 ### 2026-10-01 — Milestone 4.4: Account ↔ Managed Device Binding
 
 - `vpn/account_api.py`: authenticated `GET /devices` and `POST /devices`. The server
@@ -669,8 +682,8 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | **Milestone 4.2 (Register/Login HTTPS API)** | ✅ Completed | Standalone HTTPS API with register/login/me/logout, hashed session tokens, TLS enforcement, bounded rate limiting, and AccountStore integration (429 passed / 2 skipped baseline) |
 | **Milestone 4.3 (Desktop Auth UX)** | ✅ Completed | PySide6 Login/Register/Logout UI, memory-only session, standard-library HTTPS account client in `app/client.py`, sanitized errors (472 passed / 2 skipped) |
 | **Milestone 4.4 (Account-Device Binding)** | ✅ Completed | Authenticated `/devices` API and desktop "This Device" binding of the managed public Ed25519 identity; private keys remain local; no `AuthorizedClients` change |
-| **Milestone 4.5 (Admin Enrollment Approval)** | ⏳ Next | Administrator trust boundary linking pending account devices to `AuthorizedClients` for tunnel permission |
-| **Milestone 4.6 (Account-Aware Desktop UX)** | ⏳ Planned | 10-state comprehensive desktop UX visualizing account, device approval, and live VPN telemetry/metrics |
+| **Milestone 4.5 (Admin Enrollment Approval)** | ✅ Completed | Schema v2 device review status with v1 migration; root-only `vpn.cli account` approve/reject/revoke is the sole path into `AuthorizedClients` |
+| **Milestone 4.6 (Account-Aware Desktop UX)** | ⏳ Next | 10-state comprehensive desktop UX visualizing account, device approval, and live VPN telemetry/metrics |
 | **Milestone 4.7 (E2E Multi-Node Validation)** | ⏳ Planned | Full live system validation on Omarchy desktop ↔ Ubuntu server VM (KEMTLS v2, TUN, routes, DNS, rekeying, disconnect/logout) |
 | **Desktop Client Milestone 3** | ✅ Completed | Managed identity/onboarding plus live GUI enrollment, connect, disconnect, identity persistence, rekey, cleanup, and native PQC validation passed against Ubuntu 26.04 |
 | **Arch / Omarchy Packaging** | ✅ Completed | Pinned checksum-verified liboqs/Python packages, deterministic app archive, and Python `-s` isolation in both client units; manual Pacman install chain pending |

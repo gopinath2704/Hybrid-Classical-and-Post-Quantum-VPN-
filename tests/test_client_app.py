@@ -1029,7 +1029,9 @@ class TestDeviceBindingGUI:
         gui.device_name_input.setText("work laptop")
         gui._on_bind_device_clicked()
         TestAccountGUI.wait_for(qapp, lambda: gui._current_account_device() is not None)
-        assert gui.device_binding_row.value_label.text() == "Registered as work laptop"
+        assert gui.device_binding_row.value_label.text() == (
+            "Registered as work laptop · Pending administrator approval"
+        )
         assert not gui.device_bind_btn.isEnabled()
         fingerprint = _device_setup()["setup"]["identity_fingerprint"]
         device = store.get_device_by_fingerprint(fingerprint)

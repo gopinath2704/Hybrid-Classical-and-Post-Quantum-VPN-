@@ -2,6 +2,9 @@
 
 This module deliberately does not grant VPN access.  ``AuthorizedClients`` remains
 the independent authority for deciding whether an Ed25519 device may connect.
+A device ``status`` only records the administrator's review decision; the
+explicit administrator command that approves a device is what writes
+``AuthorizedClients``.
 """
 from __future__ import annotations
 
@@ -22,7 +25,8 @@ from argon2.exceptions import HashingError, InvalidHashError, VerificationError
 from vpn.identity import fingerprint
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+DEVICE_STATUSES = ("pending", "approved", "rejected", "revoked")
 DEFAULT_ACCOUNT_DATABASE = Path("/var/lib/pqvpn/accounts/accounts.db")
 MIN_PASSWORD_LENGTH = 12
 MAX_PASSWORD_LENGTH = 1024
@@ -90,6 +94,7 @@ class DeviceRecord:
     enabled: bool
     created_at: str
     updated_at: str
+    status: str = "pending"
 
 
 @dataclass(frozen=True)
@@ -201,6 +206,12 @@ def _validate_device_name(device_name: object) -> str:
     return normalized
 
 
+def _validate_device_status(status: object) -> str:
+    if status not in DEVICE_STATUSES:
+        raise InvalidAccountInput(f"device status must be one of {', '.join(DEVICE_STATUSES)}")
+    return status
+
+
 def _validate_enabled(enabled: object) -> bool:
     if type(enabled) is not bool:
         raise InvalidAccountInput("enabled must be boolean")
@@ -307,6 +318,8 @@ _SCHEMA_STATEMENTS = (
         enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending', 'approved', 'rejected', 'revoked')),
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
     """,
@@ -327,13 +340,22 @@ _SCHEMA_STATEMENTS = (
     "CREATE INDEX idx_sessions_expires_at ON sessions(expires_at)",
 )
 
+# Version 1 → 2 adds the administrator review state. Existing bindings start as
+# pending: no version 1 device was ever approved through the account workflow.
+_MIGRATION_V2 = (
+    """
+    ALTER TABLE devices ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'approved', 'rejected', 'revoked'))
+    """,
+)
+
 _EXPECTED_COLUMNS = {
     "users": (
         "id", "username", "email", "password_hash", "enabled", "created_at", "updated_at"
     ),
     "devices": (
         "id", "user_id", "device_name", "client_fingerprint", "client_public_key",
-        "enabled", "created_at", "updated_at"
+        "enabled", "created_at", "updated_at", "status"
     ),
     "sessions": (
         "id", "user_id", "token_hash", "created_at", "expires_at", "revoked_at",
@@ -341,6 +363,10 @@ _EXPECTED_COLUMNS = {
     ),
 }
 _EXPECTED_INDEXES = {"idx_devices_user_id", "idx_sessions_user_id", "idx_sessions_expires_at"}
+_DEVICE_COLUMNS = (
+    "id, user_id, device_name, client_fingerprint, client_public_key, "
+    "enabled, created_at, updated_at, status"
+)
 
 
 class AccountStore:
@@ -435,7 +461,7 @@ class AccountStore:
             )
         if version != SCHEMA_VERSION:
             raise UnsupportedSchemaVersion(
-                f"account schema version {version} is not supported; initialize a version 1 database"
+                f"account schema version {version} is not supported; run initialize() to migrate"
             )
 
     @staticmethod
@@ -446,13 +472,16 @@ class AccountStore:
         return {str(row[0]) for row in rows}
 
     @classmethod
-    def _validate_schema(cls, connection: sqlite3.Connection) -> None:
+    def _validate_schema(cls, connection: sqlite3.Connection, *, version: int = SCHEMA_VERSION) -> None:
         integrity = connection.execute("PRAGMA quick_check").fetchall()
         if len(integrity) != 1 or integrity[0][0] != "ok":
             raise AccountDatabaseError("account database integrity check failed")
         if cls._application_tables(connection) != set(_EXPECTED_COLUMNS):
             raise AccountDatabaseError("account database has an incompatible table layout")
-        for table, expected in _EXPECTED_COLUMNS.items():
+        columns = dict(_EXPECTED_COLUMNS)
+        if version == 1:
+            columns["devices"] = columns["devices"][:-1]
+        for table, expected in columns.items():
             actual = tuple(row[1] for row in connection.execute(f'PRAGMA table_info("{table}")'))
             if actual != expected:
                 raise AccountDatabaseError(f"account database table {table} has incompatible columns")
@@ -471,7 +500,7 @@ class AccountStore:
             raise AccountDatabaseError("account database contains invalid ownership references")
 
     def initialize(self) -> None:
-        """Create schema version 1 or validate an existing current database."""
+        """Create the current schema, migrate version 1, or validate a current database."""
         with self._connection(current_schema=False) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -479,6 +508,11 @@ class AccountStore:
                 tables = self._application_tables(connection)
                 if version == 0 and not tables:
                     for statement in _SCHEMA_STATEMENTS:
+                        connection.execute(statement)
+                    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                elif version == 1:
+                    self._validate_schema(connection, version=1)
+                    for statement in _MIGRATION_V2:
                         connection.execute(statement)
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 elif version > SCHEMA_VERSION:
@@ -518,7 +552,7 @@ class AccountStore:
             id=row["id"], user_id=row["user_id"], device_name=row["device_name"],
             client_fingerprint=row["client_fingerprint"],
             client_public_key=bytes(row["client_public_key"]), enabled=bool(row["enabled"]),
-            created_at=row["created_at"], updated_at=row["updated_at"]
+            created_at=row["created_at"], updated_at=row["updated_at"], status=row["status"],
         )
 
     @staticmethod
@@ -738,9 +772,8 @@ class AccountStore:
                     ),
                 )
                 row = connection.execute(
-                    """
-                    SELECT id, user_id, device_name, client_fingerprint, client_public_key,
-                           enabled, created_at, updated_at
+                    f"""
+                    SELECT {_DEVICE_COLUMNS}
                     FROM devices WHERE id = ?
                     """,
                     (cursor.lastrowid,),
@@ -767,9 +800,8 @@ class AccountStore:
             raise InvalidAccountInput("client fingerprint must be lowercase SHA-256 hex")
         with self._connection() as connection:
             return self._device(connection.execute(
-                """
-                SELECT id, user_id, device_name, client_fingerprint, client_public_key,
-                       enabled, created_at, updated_at
+                f"""
+                SELECT {_DEVICE_COLUMNS}
                 FROM devices WHERE client_fingerprint = ?
                 """,
                 (client_fingerprint,),
@@ -781,14 +813,65 @@ class AccountStore:
             if not connection.execute("SELECT 1 FROM users WHERE id = ?", (validated,)).fetchone():
                 raise AccountNotFound("user does not exist")
             rows = connection.execute(
-                """
-                SELECT id, user_id, device_name, client_fingerprint, client_public_key,
-                       enabled, created_at, updated_at
+                f"""
+                SELECT {_DEVICE_COLUMNS}
                 FROM devices WHERE user_id = ? ORDER BY id
                 """,
                 (validated,),
             ).fetchall()
         return [device for row in rows if (device := self._device(row)) is not None]
+
+    def get_device_by_id(self, device_id: int) -> DeviceRecord | None:
+        validated = _validate_id(device_id, "device ID")
+        with self._connection() as connection:
+            return self._device(connection.execute(
+                f"SELECT {_DEVICE_COLUMNS} FROM devices WHERE id = ?", (validated,)
+            ).fetchone())
+
+    def list_devices(self, status: str | None = None) -> list[DeviceRecord]:
+        """List every bound device, optionally filtered by review status (admin use)."""
+        with self._connection() as connection:
+            if status is None:
+                rows = connection.execute(
+                    f"SELECT {_DEVICE_COLUMNS} FROM devices ORDER BY id"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    f"SELECT {_DEVICE_COLUMNS} FROM devices WHERE status = ? ORDER BY id",
+                    (_validate_device_status(status),),
+                ).fetchall()
+        return [device for row in rows if (device := self._device(row)) is not None]
+
+    def set_device_status(
+        self, device_id: int, status: str, *, expected: tuple[str, ...] | None = None
+    ) -> DeviceRecord:
+        """Record an administrator review decision.
+
+        ``expected`` makes the change compare-and-set so a concurrent decision is
+        not silently overwritten.  This never edits ``AuthorizedClients``.
+        """
+        validated_id = _validate_id(device_id, "device ID")
+        validated_status = _validate_device_status(status)
+        allowed = tuple(_validate_device_status(item) for item in (expected or DEVICE_STATUSES))
+        now = _utc_now()
+        placeholders = ", ".join("?" for _ in allowed)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                f"UPDATE devices SET status = ?, updated_at = ? WHERE id = ? AND status IN ({placeholders})",
+                (validated_status, now, validated_id, *allowed),
+            )
+            row = connection.execute(
+                f"SELECT {_DEVICE_COLUMNS} FROM devices WHERE id = ?", (validated_id,)
+            ).fetchone()
+            connection.commit()
+        if row is None:
+            raise AccountNotFound("device does not exist")
+        if cursor.rowcount != 1:
+            raise InvalidAccountInput(f"device status is {row['status']}, expected {'/'.join(allowed)}")
+        result = self._device(row)
+        assert result is not None
+        return result
 
     def set_device_enabled(self, device_id: int, enabled: bool) -> DeviceRecord:
         validated_id = _validate_id(device_id, "device ID")
@@ -804,9 +887,8 @@ class AccountStore:
                 connection.rollback()
                 raise AccountNotFound("device does not exist")
             row = connection.execute(
-                """
-                SELECT id, user_id, device_name, client_fingerprint, client_public_key,
-                       enabled, created_at, updated_at
+                f"""
+                SELECT {_DEVICE_COLUMNS}
                 FROM devices WHERE id = ?
                 """,
                 (validated_id,),

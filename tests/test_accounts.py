@@ -62,7 +62,7 @@ def test_fresh_database_initialization_schema_and_permissions(tmp_path):
     assert not path.exists()
     account_store.initialize()
 
-    assert account_store.schema_version() == SCHEMA_VERSION == 1
+    assert account_store.schema_version() == SCHEMA_VERSION == 2
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     with raw_connection(account_store) as connection:
@@ -94,7 +94,7 @@ def test_store_connections_enable_foreign_keys(store):
         connection.close()
 
 
-@pytest.mark.parametrize("version", [2, 99])
+@pytest.mark.parametrize("version", [3, 99])
 def test_newer_schema_version_fails_closed(tmp_path, version):
     path = tmp_path / "accounts.db"
     with sqlite3.connect(path) as connection:
@@ -280,6 +280,86 @@ def test_duplicate_fingerprint_unknown_user_and_invalid_identity(store, user):
         store.add_device(user.id, "Private-ish", fingerprint(b"x" * 31), b"x" * 31)
 
 
+_V1_SCHEMA = (
+    """CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+        email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""",
+    """CREATE TABLE devices (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,
+        device_name TEXT NOT NULL, client_fingerprint TEXT NOT NULL UNIQUE,
+        client_public_key BLOB NOT NULL CHECK (length(client_public_key) = 32),
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)""",
+    """CREATE TABLE sessions (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,
+        token_hash BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+        created_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT,
+        last_used_at TEXT, FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)""",
+    "CREATE INDEX idx_devices_user_id ON devices(user_id)",
+    "CREATE INDEX idx_sessions_user_id ON sessions(user_id)",
+    "CREATE INDEX idx_sessions_expires_at ON sessions(expires_at)",
+)
+
+
+def test_version_1_database_migrates_with_devices_pending(tmp_path):
+    path = tmp_path / "accounts" / "accounts.db"
+    path.parent.mkdir(mode=0o700)
+    public, identity_fingerprint, _ = public_identity()
+    with sqlite3.connect(path) as connection:
+        for statement in _V1_SCHEMA:
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO users VALUES (1, 'alice', 'alice@example.com', ?, 1, 't', 't')",
+            (hash_password("correct horse battery staple"),),
+        )
+        connection.execute(
+            "INSERT INTO devices VALUES (1, 1, 'Laptop', ?, ?, 1, 't', 't')",
+            (identity_fingerprint, public),
+        )
+        connection.execute("PRAGMA user_version = 1")
+    store = AccountStore(path)
+    store.initialize()
+    assert store.schema_version() == 2
+    device = store.get_device_by_fingerprint(identity_fingerprint)
+    assert device.status == "pending" and device.client_public_key == public
+    assert store.authenticate_user("alice", "correct horse battery staple") is not None
+    store.initialize()  # idempotent after migration
+    assert store.get_device_by_id(1) == device
+
+
+def test_version_1_with_incompatible_layout_is_not_migrated(tmp_path):
+    path = tmp_path / "accounts.db"
+    with sqlite3.connect(path) as connection:
+        for statement in _V1_SCHEMA:
+            connection.execute(statement)
+        connection.execute("ALTER TABLE devices ADD COLUMN surprise TEXT")
+        connection.execute("PRAGMA user_version = 1")
+    with pytest.raises(AccountDatabaseError, match="incompatible columns"):
+        AccountStore(path).initialize()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+def test_device_review_status_is_compare_and_set(store, user):
+    public, identity_fingerprint, _ = public_identity()
+    device = store.add_device(user.id, "Laptop", identity_fingerprint, public)
+    assert device.status == "pending"
+    assert store.list_devices("pending") == [device]
+    approved = store.set_device_status(device.id, "approved", expected=("pending",))
+    assert approved.status == "approved"
+    with pytest.raises(InvalidAccountInput, match="approved"):
+        store.set_device_status(device.id, "rejected", expected=("pending",))
+    assert store.get_device_by_id(device.id).status == "approved"
+    with pytest.raises(InvalidAccountInput, match="status"):
+        store.set_device_status(device.id, "trusted")
+    with pytest.raises(AccountNotFound):
+        store.set_device_status(9999, "revoked")
+    assert store.list_devices("pending") == []
+    assert [d.id for d in store.list_devices()] == [device.id]
+    with raw_connection(store) as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute("UPDATE devices SET status = 'trusted'")
+
+
 def test_device_can_be_disabled_independently(store, user):
     public, identity_fingerprint, _ = public_identity()
     device = store.add_device(user.id, "Laptop", identity_fingerprint, public)
@@ -377,3 +457,85 @@ def test_argon2_dependency_is_declared_for_python_arch_and_debian():
     assert "argon2-cffi==25.1.0" in (root / "constraints-tested.txt").read_text()
     assert "'python-argon2-cffi'" in (root / "packaging/arch/PKGBUILD").read_text()
     assert "python3-argon2" in (root / "packaging/deb/debian/control").read_text()
+
+
+# ─── Milestone 4.5: administrator device approval (vpn.cli account) ───────
+
+def _cli(*argv: str) -> None:
+    from vpn.cli import main
+    main(list(argv))
+
+
+@pytest.fixture
+def review(tmp_path, store, user):
+    public, identity_fingerprint, _ = public_identity()
+    device = store.add_device(user.id, "Laptop", identity_fingerprint, public)
+    authorized = tmp_path / "authorized_clients.json"
+    return store, device, authorized, ("--accounts-db", str(store.path))
+
+
+def test_admin_lists_pending_devices(review, capsys):
+    store, device, _authorized, db = review
+    _cli("account", "devices", "--status", "pending", *db)
+    out = capsys.readouterr().out
+    assert device.client_fingerprint in out and "alice" in out and "pending" in out
+    _cli("account", "devices", "--status", "approved", *db)
+    assert "No devices" in capsys.readouterr().out
+
+
+def test_admin_approval_is_the_only_path_into_authorized_clients(review):
+    store, device, authorized, db = review
+    assert not authorized.exists()  # binding alone never authorizes
+    _cli("account", "approve", str(device.id), *db, "--database", str(authorized))
+    record = AuthorizedClients(authorized).find(device.client_public_key)
+    assert record["client_id"] == f"alice-{device.id}" and record["enabled"] is True
+    assert store.get_device_by_id(device.id).status == "approved"
+    with pytest.raises(SystemExit, match="already approved"):
+        _cli("account", "approve", str(device.id), *db, "--database", str(authorized))
+
+
+def test_admin_reject_leaves_vpn_authorization_untouched(review):
+    store, device, authorized, db = review
+    _cli("account", "reject", str(device.id), *db)
+    assert store.get_device_by_id(device.id).status == "rejected"
+    assert not authorized.exists()
+    with pytest.raises(SystemExit, match="only pending"):
+        _cli("account", "reject", str(device.id), *db)
+
+
+def test_admin_revoke_disables_tunnel_authorization(review):
+    store, device, authorized, db = review
+    with pytest.raises(SystemExit, match="only approved"):
+        _cli("account", "revoke", str(device.id), *db, "--database", str(authorized))
+    _cli("account", "approve", str(device.id), *db, "--database", str(authorized))
+    with pytest.raises(SystemExit, match="account revoke"):
+        _cli("account", "reject", str(device.id), *db)
+    _cli("account", "revoke", str(device.id), *db, "--database", str(authorized))
+    assert AuthorizedClients(authorized).find(device.client_public_key) is None
+    assert store.get_device_by_id(device.id).status == "revoked"
+    # An explicit re-approval is allowed after revocation.
+    _cli("account", "approve", str(device.id), *db, "--database", str(authorized))
+    assert AuthorizedClients(authorized).find(device.client_public_key) is not None
+
+
+def test_admin_refuses_disabled_account_or_device(review):
+    store, device, authorized, db = review
+    store.set_device_enabled(device.id, False)
+    with pytest.raises(SystemExit, match="disabled"):
+        _cli("account", "approve", str(device.id), *db, "--database", str(authorized))
+    store.set_device_enabled(device.id, True)
+    store.set_user_enabled(device.user_id, False)
+    with pytest.raises(SystemExit, match="disabled"):
+        _cli("account", "approve", str(device.id), *db, "--database", str(authorized))
+    assert not authorized.exists()
+    assert store.get_device_by_id(device.id).status == "pending"
+
+
+def test_admin_unknown_device_and_bad_vpn_ip(review):
+    store, device, authorized, db = review
+    with pytest.raises(SystemExit, match="not found"):
+        _cli("account", "approve", "999", *db, "--database", str(authorized))
+    with pytest.raises(SystemExit, match="account error"):
+        _cli("account", "approve", str(device.id), *db, "--database", str(authorized),
+             "--vpn-ip", "not-an-ip")
+    assert store.get_device_by_id(device.id).status == "pending"

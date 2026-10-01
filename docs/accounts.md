@@ -26,18 +26,22 @@ access. When it creates state, it rejects symlink path components, makes the
 database directory mode `0700`, and makes the database mode `0600`.
 
 SQLite foreign-key enforcement is enabled on every store connection. Mutations
-use transactions and parameterized statements. Schema version 1 is recorded in
-SQLite `PRAGMA user_version`; an unversioned non-empty database, incompatible
-layout, integrity failure, or newer version fails closed. Version 1 has no
-automatic migration because there is no earlier account schema to migrate.
+use transactions and parameterized statements. The schema version (currently 2)
+is recorded in SQLite `PRAGMA user_version`; an unversioned non-empty database,
+incompatible layout, integrity failure, or newer version fails closed.
+`initialize()` migrates a version 1 database in one transaction after checking
+its exact version 1 layout: it adds the device `status` column, and every
+existing device starts as `pending`. Any other version is never migrated
+automatically.
 
-## Version 1 schema
+## Schema (version 2)
 
 - `users`: numeric primary key, normalized unique username and email, Argon2id
   password hash, enabled flag, and UTC creation/update timestamps.
 - `devices`: numeric primary key, owning user with `ON DELETE CASCADE`, display
   name, unique lowercase SHA-256 fingerprint, exactly 32 public Ed25519 key
-  bytes, independent enabled flag, and UTC timestamps.
+  bytes, independent enabled flag, UTC timestamps, and an administrator review
+  `status` (`pending`, `approved`, `rejected`, or `revoked`; default `pending`).
 - `sessions`: numeric primary key, owning user with
   `ON DELETE CASCADE`, unique 32-byte token hash, creation/expiry timestamps, and
   nullable revocation/last-use timestamps. There is intentionally no raw-token
@@ -134,7 +138,8 @@ Valid activity updates `last_used_at` at most once per minute.
 
 Both require the Bearer header. `GET /devices` returns the signed-in account's
 devices as `{"devices": [...]}` with only `id`, `device_name`, `fingerprint`,
-`enabled`, and `created_at`.
+`enabled`, `status`, and `created_at`. The API can read the review status but has
+no endpoint that changes it.
 
 `POST /devices` binds a public Ed25519 identity to the account:
 
@@ -180,6 +185,35 @@ at most 4,096 keys and the registration limiter at most 2,048; old entries
 expire and least-recent entries are evicted at the bound. The state is local to
 one API process and intentionally provides prototype abuse protection rather
 than a distributed rate-limit service.
+
+## Administrator device approval (Milestone 4.5)
+
+The account API never writes `AuthorizedClients`. Approval stays an explicit
+administrator action on the server, run as root with the `vpn.cli account`
+commands:
+
+```bash
+sudo /opt/pqvpn/.venv/bin/python -m vpn.cli account devices --status pending \
+  --accounts-db /var/lib/pqvpn/accounts/accounts.db
+sudo /opt/pqvpn/.venv/bin/python -m vpn.cli account approve DEVICE_ID \
+  --accounts-db /var/lib/pqvpn/accounts/accounts.db \
+  --database /etc/pqvpn/authorized_clients.json [--vpn-ip 10.8.0.N]
+sudo chown root:pqvpn /etc/pqvpn/authorized_clients.json
+sudo chmod 0640 /etc/pqvpn/authorized_clients.json
+```
+
+| Command | Allowed from | Account DB | `AuthorizedClients` |
+|---|---|---|---|
+| `approve` | pending, rejected, revoked | → `approved` | adds/enables the device as `<username>-<device id>` |
+| `reject` | pending | → `rejected` | unchanged |
+| `revoke` | approved | → `revoked` | disables the fingerprint first |
+
+`approve` refuses a disabled account or disabled device. Status changes are
+compare-and-set, so a concurrent decision is not overwritten. If recording
+`approved` fails after the authorization write, the authorization is disabled
+again. As with `client revoke`, revocation affects new sessions only; restart the
+VPN server to end existing sessions. The VPN server keeps using only
+`AuthorizedClients`; it never reads the account database.
 
 ## Desktop client
 

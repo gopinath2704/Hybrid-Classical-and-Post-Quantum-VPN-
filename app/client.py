@@ -884,6 +884,12 @@ DEFAULT_ACCOUNT_API_URL = "http://127.0.0.1:8443"
 ACCOUNT_API_TIMEOUT = 10.0
 MAX_ACCOUNT_RESPONSE = 64 * 1024
 ACCOUNT_SESSION_CHECK_MS = 60_000
+DEVICE_STATUS_LABELS = {
+    "pending": "Pending administrator approval",
+    "approved": "Approved",
+    "rejected": "Rejected",
+    "revoked": "Revoked",
+}
 
 _ACCOUNT_ERROR_MESSAGES = {
     "invalid_credentials": "Invalid username/email or password.",
@@ -2698,7 +2704,10 @@ if PYSIDE6_AVAILABLE:
             elif device is None:
                 binding = "Not registered"
             else:
-                binding = f"Registered as {sanitize_error(device.get('device_name', ''), 100)}"
+                status = DEVICE_STATUS_LABELS.get(device.get("status"), "Unknown status")
+                binding = (
+                    f"Registered as {sanitize_error(device.get('device_name', ''), 100)} · {status}"
+                )
             self.device_binding_row.set_value(binding)
             self.device_count_row.set_value(len(self._account_devices))
             self.device_bind_btn.setEnabled(

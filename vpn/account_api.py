@@ -368,6 +368,7 @@ def _public_device(device: DeviceRecord) -> dict[str, object]:
         "device_name": device.device_name,
         "fingerprint": device.client_fingerprint,
         "enabled": device.enabled,
+        "status": device.status,
         "created_at": device.created_at,
     }
 
