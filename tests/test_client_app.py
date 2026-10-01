@@ -354,7 +354,7 @@ class TestGUIHeadless:
 
     def test_home_constructs_at_target_size(self, window):
         gui, _ = window
-        assert gui.pages.count() == 6
+        assert gui.pages.count() == 7
         assert gui.width() == 1180 and gui.height() == 760
         assert gui.minimumWidth() == 980 and gui.minimumHeight() == 650
 
@@ -366,7 +366,7 @@ class TestGUIHeadless:
 
     def test_navigation_switches_without_vpn_actions(self, window):
         gui, fake = window
-        for index, name in enumerate(("Home", "Servers", "Security", "Settings", "Logs", "About")):
+        for index, name in enumerate(("Home", "Servers", "Security", "Account", "Settings", "Logs", "About")):
             gui.switch_page(index)
             assert gui.pages.currentIndex() == index
             assert gui.page_title.text() == name
@@ -567,3 +567,391 @@ class TestGUIHeadless:
         assert gui.settings_state_path.value_label.text() == "/var/lib/pqvpn/identity"
         assert "private" not in gui.settings_state_path.value_label.text().lower()
         assert gui._worker._thread.is_alive()
+
+
+# ─── Milestone 4.3: account API client, memory-only session, desktop auth ──
+
+from app.client import (  # noqa: E402 - grouped with the M4 account tests
+    AccountAPIError,
+    AccountClient,
+    AccountSession,
+    SessionState,
+    UserProfile,
+    _sanitized_message,
+)
+
+ACCOUNT_PASSWORD = "correct horse battery staple"
+
+
+@pytest.fixture
+def live_account_api(tmp_path):
+    """Run the real pqvpn-account-api app on loopback for client integration tests."""
+    import uvicorn
+    from vpn.account_api import AccountAPIConfig, create_app
+    from vpn.accounts import AccountStore
+
+    store = AccountStore(tmp_path / "accounts" / "accounts.db")
+    app = create_app(
+        AccountAPIConfig(database_path=store.path, allow_insecure_loopback=True), store=store
+    )
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert server.started
+    yield f"http://127.0.0.1:{port}", store, app
+    server.should_exit = True
+    thread.join(timeout=10)
+
+
+class TestAccountClientConstruction:
+    def test_loopback_http_allowed(self):
+        assert AccountClient("http://127.0.0.1:8443")._ssl_context is None
+        assert AccountClient("http://[::1]:8443")._ssl_context is None
+
+    @pytest.mark.parametrize("url", [
+        "http://192.168.1.1:8443", "http://localhost.example:8443", "http://8.8.8.8",
+    ])
+    def test_non_loopback_http_rejected(self, url):
+        with pytest.raises(AccountAPIError) as exc_info:
+            AccountClient(url)
+        assert exc_info.value.code == "tls_required"
+
+    @pytest.mark.parametrize("url", [
+        "ftp://127.0.0.1", "https://", "https://u:p@server:8443", "https://server:99999",
+        "https://server/?token=x",
+    ])
+    def test_invalid_urls_rejected(self, url):
+        with pytest.raises(AccountAPIError):
+            AccountClient(url)
+
+    def test_https_always_verifies_certificates(self):
+        import ssl
+        context = AccountClient("https://server.example.com:8443/")._ssl_context
+        assert context.verify_mode == ssl.CERT_REQUIRED
+        assert context.check_hostname is True
+
+    def test_unreadable_ca_certificate_is_reported(self, tmp_path):
+        with pytest.raises(AccountAPIError) as exc_info:
+            AccountClient("https://server:8443", tmp_path / "missing.pem")
+        assert exc_info.value.code == "ssl_error"
+
+    def test_trailing_slash_stripped(self):
+        assert AccountClient("http://127.0.0.1:8443/").base_url == "http://127.0.0.1:8443"
+
+
+class TestAccountErrorMessages:
+    def test_known_codes_are_uniform(self):
+        assert _sanitized_message("invalid_credentials", 401) == "Invalid username/email or password."
+        assert "expired" in _sanitized_message("invalid_session", 401)
+        assert "already exists" in _sanitized_message("account_exists", 409)
+
+    def test_unknown_codes_never_echo_server_text(self):
+        assert "unavailable" in _sanitized_message("whatever", 503).lower()
+        assert "unexpected" in _sanitized_message("whatever", 400).lower()
+
+
+class TestAccountClientLiveAPI:
+    def test_full_lifecycle_against_real_api(self, live_account_api):
+        url, _store, _app = live_account_api
+        client = AccountClient(url)
+        user = client.register("Alice", "Alice@Example.com", ACCOUNT_PASSWORD)
+        assert user["username"] == "alice"
+        token, login_user, expires_at = client.login("alice", ACCOUNT_PASSWORD)
+        assert login_user["email"] == "alice@example.com" and expires_at
+        assert client.get_me(token)["username"] == "alice"
+        client.logout(token)
+        with pytest.raises(AccountAPIError) as exc_info:
+            client.get_me(token)
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.code == "invalid_session"
+
+    def test_email_login(self, live_account_api):
+        url, _store, _app = live_account_api
+        client = AccountClient(url)
+        client.register("bob", "bob@example.com", ACCOUNT_PASSWORD)
+        token, user, _ = client.login("BOB@example.com", ACCOUNT_PASSWORD)
+        assert user["username"] == "bob" and token
+
+    def test_failures_are_indistinguishable(self, live_account_api):
+        url, store, _app = live_account_api
+        client = AccountClient(url)
+        created = client.register("carol", "carol@example.com", ACCOUNT_PASSWORD)
+        store.set_user_enabled(created["id"], False)
+        messages = set()
+        for identifier, password in (
+            ("carol", "wrong password value"),   # wrong password
+            ("nobody", ACCOUNT_PASSWORD),        # nonexistent account
+            ("carol", ACCOUNT_PASSWORD),         # disabled account
+        ):
+            with pytest.raises(AccountAPIError) as exc_info:
+                client.login(identifier, password)
+            assert exc_info.value.status_code == 401
+            messages.add((exc_info.value.code, exc_info.value.message))
+        assert messages == {("invalid_credentials", "Invalid username/email or password.")}
+
+    def test_disabled_account_session_is_rejected(self, live_account_api):
+        url, store, _app = live_account_api
+        client = AccountClient(url)
+        created = client.register("dave", "dave@example.com", ACCOUNT_PASSWORD)
+        token, _, _ = client.login("dave", ACCOUNT_PASSWORD)
+        store.set_user_enabled(created["id"], False)
+        with pytest.raises(AccountAPIError) as exc_info:
+            client.get_me(token)
+        assert exc_info.value.status_code == 401
+
+    def test_login_rate_limit_reports_retry_after(self, live_account_api):
+        url, _store, _app = live_account_api
+        client = AccountClient(url)
+        for _ in range(5):
+            with pytest.raises(AccountAPIError):
+                client.login("erin", "wrong password value")
+        with pytest.raises(AccountAPIError) as exc_info:
+            client.login("erin", "wrong password value")
+        assert exc_info.value.code == "rate_limited"
+        assert exc_info.value.retry_after > 0
+        assert str(exc_info.value.retry_after) in exc_info.value.message
+
+    def test_registration_rate_limit(self, live_account_api):
+        url, _store, _app = live_account_api
+        client = AccountClient(url)
+        for index in range(3):
+            client.register(f"user{index}", f"user{index}@example.com", ACCOUNT_PASSWORD)
+        with pytest.raises(AccountAPIError) as exc_info:
+            client.register("user9", "user9@example.com", ACCOUNT_PASSWORD)
+        assert exc_info.value.code == "rate_limited"
+
+    @pytest.mark.parametrize("username,email,password,code", [
+        ("frank", "frank@example.com", "short", "invalid_registration"),
+        ("frank", "frank@example.com", "x" * 1025, "invalid_registration"),
+        ("bad name!", "frank@example.com", ACCOUNT_PASSWORD, "invalid_registration"),
+        ("frank", "not-an-email", ACCOUNT_PASSWORD, "invalid_registration"),
+    ], ids=["short-password", "long-password", "invalid-username", "invalid-email"])
+    def test_invalid_registration(self, live_account_api, username, email, password, code):
+        url, _store, _app = live_account_api
+        with pytest.raises(AccountAPIError) as exc_info:
+            AccountClient(url).register(username, email, password)
+        assert exc_info.value.code == code
+        assert password not in exc_info.value.message
+
+    def test_duplicate_username_and_email(self, live_account_api):
+        url, _store, _app = live_account_api
+        client = AccountClient(url)
+        client.register("gina", "gina@example.com", ACCOUNT_PASSWORD)
+        for username, email in (("gina", "other@example.com"), ("other", "gina@example.com")):
+            with pytest.raises(AccountAPIError) as exc_info:
+                client.register(username, email, ACCOUNT_PASSWORD)
+            assert exc_info.value.code == "account_exists"
+
+    def test_api_unavailable(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        with pytest.raises(AccountAPIError) as exc_info:
+            AccountClient(f"http://127.0.0.1:{port}").login("x", "y")
+        assert exc_info.value.code == "connection_error"
+
+
+class TestAccountClientMalformedResponses:
+    @pytest.fixture
+    def stub(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        bodies = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                status, body = bodies[self.path]
+                self.send_response(status)
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = do_POST
+
+            def log_message(self, *_args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        yield f"http://127.0.0.1:{server.server_address[1]}", bodies
+        server.shutdown()
+
+    @pytest.mark.parametrize("body", [
+        b"not json", b"[1, 2]", b'{"access_token": ""}', b'{"access_token": "t", "user": 5}',
+    ])
+    def test_malformed_login_response(self, stub, body):
+        url, bodies = stub
+        bodies["/auth/login"] = (200, body)
+        with pytest.raises(AccountAPIError) as exc_info:
+            AccountClient(url).login("alice", ACCOUNT_PASSWORD)
+        assert exc_info.value.code == "invalid_response"
+
+    def test_server_error_text_is_not_echoed(self, stub):
+        url, bodies = stub
+        bodies["/auth/login"] = (500, b'{"error": {"code": "x", "message": "sqlite /var/lib secret"}}')
+        with pytest.raises(AccountAPIError) as exc_info:
+            AccountClient(url).login("alice", ACCOUNT_PASSWORD)
+        assert "sqlite" not in exc_info.value.message
+        assert exc_info.value.status_code == 500
+
+
+class TestAccountSession:
+    USER = UserProfile(id=1, username="alice", email="a@b.com", enabled=True, created_at="")
+
+    def test_lifecycle(self):
+        session = AccountSession()
+        assert session.state == SessionState.LOGGED_OUT and session.get_token() is None
+        session.set_authenticating()
+        assert not session.is_authenticated and session.get_token() is None
+        session.set_session("secret_token", self.USER, "2026-01-02")
+        assert session.is_authenticated and session.get_token() == "secret_token"
+        session.clear_session(expired=True)
+        assert session.state == SessionState.SESSION_EXPIRED
+        assert session.get_token() is None and session.get_user() is None
+
+    def test_repr_and_str_redact_token(self):
+        session = AccountSession()
+        session.set_session("super_secret_token_value", self.USER, "2026-01-02")
+        for text in (repr(session), str(session)):
+            assert "super_secret_token_value" not in text
+            assert "[REDACTED]" in text
+
+    def test_user_profile_from_partial_dict(self):
+        user = UserProfile.from_dict({})
+        assert (user.id, user.username, user.email) == (0, "", "")
+        with pytest.raises(AttributeError):
+            user.username = "changed"
+
+    def test_thread_safety(self):
+        session = AccountSession()
+        errors = []
+
+        def churn():
+            try:
+                for _ in range(200):
+                    session.set_session("tok", self.USER, "exp")
+                    session.get_token()
+                    session.clear_session()
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [threading.Thread(target=churn) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert not errors
+
+
+@pytest.mark.skipif(not _pyside6_available(), reason="PySide6 not installed")
+class TestAccountGUI:
+    @pytest.fixture
+    def gui(self, qapp):
+        from app.client import MainWindow
+        window = MainWindow(TestGUIHeadless.FakeIPC(), start_polling=False)
+        yield window
+        window.close()
+        qapp.processEvents()
+
+    @staticmethod
+    def wait_for(qapp, predicate, timeout=15.0):
+        deadline = time.monotonic() + timeout
+        while not predicate() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.01)
+        qapp.processEvents()
+        assert predicate()
+
+    def sign_in(self, gui, qapp, url, identifier="alice"):
+        gui.account_api_url.setText(url)
+        gui.login_identifier.setText(identifier)
+        gui.login_password.setText(ACCOUNT_PASSWORD)
+        gui._on_login_clicked()
+        self.wait_for(qapp, lambda: gui.login_btn.text() == "Sign In")
+
+    def test_login_logout_flow_keeps_token_out_of_ui(self, gui, qapp, live_account_api, caplog):
+        from PySide6.QtWidgets import QLabel, QLineEdit
+        url, store, _app = live_account_api
+        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
+        caplog.set_level("DEBUG")
+        self.sign_in(gui, qapp, url, "alice@example.com")
+        assert gui._account_session.is_authenticated
+        assert gui.account_stack.currentIndex() == 2
+        assert gui.profile_username.text() == "@alice"
+        assert gui.login_password.text() == ""
+        token = gui._account_session.get_token()
+        widgets_text = " ".join(
+            w.text() for w in gui.findChildren(QLabel) + gui.findChildren(QLineEdit)
+        )
+        assert token not in widgets_text
+        assert token not in caplog.text and ACCOUNT_PASSWORD not in caplog.text
+
+        gui._on_logout_clicked()
+        assert gui._account_session.get_token() is None
+        assert gui.account_stack.currentIndex() == 0
+        token_hash = __import__("hashlib").sha256(token.encode()).digest()
+        self.wait_for(qapp, lambda: store.get_session_by_token_hash(token_hash).revoked_at)
+
+    def test_login_failure_is_sanitized(self, gui, qapp, live_account_api):
+        url, _store, _app = live_account_api
+        self.sign_in(gui, qapp, url, "nobody")
+        assert not gui._account_session.is_authenticated
+        assert gui.login_error.text() == "Invalid username/email or password."
+
+    def test_logout_clears_locally_when_api_unavailable(self, gui):
+        gui._account_session.set_session("tok", TestAccountSession.USER, "")
+        gui._account_client = AccountClient("http://127.0.0.1:1")
+        gui._on_logout_clicked()
+        assert gui._account_session.get_token() is None
+        assert gui._account_session.state == SessionState.LOGGED_OUT
+
+    def test_revoked_session_returns_to_login(self, gui, qapp, live_account_api):
+        url, _store, _app = live_account_api
+        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
+        self.sign_in(gui, qapp, url)
+        AccountClient(url).logout(gui._account_session.get_token())
+        gui._validate_account_session()
+        self.wait_for(qapp, lambda: gui._account_session.state == SessionState.SESSION_EXPIRED)
+        assert gui.account_stack.currentIndex() == 0
+        assert "expired" in gui.login_error.text()
+
+    def test_api_unavailable_keeps_session_and_warns(self, gui):
+        gui._account_session.set_session("tok", TestAccountSession.USER, "")
+        gui._account_validate_finished(False, "connection_error", "x", 0, 0)
+        assert gui._account_session.is_authenticated
+        assert "UNAVAILABLE" in gui.profile_session_badge.text()
+
+    def test_cleartext_remote_url_is_refused_inline(self, gui):
+        gui.account_api_url.setText("http://203.0.113.5:8443")
+        gui.login_identifier.setText("alice")
+        gui.login_password.setText(ACCOUNT_PASSWORD)
+        gui._on_login_clicked()
+        assert "loopback" in gui.login_error.text()
+        assert gui.login_btn.isEnabled()
+
+    def test_register_client_validation(self, gui):
+        gui.register_username.setText("alice")
+        gui.register_email.setText("alice@example.com")
+        gui.register_password.setText("short")
+        gui.register_confirm.setText("short")
+        gui._on_register_clicked()
+        assert "12" in gui.register_error.text()
+        gui.register_password.setText(ACCOUNT_PASSWORD)
+        gui.register_confirm.setText(ACCOUNT_PASSWORD + "x")
+        gui._on_register_clicked()
+        assert "match" in gui.register_error.text()
+
+    def test_login_never_touches_authorized_clients(self, gui, qapp, live_account_api, tmp_path):
+        url, _store, _app = live_account_api
+        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
+        self.sign_in(gui, qapp, url)
+        assert gui._account_session.is_authenticated
+        assert not list(tmp_path.rglob("authorized_clients.json"))

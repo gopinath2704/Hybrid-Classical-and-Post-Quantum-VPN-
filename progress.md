@@ -23,7 +23,7 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ├── config/                 # Shared server/client TOML examples; secrets ignored
 ├── crypto/                 # X25519, native ML-KEM-768 and HKDF
 ├── deploy/                 # Server/client systemd units and consolidated version provenance
-├── docs/                   # design, deployment and historical security audit
+├── docs/                   # design, deployment, accounts, and historical security audit
 ├── handshake/              # Frozen authenticated v2 protocol and record layer
 ├── packaging/
 │   ├── arch/               # Main PQ-VPN plus pinned native/Python liboqs Pacman packages
@@ -41,6 +41,26 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ---
 
 ## 📝 Modification Log & Project Progress
+
+### 2026-10-01 — Milestone 4.3: Desktop Client Login, Registration, and Session UX
+
+- **Account API client in `app/client.py`** (no new module, no new runtime dependency):
+  `AccountClient` uses standard-library `urllib`/`ssl`; HTTPS always verifies
+  certificates (optional private CA file), cleartext HTTP is accepted only on loopback,
+  URLs with credentials/query strings are refused, responses are size-bounded and
+  validated, and every server error is mapped to a fixed user-safe message.
+- **Memory-only `AccountSession`**: the bearer token lives only in GUI process memory,
+  is redacted from `repr`/`str`, and is never logged, displayed, persisted, or sent over IPC.
+- **Account page**: Login (username or email), Register (client-side length/confirm
+  checks; server authoritative), profile view loaded through `/auth/me`, Sign Out,
+  rate-limit countdown, and session-expired / API-unavailable states. A 60-second
+  `/auth/me` check returns an expired, revoked, or disabled-account session to Login.
+  Sign Out clears the local token first, so a failed remote logout cannot leave it behind.
+- **Tests** (`tests/test_client_app.py`): real `pqvpn-account-api` on loopback for
+  username/email login, wrong password / unknown / disabled account uniformity,
+  rate limits, invalid and duplicate registration, revocation, malformed responses,
+  API unavailable, plus headless GUI session-lifecycle and token-never-shown checks.
+- Login never touches `authorized_clients.json`; the frozen VPN core diff is empty.
 
 ### 2026-09-19 — Project File Consolidation
 
@@ -636,6 +656,11 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | :--- | :---: | :--- |
 | **Milestone 4.1 (Account/Device Store)** | ✅ Completed | SQLite AccountStore/DeviceStore with WAL mode, Argon2id hashing, strict RBAC, device management, session tokens; cleanly separated from VPN core (385 passed / 2 skipped) |
 | **Milestone 4.2 (Register/Login HTTPS API)** | ✅ Completed | Standalone HTTPS API with register/login/me/logout, hashed session tokens, TLS enforcement, bounded rate limiting, and AccountStore integration (429 passed / 2 skipped baseline) |
+| **Milestone 4.3 (Desktop Auth UX)** | ✅ Completed | PySide6 Login/Register/Logout UI, memory-only session, standard-library HTTPS account client in `app/client.py`, sanitized errors (472 passed / 2 skipped) |
+| **Milestone 4.4 (Account-Device Binding)** | ⏳ Next | Associate authenticated user accounts with existing managed Ed25519 client identity via public key & SHA-256 fingerprint; private keys remain local |
+| **Milestone 4.5 (Admin Enrollment Approval)** | ⏳ Planned | Administrator trust boundary linking pending account devices to `AuthorizedClients` for tunnel permission |
+| **Milestone 4.6 (Account-Aware Desktop UX)** | ⏳ Planned | 10-state comprehensive desktop UX visualizing account, device approval, and live VPN telemetry/metrics |
+| **Milestone 4.7 (E2E Multi-Node Validation)** | ⏳ Planned | Full live system validation on Omarchy desktop ↔ Ubuntu server VM (KEMTLS v2, TUN, routes, DNS, rekeying, disconnect/logout) |
 | **Desktop Client Milestone 3** | ✅ Completed | Managed identity/onboarding plus live GUI enrollment, connect, disconnect, identity persistence, rekey, cleanup, and native PQC validation passed against Ubuntu 26.04 |
 | **Arch / Omarchy Packaging** | ✅ Completed | Pinned checksum-verified liboqs/Python packages, deterministic app archive, and Python `-s` isolation in both client units; manual Pacman install chain pending |
 | **Debian / Ubuntu Packaging** | ✅ Completed | Exact pinned liboqs 0.16.0 native/Python packages and main app built, inspected, and clean-installed on Ubuntu 26.04 with native backend and GUI imports verified |

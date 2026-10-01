@@ -871,6 +871,307 @@ class IPCClient:
         return self.send_command("EXPORT_ENROLLMENT_REQUEST", client_id=client_id)
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ACCOUNT API CLIENT AND MEMORY-ONLY SESSION (MILESTONE 4)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Uses only standard-library HTTP/TLS so no runtime dependency reaches the Arch
+# or Debian packages.  Account sessions identify a user only.  They never
+# authorize a device or alter the VPN data-plane authorization store.
+
+DEFAULT_ACCOUNT_API_URL = "http://127.0.0.1:8443"
+ACCOUNT_API_TIMEOUT = 10.0
+MAX_ACCOUNT_RESPONSE = 64 * 1024
+ACCOUNT_SESSION_CHECK_MS = 60_000
+
+_ACCOUNT_ERROR_MESSAGES = {
+    "invalid_credentials": "Invalid username/email or password.",
+    "invalid_session": "Your session has expired. Please sign in again.",
+    "account_exists": "An account with this username or email already exists.",
+    "invalid_registration": "Registration details are invalid. Please check your inputs.",
+    "invalid_request": "The request was rejected. Please check your inputs.",
+    "rate_limited": "Too many attempts. Please wait before trying again.",
+    "request_too_large": "The request was too large.",
+    "unsupported_media_type": "Unsupported content type.",
+    "internal_error": "The account service encountered an internal error.",
+    "invalid_response": "The account service returned an invalid response.",
+}
+
+
+class AccountAPIError(Exception):
+    """Structured, user-safe error from the account API or transport layer."""
+
+    def __init__(self, code: str, message: str, status_code: int = 0, retry_after: int = 0) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+def _sanitized_message(code: str, status_code: int) -> str:
+    """Map an API error code to a uniform message that never echoes server text."""
+    if code in _ACCOUNT_ERROR_MESSAGES:
+        return _ACCOUNT_ERROR_MESSAGES[code]
+    if status_code >= 500:
+        return "The account service is temporarily unavailable."
+    return "An unexpected error occurred."
+
+
+def _invalid_response() -> AccountAPIError:
+    return AccountAPIError("invalid_response", _ACCOUNT_ERROR_MESSAGES["invalid_response"])
+
+
+def _unavailable() -> AccountAPIError:
+    return AccountAPIError(
+        "connection_error", "Cannot reach Account API. Check network or server configuration."
+    )
+
+
+class AccountClient:
+    """Blocking HTTPS client for pqvpn-account-api; call from a worker thread."""
+
+    def __init__(self, base_url: str, ca_cert: Path | None = None,
+                 timeout: float = ACCOUNT_API_TIMEOUT) -> None:
+        self.base_url = base_url.strip().rstrip("/")
+        self.ca_cert = ca_cert
+        self.timeout = timeout
+        self._ssl_context = self._create_ssl_context()
+
+    def _create_ssl_context(self):
+        import ipaddress
+        import ssl
+        from urllib.parse import urlsplit
+
+        try:
+            parts = urlsplit(self.base_url)
+            host = parts.hostname or ""
+            parts.port  # noqa: B018 - raises ValueError for an invalid port
+        except ValueError:
+            raise AccountAPIError("invalid_url", "Account API URL is invalid.") from None
+        if parts.scheme not in {"http", "https"} or not host or parts.query or parts.fragment:
+            raise AccountAPIError("invalid_url", "Account API URL is invalid.")
+        if parts.username or parts.password:
+            raise AccountAPIError("invalid_url", "Account API URL must not contain credentials.")
+        if parts.scheme == "http":
+            # Cleartext is permitted only for explicit loopback development.
+            try:
+                loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                loopback = False
+            if not loopback:
+                raise AccountAPIError(
+                    "tls_required", "Cleartext HTTP is only permitted on loopback addresses."
+                )
+            return None
+        context = ssl.create_default_context()
+        if self.ca_cert is not None:
+            try:
+                context.load_verify_locations(str(self.ca_cert))
+            except (OSError, ssl.SSLError):
+                raise AccountAPIError(
+                    "ssl_error", "The configured CA certificate could not be loaded."
+                ) from None
+        return context
+
+    def _request(self, method: str, path: str, body: dict | None = None,
+                 token: str | None = None) -> dict | None:
+        import urllib.error
+        import urllib.request
+
+        headers = {"Accept": "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(
+            f"{self.base_url}{path}", data=data, headers=headers, method=method
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout, context=self._ssl_context
+            ) as response:
+                raw = response.read(MAX_ACCOUNT_RESPONSE + 1)
+        except urllib.error.HTTPError as exc:
+            raise self._http_error(exc) from None
+        except urllib.error.URLError as exc:
+            reason = str(getattr(exc, "reason", exc)).upper()
+            if "CERTIFICATE" in reason or "SSL" in reason:
+                raise AccountAPIError(
+                    "ssl_error", "Secure connection failed. Untrusted or invalid certificate."
+                ) from None
+            raise _unavailable() from None
+        except (OSError, ValueError):
+            raise _unavailable() from None
+        if len(raw) > MAX_ACCOUNT_RESPONSE:
+            raise _invalid_response()
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise _invalid_response() from None
+        if not isinstance(parsed, dict):
+            raise _invalid_response()
+        return parsed
+
+    @staticmethod
+    def _http_error(exc) -> AccountAPIError:
+        try:
+            parsed = json.loads(exc.read(MAX_ACCOUNT_RESPONSE) or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            parsed = {}
+        error = parsed.get("error") if isinstance(parsed, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        if not isinstance(code, str):
+            code = "unknown_error"
+        retry_after = 0
+        try:
+            retry_after = max(0, int((exc.headers or {}).get("Retry-After", "0")))
+        except (TypeError, ValueError):
+            pass
+        message = _sanitized_message(code, exc.code)
+        if retry_after > 0:
+            message = f"Too many attempts. Please wait {retry_after} seconds."
+        return AccountAPIError(code, message, exc.code, retry_after)
+
+    @staticmethod
+    def _user(body: dict | None) -> dict:
+        user = body.get("user") if isinstance(body, dict) else None
+        if not isinstance(user, dict) or not isinstance(user.get("username"), str):
+            raise _invalid_response()
+        return user
+
+    def register(self, username: str, email: str, password: str) -> dict:
+        """Register a new account and return its public user fields."""
+        user = self._user(self._request(
+            "POST", "/auth/register",
+            body={"username": username, "email": email, "password": password},
+        ))
+        logger.info("account registration succeeded")
+        return user
+
+    def login(self, identifier: str, password: str) -> tuple[str, dict, str]:
+        """Authenticate and return (token, user, expires_at)."""
+        body = self._request(
+            "POST", "/auth/login", body={"identifier": identifier, "password": password}
+        )
+        token = body.get("access_token") if isinstance(body, dict) else None
+        if not isinstance(token, str) or not token or len(token) > 256:
+            raise _invalid_response()
+        user = self._user(body)
+        expires_at = body.get("expires_at")
+        logger.info("account login succeeded")
+        return token, user, expires_at if isinstance(expires_at, str) else ""
+
+    def get_me(self, token: str) -> dict:
+        """Validate the session and return the current public user fields."""
+        return self._user(self._request("GET", "/auth/me", token=token))
+
+    def logout(self, token: str) -> None:
+        """Revoke the presented session on the server."""
+        self._request("POST", "/auth/logout", token=token)
+        logger.info("account logout completed")
+
+
+@dataclass(frozen=True)
+class UserProfile:
+    """Immutable snapshot of the authenticated user, safe for UI display."""
+
+    id: int
+    username: str
+    email: str
+    enabled: bool
+    created_at: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> UserProfile:
+        return cls(
+            id=int(data.get("id", 0)),
+            username=str(data.get("username", "")),
+            email=str(data.get("email", "")),
+            enabled=bool(data.get("enabled", True)),
+            created_at=str(data.get("created_at", "")),
+        )
+
+
+class SessionState(enum.Enum):
+    LOGGED_OUT = "logged_out"
+    AUTHENTICATING = "authenticating"
+    AUTHENTICATED = "authenticated"
+    SESSION_EXPIRED = "session_expired"
+
+
+class AccountSession:
+    """Thread-safe, memory-only session container.
+
+    The bearer token is never written to disk, passed through IPC, or included
+    in ``repr``/``str`` output.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state = SessionState.LOGGED_OUT
+        self._token: str | None = None
+        self._user: UserProfile | None = None
+        self._expires_at: str | None = None
+
+    def set_authenticating(self) -> None:
+        with self._lock:
+            self._state = SessionState.AUTHENTICATING
+
+    def set_session(self, token: str, user: UserProfile, expires_at: str) -> None:
+        with self._lock:
+            self._token = token
+            self._user = user
+            self._expires_at = expires_at
+            self._state = SessionState.AUTHENTICATED
+
+    def update_user(self, user: UserProfile) -> None:
+        with self._lock:
+            if self._state == SessionState.AUTHENTICATED:
+                self._user = user
+
+    def clear_session(self, *, expired: bool = False) -> None:
+        with self._lock:
+            self._token = None
+            self._user = None
+            self._expires_at = None
+            self._state = SessionState.SESSION_EXPIRED if expired else SessionState.LOGGED_OUT
+
+    @property
+    def state(self) -> SessionState:
+        with self._lock:
+            return self._state
+
+    @property
+    def is_authenticated(self) -> bool:
+        with self._lock:
+            return self._state == SessionState.AUTHENTICATED and self._token is not None
+
+    def get_token(self) -> str | None:
+        with self._lock:
+            return self._token if self._state == SessionState.AUTHENTICATED else None
+
+    def get_user(self) -> UserProfile | None:
+        with self._lock:
+            return self._user
+
+    def get_expires_at(self) -> str | None:
+        with self._lock:
+            return self._expires_at
+
+    def __repr__(self) -> str:
+        with self._lock:
+            user = self._user.username if self._user else None
+            return f"AccountSession(state={self._state.value!r}, user={user!r}, token=[REDACTED])"
+
+    __str__ = __repr__
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PYSIDE6 GUI — DESKTOP MILESTONE 3
 # ═══════════════════════════════════════════════════════════════════════════
@@ -887,6 +1188,7 @@ try:
         QGridLayout,
         QHBoxLayout,
         QLabel,
+        QLineEdit,
         QInputDialog,
         QMainWindow,
         QMessageBox,
@@ -1005,6 +1307,23 @@ if PYSIDE6_AVAILABLE:
         QProgressBar::chunk {{
             border-radius: 2px;
             background: {GUI_COLORS['amber']};
+        }}
+        QLineEdit {{
+            background-color: {GUI_COLORS['surface']};
+            color: {GUI_COLORS['text']};
+            border: 1px solid {GUI_COLORS['border']};
+            border-radius: 8px;
+            padding: 10px 14px;
+            font-size: 13px;
+            selection-background-color: #214833;
+        }}
+        QLineEdit:focus {{
+            border-color: {GUI_COLORS['green']};
+        }}
+        QLineEdit:disabled {{
+            color: {GUI_COLORS['muted']};
+            background-color: #10151B;
+            border-color: {GUI_COLORS['border_soft']};
         }}
     """
 
@@ -1233,7 +1552,7 @@ if PYSIDE6_AVAILABLE:
 
     class NavRail(QFrame):
         page_selected = Signal(int, str)
-        ITEMS = ("Home", "Servers", "Security", "Settings", "Logs", "About")
+        ITEMS = ("Home", "Servers", "Security", "Account", "Settings", "Logs", "About")
 
         def __init__(self) -> None:
             super().__init__()
@@ -1388,6 +1707,42 @@ if PYSIDE6_AVAILABLE:
                             self._status_pending = False
 
 
+    class _AccountWorker(QObject):
+        """Background worker that serializes blocking account API calls.
+
+        Each submitted callable runs off the GUI thread; its outcome arrives as
+        ``finished(op, ok, data, message, status_code, retry_after)``.
+        """
+
+        finished = Signal(str, bool, object, str, int, int)
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._queue: queue.Queue = queue.Queue()
+            self._thread = threading.Thread(
+                target=self._run, daemon=True, name="pqvpn-gui-account"
+            )
+            self._thread.start()
+
+        def submit(self, op: str, call) -> None:
+            self._queue.put((op, call))
+
+        def stop(self) -> None:
+            self._queue.put(None)
+
+        def _run(self) -> None:
+            while (item := self._queue.get()) is not None:
+                op, call = item
+                try:
+                    self.finished.emit(op, True, call(), "", 0, 0)
+                except AccountAPIError as exc:
+                    self.finished.emit(
+                        op, False, exc.code, exc.message, exc.status_code, exc.retry_after
+                    )
+                except Exception as exc:
+                    self.finished.emit(op, False, "client_error", sanitize_error(exc), 0, 0)
+
+
     def scroll_page(page: QWidget) -> QScrollArea:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1402,6 +1757,7 @@ if PYSIDE6_AVAILABLE:
             ("Home", "Connection overview and live tunnel health"),
             ("Servers", "Imported public server profiles"),
             ("Security", "Cryptography, network protection, and identity"),
+            ("Account", "Authentication and user session management"),
             ("Settings", "Validated service-owned configuration (read-only)"),
             ("Logs", "Bounded, sanitized client service events"),
             ("About", "Project scope and security boundaries"),
@@ -1458,6 +1814,7 @@ if PYSIDE6_AVAILABLE:
             self.pages.addWidget(scroll_page(self._build_home_page()))
             self.pages.addWidget(scroll_page(self._build_servers_page()))
             self.pages.addWidget(scroll_page(self._build_security_page()))
+            self.pages.addWidget(scroll_page(self._build_account_page()))
             self.pages.addWidget(scroll_page(self._build_settings_page()))
             self.pages.addWidget(self._build_logs_page())
             self.pages.addWidget(scroll_page(self._build_about_page()))
@@ -1477,6 +1834,20 @@ if PYSIDE6_AVAILABLE:
             self._worker.status_ready.connect(self._render)
             self._worker.action_finished.connect(self._action_finished)
             self._worker.logs_ready.connect(self._render_logs)
+
+            # Account session state (memory-only)
+            self._account_session = AccountSession()
+            self._account_client: AccountClient | None = None
+            self._account_worker = _AccountWorker()
+            self._account_worker.finished.connect(self._account_finished)
+            self._session_timer = QTimer(self)
+            self._session_timer.setInterval(ACCOUNT_SESSION_CHECK_MS)
+            self._session_timer.timeout.connect(self._validate_account_session)
+            self._cooldown_timer = QTimer(self)
+            self._cooldown_timer.setInterval(1000)
+            self._cooldown_timer.timeout.connect(self._tick_cooldown)
+            self._cooldown_remaining = 0
+            self._cooldown_is_login = True
 
             self._timer = QTimer(self)
             self._timer.setInterval(1000)
@@ -1730,6 +2101,524 @@ if PYSIDE6_AVAILABLE:
             layout.addStretch(1)
             return page
 
+        def _build_account_page(self) -> QWidget:
+            page = QWidget()
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(0, 2, 0, 10)
+            layout.setSpacing(14)
+
+            # ── Account API URL configuration ──
+            api_card = Card("Account API Server")
+            self.account_api_url = QLineEdit()
+            self.account_api_url.setPlaceholderText("https://server:8443 or http://127.0.0.1:8443")
+            self.account_api_url.setText(DEFAULT_ACCOUNT_API_URL)
+            self.account_api_url.setMaximumWidth(500)
+            api_card.body.addWidget(gui_label("API ENDPOINT", 9, GUI_COLORS["muted"], 700))
+            api_card.body.addWidget(self.account_api_url)
+            self.account_ca_cert = QLineEdit()
+            self.account_ca_cert.setPlaceholderText("Optional CA certificate path for a private server certificate")
+            self.account_ca_cert.setMaximumWidth(500)
+            api_card.body.addWidget(gui_label("CA CERTIFICATE", 9, GUI_COLORS["muted"], 700))
+            api_card.body.addWidget(self.account_ca_cert)
+            api_card.body.addWidget(gui_label(
+                "HTTPS certificates are always verified. Cleartext HTTP is accepted only on loopback.",
+                10, GUI_COLORS["secondary"]
+            ))
+            layout.addWidget(api_card)
+
+            # ── Sub-view stack: Login / Register / Profile ──
+            self.account_stack = QStackedWidget()
+
+            # --- Sub-view 0: Login ---
+            login_widget = QWidget()
+            login_layout = QVBoxLayout(login_widget)
+            login_layout.setContentsMargins(0, 0, 0, 0)
+            login_layout.setSpacing(12)
+
+            login_card = Card("Sign In", "Authenticate with your PQ-VPN account credentials.")
+            login_card.body.addWidget(gui_label("IDENTIFIER", 9, GUI_COLORS["muted"], 700))
+            self.login_identifier = QLineEdit()
+            self.login_identifier.setPlaceholderText("Username or email address")
+            self.login_identifier.setMaximumWidth(440)
+            login_card.body.addWidget(self.login_identifier)
+
+            login_card.body.addWidget(gui_label("PASSWORD", 9, GUI_COLORS["muted"], 700))
+            password_row = QHBoxLayout()
+            self.login_password = QLineEdit()
+            self.login_password.setPlaceholderText("Enter password")
+            self.login_password.setEchoMode(QLineEdit.Password)
+            self.login_password.setMaximumWidth(380)
+            self.login_reveal_btn = QPushButton("Show")
+            self.login_reveal_btn.setFixedWidth(60)
+            self.login_reveal_btn.setCursor(Qt.PointingHandCursor)
+            self.login_reveal_btn.clicked.connect(self._toggle_login_password_visibility)
+            password_row.addWidget(self.login_password)
+            password_row.addWidget(self.login_reveal_btn)
+            password_row.addStretch(1)
+            login_card.body.addLayout(password_row)
+
+            self.login_error = gui_label("", 11, GUI_COLORS["red"], 550)
+            self.login_error.setWordWrap(True)
+            self.login_error.hide()
+            login_card.body.addWidget(self.login_error)
+
+            self.login_cooldown_label = gui_label("", 11, GUI_COLORS["amber"], 600)
+            self.login_cooldown_label.hide()
+            login_card.body.addWidget(self.login_cooldown_label)
+
+            login_actions = QHBoxLayout()
+            self.login_btn = QPushButton("Sign In")
+            self.login_btn.setCursor(Qt.PointingHandCursor)
+            self.login_btn.setFixedWidth(140)
+            self.login_btn.setStyleSheet(f"""
+                QPushButton {{
+                    min-height: 22px;
+                    background: {GUI_COLORS['green']}; color: #06110B;
+                    border: 1px solid {GUI_COLORS['green']}; border-radius: 9px;
+                    padding: 10px 22px; font-size: 13px; font-weight: 700;
+                }}
+                QPushButton:hover {{ background: #2EE88A; border-color: #2EE88A; }}
+                QPushButton:disabled {{
+                    background: #10151B; color: {GUI_COLORS['muted']};
+                    border-color: {GUI_COLORS['border_soft']};
+                }}
+            """)
+            self.login_btn.clicked.connect(self._on_login_clicked)
+            self.login_password.returnPressed.connect(self._on_login_clicked)
+
+            self.login_register_link = QPushButton("Need an account? Register")
+            self.login_register_link.setCursor(Qt.PointingHandCursor)
+            self.login_register_link.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent; border: none; color: {GUI_COLORS['cyan']};
+                    font-size: 12px; font-weight: 550; padding: 8px 0px;
+                }}
+                QPushButton:hover {{ color: #7FD9E8; }}
+            """)
+            self.login_register_link.clicked.connect(self._show_register_view)
+            login_actions.addWidget(self.login_btn)
+            login_actions.addWidget(self.login_register_link)
+            login_actions.addStretch(1)
+            login_card.body.addLayout(login_actions)
+            login_layout.addWidget(login_card)
+            login_layout.addStretch(1)
+
+            # --- Sub-view 1: Register ---
+            register_widget = QWidget()
+            register_layout = QVBoxLayout(register_widget)
+            register_layout.setContentsMargins(0, 0, 0, 0)
+            register_layout.setSpacing(12)
+
+            register_card = Card("Create Account", "Register a new PQ-VPN user account.")
+            register_card.body.addWidget(gui_label("USERNAME", 9, GUI_COLORS["muted"], 700))
+            self.register_username = QLineEdit()
+            self.register_username.setPlaceholderText("Choose a username")
+            self.register_username.setMaximumWidth(440)
+            register_card.body.addWidget(self.register_username)
+
+            register_card.body.addWidget(gui_label("EMAIL", 9, GUI_COLORS["muted"], 700))
+            self.register_email = QLineEdit()
+            self.register_email.setPlaceholderText("Your email address")
+            self.register_email.setMaximumWidth(440)
+            register_card.body.addWidget(self.register_email)
+
+            register_card.body.addWidget(gui_label("PASSWORD", 9, GUI_COLORS["muted"], 700))
+            self.register_password = QLineEdit()
+            self.register_password.setPlaceholderText("Minimum 12 characters")
+            self.register_password.setEchoMode(QLineEdit.Password)
+            self.register_password.setMaximumWidth(440)
+            self.register_password.textChanged.connect(self._update_register_validation)
+            register_card.body.addWidget(self.register_password)
+
+            register_card.body.addWidget(gui_label("CONFIRM PASSWORD", 9, GUI_COLORS["muted"], 700))
+            self.register_confirm = QLineEdit()
+            self.register_confirm.setPlaceholderText("Re-enter password")
+            self.register_confirm.setEchoMode(QLineEdit.Password)
+            self.register_confirm.setMaximumWidth(440)
+            self.register_confirm.textChanged.connect(self._update_register_validation)
+            register_card.body.addWidget(self.register_confirm)
+
+            self.register_validation = gui_label("", 10, GUI_COLORS["muted"])
+            register_card.body.addWidget(self.register_validation)
+
+            self.register_error = gui_label("", 11, GUI_COLORS["red"], 550)
+            self.register_error.setWordWrap(True)
+            self.register_error.hide()
+            register_card.body.addWidget(self.register_error)
+
+            self.register_cooldown_label = gui_label("", 11, GUI_COLORS["amber"], 600)
+            self.register_cooldown_label.hide()
+            register_card.body.addWidget(self.register_cooldown_label)
+
+            register_actions = QHBoxLayout()
+            self.register_btn = QPushButton("Create Account")
+            self.register_btn.setCursor(Qt.PointingHandCursor)
+            self.register_btn.setFixedWidth(180)
+            self.register_btn.setStyleSheet(f"""
+                QPushButton {{
+                    min-height: 22px;
+                    background: {GUI_COLORS['green']}; color: #06110B;
+                    border: 1px solid {GUI_COLORS['green']}; border-radius: 9px;
+                    padding: 10px 22px; font-size: 13px; font-weight: 700;
+                }}
+                QPushButton:hover {{ background: #2EE88A; border-color: #2EE88A; }}
+                QPushButton:disabled {{
+                    background: #10151B; color: {GUI_COLORS['muted']};
+                    border-color: {GUI_COLORS['border_soft']};
+                }}
+            """)
+            self.register_btn.clicked.connect(self._on_register_clicked)
+            self.register_confirm.returnPressed.connect(self._on_register_clicked)
+
+            self.register_back_link = QPushButton("Already have an account? Sign In")
+            self.register_back_link.setCursor(Qt.PointingHandCursor)
+            self.register_back_link.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent; border: none; color: {GUI_COLORS['cyan']};
+                    font-size: 12px; font-weight: 550; padding: 8px 0px;
+                }}
+                QPushButton:hover {{ color: #7FD9E8; }}
+            """)
+            self.register_back_link.clicked.connect(self._show_login_view)
+            register_actions.addWidget(self.register_btn)
+            register_actions.addWidget(self.register_back_link)
+            register_actions.addStretch(1)
+            register_card.body.addLayout(register_actions)
+            register_layout.addWidget(register_card)
+            register_layout.addStretch(1)
+
+            # --- Sub-view 2: Authenticated Profile ---
+            profile_widget = QWidget()
+            profile_layout = QVBoxLayout(profile_widget)
+            profile_layout.setContentsMargins(0, 0, 0, 0)
+            profile_layout.setSpacing(12)
+
+            profile_card = Card("Account Profile")
+            profile_header = QHBoxLayout()
+            self.profile_avatar = QLabel("👤")
+            self.profile_avatar.setStyleSheet(f"""
+                font-size: 36px; background: {GUI_COLORS['surface']};
+                border: 2px solid {GUI_COLORS['green']}; border-radius: 28px;
+                padding: 8px;
+            """)
+            self.profile_avatar.setFixedSize(56, 56)
+            self.profile_avatar.setAlignment(Qt.AlignCenter)
+            profile_names = QVBoxLayout()
+            profile_names.setSpacing(2)
+            self.profile_username = gui_label("—", 18, weight=700)
+            self.profile_email = gui_label("—", 12, GUI_COLORS["secondary"])
+            profile_names.addWidget(self.profile_username)
+            profile_names.addWidget(self.profile_email)
+            profile_header.addWidget(self.profile_avatar)
+            profile_header.addSpacing(14)
+            profile_header.addLayout(profile_names)
+            profile_header.addStretch(1)
+
+            self.profile_session_badge = gui_label("SESSION ACTIVE", 9, GUI_COLORS["green"], 700)
+            self.profile_session_badge.setStyleSheet(self._badge_style(GUI_COLORS["green"]))
+            profile_header.addWidget(self.profile_session_badge)
+            profile_card.body.addLayout(profile_header)
+
+            self.profile_id_row = DataRow("User ID")
+            self.profile_status_row = DataRow("Account status")
+            self.profile_created_row = DataRow("Created")
+            for row in (self.profile_id_row, self.profile_status_row, self.profile_created_row):
+                profile_card.body.addWidget(row)
+
+            signout_row = QHBoxLayout()
+            self.signout_btn = QPushButton("Sign Out")
+            self.signout_btn.setCursor(Qt.PointingHandCursor)
+            self.signout_btn.setFixedWidth(140)
+            self.signout_btn.setStyleSheet(f"""
+                QPushButton {{
+                    min-height: 22px;
+                    background: #2A171B; color: {GUI_COLORS['red']};
+                    border: 1px solid #63303A; border-radius: 9px;
+                    padding: 10px 22px; font-size: 12px; font-weight: 700;
+                }}
+                QPushButton:hover {{ border-color: {GUI_COLORS['red']}; }}
+                QPushButton:disabled {{
+                    background: #10151B; color: {GUI_COLORS['muted']};
+                    border-color: {GUI_COLORS['border_soft']};
+                }}
+            """)
+            self.signout_btn.clicked.connect(self._on_logout_clicked)
+            signout_row.addWidget(self.signout_btn)
+            signout_row.addStretch(1)
+            profile_card.body.addLayout(signout_row)
+            profile_layout.addWidget(profile_card)
+
+            # Security separation callout
+            separation_card = Card("VPN Authorization Notice")
+            separation_card.body.addWidget(gui_label(
+                "⚠️  Account login authenticates user identity only. "
+                "Device enrollment and administrator authorization are required "
+                "for VPN tunnel access. Signing in does not grant VPN permission.",
+                11, GUI_COLORS["amber"], 550,
+            ))
+            profile_layout.addWidget(separation_card)
+            profile_layout.addStretch(1)
+
+            # --- Assemble stack ---
+            self.account_stack.addWidget(login_widget)
+            self.account_stack.addWidget(register_widget)
+            self.account_stack.addWidget(profile_widget)
+            self.account_stack.setCurrentIndex(0)
+            layout.addWidget(self.account_stack)
+            return page
+
+        # ── Account page helpers ──────────────────────────────────────
+
+        def _get_or_create_account_client(self) -> AccountClient:
+            """Create the AccountClient from the current URL and CA inputs."""
+            url = self.account_api_url.text().strip() or DEFAULT_ACCOUNT_API_URL
+            ca_text = self.account_ca_cert.text().strip()
+            ca_cert = Path(ca_text).expanduser() if ca_text else None
+            client = self._account_client
+            if client is None or client.base_url != url.rstrip("/") or client.ca_cert != ca_cert:
+                self._account_client = AccountClient(url, ca_cert)
+            return self._account_client
+
+        def _show_login_view(self) -> None:
+            self.account_stack.setCurrentIndex(0)
+            self.login_error.hide()
+            self.register_error.hide()
+
+        def _show_register_view(self) -> None:
+            self.account_stack.setCurrentIndex(1)
+            self.login_error.hide()
+            self.register_error.hide()
+
+        def _show_profile_view(self) -> None:
+            self.account_stack.setCurrentIndex(2)
+
+        def _toggle_login_password_visibility(self) -> None:
+            if self.login_password.echoMode() == QLineEdit.Password:
+                self.login_password.setEchoMode(QLineEdit.Normal)
+                self.login_reveal_btn.setText("Hide")
+            else:
+                self.login_password.setEchoMode(QLineEdit.Password)
+                self.login_reveal_btn.setText("Show")
+
+        def _update_register_validation(self) -> None:
+            password = self.register_password.text()
+            confirm = self.register_confirm.text()
+            parts = []
+            if password and len(password) < 12:
+                parts.append(f"Password too short ({len(password)}/12 characters)")
+            elif password:
+                parts.append(f"Password length OK ({len(password)} characters)")
+            if confirm and password != confirm:
+                parts.append("Passwords do not match")
+            elif confirm and password == confirm:
+                parts.append("Passwords match ✓")
+            color = GUI_COLORS["amber"] if any(
+                "too short" in p or "do not match" in p for p in parts
+            ) else GUI_COLORS["green"] if parts else GUI_COLORS["muted"]
+            self.register_validation.setText("  ·  ".join(parts))
+            self.register_validation.setStyleSheet(
+                f"font-size: 10px; color: {color}; font-weight: 500;"
+            )
+
+        def _set_account_inputs_enabled(self, enabled: bool) -> None:
+            for widget in (self.login_identifier, self.login_password,
+                           self.login_btn, self.login_register_link,
+                           self.register_username, self.register_email,
+                           self.register_password, self.register_confirm,
+                           self.register_btn, self.register_back_link,
+                           self.account_api_url, self.account_ca_cert):
+                widget.setEnabled(enabled)
+
+        def _submit_account(self, op: str, call, error_label: QLabel | None = None) -> bool:
+            """Queue a blocking account call; report configuration errors inline."""
+            try:
+                client = self._get_or_create_account_client()
+            except AccountAPIError as exc:
+                if error_label is not None:
+                    error_label.setText(exc.message)
+                    error_label.show()
+                return False
+            self._account_worker.submit(op, lambda: call(client))
+            return True
+
+        def _on_login_clicked(self) -> None:
+            identifier = self.login_identifier.text().strip()
+            password = self.login_password.text()
+            if not identifier or not password:
+                self.login_error.setText("Please enter your username/email and password.")
+                self.login_error.show()
+                return
+            self.login_error.hide()
+
+            def login(client: AccountClient) -> dict:
+                token, _user, expires_at = client.login(identifier, password)
+                # The server is authoritative: load the profile through the new session.
+                return {"token": token, "user": client.get_me(token), "expires_at": expires_at}
+
+            if self._submit_account("login", login, self.login_error):
+                self._account_session.set_authenticating()
+                self._set_account_inputs_enabled(False)
+                self.login_btn.setText("Signing in…")
+
+        def _on_register_clicked(self) -> None:
+            username = self.register_username.text().strip()
+            email = self.register_email.text().strip()
+            password = self.register_password.text()
+            confirm = self.register_confirm.text()
+            message = ""
+            if not username or not email or not password:
+                message = "All fields are required."
+            elif len(password) < 12:
+                message = "Password must be at least 12 characters."
+            elif len(password) > 1024:
+                message = "Password must be at most 1024 characters."
+            elif password != confirm:
+                message = "Passwords do not match."
+            self._set_register_message(message)
+            if message:
+                return
+            if self._submit_account(
+                "register", lambda client: client.register(username, email, password),
+                self.register_error,
+            ):
+                self._set_account_inputs_enabled(False)
+                self.register_btn.setText("Creating account…")
+
+        def _set_register_message(self, text: str, *, success: bool = False) -> None:
+            color = GUI_COLORS["green"] if success else GUI_COLORS["red"]
+            self.register_error.setStyleSheet(f"font-size: 11px; color: {color}; font-weight: 550;")
+            self.register_error.setText(text)
+            self.register_error.setVisible(bool(text))
+
+        def _on_logout_clicked(self) -> None:
+            token = self._account_session.get_token()
+            # Clear the local session first so the token is gone even if the
+            # remote revocation fails or the session was already invalid.
+            self._end_account_session(expired=False)
+            if token and self._account_client is not None:
+                client = self._account_client
+                self._account_worker.submit("logout", lambda: client.logout(token))
+
+        def _end_account_session(self, *, expired: bool) -> None:
+            self._session_timer.stop()
+            self._account_session.clear_session(expired=expired)
+            self._add_gui_event(
+                "warning" if expired else "info",
+                "Session expired — signed out automatically" if expired else "Signed out",
+            )
+            self._refresh_account_view()
+
+        def _validate_account_session(self) -> None:
+            token = self._account_session.get_token()
+            client = self._account_client
+            if token and client is not None:
+                self._account_worker.submit("validate", lambda: client.get_me(token))
+
+        def _account_finished(self, op: str, ok: bool, data: object, message: str,
+                              status_code: int, retry_after: int) -> None:
+            handler = getattr(self, f"_account_{op}_finished", None)
+            if handler is not None:
+                handler(ok, data, message, status_code, retry_after)
+
+        def _account_login_finished(self, ok, data, message, status_code, retry_after) -> None:
+            self._set_account_inputs_enabled(True)
+            self.login_btn.setText("Sign In")
+            self.login_password.clear()
+            if ok and isinstance(data, dict):
+                user = UserProfile.from_dict(data["user"])
+                self._account_session.set_session(data["token"], user, data["expires_at"])
+                self._session_timer.start()
+                self._add_gui_event("info", f"Signed in as {user.username}")
+                self._refresh_account_view()
+                return
+            self._account_session.clear_session()
+            if retry_after > 0:
+                self._start_cooldown(retry_after, is_login=True)
+            self.login_error.setText(message or "Authentication failed.")
+            self.login_error.show()
+
+        def _account_register_finished(self, ok, data, message, status_code, retry_after) -> None:
+            self._set_account_inputs_enabled(True)
+            self.register_btn.setText("Create Account")
+            if ok:
+                username = data.get("username", "") if isinstance(data, dict) else ""
+                self._add_gui_event("info", f"Account created for {username}")
+                for widget in (self.register_password, self.register_confirm):
+                    widget.clear()
+                if username:
+                    self.login_identifier.setText(username)
+                self._set_register_message(
+                    "Account created. Sign in to continue. This does not grant VPN access.",
+                    success=True,
+                )
+                QTimer.singleShot(1800, self._show_login_view)
+                return
+            if retry_after > 0:
+                self._start_cooldown(retry_after, is_login=False)
+            self._set_register_message(message or "Registration failed.")
+
+        def _account_logout_finished(self, ok, data, message, status_code, retry_after) -> None:
+            if not ok and status_code != 401:
+                self._add_gui_event("warning", "Remote sign-out failed; local session was cleared")
+
+        def _account_validate_finished(self, ok, data, message, status_code, retry_after) -> None:
+            if not self._account_session.is_authenticated:
+                return
+            if ok and isinstance(data, dict):
+                self._account_session.update_user(UserProfile.from_dict(data))
+                self._set_account_api_available(True)
+                self._refresh_account_view()
+            elif status_code == 401:
+                self._end_account_session(expired=True)
+            else:
+                self._set_account_api_available(False)
+
+        def _set_account_api_available(self, available: bool) -> None:
+            if available:
+                self.profile_session_badge.setText("SESSION ACTIVE")
+                self.profile_session_badge.setStyleSheet(self._badge_style(GUI_COLORS["green"]))
+            else:
+                self.profile_session_badge.setText("ACCOUNT API UNAVAILABLE")
+                self.profile_session_badge.setStyleSheet(self._badge_style(GUI_COLORS["amber"]))
+
+        def _start_cooldown(self, seconds: int, *, is_login: bool) -> None:
+            self._cooldown_remaining = seconds
+            self._cooldown_is_login = is_login
+            self._set_account_inputs_enabled(False)
+            label = self.login_cooldown_label if is_login else self.register_cooldown_label
+            label.setText(f"Rate limited. Please wait {seconds} seconds…")
+            label.show()
+            self._cooldown_timer.start()
+
+        def _tick_cooldown(self) -> None:
+            self._cooldown_remaining -= 1
+            label = self.login_cooldown_label if self._cooldown_is_login else self.register_cooldown_label
+            if self._cooldown_remaining <= 0:
+                self._cooldown_timer.stop()
+                label.hide()
+                self._set_account_inputs_enabled(True)
+            else:
+                label.setText(f"Rate limited. Please wait {self._cooldown_remaining} seconds…")
+
+        def _refresh_account_view(self) -> None:
+            """Update the Account page sub-view based on current session state."""
+            state = self._account_session.state
+            if state == SessionState.AUTHENTICATED:
+                user = self._account_session.get_user()
+                if user:
+                    self.profile_username.setText(f"@{user.username}")
+                    self.profile_email.setText(user.email)
+                    self.profile_id_row.set_value(user.id)
+                    self.profile_status_row.set_value("Active" if user.enabled else "Disabled")
+                    self.profile_created_row.set_value(user.created_at or "—")
+                self._show_profile_view()
+            elif state == SessionState.SESSION_EXPIRED:
+                self._show_login_view()
+                self.login_error.setText("Your session has expired. Please sign in again.")
+                self.login_error.show()
+            else:
+                self._show_login_view()
+
         def _build_settings_page(self) -> QWidget:
             page = QWidget()
             layout = QVBoxLayout(page)
@@ -1829,7 +2718,7 @@ if PYSIDE6_AVAILABLE:
             title, subtitle = self.PAGE_TITLES[index]
             self.page_title.setText(title)
             self.page_subtitle.setText(subtitle)
-            if index == 4:
+            if index == 5:
                 self._refresh_logs()
 
         def _poll_status(self) -> None:
@@ -1934,7 +2823,7 @@ if PYSIDE6_AVAILABLE:
                     )
                 self._add_gui_event("info", f"{action.title()} completed")
             self._worker.request_status()
-            if self.pages.currentIndex() == 4:
+            if self.pages.currentIndex() == 5:
                 self._worker.request_logs()
 
         def _add_gui_event(self, level: str, message: str) -> None:
@@ -2377,7 +3266,10 @@ if PYSIDE6_AVAILABLE:
 
         def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
             self._timer.stop()
+            self._cooldown_timer.stop()
+            self._session_timer.stop()
             self._worker.stop()
+            self._account_worker.stop()
             super().closeEvent(event)
 
 
