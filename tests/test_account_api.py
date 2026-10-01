@@ -507,6 +507,117 @@ def test_default_session_lifetime_is_twelve_hours(client):
     assert before <= expires <= after
 
 
+def device_identity(seed: int = 1) -> tuple[str, str]:
+    """Deterministic public test fixture; no real secret material."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    public = Ed25519PrivateKey.from_private_bytes(bytes([seed]) * 32).public_key().public_bytes(
+        Encoding.Raw, PublicFormat.Raw
+    )
+    return base64.b64encode(public).decode(), hashlib.sha256(public).hexdigest()
+
+
+def bearer(client: TestClient, username="alice", email="alice@example.com") -> dict[str, str]:
+    assert register(client, username, email).status_code == 201
+    return {"Authorization": f"Bearer {login(client, username).json()['access_token']}"}
+
+
+def bind(client: TestClient, headers, seed=1, name="laptop", **overrides):
+    public_key, fp = device_identity(seed)
+    body = {"device_name": name, "public_key": public_key, "fingerprint": fp, **overrides}
+    return client.post("/devices", json=body, headers=headers)
+
+
+def test_device_endpoints_require_a_valid_session(client):
+    assert client.get("/devices").status_code == 401
+    response = bind(client, {"Authorization": "Bearer nope"})
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "invalid_session"
+
+
+def test_bind_device_records_public_identity_only(client, app):
+    headers = bearer(client)
+    public_key, fp = device_identity(1)
+    response = bind(client, headers)
+    assert response.status_code == 201
+    device = response.json()["device"]
+    assert set(device) == {"id", "device_name", "fingerprint", "enabled", "created_at"}
+    assert device["fingerprint"] == fp and device["device_name"] == "laptop"
+    assert public_key not in response.text
+    stored = app.state.account_store.get_device_by_fingerprint(fp)
+    assert stored.client_public_key == base64.b64decode(public_key)
+    listed = client.get("/devices", headers=headers).json()["devices"]
+    assert [d["fingerprint"] for d in listed] == [fp]
+
+
+def test_rebinding_same_device_is_idempotent(client):
+    headers = bearer(client)
+    first = bind(client, headers)
+    again = bind(client, headers, name="renamed")
+    assert again.status_code == 200
+    assert again.json()["device"]["id"] == first.json()["device"]["id"]
+    assert len(client.get("/devices", headers=headers).json()["devices"]) == 1
+
+
+def test_device_owned_by_another_account_is_rejected(client):
+    assert bind(client, bearer(client)).status_code == 201
+    other = bearer(client, "bob", "bob@example.com")
+    response = bind(client, other)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "device_exists"
+    assert client.get("/devices", headers=other).json()["devices"] == []
+
+
+@pytest.mark.parametrize("overrides", [
+    {"fingerprint": "0" * 64},
+    {"fingerprint": "Z" * 64},
+    {"public_key": "not base64!"},
+    {"public_key": base64.b64encode(b"x" * 31).decode()},
+    {"device_name": "bad\x00name"},
+    {"device_name": ""},
+])
+def test_invalid_device_identity_is_rejected(client, app, overrides):
+    headers = bearer(client)
+    response = bind(client, headers, **overrides)
+    assert response.status_code == 400
+    assert client.get("/devices", headers=headers).json()["devices"] == []
+
+
+def test_private_key_field_and_non_json_are_refused(client):
+    headers = bearer(client)
+    assert bind(client, headers, private_key="secret").status_code == 400
+    public_key, fp = device_identity(1)
+    response = client.post(
+        "/devices", content=f"device_name=x&public_key={public_key}&fingerprint={fp}",
+        headers={**headers, "Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert response.status_code == 415
+
+
+def test_device_limit_per_account(client):
+    from vpn.account_api import MAX_DEVICES_PER_USER
+
+    headers = bearer(client)
+    for seed in range(1, MAX_DEVICES_PER_USER + 1):
+        assert bind(client, headers, seed=seed, name=f"d{seed}").status_code == 201
+    response = bind(client, headers, seed=MAX_DEVICES_PER_USER + 1)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "device_limit"
+
+
+def test_device_binding_never_changes_vpn_authorization(tmp_path):
+    authorized_path = tmp_path / "authorized_clients.json"
+    authorized_path.write_text('{"clients":[]}\n')
+    before = authorized_path.read_bytes()
+    cfg = AccountAPIConfig(
+        database_path=tmp_path / "accounts" / "accounts.db", allow_insecure_loopback=True
+    )
+    with TestClient(create_app(cfg)) as local_client:
+        assert bind(local_client, bearer(local_client)).status_code == 201
+    assert authorized_path.read_bytes() == before
+
+
 def test_dependency_and_service_packaging_metadata_are_declared():
     root = Path(__file__).parents[1]
     project = (root / "pyproject.toml").read_text()

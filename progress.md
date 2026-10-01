@@ -42,6 +42,17 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 
 ## 📝 Modification Log & Project Progress
 
+### 2026-10-01 — Milestone 4.4: Account ↔ Managed Device Binding
+
+- `vpn/account_api.py`: authenticated `GET /devices` and `POST /devices`. The server
+  verifies `SHA-256(public key) == fingerprint`, returns public fields only, treats a
+  repeat binding as idempotent, rejects identities owned by another account and any
+  extra (e.g. private-key) field, and caps accounts at 20 devices.
+- `app/client.py`: "This Device" card on the Account page. It reads the managed public
+  identity via the existing `SETUP_STATUS` IPC, re-verifies it locally, and uploads only
+  the public key, fingerprint, and a device name. Device list refreshes with the session check.
+- Binding never edits `AuthorizedClients`; tests assert `authorized_clients.json` is unchanged.
+
 ### 2026-10-01 — Milestone 4.3: Desktop Client Login, Registration, and Session UX
 
 - **Account API client in `app/client.py`** (no new module, no new runtime dependency):
@@ -657,8 +668,8 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | **Milestone 4.1 (Account/Device Store)** | ✅ Completed | SQLite AccountStore/DeviceStore with WAL mode, Argon2id hashing, strict RBAC, device management, session tokens; cleanly separated from VPN core (385 passed / 2 skipped) |
 | **Milestone 4.2 (Register/Login HTTPS API)** | ✅ Completed | Standalone HTTPS API with register/login/me/logout, hashed session tokens, TLS enforcement, bounded rate limiting, and AccountStore integration (429 passed / 2 skipped baseline) |
 | **Milestone 4.3 (Desktop Auth UX)** | ✅ Completed | PySide6 Login/Register/Logout UI, memory-only session, standard-library HTTPS account client in `app/client.py`, sanitized errors (472 passed / 2 skipped) |
-| **Milestone 4.4 (Account-Device Binding)** | ⏳ Next | Associate authenticated user accounts with existing managed Ed25519 client identity via public key & SHA-256 fingerprint; private keys remain local |
-| **Milestone 4.5 (Admin Enrollment Approval)** | ⏳ Planned | Administrator trust boundary linking pending account devices to `AuthorizedClients` for tunnel permission |
+| **Milestone 4.4 (Account-Device Binding)** | ✅ Completed | Authenticated `/devices` API and desktop "This Device" binding of the managed public Ed25519 identity; private keys remain local; no `AuthorizedClients` change |
+| **Milestone 4.5 (Admin Enrollment Approval)** | ⏳ Next | Administrator trust boundary linking pending account devices to `AuthorizedClients` for tunnel permission |
 | **Milestone 4.6 (Account-Aware Desktop UX)** | ⏳ Planned | 10-state comprehensive desktop UX visualizing account, device approval, and live VPN telemetry/metrics |
 | **Milestone 4.7 (E2E Multi-Node Validation)** | ⏳ Planned | Full live system validation on Omarchy desktop ↔ Ubuntu server VM (KEMTLS v2, TUN, routes, DNS, rekeying, disconnect/logout) |
 | **Desktop Client Milestone 3** | ✅ Completed | Managed identity/onboarding plus live GUI enrollment, connect, disconnect, identity persistence, rekey, cleanup, and native PQC validation passed against Ubuntu 26.04 |

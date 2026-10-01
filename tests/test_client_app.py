@@ -955,3 +955,95 @@ class TestAccountGUI:
         self.sign_in(gui, qapp, url)
         assert gui._account_session.is_authenticated
         assert not list(tmp_path.rglob("authorized_clients.json"))
+
+
+# ─── Milestone 4.4: account ↔ managed device binding ──────────────────────
+
+def _device_setup(seed: int = 7) -> dict:
+    """SETUP_STATUS-shaped public identity built from a deterministic test key."""
+    import base64
+    import hashlib
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    public = Ed25519PrivateKey.from_private_bytes(bytes([seed]) * 32).public_key().public_bytes(
+        Encoding.Raw, PublicFormat.Raw
+    )
+    return {"setup": {
+        "identity_public_key": base64.b64encode(public).decode(),
+        "identity_fingerprint": hashlib.sha256(public).hexdigest(),
+    }}
+
+
+class TestPublicDeviceIdentity:
+    def test_valid_identity_is_returned(self):
+        from app.client import public_device_identity
+        setup = _device_setup()
+        assert public_device_identity(setup) == (
+            setup["setup"]["identity_public_key"], setup["setup"]["identity_fingerprint"]
+        )
+
+    @pytest.mark.parametrize("setup", [
+        {"error": "Service not running"},
+        {"setup": {"identity_public_key": None, "identity_fingerprint": None}},
+        {"setup": {**_device_setup()["setup"], "identity_fingerprint": "0" * 64}},
+        {"setup": {**_device_setup()["setup"], "identity_public_key": "!!"}},
+    ])
+    def test_missing_or_inconsistent_identity_is_refused(self, setup):
+        from app.client import public_device_identity
+        with pytest.raises(AccountAPIError) as exc_info:
+            public_device_identity(setup)
+        assert exc_info.value.code == "identity_unavailable"
+
+
+@pytest.mark.skipif(not _pyside6_available(), reason="PySide6 not installed")
+class TestDeviceBindingGUI:
+    class IdentityIPC(TestGUIHeadless.FakeIPC):
+        def __init__(self):
+            super().__init__()
+            self.setup_calls = 0
+
+        def setup_status(self):
+            self.setup_calls += 1
+            return _device_setup()
+
+    @pytest.fixture
+    def gui(self, qapp):
+        from app.client import MainWindow
+        ipc = self.IdentityIPC()
+        window = MainWindow(ipc, start_polling=False)
+        window._render(ClientStatus(
+            state="DISCONNECTED", managed_mode=True, identity_ready=True,
+            identity_fingerprint=_device_setup()["setup"]["identity_fingerprint"],
+        ))
+        yield window
+        window.close()
+        qapp.processEvents()
+
+    def test_bind_current_device_sends_public_identity_only(self, gui, qapp, live_account_api):
+        url, store, _app = live_account_api
+        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
+        TestAccountGUI().sign_in(gui, qapp, url)
+        TestAccountGUI.wait_for(qapp, lambda: gui.device_bind_btn.isEnabled())
+        assert gui.device_binding_row.value_label.text() == "Not registered"
+        gui.device_name_input.setText("work laptop")
+        gui._on_bind_device_clicked()
+        TestAccountGUI.wait_for(qapp, lambda: gui._current_account_device() is not None)
+        assert gui.device_binding_row.value_label.text() == "Registered as work laptop"
+        assert not gui.device_bind_btn.isEnabled()
+        fingerprint = _device_setup()["setup"]["identity_fingerprint"]
+        device = store.get_device_by_fingerprint(fingerprint)
+        assert device.device_name == "work laptop" and len(device.client_public_key) == 32
+
+    def test_bind_is_unavailable_when_signed_out(self, gui):
+        assert not gui.device_bind_btn.isEnabled()
+        gui._on_bind_device_clicked()
+        assert gui.ipc.setup_calls == 0
+
+    def test_identity_failure_is_reported(self, gui, qapp):
+        gui._account_session.set_session("tok", TestAccountSession.USER, "")
+        gui._account_client = AccountClient("http://127.0.0.1:1")
+        gui.ipc.setup_status = lambda: {"error": "Service not running"}
+        gui._on_bind_device_clicked()
+        TestAccountGUI.wait_for(qapp, lambda: gui.device_error.isVisible() or not gui.device_error.isHidden())
+        assert "identity" in gui.device_error.text().lower()

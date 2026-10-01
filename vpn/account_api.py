@@ -1,11 +1,14 @@
-"""Dedicated HTTPS account-authentication API.
+"""Dedicated HTTPS account-authentication and device-binding API.
 
-Account sessions identify a user only. They never authorize a device or alter
-the VPN data-plane authorization store.
+Account sessions identify a user only. Binding a device records its public
+identity under an account. Neither authorizes a device or alters the VPN
+data-plane authorization store; that remains an explicit administrator action.
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import ipaddress
 import logging
@@ -29,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from vpn.accounts import (
     DEFAULT_ACCOUNT_DATABASE,
+    MAX_DEVICE_NAME_LENGTH,
     MAX_EMAIL_LENGTH,
     MAX_PASSWORD_LENGTH,
     MAX_USERNAME_LENGTH,
@@ -36,6 +40,7 @@ from vpn.accounts import (
     AccountDatabaseError,
     AccountNotFound,
     AccountStore,
+    DeviceRecord,
     InvalidAccountInput,
     SessionRecord,
     UserRecord,
@@ -49,6 +54,9 @@ DEFAULT_SESSION_LIFETIME_SECONDS = 12 * 60 * 60
 DEFAULT_BODY_LIMIT = 16 * 1024
 SESSION_TOKEN_BYTES = 32
 SESSION_TOUCH_INTERVAL_SECONDS = 60
+MAX_DEVICES_PER_USER = 20
+_LIMITED_PREFIXES = ("/auth/", "/devices")
+_JSON_POST_PATHS = {"/auth/register", "/auth/login", "/devices"}
 
 
 class AccountAPIConfigError(ValueError):
@@ -263,6 +271,13 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
 
 
+class DeviceBindRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    device_name: str = Field(min_length=1, max_length=MAX_DEVICE_NAME_LENGTH + 2)
+    public_key: str = Field(min_length=1, max_length=64)
+    fingerprint: str = Field(min_length=64, max_length=64)
+
+
 @dataclass(frozen=True)
 class AuthenticatedContext:
     user: UserRecord
@@ -284,7 +299,7 @@ class BodyLimitMiddleware:
         self.max_bytes = max_bytes
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not scope.get("path", "").startswith("/auth/"):
+        if scope["type"] != "http" or not scope.get("path", "").startswith(_LIMITED_PREFIXES):
             await self.app(scope, receive, send)
             return
         headers = {key.lower(): value for key, value in scope.get("headers", [])}
@@ -297,7 +312,7 @@ class BodyLimitMiddleware:
             except ValueError:
                 await _error(400, "invalid_request", "invalid Content-Length header")(scope, receive, send)
                 return
-        if scope.get("method") == "POST" and scope.get("path") in {"/auth/register", "/auth/login"}:
+        if scope.get("method") == "POST" and scope.get("path") in _JSON_POST_PATHS:
             content_type = headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower()
             if content_type != b"application/json":
                 await _error(415, "unsupported_media_type", "Content-Type must be application/json")(
@@ -343,6 +358,17 @@ def _public_user(user: UserRecord) -> dict[str, object]:
         "email": user.email,
         "enabled": user.enabled,
         "created_at": user.created_at,
+    }
+
+
+def _public_device(device: DeviceRecord) -> dict[str, object]:
+    """Public device fields only; the account API never handles private keys."""
+    return {
+        "id": device.id,
+        "device_name": device.device_name,
+        "fingerprint": device.client_fingerprint,
+        "enabled": device.enabled,
+        "created_at": device.created_at,
     }
 
 
@@ -503,6 +529,50 @@ def create_app(
         if isinstance(context, JSONResponse):
             return context
         return {"user": _public_user(context.user)}
+
+    @application.get("/devices")
+    async def list_devices(context=Depends(get_authenticated_user)):
+        if isinstance(context, JSONResponse):
+            return context
+        devices = account_store.list_devices_for_user(context.user.id)
+        return {"devices": [_public_device(device) for device in devices]}
+
+    @application.post("/devices", status_code=201)
+    async def bind_device(
+        payload: DeviceBindRequest, request: Request, context=Depends(get_authenticated_user)
+    ):
+        """Bind a public Ed25519 identity to the account; never grants VPN access."""
+        if isinstance(context, JSONResponse):
+            return context
+        try:
+            public_key = base64.b64decode(payload.public_key, validate=True)
+        except (binascii.Error, ValueError):
+            return _error(400, "invalid_device", "device public key must be base64")
+        existing = None
+        try:
+            existing = account_store.get_device_by_fingerprint(payload.fingerprint)
+        except InvalidAccountInput:
+            pass  # rejected with the full validation message below
+        if existing is not None:
+            if existing.user_id == context.user.id and existing.client_public_key == public_key:
+                return JSONResponse(status_code=200, content={"device": _public_device(existing)})
+            logger.info("device binding rejected category=duplicate user_id=%d", context.user.id)
+            return _error(409, "device_exists", "device identity is already registered")
+        if len(account_store.list_devices_for_user(context.user.id)) >= MAX_DEVICES_PER_USER:
+            return _error(409, "device_limit", "account device limit reached")
+        try:
+            device = account_store.add_device(
+                context.user.id, payload.device_name, payload.fingerprint, public_key
+            )
+        except AccountAlreadyExists:
+            return _error(409, "device_exists", "device identity is already registered")
+        except InvalidAccountInput as exc:
+            return _error(400, "invalid_device", str(exc))
+        logger.info(
+            "device bound user_id=%d device_id=%d source=%s",
+            context.user.id, device.id, _source(request),
+        )
+        return JSONResponse(status_code=201, content={"device": _public_device(device)})
 
     @application.post("/auth/logout", status_code=204)
     async def logout(request: Request, context=Depends(get_authenticated_user)):

@@ -1076,6 +1076,49 @@ class AccountClient:
         self._request("POST", "/auth/logout", token=token)
         logger.info("account logout completed")
 
+    def list_devices(self, token: str) -> list[dict]:
+        """Return the public device records bound to the signed-in account."""
+        body = self._request("GET", "/devices", token=token)
+        devices = body.get("devices") if isinstance(body, dict) else None
+        if not isinstance(devices, list) or not all(isinstance(d, dict) for d in devices):
+            raise _invalid_response()
+        return devices
+
+    def bind_device(self, token: str, device_name: str, public_key: str, fingerprint: str) -> dict:
+        """Bind a public device identity to the account.  Never grants VPN access."""
+        body = self._request("POST", "/devices", token=token, body={
+            "device_name": device_name, "public_key": public_key, "fingerprint": fingerprint,
+        })
+        device = body.get("device") if isinstance(body, dict) else None
+        if not isinstance(device, dict) or device.get("fingerprint") != fingerprint:
+            raise _invalid_response()
+        logger.info("device bound to account")
+        return device
+
+
+def public_device_identity(setup: object) -> tuple[str, str]:
+    """Extract and verify the managed public identity from a SETUP_STATUS reply.
+
+    Only the base64 public key and its SHA-256 fingerprint ever leave the
+    client; the private key stays inside the privileged service.
+    """
+    import hashlib
+
+    identity = setup.get("setup") if isinstance(setup, dict) else None
+    public_key = identity.get("identity_public_key") if isinstance(identity, dict) else None
+    fingerprint = identity.get("identity_fingerprint") if isinstance(identity, dict) else None
+    if not isinstance(public_key, str) or not isinstance(fingerprint, str):
+        raise AccountAPIError(
+            "identity_unavailable", "Device identity is not ready. Create it on the Home page first."
+        )
+    try:
+        raw = base64.b64decode(public_key, validate=True)
+    except ValueError:
+        raw = b""
+    if len(raw) != 32 or hashlib.sha256(raw).hexdigest() != fingerprint:
+        raise AccountAPIError("identity_unavailable", "Device identity failed its consistency check.")
+    return public_key, fingerprint
+
 
 @dataclass(frozen=True)
 class UserProfile:
@@ -1838,6 +1881,7 @@ if PYSIDE6_AVAILABLE:
             # Account session state (memory-only)
             self._account_session = AccountSession()
             self._account_client: AccountClient | None = None
+            self._account_devices: list[dict] = []
             self._account_worker = _AccountWorker()
             self._account_worker.finished.connect(self._account_finished)
             self._session_timer = QTimer(self)
@@ -2348,6 +2392,35 @@ if PYSIDE6_AVAILABLE:
             profile_card.body.addLayout(signout_row)
             profile_layout.addWidget(profile_card)
 
+            # This device: bind the managed public identity to the account.
+            device_card = Card(
+                "This Device",
+                "Bind this device's public identity to your account. Only the public key "
+                "and fingerprint are sent; the private key never leaves this machine.",
+            )
+            self.device_fingerprint_row = DataRow("Device fingerprint")
+            self.device_binding_row = DataRow("Account binding")
+            self.device_count_row = DataRow("Devices on account")
+            for row in (self.device_fingerprint_row, self.device_binding_row,
+                        self.device_count_row):
+                device_card.body.addWidget(row)
+            device_card.body.addWidget(gui_label("DEVICE NAME", 9, GUI_COLORS["muted"], 700))
+            self.device_name_input = QLineEdit(socket.gethostname()[:100])
+            self.device_name_input.setMaxLength(100)
+            self.device_name_input.setMaximumWidth(440)
+            device_card.body.addWidget(self.device_name_input)
+            self.device_error = gui_label("", 11, GUI_COLORS["red"], 550)
+            self.device_error.setWordWrap(True)
+            self.device_error.hide()
+            device_card.body.addWidget(self.device_error)
+            device_actions = QHBoxLayout()
+            self.device_bind_btn = QPushButton("Register This Device")
+            self.device_bind_btn.clicked.connect(self._on_bind_device_clicked)
+            device_actions.addWidget(self.device_bind_btn)
+            device_actions.addStretch(1)
+            device_card.body.addLayout(device_actions)
+            profile_layout.addWidget(device_card)
+
             # Security separation callout
             separation_card = Card("VPN Authorization Notice")
             separation_card.body.addWidget(gui_label(
@@ -2502,6 +2575,7 @@ if PYSIDE6_AVAILABLE:
         def _end_account_session(self, *, expired: bool) -> None:
             self._session_timer.stop()
             self._account_session.clear_session(expired=expired)
+            self._account_devices = []
             self._add_gui_event(
                 "warning" if expired else "info",
                 "Session expired — signed out automatically" if expired else "Signed out",
@@ -2513,6 +2587,28 @@ if PYSIDE6_AVAILABLE:
             client = self._account_client
             if token and client is not None:
                 self._account_worker.submit("validate", lambda: client.get_me(token))
+                self._account_worker.submit("devices", lambda: client.list_devices(token))
+
+        def _on_bind_device_clicked(self) -> None:
+            token = self._account_session.get_token()
+            client = self._account_client
+            name = self.device_name_input.text().strip()
+            if not token or client is None:
+                return
+            if not name:
+                self.device_error.setText("Enter a device name.")
+                self.device_error.show()
+                return
+            self.device_error.hide()
+            ipc = self.ipc
+
+            def bind() -> dict:
+                public_key, fingerprint = public_device_identity(ipc.setup_status())
+                return client.bind_device(token, name, public_key, fingerprint)
+
+            self.device_bind_btn.setEnabled(False)
+            self.device_bind_btn.setText("Registering…")
+            self._account_worker.submit("bind", bind)
 
         def _account_finished(self, op: str, ok: bool, data: object, message: str,
                               status_code: int, retry_after: int) -> None:
@@ -2530,6 +2626,8 @@ if PYSIDE6_AVAILABLE:
                 self._session_timer.start()
                 self._add_gui_event("info", f"Signed in as {user.username}")
                 self._refresh_account_view()
+                client, token = self._account_client, data["token"]
+                self._account_worker.submit("devices", lambda: client.list_devices(token))
                 return
             self._account_session.clear_session()
             if retry_after > 0:
@@ -2556,6 +2654,56 @@ if PYSIDE6_AVAILABLE:
             if retry_after > 0:
                 self._start_cooldown(retry_after, is_login=False)
             self._set_register_message(message or "Registration failed.")
+
+        def _account_devices_finished(self, ok, data, message, status_code, retry_after) -> None:
+            if not self._account_session.is_authenticated:
+                return
+            if ok and isinstance(data, list):
+                self._account_devices = data
+                self._render_account_device()
+            elif status_code == 401:
+                self._end_account_session(expired=True)
+
+        def _account_bind_finished(self, ok, data, message, status_code, retry_after) -> None:
+            self.device_bind_btn.setText("Register This Device")
+            if ok and isinstance(data, dict):
+                self._add_gui_event(
+                    "info", "Device bound to account; VPN access still requires administrator approval"
+                )
+                self._account_devices = [
+                    d for d in self._account_devices if d.get("fingerprint") != data.get("fingerprint")
+                ] + [data]
+            elif status_code == 401:
+                self._end_account_session(expired=True)
+                return
+            else:
+                self.device_error.setText(message or "Device registration failed.")
+                self.device_error.show()
+            self._render_account_device()
+
+        def _current_account_device(self) -> dict | None:
+            fingerprint = self._last_status.identity_fingerprint
+            if not fingerprint:
+                return None
+            return next(
+                (d for d in self._account_devices if d.get("fingerprint") == fingerprint), None
+            )
+
+        def _render_account_device(self) -> None:
+            fingerprint = self._last_status.identity_fingerprint
+            device = self._current_account_device()
+            self.device_fingerprint_row.set_value(truncate_fingerprint(fingerprint))
+            if not fingerprint:
+                binding = "Identity not ready"
+            elif device is None:
+                binding = "Not registered"
+            else:
+                binding = f"Registered as {sanitize_error(device.get('device_name', ''), 100)}"
+            self.device_binding_row.set_value(binding)
+            self.device_count_row.set_value(len(self._account_devices))
+            self.device_bind_btn.setEnabled(
+                bool(fingerprint) and device is None and self._account_session.is_authenticated
+            )
 
         def _account_logout_finished(self, ok, data, message, status_code, retry_after) -> None:
             if not ok and status_code != 401:
@@ -2849,6 +2997,7 @@ if PYSIDE6_AVAILABLE:
             state = status.state
             connected = state == ConnectionState.CONNECTED.value
             self._set_visual_state(state)
+            self._render_account_device()
 
             messages = {
                 ConnectionState.DISCONNECTED.value: "Ready to establish a secure tunnel",

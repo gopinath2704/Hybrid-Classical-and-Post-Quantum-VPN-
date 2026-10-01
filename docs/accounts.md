@@ -1,9 +1,10 @@
-# Account storage and authentication API (Milestones 4.1–4.2)
+# Account storage, authentication, and device binding (Milestone 4)
 
-Milestone 4.1 is the frozen server-side persistence baseline. Milestone 4.2 adds
-a dedicated account registration, login, logout, and session-validation API on
-top of that store. It does not add a GUI, remote enrollment, account/device
-binding workflow, password recovery, MFA, or an administrator web interface.
+Milestone 4.1 is the server-side persistence baseline. Milestone 4.2 adds a
+dedicated account registration, login, logout, and session-validation API on top
+of that store. Milestone 4.3 adds the desktop Login/Register/Sign Out UI and
+Milestone 4.4 lets a signed-in user bind the device's managed public identity to
+the account. There is no password recovery, MFA, or administrator web interface.
 
 Three decisions remain deliberately independent:
 
@@ -129,6 +130,25 @@ returns the same safe public user fields. Session validation requires an
 unexpired, unrevoked session whose owning user still exists and remains enabled.
 Valid activity updates `last_used_at` at most once per minute.
 
+### `GET /devices` and `POST /devices`
+
+Both require the Bearer header. `GET /devices` returns the signed-in account's
+devices as `{"devices": [...]}` with only `id`, `device_name`, `fingerprint`,
+`enabled`, and `created_at`.
+
+`POST /devices` binds a public Ed25519 identity to the account:
+
+```json
+{"device_name":"work laptop","public_key":"base64 of 32 public bytes","fingerprint":"lowercase SHA-256 hex"}
+```
+
+The server verifies that the fingerprint is the SHA-256 digest of exactly those
+32 bytes. A new binding is `201`; repeating the same binding for the same account
+is `200` with the existing record. An identity already bound to any other account
+is `409 device_exists`; an account may own at most 20 devices (`409
+device_limit`). Unknown fields, including any private-key field, are rejected.
+**Binding never authorizes VPN access and never touches `AuthorizedClients`.**
+
 ### `POST /auth/logout`
 
 This endpoint requires the same Bearer header, revokes the presented session,
@@ -147,6 +167,8 @@ responses.
 
 ## Rate limits
 
+Device documents share the same body limit and JSON content-type requirement.
+
 Login failures are limited by a SHA-256-derived key for source address plus
 normalized identifier: five failures in 60 seconds cause a 60-second cooldown.
 A successful login clears that key. Registration has an independent per-source
@@ -158,6 +180,21 @@ at most 4,096 keys and the registration limiter at most 2,048; old entries
 expire and least-recent entries are evicted at the bound. The state is local to
 one API process and intentionally provides prototype abuse protection rather
 than a distributed rate-limit service.
+
+## Desktop client
+
+The GUI Account page talks to this API with a standard-library HTTPS client in
+`app/client.py`. HTTPS certificates are always verified (an optional CA file can
+be supplied for a private certificate); cleartext HTTP is accepted only for a
+loopback URL. The bearer token is held only in GUI process memory: it is never
+written to disk, sent over the service IPC socket, shown, or logged. A 60-second
+`/auth/me` check returns an expired, revoked, or disabled-account session to the
+Login view, and Sign Out clears the local token even if remote revocation fails.
+
+"Register This Device" asks the local service for the managed public identity
+(`SETUP_STATUS`), re-checks that the fingerprint matches the public key, and sends
+only those public values to `POST /devices`. The private key never leaves the
+privileged service.
 
 ## HTTPS configuration and service
 
