@@ -64,19 +64,22 @@ layout (`/etc/pqvpn/account-api.toml`) is unreadable by `pqvpn-account` in that 
 | Administrator approval (`vpn.cli account approve 1`) | PASS — `shadow-1` authorized, status `approved`, file reset to `root:pqvpn 0640`, server restarted cleanly |
 | Connect | PASS — `CONNECTED`, `pqvpn0` 10.8.0.2/24, `native_liboqs`, quantum-safe, ping 10.8.0.1 0% loss (~0.9 ms) |
 | Routes / DNS / IPv6 guard | PASS — `0.0.0.0/1` + `128.0.0.0/1` via `pqvpn0`, server bypass via physical link; DNS 1.1.1.1/9.9.9.9 with `~.` on `pqvpn0`; IPv6 guard active, external IPv6 ping blocked |
-| Automatic rekey | PASS — epoch 0 → 1 at 300 s, no ping loss (0 → 1 → 2 not yet observed) |
+| Automatic rekey | PASS — epoch 0 → 1 → 2 at 300 s intervals (17:36:58, 17:41:58 IST); continuous 0.2 s ping across the epoch-2 rekey: 577/577 received, 0% loss |
 | Disconnect cleanup | PASS — `pqvpn0`, VPN and bypass routes, VPN DNS removed; default route and DNS restored; Internet HTTP 200; server still active |
 | Reconnect | PASS — same device fingerprint and VPN IP, connected in ~1 s |
 | Logout | PASS — both account sessions revoked server-side; VPN stayed `CONNECTED` and device stayed `approved` (login ≠ VPN authorization) |
+| Unauthorized device | PASS — fresh never-approved Ed25519 identity (`96eb61be…`) refused during the handshake (`reason=unauthorized client`); no TUN created, existing session unaffected |
+| Revocation | PASS — `account revoke 1` disabled `shadow-1` and set status `revoked`; after server restart the session dropped, the client cleaned up (`pqvpn0` absent, default route intact) and every reconnect was refused with `unauthorized client` |
+| Re-approval | PASS — `account approve 1` from `revoked` re-enabled `shadow-1`; after restart the same identity reconnected (10.8.0.2, native PQC, ping 0% loss) |
 
 **Open items.** (1) IPv6 guard teardown verified only through client status, not
 `nft list tables`. (2) The server logs `rejected spoofed/malformed inner packet
 client_id=shadow-1` (~33 in the first 5 minutes, decaying): anti-spoofing correctly drops
 inner packets whose source is not the assigned VPN IP; the source (likely pre-tunnel
 connections retransmitting from the physical address, or link-local IPv6 on `pqvpn0`)
-is unconfirmed and any fix would touch the frozen client network code. (3) Not yet run:
-unauthorized-device rejection, revoke → reconnect refused, rekey epoch 2. (4) VM IP is a
-DHCP lease; profile and TLS certificate depend on it.
+is unconfirmed and any fix would touch the frozen client network code. (3) VM IP is a
+DHCP lease; profile and TLS certificate depend on it. (4) Revocation still needs a server
+restart to end live sessions (documented; no live reload).
 
 ### 2026-10-01 — Milestone 4.6: Account-Aware Desktop UX
 
@@ -732,7 +735,7 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | **Milestone 4.4 (Account-Device Binding)** | ✅ Completed | Authenticated `/devices` API and desktop "This Device" binding of the managed public Ed25519 identity; private keys remain local; no `AuthorizedClients` change |
 | **Milestone 4.5 (Admin Enrollment Approval)** | ✅ Completed | Schema v2 device review status with v1 migration; root-only `vpn.cli account` approve/reject/revoke is the sole path into `AuthorizedClients` |
 | **Milestone 4.6 (Account-Aware Desktop UX)** | ✅ Completed | Home "Account & Device" card driven by `account_ux_state()` across account, device review, and VPN states; never gates Connect |
-| **Milestone 4.7 (E2E Multi-Node Validation)** | 🟡 Core flow passed | Omarchy ↔ Ubuntu VM: register, login, device binding, admin approval, connect, routes/DNS/IPv6 guard, native PQC, rekey 0→1, disconnect cleanup, reconnect, logout all PASS; unauthorized-device, revocation, and epoch-2 checks pending |
+| **Milestone 4.7 (E2E Multi-Node Validation)** | ✅ Completed | Omarchy ↔ Ubuntu VM: register, login, device binding, admin approval, connect, routes/DNS/IPv6 guard, native PQC, rekey 0→1→2 without loss, disconnect cleanup, reconnect, logout, unauthorized-device rejection, revoke and re-approve all PASS; IPv6-guard teardown via `nft` and spoofed-packet source remain open notes |
 | **Desktop Client Milestone 3** | ✅ Completed | Managed identity/onboarding plus live GUI enrollment, connect, disconnect, identity persistence, rekey, cleanup, and native PQC validation passed against Ubuntu 26.04 |
 | **Arch / Omarchy Packaging** | ✅ Completed | Pinned checksum-verified liboqs/Python packages, deterministic app archive, and Python `-s` isolation in both client units; manual Pacman install chain pending |
 | **Debian / Ubuntu Packaging** | ✅ Completed | Exact pinned liboqs 0.16.0 native/Python packages and main app built, inspected, and clean-installed on Ubuntu 26.04 with native backend and GUI imports verified |
