@@ -42,6 +42,42 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 
 ## 📝 Modification Log & Project Progress
 
+### 2026-10-01 — Milestone 4.7: Live Account + Device + VPN Validation (Omarchy ↔ Ubuntu VM)
+
+**Environment.** Server: Ubuntu 26.04.1 VM `192.168.5.159` (kernel 7.0.0-34, Python 3.14.4,
+native liboqs/liboqs-python 0.16.0), source install of commit `9527da3` into `/opt/pqvpn`
+per `docs/deployment.md`; `pqvpn-server` (WAN `enp0s3`, `10.8.0.0/24`) and
+`pqvpn-account-api` (HTTPS `:8443`, test-CA certificate for the VM IP) under systemd.
+Client: Omarchy host `192.168.5.16`, installed `pqvpn 2.0.0-1` client service with the
+M4 GUI run from the repository. Doctor: all PASS; WARN for Python 3.14.4 ≠ 3.14.7
+baseline and operator-verified external firewall.
+
+**Test-only configuration (not a release default):** `rekey_interval = 300`; account API
+config/TLS under `/etc/pqvpn-account/` (0750 `root:pqvpn-account`) with a systemd drop-in
+running the `/opt/pqvpn` venv, because `/etc/pqvpn` is 0750 `root:pqvpn` and the packaged
+layout (`/etc/pqvpn/account-api.toml`) is unreadable by `pqvpn-account` in that case.
+
+| Step | Result |
+|---|---|
+| Register → login over verified HTTPS (client CA option) | PASS — server logged `registration succeeded`/`login succeeded user_id=1` |
+| Register current device | PASS — device 1 `pending`, fingerprint `71a07a73…614fb1` matches client; `authorized_clients.json` still empty |
+| Administrator approval (`vpn.cli account approve 1`) | PASS — `shadow-1` authorized, status `approved`, file reset to `root:pqvpn 0640`, server restarted cleanly |
+| Connect | PASS — `CONNECTED`, `pqvpn0` 10.8.0.2/24, `native_liboqs`, quantum-safe, ping 10.8.0.1 0% loss (~0.9 ms) |
+| Routes / DNS / IPv6 guard | PASS — `0.0.0.0/1` + `128.0.0.0/1` via `pqvpn0`, server bypass via physical link; DNS 1.1.1.1/9.9.9.9 with `~.` on `pqvpn0`; IPv6 guard active, external IPv6 ping blocked |
+| Automatic rekey | PASS — epoch 0 → 1 at 300 s, no ping loss (0 → 1 → 2 not yet observed) |
+| Disconnect cleanup | PASS — `pqvpn0`, VPN and bypass routes, VPN DNS removed; default route and DNS restored; Internet HTTP 200; server still active |
+| Reconnect | PASS — same device fingerprint and VPN IP, connected in ~1 s |
+| Logout | PASS — both account sessions revoked server-side; VPN stayed `CONNECTED` and device stayed `approved` (login ≠ VPN authorization) |
+
+**Open items.** (1) IPv6 guard teardown verified only through client status, not
+`nft list tables`. (2) The server logs `rejected spoofed/malformed inner packet
+client_id=shadow-1` (~33 in the first 5 minutes, decaying): anti-spoofing correctly drops
+inner packets whose source is not the assigned VPN IP; the source (likely pre-tunnel
+connections retransmitting from the physical address, or link-local IPv6 on `pqvpn0`)
+is unconfirmed and any fix would touch the frozen client network code. (3) Not yet run:
+unauthorized-device rejection, revoke → reconnect refused, rekey epoch 2. (4) VM IP is a
+DHCP lease; profile and TLS certificate depend on it.
+
 ### 2026-10-01 — Milestone 4.6: Account-Aware Desktop UX
 
 - `account_ux_state()` in `app/client.py` combines session, account-server reachability,
@@ -696,7 +732,7 @@ transparent, honest, production-ready VPN implementation as audited and approved
 | **Milestone 4.4 (Account-Device Binding)** | ✅ Completed | Authenticated `/devices` API and desktop "This Device" binding of the managed public Ed25519 identity; private keys remain local; no `AuthorizedClients` change |
 | **Milestone 4.5 (Admin Enrollment Approval)** | ✅ Completed | Schema v2 device review status with v1 migration; root-only `vpn.cli account` approve/reject/revoke is the sole path into `AuthorizedClients` |
 | **Milestone 4.6 (Account-Aware Desktop UX)** | ✅ Completed | Home "Account & Device" card driven by `account_ux_state()` across account, device review, and VPN states; never gates Connect |
-| **Milestone 4.7 (E2E Multi-Node Validation)** | ⏳ Next | Full live system validation on Omarchy desktop ↔ Ubuntu server VM (KEMTLS v2, TUN, routes, DNS, rekeying, disconnect/logout) |
+| **Milestone 4.7 (E2E Multi-Node Validation)** | 🟡 Core flow passed | Omarchy ↔ Ubuntu VM: register, login, device binding, admin approval, connect, routes/DNS/IPv6 guard, native PQC, rekey 0→1, disconnect cleanup, reconnect, logout all PASS; unauthorized-device, revocation, and epoch-2 checks pending |
 | **Desktop Client Milestone 3** | ✅ Completed | Managed identity/onboarding plus live GUI enrollment, connect, disconnect, identity persistence, rekey, cleanup, and native PQC validation passed against Ubuntu 26.04 |
 | **Arch / Omarchy Packaging** | ✅ Completed | Pinned checksum-verified liboqs/Python packages, deterministic app archive, and Python `-s` isolation in both client units; manual Pacman install chain pending |
 | **Debian / Ubuntu Packaging** | ✅ Completed | Exact pinned liboqs 0.16.0 native/Python packages and main app built, inspected, and clean-installed on Ubuntu 26.04 with native backend and GUI imports verified |
