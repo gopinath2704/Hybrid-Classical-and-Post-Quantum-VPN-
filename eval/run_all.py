@@ -79,21 +79,6 @@ SYSTEMS = {
         "output": "wireguard.csv",
         "requires_root": True,
     },
-    "openvpn": {
-        "cmd": lambda iters, out: ["bash", str(_EVAL / "run_openvpn.sh"), str(iters), str(out)],
-        "output": "openvpn.csv",
-        "requires_root": True,
-    },
-    "rosenpass": {
-        "cmd": lambda iters, out: ["bash", str(_EVAL / "run_rosenpass.sh"), str(iters), str(out)],
-        "output": "rosenpass.csv",
-        "requires_root": True,
-    },
-    "strongswan": {
-        "cmd": lambda iters, out: ["bash", str(_EVAL / "run_strongswan.sh"), str(iters), str(out)],
-        "output": "strongswan.csv",
-        "requires_root": True,
-    },
 }
 
 

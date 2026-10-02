@@ -287,7 +287,7 @@ def test_native_installer_verifies_commit_before_build(tmp_path,match):
     import re
     source=Path('scripts/install-liboqs.sh').read_text()
     commit=re.search(r'^LIBOQS_COMMIT=([0-9a-f]{40})$',source,re.M)[1]
-    assert f'liboqs-source-commit={commit}' in Path('VERSIONS.txt').read_text()
+    assert f'# liboqs-source-commit={commit}' in Path('constraints-tested.txt').read_text()
     bin=tmp_path/'bin';bin.mkdir()
     script='''#!/usr/bin/env python3
 import os,sys,pathlib

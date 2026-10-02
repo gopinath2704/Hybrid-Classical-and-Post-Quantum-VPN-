@@ -2,14 +2,14 @@ Source: pqvpn
 Section: net
 Priority: optional
 Maintainer: PQ-VPN research project <noreply@example.invalid>
-Build-Depends: debhelper-compat (= 13), dh-sequence-installsysusers, dh-python, pybuild-plugin-pyproject, python3-all, python3-build, python3-cryptography, python3-installer, python3-setuptools, python3-wheel, python3-liboqs-pqvpn (= 0.16.0-1), liboqs-pqvpn (= 0.16.0-1)
+Build-Depends: debhelper-compat (= 13), dh-sequence-installsysusers, dh-python, pybuild-plugin-pyproject, python3-all, python3-build, python3-cryptography, python3-installer, python3-setuptools, python3-wheel
 Standards-Version: 4.7.2
 Rules-Requires-Root: no
 Homepage: https://github.com/gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-
 
 Package: pqvpn
 Architecture: any
-Depends: ${misc:Depends}, ${python3:Depends}, python3 (>= 3.11), python3-argon2, python3-cryptography, python3-fastapi, python3-uvicorn, python3-pyside6.qtwidgets, python3-liboqs-pqvpn (= 0.16.0-1), liboqs-pqvpn (= 0.16.0-1), iproute2, nftables
+Depends: ${misc:Depends}, ${python3:Depends}, python3 (>= 3.11), python3-argon2, python3-cryptography, python3-fastapi, python3-uvicorn, python3-pyside6.qtwidgets, iproute2, nftables
 Description: hybrid classical and post-quantum research VPN client
  PQ-VPN is a deployable research/prototype Linux VPN using X25519 and
  ML-KEM-768 session establishment, a pinned static ML-KEM-768 server identity,

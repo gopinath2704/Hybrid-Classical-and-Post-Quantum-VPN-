@@ -6,10 +6,10 @@ pkgdesc='Hybrid classical and post-quantum research VPN client for Linux'
 arch=('x86_64')
 url='https://github.com/gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-'
 license=('custom')
-depends=('python>=3.14' 'python-argon2-cffi' 'python-cryptography' 'python-fastapi' 'uvicorn' 'pyside6' 'python-liboqs-pqvpn=0.16.0' 'liboqs-pqvpn=0.16.0' 'iproute2' 'nftables')
+depends=('python>=3.14' 'python-argon2-cffi' 'python-cryptography' 'python-fastapi' 'uvicorn' 'pyside6' 'iproute2' 'nftables')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 source=("${pkgname}-${pkgver}.tar.gz")
-sha256sums=('a750247da7bd5164f92f9f6a398acdb915b4505f66bd25a5d0458b3bb06111c8')
+sha256sums=('3314c54af3d1820f23c212e3b4b936610df6380d87f83587269585e125b0cf8d')
 
 build() {
   cd "${srcdir}/${pkgname}-${pkgver}"

@@ -1,3 +1,32 @@
+# Tested runtime and native source versions
+# CPython=3.14.7
+# liboqs-python=0.16.0
+# liboqs=0.16.0
+# liboqs-source-commit=5a1a854b0dc9f2141bdc771c555ee60c37950183
+# Platform=Linux x86_64
+# Python constraints=constraints-tested.txt
+# Native systemd/root namespace/VPS validation=PENDING
+#
+# Recorded native validation build
+# Validation date=2026-09-08
+# Source repository=https://github.com/open-quantum-safe/liboqs.git
+# Source tag=0.16.0
+# Source commit=5a1a854b0dc9f2141bdc771c555ee60c37950183
+# Compiler=GCC 16.2.1 20260810
+# CMake=4.4.3
+# Ninja=1.13.2
+# Build options=BUILD_SHARED_LIBS=ON CMAKE_BUILD_TYPE=Release OQS_BUILD_ONLY_LIB=ON OQS_MINIMAL_BUILD=KEM_ml_kem_768 CMAKE_INSTALL_LIBDIR=lib
+# Platform=Linux x86_64
+# Tested library SHA256=accf52d6e4e6b277aa3fa80e0fdee171fa95bd21b40f6888294c5fa8557abc4d
+# Validation build prefix=temporary /tmp prefix, removed after validation
+# Prior continuation library SHA256=2b70c3af00444504523cb503f1d7c7406fe61f0df821bfc40a2b9124971e12a5
+# Previous session library SHA256=53ba2e7300561d0537bc65701c7f917cdb9ed6d8632529ae18d9c35d21797d0f
+# Native loading=Explicit temporary OQS_INSTALL_PATH and LD_LIBRARY_PATH; /proc/self/maps verified loaded library path
+# Python=3.14.7
+# liboqs-python=0.16.0
+# liboqs=0.16.0
+# Production installer=Same pinned source, default broader algorithm build; different build options/platforms produce different binary hashes
+# Python package artifacts=Existing constraints-tested.txt version pins; artifact hash locking not added
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1

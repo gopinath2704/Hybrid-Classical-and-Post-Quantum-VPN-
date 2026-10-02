@@ -10,8 +10,8 @@ client. Privileged namespace, systemd, and VPS results must be recorded separate
 ## Exact tested dependencies
 
 The recorded baseline is CPython **3.14.7**, **liboqs-python 0.16.0**, native
-**liboqs 0.16.0**, Linux x86_64. `VERSIONS.txt` records the versions;
-`constraints-tested.txt` pins every Python dependency in the test environment.
+**liboqs 0.16.0**, Linux x86_64. `constraints-tested.txt` records the tested
+versions and pins every Python dependency in the test environment.
 Install `.` for the daemon or CLI, `.[desktop]` for the PySide6 GUI, and `.[dev]`
 for validation and benchmarks. Always pass `-c constraints-tested.txt`
 to reproduce all transitive pins. IPv6 leak blocking additionally needs nftables
@@ -159,43 +159,11 @@ download, mock fallback, hidden native copy, or unpinned native build is enabled
 
 #### Arch / Omarchy
 
-Build and install the dependencies in order from the repository root. These
-commands acquire sources only during makepkg's source phase; neither package
-performs a build-time or runtime download after that.
+Install native liboqs 0.16.0 using the project installer before building the
+main package:
 
 ```bash
-(cd packaging/arch/liboqs-pqvpn && makepkg --cleanbuild --syncdeps)
-sudo pacman -U packaging/arch/liboqs-pqvpn/liboqs-pqvpn-0.16.0-1-x86_64.pkg.tar.zst
-
-(cd packaging/arch/python-liboqs-pqvpn && makepkg --cleanbuild --syncdeps)
-sudo pacman -U packaging/arch/python-liboqs-pqvpn/python-liboqs-pqvpn-0.16.0-1-any.pkg.tar.zst
-PYTHONNOUSERSITE=1 OQS_INSTALL_PATH=/usr python - <<'PY'
-from pathlib import Path
-import oqs
-assert oqs.oqs_python_version() == "0.16.0"
-assert oqs.oqs_version() == "0.16.0"
-assert "ML-KEM-768" in oqs.get_enabled_kem_mechanisms()
-mapped = {line.split()[-1] for line in Path("/proc/self/maps").read_text().splitlines()
-          if "/liboqs.so" in line}
-assert mapped and all(path.startswith("/usr/lib/liboqs.so") for path in mapped), mapped
-PY
-```
-
-`liboqs-pqvpn` uses the official liboqs commit archive for
-`5a1a854b0dc9f2141bdc771c555ee60c37950183`:
-
-```text
-https://github.com/open-quantum-safe/liboqs/archive/5a1a854b0dc9f2141bdc771c555ee60c37950183.tar.gz
-SHA-256 83c6e6cff490638312e1e20ed5de593fb5d7bfab162235f6238f519d6a1feafb
-```
-
-`python-liboqs-pqvpn` uses the official liboqs-python commit archive for the
-`0.16.0` tag at `c6378cd5c8db74c0adf34ddcfbb96ee9c99f8061`:
-
-```text
-https://github.com/open-quantum-safe/liboqs-python/archive/c6378cd5c8db74c0adf34ddcfbb96ee9c99f8061.tar.gz
-SHA-256 3de72cde836a72e4584dad6415a41610f980f924cae95a3848011fcb4f3a3b05
-downstream patch SHA-256 0693b70ffa0a6475f018be369e614df99661b6643a2e6ffc6830b9f2087333b1
+sudo bash scripts/install-liboqs.sh /usr/local
 ```
 
 The private development branch has no release archive, so create the main
@@ -230,40 +198,22 @@ Pacman-managed wrapper.
 
 #### Debian / Ubuntu 26.04-class
 
-Ubuntu 26.04 does not provide the `python3-liboqs` and `liboqs0` dependency names
-previously referenced by the main package. Build the two project-owned, exact-
-version packages first; their metadata lives under `packaging/deb/liboqs-pqvpn`
-and `packaging/deb/python3-liboqs-pqvpn`. They deliberately do not fetch source
-or native libraries at build or run time.
+Install native liboqs 0.16.0 using the project installer before building the
+main package:
 
-Download the official commit archives separately and verify them before adding
-the matching `debian` directory:
+```bash
+sudo bash scripts/install-liboqs.sh /usr/local
+```
 
-| package | pinned commit | archive SHA-256 |
-| --- | --- | --- |
-| liboqs 0.16.0 | `5a1a854b0dc9f2141bdc771c555ee60c37950183` | `83c6e6cff490638312e1e20ed5de593fb5d7bfab162235f6238f519d6a1feafb` |
-| liboqs-python 0.16.0 | `c6378cd5c8db74c0adf34ddcfbb96ee9c99f8061` | `3de72cde836a72e4584dad6415a41610f980f924cae95a3848011fcb4f3a3b05` |
-
-The Python wrapper also applies
-`packaging/deb/python3-liboqs-pqvpn/debian/patches/disable-runtime-liboqs-download.patch`
-with SHA-256
-`0693b70ffa0a6475f018be369e614df99661b6643a2e6ffc6830b9f2087333b1`.
-Build in this order with `dpkg-buildpackage --build=binary --no-sign`:
-
-1. `liboqs-pqvpn_0.16.0-1_amd64.deb`
-2. `python3-liboqs-pqvpn_0.16.0-1_all.deb`
-3. `pqvpn_2.0.0-1_amd64.deb`
-
-Install the first package before building the second, and both before building
-the main package. The main build runs an explicit import check that requires
-`native_liboqs`, so a mock or missing backend cannot produce a successful build.
-Its Debian-only `use-debian-runtime-dependencies.patch` prevents upstream PyPI
-pins from producing dependencies unavailable in Ubuntu; the complete runtime
-set remains explicit in `packaging/deb/debian/control`. Inspect the results with
-`dpkg-deb --info`, `dpkg-deb --contents`, and `dpkg-deb --field`; then install all
-three together in a clean Ubuntu 26.04 environment and confirm
-`oqs.oqs_version()` and `oqs.oqs_python_version()` both return `0.16.0` and
-`ML-KEM-768` is enabled.
+Build the main package with `dpkg-buildpackage --build=binary --no-sign`.
+The build runs an explicit import check that requires `native_liboqs`, so a
+mock or missing backend cannot produce a successful build. Its Debian-only
+`use-debian-runtime-dependencies.patch` prevents upstream PyPI pins from
+producing dependencies unavailable in Ubuntu; the complete runtime set remains
+explicit in `packaging/deb/debian/control`. Inspect the results with
+`dpkg-deb --info`, `dpkg-deb --contents`, and `dpkg-deb --field`; then install
+in a clean Ubuntu 26.04 environment and confirm `oqs.oqs_version()` and
+`oqs.oqs_python_version()` both return `0.16.0` and `ML-KEM-768` is enabled.
 
 The upstream PQ-VPN repository currently lacks a declared license, so
 redistribution of these packages must remain blocked until the owner adds one.
@@ -423,7 +373,7 @@ manager is supplied or the operator explicitly chooses `dns_mode="none"`. Do not
 
 `liboqs 0.16.0` is pinned to full source commit
 `5a1a854b0dc9f2141bdc771c555ee60c37950183` in `scripts/install-liboqs.sh` and
-`VERSIONS.txt`. The helper clones tag 0.16.0 and compares HEAD with that
+`constraints-tested.txt`. The helper clones tag 0.16.0 and compares HEAD with that
 commit before running CMake; any mismatch fails. It never selects latest/main.
 The Python binding remains 0.16.0 and every Python dependency version remains unchanged.
 
@@ -436,7 +386,7 @@ dependency-validation pass, not an untested upgrade.
 
 This pass built the verified revision in a temporary prefix with only ML-KEM-768
 enabled and ran native tests and complete regressions against that loaded library.
-`VERSIONS.txt` records compiler/build options and the tested binary digest.
+`constraints-tested.txt` records compiler/build options and the tested binary digest.
 The installer keeps its broader default algorithm build; the validation does not
 certify unused algorithms or an OS image. The prior installed library exposed the
 same 0.16.0 version but lacked a source provenance record. Python versions are pinned

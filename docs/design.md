@@ -16,7 +16,7 @@ Every record header is AAD, including its DATA/CONTROL channel. Each channel and
 
 Production never falls back to socket-pipe TUN. Emulation requires `--dev-emulated-tun`. Host changes are transactional on the client; server firewall helpers own isolated nftables tables and do not flush user rules.
 
-Current limitations are tracked in `progress.md`: IPv4 routing is implemented; IPv6 forwarding/data-route coverage, optional kill switch, and dynamic PMTU discovery remain future work. Post-compromise security via hybrid re-handshake and stateless DoS-resistance cookies are implemented in v3. The root namespace integration marker requires a privileged Linux runner and is not evidence until executed there.
+Current limitations are tracked in the README: IPv4 routing is implemented; IPv6 forwarding/data-route coverage, optional kill switch, and dynamic PMTU discovery remain future work. Post-compromise security via hybrid re-handshake and stateless DoS-resistance cookies are implemented in v3. The root namespace integration marker requires a privileged Linux runner and is not evidence until executed there.
 
 ## Deployment and diagnostics
 
@@ -132,7 +132,7 @@ Authorized-client revocation affects future ClientHello authorization. Existing
 sessions and already-authorized handshakes are not actively terminated. Server restart
 terminates all sessions; no live reload/remote termination mechanism is implemented.
 Native source provenance is pinned to the exact 0.16.0 commit in
-`VERSIONS.txt`; cryptographic components and versions are unchanged.
+`constraints-tested.txt`; cryptographic components and versions are unchanged.
 
 ## Cryptographic and Protocol Design
 ### Protocol v2
@@ -184,7 +184,7 @@ Rekey request payload is `next_epoch:u32 || nonce:32`. The server returns `next_
 v3 (`0x30`) replaces classical Ed25519 client authentication with ML-KEM-768
 static key mutual authentication. Both sides authenticate by encapsulating to
 the peer's pre-shared static ML-KEM key; only the true key owner can
-decapsulate and derive the Finished MAC. Design decision: `docs/decisions/D1-client-auth-flow.md`.
+decapsulate and derive the Finished MAC. Design decision: [D1](#d1-client-authentication-flow-for-v3).
 
 Suite: X25519, ML-KEM-768, HKDF-SHA256, ML-KEM-768 client identities, AES-256-GCM.
 No signatures in the handshake.
@@ -347,7 +347,7 @@ The custom protocol has not received independent cryptographic review or a forma
 
 Frequent epoch rekey derives successors from the prior `rekey_secret` plus a public nonce. It provides key evolution, not post-compromise recovery: compromise of the current rekey secret plus observation/decryption of the rekey records can expose future epochs. v3 adds a hybrid re-handshake that mixes fresh X25519 + ML-KEM ephemeral material to restore secrecy after state compromise (see *Hybrid re-handshake* above).
 
-The data plane is a Python userspace packet loop (TUN ↔ UDP AES-256-GCM). Profiling shows ~10 µs per packet (~100k pps), with Python overhead (nonce XOR, struct, locks) accounting for 2–3× the raw AES-GCM cost (~0.9 µs). This is comparable to OpenVPN (C userspace, ~5–15 µs) but far slower than WireGuard (kernel, ~0.3 µs). The research contribution is the handshake and control plane; throughput is reported as a functional check with the limitation stated openly. Decision: `docs/decisions/D6-data-plane.md`.
+The data plane is a Python userspace packet loop (TUN ↔ UDP AES-256-GCM). Profiling shows ~10 µs per packet (~100k pps), with Python overhead (nonce XOR, struct, locks) accounting for 2–3× the raw AES-GCM cost (~0.9 µs). This is comparable to OpenVPN (C userspace, ~5–15 µs) but far slower than WireGuard (kernel, ~0.3 µs). The research contribution is the handshake and control plane; throughput is reported as a functional check with the limitation stated openly. Decision: [D6](#d6-data-plane-implementation-scope).
 
 Python cannot guarantee erasure of all secret copies. Mutable long-lived buffers are overwritten on rekey/disconnect as best-effort in-process zeroization; interpreter, library, allocator, swap, and core-dump copies may remain.
 
@@ -439,3 +439,76 @@ The `lan` profile runs in-process without network namespaces. Other profiles req
 root and use `scripts/bench_netem.sh` to create isolated namespaces with `tc netem`
 rules applied to both ends of a veth pair. The v2 baseline is tagged as
 `v2-research-baseline` and frozen for comparison with later protocol versions.
+
+---
+
+## Design decisions
+
+### D1: Client authentication flow for v3
+
+**Context.** v2 uses Ed25519 signatures for client authentication — the only classical
+cryptographic primitive remaining in the handshake. Replacing it with ML-KEM
+makes the system fully post-quantum mutually authenticated without any signatures.
+
+Both long-term public keys are pre-shared: the client pins the server key
+(from `.pqvpn`), and the server stores the client key (from `.pqenroll`).
+Each side can authenticate the other by encapsulating to the peer's static
+key — only the true key owner can decapsulate and derive the Finished MAC.
+
+**Options.**
+- A: Keep current message shape. `ct_S` stays in ClientKeyExchange; server adds
+  `ct_C` to ServerHello. Minimal change from v2. Client identity hash is sent in the
+  clear (same exposure as v2's Ed25519 public key). 1.5 RTT.
+- B: PDK-style. `ct_S` moves into ClientHello; client identity is encrypted under a
+  key derived from `K_S`. Hides client identity from passive observers. Larger
+  ClientHello, replay handling needed, more modelling work.
+
+**Choice: Option A.** Minimal wire-format delta from v2 — easier to verify correctness
+and model in Tamarin. Client identity exposure is equivalent to v2. Option B can be
+revisited after the Tamarin model is stable.
+
+Wire sizes (Option A):
+
+| Message | v2 | v3 | Delta |
+|---|---|---|---|
+| ClientHello | 1,318 | 1,318 | 0 |
+| ServerHello | 1,222 | 2,310 | +1,088 (ct_C) |
+| ClientKeyExchange | 1,190 | 1,126 | −64 (no signature) |
+| ServerFinished | 38 | 38 | 0 |
+| **Total** | **3,768** | **4,792** | **+1,024** |
+
+Key schedule:
+
+```
+ES  = HKDF-Extract(salt, X25519_ss ‖ K_eph)     — ephemeral handshake secret
+AS  = HKDF-Extract(ES,  K_S ‖ K_C ‖ transcript)  — authenticated master secret
+```
+
+From AS, derive Finished keys, data/control keys, rekey secret, and
+confirmation key using the same HKDF-Expand labels as v2.
+
+### D6: Data-plane implementation scope
+
+**Context.** The Python packet loop (TUN read → AES-GCM encrypt → UDP send, and reverse)
+will lose to WireGuard (kernel) and OpenVPN (C userspace) on throughput.
+
+Profiling (2026-10-01) on the project host with 10,000 × 1,400 B synthetic IPv4 packets:
+
+| Component | µs/pkt | Notes |
+|---|---|---|
+| AES-256-GCM encrypt (raw openssl) | 0.90 | Via `cryptography` Rust binding |
+| AES-256-GCM decrypt (raw openssl) | 0.91 | Same |
+| Python `encrypt_frame` total | 3.2 | Nonce XOR, struct.pack, lock, list append |
+| Python `decrypt_frame` total | 4.0 | + enum lookup, replay window, struct.unpack |
+
+Per-packet budget: ~8–12 µs → ~80k–125k pps theoretical.
+
+**Options.**
+- A: Scope it. Contribution is the handshake and control plane. Effort: zero.
+- B: Native data plane. Move framing to Rust (PyO3) or C. Effort: 2–4 weeks.
+
+**Choice: Option A.** The research contribution is the handshake. Python throughput
+(~100k pps, ~1.1 Gbps for 1,400 B packets) is adequate for functional validation
+and comparable to OpenVPN (~5–15 µs/pkt). The bottleneck is Python overhead, not
+crypto. A native rewrite introduces build complexity orthogonal to the research
+question. The paper states the limitation openly.

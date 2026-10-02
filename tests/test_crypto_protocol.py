@@ -1016,3 +1016,26 @@ def test_mldsa_key_schedule_differs_from_v3_kem():
     s_mldsa = derive_schedule_mldsa(ikm, cr, sr, sid, th)
     s_v3 = derive_schedule_v3(ikm[:64], ikm[64:], cr, sr, sid, th)
     assert bytes(s_mldsa.data_c2s_key) != bytes(s_v3.data_c2s_key)
+
+
+# ─── Native PQC Tests (moved from test_native_pqc.py) ─────────────────────
+
+@pytest.mark.native_pqc
+@pytest.mark.skipif(not _OQS_AVAILABLE, reason="native liboqs ML-KEM-768 unavailable")
+def test_native_mlkem_self_test():
+    p = PQCProvider()
+    sk, pk = p.generate_keypair()
+    ct, a = p.encapsulate(pk)
+    b = p.decapsulate(sk, ct)
+    assert a == b and p.is_quantum_safe
+
+
+@pytest.mark.native_pqc
+@pytest.mark.skipif(not _OQS_AVAILABLE, reason='native liboqs ML-KEM-768 unavailable')
+def test_native_authenticated_session_records(identities):
+    assert PQCProvider().is_quantum_safe
+    client, server = exchange(identities)
+    ping = client.encrypt_frame(b'12345678', FrameType.PING)
+    assert server.decrypt_frame(ping, FrameType.PING)[1] == b'12345678'
+    assert client.decrypt_frame(server.encrypt_frame(b'12345678', FrameType.PONG), FrameType.PONG)[1] == b'12345678'
+    client.secure_wipe(); server.secure_wipe()
