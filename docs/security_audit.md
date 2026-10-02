@@ -431,7 +431,7 @@ retained. No changes were made to `handshake/kemtls.py` or `crypto/hybrid_crypto
 | Native ML-KEM marker, separately | PASS: 2 passed, 243 deselected; `ALLOW_MOCK_PQC=0` |
 | Python / liboqs-python / native liboqs | 3.14.7 / 0.16.0 / 0.16.0 |
 | Native source commit | `5a1a854b0dc9f2141bdc771c555ee60c37950183` |
-| Native provenance | PASS: exact upstream tag/checkout verified, ML-KEM-only shared library built; loaded path verified in `/proc/self/maps`; options/digest in `VERSIONS.txt` |
+| Native provenance | PASS: exact upstream tag/checkout verified, ML-KEM-only shared library built; loaded path verified in `/proc/self/maps`; options/digest in `constraints-tested.txt` |
 | Compileall | PASS: crypto, handshake, vpn, app, benchmarks, tests |
 | Setup shell syntax | PASS |
 | Cleanup shell syntax | PASS |
@@ -509,7 +509,7 @@ handshake, rekey, route or firewall behavior changed during continuation.
 The [next-phase handoff](deployment.md) records local-tag transfer without pushing,
 the actual bounded namespace invocation and the VPS/client sequence. Full available
 tests, native validation, static checks and doctors are rerun after the final file
-edits before the local commit/tag. Historical counts in progress.md remain intact.
+edits before the local commit/tag. Historical counts remain intact in git history.
 
 Remaining limitations: custom protocol lacks independent review; Ed25519 client
 identity proof is classical; epoch rekey provides key evolution rather than

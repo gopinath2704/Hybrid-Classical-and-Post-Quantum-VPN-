@@ -24,7 +24,7 @@ Optional for constrained-device evaluation: Raspberry Pi 4/5 (aarch64).
 ### Option A: Docker (recommended)
 
 ```bash
-docker build -t pqvpn-artifact -f Dockerfile.artifact .
+docker build --target artifact -t pqvpn-artifact .
 docker run --rm -v $(pwd)/results:/app/results pqvpn-artifact
 ```
 
@@ -108,15 +108,83 @@ Latency and throughput numbers vary with hardware.
 
 ## Formal verification
 
-The Tamarin Prover model verifies 7 security lemmas for the v3 protocol.
+The Tamarin Prover model (`formal/pqvpn_v3.spthy`) verifies 7 security lemmas
+for the v3 protocol.
+
+### Prerequisites
+
+Install [Tamarin Prover](https://tamarin-prover.com/):
 
 ```bash
-# Requires: tamarin-prover (Arch: pacman -S tamarin-prover)
-./scripts/verify_formal.sh
+# Arch Linux
+sudo pacman -S tamarin-prover
+
+# macOS (Homebrew)
+brew install tamarin-prover
 ```
 
-All lemmas should report `verified`. See `formal/README.md` for the full
-list and the model's assumptions.
+### Running
+
+```bash
+# Verify all lemmas automatically:
+./scripts/verify_formal.sh
+
+# Or directly:
+tamarin-prover --prove formal/pqvpn_v3.spthy
+
+# Interactive exploration (opens a web UI):
+tamarin-prover interactive formal/pqvpn_v3.spthy
+```
+
+### Expected output
+
+All lemmas should report `verified`:
+
+| Lemma | Property | Status |
+|---|---|---|
+| `protocol_completes` | Sanity: a full handshake trace exists | verified |
+| `session_key_secrecy` | Keys secret unless both LTKs compromised | verified |
+| `forward_secrecy` | Post-session LTK compromise doesn't reveal keys | verified |
+| `server_auth` | Injective agreement: client authenticates server | verified |
+| `client_auth` | Injective agreement: server authenticates client | verified |
+| `kci_resistance_client` | Client key compromise doesn't allow server impersonation | verified |
+| `kci_resistance_server` | Server key compromise doesn't allow client impersonation | verified |
+
+### Model structure
+
+The model (`formal/pqvpn_v3.spthy`) uses:
+
+- **X25519:** Tamarin's built-in Diffie-Hellman
+- **ML-KEM-768:** Modelled as public-key encryption with CCA security
+- **HKDF:** Modelled as a keyed derivation function
+- **Finished MAC:** Modelled as a MAC with equational verification
+
+Key schedule:
+
+```
+hs     = kdf(<dhss, k_eph>, 'hs')           -- ephemeral handshake secret
+master = kdf3(hs, <k_s, k_c>, transcript)   -- authenticated master secret
+```
+
+### Assumptions
+
+1. **Perfect cryptography.** DH is CDH-hard; KEM is IND-CCA2 secure; HKDF is a PRF; MACs are unforgeable.
+2. **Dolev-Yao adversary.** The attacker controls the network.
+3. **Pre-shared public keys.** Both sides have the peer's long-term public key before the handshake.
+4. **Fresh randomness.** All nonces, session IDs, and ephemeral keys are generated freshly.
+
+### What is NOT modelled
+
+Timing/side channels, transport details, rate limiting/DoS, the data-plane record
+layer, hash-based rekey, the stateless cookie, enrollment/key distribution, and
+multi-session composition beyond Tamarin's built-in semantics.
+
+### Hybrid security argument
+
+The key schedule mixes independent DH and KEM contributions. If DH is broken but KEM
+holds, the master still depends on KEM-protected inputs. If KEM is broken but DH holds,
+`dhss` is CDH-protected. The `session_key_secrecy` lemma verifies this in the
+both-sound setting.
 
 ---
 
@@ -134,19 +202,15 @@ python eval/generate_tables.py \
 
 ## Baseline VPN comparison (optional)
 
-The evaluation framework includes scaffold scripts for comparing against:
+The evaluation framework includes a harness for comparing against
+**WireGuard** (classical) — requires `wg` and root.
 
-- **WireGuard** (classical) — requires `wg`, root
-- **WireGuard + Rosenpass** (PQ) — requires `rosenpass`, `wg`, root
-- **strongSwan IKEv2 + ML-KEM** — requires PQ-enabled `swanctl`, root
-- **OpenVPN** (classical) — requires `openvpn`, root
-
-These require the respective tools to be installed and root access for
-network namespace setup. When a tool is not available, the scaffold script
-exits cleanly with a skip message.
+OpenVPN, Rosenpass, and strongSwan baselines are not implemented; the
+scaffold stubs that previously existed have been removed. Implementing
+these comparisons requires the respective tools and manual configuration.
 
 ```bash
-sudo python eval/run_all.py --iterations 30 --systems pqvpn,wireguard,rosenpass
+sudo python eval/run_all.py --iterations 30 --systems pqvpn,wireguard
 ```
 
 ---

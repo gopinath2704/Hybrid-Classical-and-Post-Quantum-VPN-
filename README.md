@@ -1,30 +1,44 @@
 # PQ-VPN
 
-Hybrid Classical + Post-Quantum research VPN for Linux. Uses ephemeral X25519 plus ML-KEM-768 for session establishment, a pinned static ML-KEM-768 server identity, authorized Ed25519 client identities, and AES-256-GCM traffic encryption.
+A hybrid classical + post-quantum research VPN for Linux, combining X25519 and ML-KEM-768 to resist both current and future quantum threats.
 
-## What it is
+---
 
-A deployable research/prototype PQ-VPN implementing a KEMTLS-inspired custom protocol over Linux TUN/UDP. Not formally KEMTLS-compatible and not formally verified. The design reduces post-quantum handshake overhead; it does not claim production-ready or formally proven security.
+## Overview
 
-## Current status
+PQ-VPN is a deployable research prototype implementing a KEMTLS-inspired custom handshake protocol over Linux TUN/UDP. It pairs classical X25519 key exchange with post-quantum ML-KEM-768 (Kyber) so that compromise of either primitive alone does not break the session. Traffic is encrypted with AES-256-GCM using directional keys derived via HKDF-SHA256.
 
-**Deployable research/prototype PQ-VPN.**
+**This is a research prototype.** It is not standardized KEMTLS, has not received independent formal review, and does not claim production-grade security.
 
-| Validation item | Result |
+---
+
+## Features
+
+- **Hybrid handshake** — ephemeral X25519 + ML-KEM-768 session establishment
+- **Post-quantum server identity** — static ML-KEM-768 key pinned by SHA-256 fingerprint
+- **Three protocol variants** — v2 (Ed25519 client auth), v3 (fully PQ mutual auth via ML-KEM), v3-mldsa (ML-DSA-44 comparison)
+- **Post-compromise recovery** — v3 hybrid re-handshake mixes fresh DH + KEM material
+- **DoS resistance** — stateless cookie challenge before resource allocation
+- **Formal model** — Tamarin Prover verifies 7 security lemmas (secrecy, forward secrecy, mutual auth, KCI resistance)
+- **Desktop GUI** — PySide6 app with managed identity, multi-profile servers, offline enrollment
+- **Account system** — HTTPS API for login, device binding, and admin approval
+- **Privilege separation** — unprivileged GUI communicates with a CAP_NET_ADMIN service over Unix socket
+
+---
+
+## Cryptography
+
+| Role | Algorithm |
 |---|---|
-| Tested Python baseline | 3.14.7 |
-| Native liboqs | 0.16.0 (source commit `5a1a854b`) |
-| Native ML-KEM marker | 2 passed |
-| Root namespace gate (Ubuntu 26.04.1) | PASS (1 passed, 261 deselected on `784419e`) |
-| Desktop GUI | Milestone 3: managed identity, public profiles, offline enrollment |
-| Account authentication | Milestone 4.6: HTTPS account API, desktop login, device binding, admin approval |
-| Unit suite | 519 passed, 2 skipped |
+| Server authentication | Static ML-KEM-768 (pinned SHA-256 fingerprint) |
+| Session establishment | X25519 + ephemeral ML-KEM-768 |
+| Client authentication | Ed25519 (v2) or ML-KEM-768 (v3) |
+| Traffic encryption | AES-256-GCM (directional keys) |
+| Key derivation | HKDF-SHA256 |
 
-**Not yet validated / pending:**
+> **Note:** v2 client authentication uses classical Ed25519 and is not post-quantum. v3 replaces it with ML-KEM-768 for fully PQ mutual authentication.
 
-- Production VPS deployment
-- Independent protocol/security review
-- Routed IPv6, kill switch, post-compromise recovery
+---
 
 ## Architecture
 
@@ -55,201 +69,233 @@ A deployable research/prototype PQ-VPN implementing a KEMTLS-inspired custom pro
 └─────────────────┘
 ```
 
-## Normal-user onboarding
+---
 
-```text
-Install
-  ↓
-Launch PQ-VPN
-  ↓
-Device Ed25519 identity created once by the privileged service
-  ↓
-Import server.pqvpn (public server configuration only)
-  ↓
-Export device.pqenroll (public client identity only)
-  ↓
-Administrator authorizes the request offline
-  ↓
-Select the profile and Connect
-```
+## Quick start
 
-The GUI remains unprivileged. The service stores managed state under
-`/var/lib/pqvpn`, generates the device identity idempotently, and owns the only
-`VPNClient`. Exporting an enrollment request does **not** prove that a server has
-authorized it; authorization is confirmed only by a successful authenticated
-connection.
+### Prerequisites
 
-A `.pqvpn` profile contains a version, profile ID/name, IPv4 server endpoint,
-pinned public ML-KEM-768 server identity, matching SHA-256 fingerprint, and expected
-IPv4 VPN subnet. A `.pqenroll` request contains a version, client ID, raw Ed25519
-public key encoded as Base64, matching SHA-256 fingerprint, and UTC creation time.
-Neither format permits private keys, passwords, tokens, commands, or arbitrary key
-paths. There is no URL import, server discovery, TOFU, automatic invite service, or
-Internet-facing enrollment API.
+- Python 3.14+, git, CMake, Ninja, C compiler (gcc/g++)
+- iproute2, nftables, OpenSSL development headers
+- Linux with TUN support
 
-## Cryptography
-
-| Role | Algorithm |
-|---|---|
-| Server authentication | Static ML-KEM-768 (pinned SHA-256 fingerprint) |
-| Session establishment | X25519 + ephemeral ML-KEM-768 |
-| Client authentication | Ed25519 (classical, not post-quantum) |
-| Traffic encryption | AES-256-GCM (directional keys) |
-| Key derivation | HKDF-SHA256 |
-
-- KEMTLS-inspired custom protocol, not standardized KEMTLS
-- Not formally verified
-- Not fully post-quantum mutual authentication (client auth is classical Ed25519)
-
-## Quick development setup
+### 1. Install native liboqs
 
 ```bash
-# Prerequisites: Python 3.14, git, CMake, Ninja, C compiler, iproute2, nftables
 sudo bash scripts/install-liboqs.sh /usr/local
-python3 -m venv .venv
-.venv/bin/python -m pip install -c constraints-tested.txt '.[dev]'
-.venv/bin/python -m vpn.cli identity generate
-.venv/bin/python -m vpn.cli client-key generate
-.venv/bin/python -m vpn.cli client authorize config/client_identity_public.key --client-id local
-# Edit config/client.toml: set server fingerprint and hostname
 ```
 
-See [docs/deployment.md](docs/deployment.md) for the full server deployment guide.
+### 2. Set up the Python environment
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -c constraints-tested.txt '.[dev]'
+```
+
+### 3. Generate identities
+
+```bash
+python -m vpn.cli identity generate
+python -m vpn.cli client-key generate
+python -m vpn.cli client authorize config/client_identity_public.key --client-id local
+```
+
+### 4. Configure and run
+
+Edit `config/client.toml` to set the server fingerprint and hostname, then see
+[Running the server](#running-the-server) below.
+
+For full deployment instructions, see [docs/deployment.md](docs/deployment.md).
+
+---
 
 ## Running the server
 
-### Option 1: Systemd service (Recommended for background / VM deployment)
-Install and manage the server with systemd (unit template at `packaging/common/pqvpn-server.service`):
+### Option 1: Systemd (recommended)
 
 ```bash
-# Start the server service
 sudo systemctl start pqvpn-server.service
-
-# Stop or restart the server
-sudo systemctl stop pqvpn-server.service
-sudo systemctl restart pqvpn-server.service
-
-# Check status and live logs
-systemctl status pqvpn-server.service
+sudo systemctl status pqvpn-server.service
 journalctl -u pqvpn-server.service -f
 ```
 
-### Option 2: Direct CLI execution (Foreground / Debugging)
-To run the server interactively in a terminal:
+### Option 2: Direct CLI
 
 ```bash
-# 1. Configure firewall and NAT forwarding rules (run once per boot)
+# Set up firewall and NAT (once per boot)
 sudo bash scripts/server-network.sh setup $(pwd)/config/server.toml
 
-# 2. Start the server daemon
+# Start the server
 sudo .venv/bin/python -m vpn.cli server --config config/server.toml
 ```
 
-To verify that the server is actively listening on TCP & UDP port `51820`:
+Verify the server is listening:
+
 ```bash
 ss -tulpn | grep 51820
 ```
 
+---
+
 ## Desktop client
 
-The GUI runs as a normal user; a privileged client service manages the VPN connection.
-Milestone 3 adds first-run setup, real multi-profile server management, and public
-offline enrollment while retaining Home, Servers, Security, read-only Settings,
-bounded sanitized Logs, About, and the validated Unix-socket privilege boundary.
+The GUI runs as a normal user; a privileged service manages the VPN connection.
 
 ```bash
 # Install GUI dependencies
-.venv/bin/python -m pip install 'pqvpn[desktop]'
+pip install 'pqvpn[desktop]'
 
-# Start managed mode (service-owned identity/profile state)
+# Terminal 1: start the privileged service
 sudo .venv/bin/python -m app.client --service
 
-# In another terminal, launch the GUI
+# Terminal 2: launch the GUI
 .venv/bin/python -m app.client
 ```
 
 For production, use the systemd unit: `packaging/common/pqvpn-client-deploy.service`.
 
-The installed desktop workflow uses managed state. Development remains compatible
-through an explicit, unambiguous legacy configuration:
+### Legacy TOML mode
+
+Pass `--config` explicitly to use a TOML file instead of managed profiles:
 
 ```bash
 sudo .venv/bin/python -m app.client --service --config config/client.toml
-# or the foreground runtime
-sudo .venv/bin/python -m vpn.cli client connect --config config/client.toml
 ```
 
-An explicit `--config` always selects legacy TOML mode. Omitting `--config` always
-selects managed profile/identity mode; the two sources are never merged.
-
-Create and authorize a public enrollment artifact from the CLI when needed:
+### Client enrollment
 
 ```bash
+# Export an enrollment request
 python -m vpn.cli client enrollment-request \
-  --output shadow-laptop.pqenroll \
-  --client-id shadow-laptop \
+  --output my-device.pqenroll \
+  --client-id my-device \
   --public-key /path/to/client_identity_public.key
 
-sudo python -m vpn.cli client authorize-request shadow-laptop.pqenroll \
+# Administrator authorizes it
+sudo python -m vpn.cli client authorize-request my-device.pqenroll \
   --database /etc/pqvpn/authorized_clients.json \
   --vpn-ip 10.8.0.9
 ```
 
-See [docs/deployment.md](docs/deployment.md#packaging-foundation) for the Arch/Omarchy and Debian
-packaging foundation. Package builds and installation have not yet been live-validated.
+---
+
+## Onboarding flow
+
+```
+Install  →  Launch PQ-VPN  →  Device identity auto-created
+   →  Import server.pqvpn  →  Export device.pqenroll
+   →  Admin authorizes offline  →  Connect
+```
+
+- `.pqvpn` profiles contain the server endpoint, pinned ML-KEM-768 public key, and VPN subnet
+- `.pqenroll` requests contain the client's public Ed25519 key and fingerprint
+- Neither format permits private keys, passwords, tokens, or commands
+- No TOFU, no server discovery, no Internet-facing enrollment API
+
+---
 
 ## Testing
 
 ```bash
-.venv/bin/python -m pytest -q                                    # full suite
-ALLOW_MOCK_PQC=0 .venv/bin/python -m pytest -q -m native_pqc    # native ML-KEM
+python -m pytest -q                                    # full suite (555 tests)
+ALLOW_MOCK_PQC=0 python -m pytest -q -m native_pqc    # native ML-KEM only
 ```
 
-Root namespace integration tests require `sudo` with `/dev/net/tun`, nftables, and iproute2. See [docs/deployment.md](docs/deployment.md).
+Root namespace integration tests require `sudo` with `/dev/net/tun`, nftables, and iproute2.
+
+---
+
+## Docker
+
+```bash
+# Runtime server
+docker compose up --build
+
+# Reproducibility artifact (runs tests + evaluation)
+docker build --target artifact -t pqvpn-artifact .
+docker run --rm -v $(pwd)/results:/app/results pqvpn-artifact
+```
+
+See [ARTIFACT.md](ARTIFACT.md) for full reproducibility instructions.
+
+---
 
 ## Repository layout
 
 ```
 app/
-  client.py           Desktop GUI + privileged client service
+  client.py              Desktop GUI + privileged client service
 crypto/
-  hybrid_crypto.py    ML-KEM-768, X25519, AES-256-GCM, HKDF
+  hybrid_crypto.py       ML-KEM-768, X25519, AES-256-GCM, HKDF
 handshake/
-  kemtls.py           KEMTLS-inspired v2 protocol state machine
+  kemtls.py              KEMTLS-inspired v2/v3 protocol state machine
 vpn/
-  account_api.py       Dedicated account login/session and device-binding API
-  accounts.py         Server-side account/device/session SQLite store
-  cli.py              Provisioning and runtime CLI
-  config.py           TOML configuration with validation
-  doctor.py           Read-only deployment diagnostics
-  enrollment.py       Strict public .pqenroll artifacts
-  identity.py         Server/client identity management
-  network.py          TUN, nftables, MTU, IPv6 guard
-  profiles.py         Strict .pqvpn profiles and atomic profile store
-  runtime.py          VPNClient and VPNServer runtimes
-config/               Default client/server TOML
-VERSIONS.txt          Tested runtime and native source versions
-tests/                Pytest suite
-docs/                 Design, deployment, security audit
-packaging/            Arch, Debian, desktop entry, icon, and package service
+  account_api.py         Account login/session and device-binding API
+  accounts.py            Server-side account/device/session SQLite store
+  cli.py                 Provisioning and runtime CLI
+  config.py              TOML configuration with validation
+  doctor.py              Read-only deployment diagnostics
+  enrollment.py          Strict public .pqenroll artifacts
+  identity.py            Server/client identity management
+  network.py             TUN, nftables, MTU, IPv6 guard
+  profiles.py            Strict .pqvpn profiles and atomic profile store
+  runtime.py             VPNClient and VPNServer runtimes
+eval/                    Evaluation campaign scripts and table generators
+formal/                  Tamarin Prover model (pqvpn_v3.spthy)
+config/                  Default client/server TOML examples
+packaging/               Arch, Debian, desktop entry, icon, systemd units
+scripts/                 Native liboqs installer and server network helpers
+tests/                   Pytest suite with shared fixtures
+constraints-tested.txt   Tested version pins and native validation record
 ```
+
+---
 
 ## Documentation
 
-- [Protocol and design](docs/design.md)
-- [Account database and authorization separation](docs/accounts.md)
-- [Server deployment guide](docs/deployment.md)
-- [Security audit and validation records](docs/security_audit.md)
+| Document | Description |
+|---|---|
+| [docs/design.md](docs/design.md) | Protocol design, wire formats, key schedule, threat model, design decisions |
+| [docs/deployment.md](docs/deployment.md) | Server deployment, packaging, provisioning guide |
+| [docs/accounts.md](docs/accounts.md) | Account database and authorization separation |
+| [docs/security_audit.md](docs/security_audit.md) | Security audit and validation records |
+| [ARTIFACT.md](ARTIFACT.md) | Reproducibility artifact for the research evaluation |
 
-## Limitations
+---
+
+## Current status
+
+**Completed through Milestone 4.7:**
+
+- Hybrid KEMTLS-inspired handshake (v2 + v3)
+- Formal Tamarin model with 7 verified security lemmas
+- Evaluation campaign with wire-size and latency benchmarks
+- Desktop GUI with managed identity and offline enrollment
+- Account authentication API with device binding and admin approval
+- Post-compromise recovery via hybrid re-handshake
+- Stateless DoS-resistance cookies
+- ML-DSA-44 comparison protocol variant
+
+**Pending:**
+
+- Production VPS deployment
+- Independent protocol and security review
+- Routed IPv6, kill switch, dynamic PMTU discovery
+
+---
+
+## Known limitations
 
 - IPv4 tunneling only; IPv6 is blocked (leak prevention), not routed
-- No kill switch implementation
+- No kill switch
 - No dynamic PMTU discovery
-- Ed25519 client authentication is classical (not post-quantum)
+- v2 client authentication is classical Ed25519 (not post-quantum)
 - No server enrollment API or invite codes
 - Custom protocol without independent formal review
-- Up to five explicitly imported profiles; no public server discovery
+- Up to five imported profiles; no public server discovery
 - Offline administrator-approved enrollment only
-- Packaging is an initial foundation, not an installation-validation claim
+- Packaging is foundational, not live-validated
 - Python cannot guarantee complete cryptographic key zeroization
+
+Detailed milestone history is available via `git log --grep="docs(progress)"`.

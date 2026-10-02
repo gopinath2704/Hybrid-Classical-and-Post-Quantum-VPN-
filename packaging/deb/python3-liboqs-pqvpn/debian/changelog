@@ -1,6 +1,0 @@
-python3-liboqs-pqvpn (0.16.0-1) experimental; urgency=medium
-
-  * Package the reviewed liboqs-python 0.16.0 source commit for PQ-VPN.
-  * Remove the upstream runtime liboqs downloader and use /usr only.
-
- -- PQ-VPN research project <noreply@example.invalid>  Tue, 15 Sep 2026 00:00:00 +0530

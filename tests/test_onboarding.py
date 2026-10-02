@@ -429,41 +429,11 @@ def test_packaging_foundation_has_safe_launcher_and_managed_service():
     service = (root / "packaging/common/pqvpn-client.service").read_text()
     deploy_service = (root / "packaging/common/pqvpn-client-deploy.service").read_text()
     arch = (root / "packaging/arch/PKGBUILD").read_text()
-    liboqs_arch = (root / "packaging/arch/liboqs-pqvpn/PKGBUILD").read_text()
-    python_oqs_arch = (
-        root / "packaging/arch/python-liboqs-pqvpn/PKGBUILD"
-    ).read_text()
-    no_download_patch = (
-        root
-        / "packaging/arch/python-liboqs-pqvpn/disable-runtime-liboqs-download.patch"
-    ).read_text()
     debian = (root / "packaging/deb/debian/control").read_text()
     debian_rules = (root / "packaging/deb/debian/rules").read_text()
     debian_dependency_patch = (
         root
         / "packaging/deb/debian/patches/use-debian-runtime-dependencies.patch"
-    ).read_text()
-    liboqs_debian = (
-        root / "packaging/deb/liboqs-pqvpn/debian/control"
-    ).read_text()
-    liboqs_debian_rules = (
-        root / "packaging/deb/liboqs-pqvpn/debian/rules"
-    ).read_text()
-    liboqs_debian_source = (
-        root / "packaging/deb/liboqs-pqvpn/debian/README.source"
-    ).read_text()
-    python_oqs_debian = (
-        root / "packaging/deb/python3-liboqs-pqvpn/debian/control"
-    ).read_text()
-    python_oqs_debian_rules = (
-        root / "packaging/deb/python3-liboqs-pqvpn/debian/rules"
-    ).read_text()
-    python_oqs_debian_source = (
-        root / "packaging/deb/python3-liboqs-pqvpn/debian/README.source"
-    ).read_text()
-    debian_no_download_patch = (
-        root
-        / "packaging/deb/python3-liboqs-pqvpn/debian/patches/disable-runtime-liboqs-download.patch"
     ).read_text()
     assert "Exec=pqvpn-gui" in desktop and "sudo" not in desktop.lower()
     assert "--service" in service and "--config" not in service
@@ -474,73 +444,25 @@ def test_packaging_foundation_has_safe_launcher_and_managed_service():
     )
     assert "StateDirectory=pqvpn" in service and "/var/lib/pqvpn" in service
     for metadata in (arch, debian):
-        assert "0.16.0" in metadata
         assert "mock" not in metadata.lower()
     assert "'pyside6'" in arch
     assert "python-pyside6" not in arch
-    assert "'python-liboqs=0.16.0'" not in arch
-    assert "'liboqs=0.16.0'" not in arch
-    assert "'python-liboqs-pqvpn=0.16.0'" in arch
-    assert "'liboqs-pqvpn=0.16.0'" in arch
     assert "'python-setuptools'" in arch
     assert "PYTHONNOUSERSITE=1" in arch
     assert "#!/usr/bin/python -s" in arch
-    assert "5a1a854b0dc9f2141bdc771c555ee60c37950183" in liboqs_arch
-    assert "_commit=c6378cd5c8db74c0adf34ddcfbb96ee9c99f8061" in python_oqs_arch
-    assert "'liboqs-pqvpn=0.16.0'" in python_oqs_arch
-    assert "-DBUILD_SHARED_LIBS=ON" in liboqs_arch
-    assert "-DCMAKE_INSTALL_PREFIX=/usr" in liboqs_arch
-    assert "OQS_INSTALL_PATH=/usr" in python_oqs_arch
-    assert "PYTHONNOUSERSITE=1" in python_oqs_arch
-    assert "/usr/local" not in liboqs_arch + python_oqs_arch
-    assert "-def _install_liboqs(" in no_download_patch
-    assert "+    oqs_install_dir = Path(environ.get(\"OQS_INSTALL_PATH\", \"/usr\"))" in no_download_patch
-    assert "+        raise SystemExit(msg) from None" in no_download_patch
-    for pkgbuild in (liboqs_arch, python_oqs_arch):
-        assert "git clone" not in pkgbuild
-        assert "curl " not in pkgbuild
-        assert "wget " not in pkgbuild
-
-    all_arch_sources = arch + liboqs_arch + python_oqs_arch
-    assert "SKIP" not in all_arch_sources
-    assert "REPLACE_WITH" not in all_arch_sources
-    checksums = re.findall(r"'([0-9a-f]{64})'", all_arch_sources)
-    assert len(checksums) == 4
+    assert "SKIP" not in arch
+    assert "REPLACE_WITH" not in arch
+    checksums = re.findall(r"'([0-9a-f]{64})'", arch)
+    assert len(checksums) == 1
 
     assert "python3-liboqs (= 0.16.0)" not in debian
     assert "liboqs0 (= 0.16.0)" not in debian
-    assert "python3-liboqs-pqvpn (= 0.16.0-1)" in debian
-    assert "liboqs-pqvpn (= 0.16.0-1)" in debian
     assert "python3-cryptography" in debian
     assert "+dependencies = []" in debian_dependency_patch
     assert '"cryptography==50.0.1"' in debian_dependency_patch
     assert '"liboqs-python==0.16.0"' in debian_dependency_patch
     assert 'status["pqc_mode"] == "native_liboqs"' in debian_rules
     assert 'status["is_quantum_safe"] is True' in debian_rules
-    assert "Package: liboqs-pqvpn" in liboqs_debian
-    assert "Package: python3-liboqs-pqvpn" in python_oqs_debian
-    assert "liboqs-pqvpn (= 0.16.0-1)" in python_oqs_debian
-    assert "--buildsystem=cmake+ninja" in liboqs_debian_rules
-    assert "-DBUILD_SHARED_LIBS=ON" in liboqs_debian_rules
-    assert "-DCMAKE_INSTALL_PREFIX=/usr" in liboqs_debian_rules
-    assert "OQS_INSTALL_PATH=/usr" in python_oqs_debian_rules
-    assert "PYTHONNOUSERSITE=1" in python_oqs_debian_rules
-    assert "5a1a854b0dc9f2141bdc771c555ee60c37950183" in liboqs_debian_source
-    assert "83c6e6cff490638312e1e20ed5de593fb5d7bfab162235f6238f519d6a1feafb" in liboqs_debian_source
-    assert "c6378cd5c8db74c0adf34ddcfbb96ee9c99f8061" in python_oqs_debian_source
-    assert "3de72cde836a72e4584dad6415a41610f980f924cae95a3848011fcb4f3a3b05" in python_oqs_debian_source
-    assert hashlib.sha256(debian_no_download_patch.encode()).hexdigest() == (
-        "0693b70ffa0a6475f018be369e614df99661b6643a2e6ffc6830b9f2087333b1"
-    )
-    assert debian_no_download_patch == no_download_patch
-    for metadata in (
-        liboqs_debian_rules,
-        python_oqs_debian_rules,
-        debian_no_download_patch,
-    ):
-        assert "git clone" not in metadata
-        assert "curl " not in metadata
-        assert "wget " not in metadata
 
 
 def _make_arch_source_archive(root: Path, archive: Path) -> None:
@@ -565,7 +487,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
     archive = tmp_path / "pqvpn-2.0.0.tar.gz"
     _make_arch_source_archive(root, archive)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    assert digest == "a750247da7bd5164f92f9f6a398acdb915b4505f66bd25a5d0458b3bb06111c8"
+    assert digest == "3314c54af3d1820f23c212e3b4b936610df6380d87f83587269585e125b0cf8d"
     assert digest in (root / "packaging/arch/PKGBUILD").read_text()
 
     with tarfile.open(archive, "r:gz") as source:
