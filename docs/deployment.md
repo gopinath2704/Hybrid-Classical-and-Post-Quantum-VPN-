@@ -150,12 +150,18 @@ account API receives no capabilities, writes only under
 Packaging does not install a client private key, a trusted server profile, a TLS
 private key, or an authorized-client database.
 
-Native ML-KEM is fail-closed. The Arch package metadata requires the PQ-VPN
-liboqs and Python binding packages at exactly the currently validated `0.16.0`.
-The Python package carries a checksum-verified downstream patch that removes the
-upstream binding's runtime liboqs downloader, defaults its native prefix to `/usr`,
-and prefers `/usr/lib` over generic loader discovery. No application runtime
-download, mock fallback, hidden native copy, or unpinned native build is enabled.
+Native ML-KEM is fail-closed. Neither liboqs nor the Python `oqs` binding are
+available in distribution repositories, so they must be installed manually before
+building or running PQ-VPN:
+
+```bash
+sudo bash scripts/install-liboqs.sh /usr/local   # native C library (0.16.0)
+pip install liboqs-python==0.16.0                 # Python binding
+```
+
+Without them, PQ-VPN raises `PQCUnavailableError` at startup with an install
+hint. No application runtime download, mock fallback, hidden native copy, or
+unpinned native build is enabled.
 
 #### Arch / Omarchy
 
