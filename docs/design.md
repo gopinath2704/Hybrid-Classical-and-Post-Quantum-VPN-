@@ -224,10 +224,16 @@ Both sides compute: `dh_ss = X25519(local_priv, peer_pub)` and
 New epoch secrets: `seed = SHA-256(old_rekey_secret || dh_ss || k_mlkem || epoch)`,
 then HKDF expansion with `session_id || epoch` as context.
 
-Fresh X25519 + ML-KEM material means that even if an attacker has compromised
-all prior session state, the new epoch keys are secret as long as either the CDH
-or KEM assumption holds. The `pcs_recovery` lemma in the Tamarin model
-(`formal/pqvpn_v3.spthy`) verifies this property.
+Fresh X25519 + ML-KEM material restores secrecy against a **passive** adversary
+after full epoch-state compromise, and against an **active** adversary who learned
+only traffic/control keys (not the rekey secret). An active adversary who obtained
+the full epoch state (including the rekey secret) can forge the re-handshake
+exchange and is **not** recovered from; this is a stated limitation.
+
+The PCS Tamarin model (`formal/pqvpn_v3_pcs.spthy`) verifies these properties:
+`pcs_control_keys_only` and `pcs_passive_after_epoch_compromise` prove the
+recovery claims, while `attack_active_after_epoch_compromise` formally documents
+the active-attacker limitation.
 
 Re-handshake is configurable via `rehandshake_interval` (seconds, default 0 =
 disabled). It uses the same locking and epoch-switch logic as rekey, so there is
@@ -298,9 +304,9 @@ post-quantum. This is not fully post-quantum mutual authentication.
 **v3:** Fully post-quantum mutual authentication. Both server and client
 authenticate via ML-KEM-768 static key possession proofs. No classical
 signatures remain in the handshake. A Tamarin Prover model
-(`formal/pqvpn_v3.spthy`) verifies session key secrecy, forward secrecy,
-injective server/client authentication, and KCI resistance under a
-Dolev-Yao adversary with independent long-term key compromise.
+(`formal/pqvpn_v3.spthy`, `formal/pqvpn_v3_pcs.spthy`) verifies session key
+secrecy, forward secrecy, injective server/client authentication, KCI
+resistance, and post-compromise security under a Dolev-Yao adversary.
 
 Status: deployable research/prototype PQ-VPN. Passing automated and live validation
 does not revise the custom-protocol or assurance limitations.

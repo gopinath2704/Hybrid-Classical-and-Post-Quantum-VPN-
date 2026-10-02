@@ -108,8 +108,12 @@ Latency and throughput numbers vary with hardware.
 
 ## Formal verification
 
-The Tamarin Prover model (`formal/pqvpn_v3.spthy`) verifies 7 security lemmas
-for the v3 protocol.
+The Tamarin Prover models verify 12 security lemmas for the v3 protocol across
+two theories: `formal/pqvpn_v3.spthy` (handshake, 7 lemmas) and
+`formal/pqvpn_v3_pcs.spthy` (post-compromise security, 5 lemmas). Splitting the
+model avoids Tamarin state-space explosion while keeping the composition sound:
+the handshake theory proves key establishment; the PCS theory proves re-handshake
+recovery given an established session.
 
 ### Prerequisites
 
@@ -126,11 +130,12 @@ brew install tamarin-prover
 ### Running
 
 ```bash
-# Verify all lemmas automatically:
+# Verify all lemmas automatically (both models):
 ./scripts/verify_formal.sh
 
 # Or directly:
-tamarin-prover --prove formal/pqvpn_v3.spthy
+tamarin-prover --prove formal/pqvpn_v3.spthy          # handshake (7 lemmas)
+tamarin-prover --heuristic=S --prove formal/pqvpn_v3_pcs.spthy  # PCS (5 lemmas)
 
 # Interactive exploration (opens a web UI):
 tamarin-prover interactive formal/pqvpn_v3.spthy
@@ -138,32 +143,71 @@ tamarin-prover interactive formal/pqvpn_v3.spthy
 
 ### Expected output
 
-All lemmas should report `verified`:
+All lemmas should report `verified`. The exists-trace lemmas (`protocol_completes`,
+`rehandshake_completes`, `passive_rehandshake_completes`,
+`attack_active_after_epoch_compromise`) verify that witness traces exist; "verified"
+for the attack lemma means the attack is confirmed, documenting the protocol's stated
+limitation.
 
-| Lemma | Property | Status |
-|---|---|---|
-| `protocol_completes` | Sanity: a full handshake trace exists | verified |
-| `session_key_secrecy` | Keys secret unless both LTKs compromised | verified |
-| `forward_secrecy` | Post-session LTK compromise doesn't reveal keys | verified |
-| `server_auth` | Injective agreement: client authenticates server | verified |
-| `client_auth` | Injective agreement: server authenticates client | verified |
-| `kci_resistance_client` | Client key compromise doesn't allow server impersonation | verified |
-| `kci_resistance_server` | Server key compromise doesn't allow client impersonation | verified |
+**Handshake model** (`formal/pqvpn_v3.spthy`):
+
+| Lemma | Kind | Property | Expected |
+|---|---|---|---|
+| `protocol_completes` | exists-trace | Sanity: a full handshake trace exists | verified |
+| `session_key_secrecy` | all-traces | Keys secret unless both LTKs compromised | verified |
+| `forward_secrecy` | all-traces | Post-session LTK compromise doesn't reveal keys | verified |
+| `server_auth` | all-traces | Injective agreement: client authenticates server | verified |
+| `client_auth` | all-traces | Injective agreement: server authenticates client | verified |
+| `kci_resistance_client` | all-traces | Client key compromise doesn't allow server impersonation | verified |
+| `kci_resistance_server` | all-traces | Server key compromise doesn't allow client impersonation | verified |
+
+**PCS model** (`formal/pqvpn_v3_pcs.spthy`):
+
+| Lemma | Kind | Property | Expected |
+|---|---|---|---|
+| `rehandshake_completes` | exists-trace | Sanity: an active re-handshake trace exists | verified |
+| `passive_rehandshake_completes` | exists-trace | Sanity: a passive re-handshake trace exists | verified |
+| `pcs_control_keys_only` | all-traces | Control-key-only compromise: new keys stay secret | verified |
+| `pcs_passive_after_epoch_compromise` | all-traces | Full epoch compromise + passive adversary: new keys stay secret | verified |
+| `attack_active_after_epoch_compromise` | exists-trace | Active adversary with full epoch state can complete re-handshake (known limitation) | verified |
+
+Recorded results are in `formal/results/`. Run `./scripts/verify_formal.sh` to
+reproduce; the script fails if any all-traces lemma is falsified or any expected
+lemma is missing.
 
 ### Model structure
 
-The model (`formal/pqvpn_v3.spthy`) uses:
+**Handshake theory** (`formal/pqvpn_v3.spthy`):
 
 - **X25519:** Tamarin's built-in Diffie-Hellman
 - **ML-KEM-768:** Modelled as public-key encryption with CCA security
-- **HKDF:** Modelled as a keyed derivation function
+- **HKDF:** Modelled as a keyed derivation function (`kdf`/`kdf3`)
 - **Finished MAC:** Modelled as a MAC with equational verification
+- **Compromise:** `Reveal_LTK` (long-term keys only)
 
 Key schedule:
 
 ```
 hs     = kdf(<dhss, k_eph>, 'hs')           -- ephemeral handshake secret
 master = kdf3(hs, <k_s, k_c>, transcript)   -- authenticated master secret
+```
+
+**PCS theory** (`formal/pqvpn_v3_pcs.spthy`):
+
+- **KEM-only re-handshake:** Sound abstraction — DH adds an independent shared
+  secret, so KEM-only gives the adversary strictly more power
+- **Bootstrapped session state:** Two rules (`Bootstrap_Control`, `Bootstrap_Epoch`)
+  create session facts with a fresh master; the adversary receives old data keys
+  (and optionally the rekey secret) via `Out()`
+- **Direct channel facts:** `Ch_C2S`/`Ch_S2C` structurally enforce passive delivery
+  for the passive-adversary lemma, avoiding case-split explosion
+- **Single re-handshake:** `PostSession` facts (not consumed by any rule) replace
+  `Session` facts after re-handshake, preventing unbounded term nesting
+
+Re-handshake key derivation (matches `kemtls.py`):
+
+```
+new_master = kdf(h(<old_master, 'rk'>), <k_rh, h(<sid, 'rehandshake', epoch>)>)
 ```
 
 ### Assumptions

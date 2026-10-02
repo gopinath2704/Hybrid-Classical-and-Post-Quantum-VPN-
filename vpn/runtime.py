@@ -490,8 +490,12 @@ class VPNServer:
         server_dh_private, server_dh_public = hybrid.ecc.generate_keypair()
         dh_ss = hybrid.ecc.derive_shared_secret(server_dh_private, client_dh_pub)
         ct, k_mlkem = hybrid.pqc.encapsulate(client_kem_pub)
-        next_keys = item.crypto.derive_rehandshake_epoch(epoch, dh_ss, k_mlkem)
-        response = struct.pack("!I", epoch) + server_dh_public + ct
+        response_body = struct.pack("!I", epoch) + server_dh_public + ct
+        transcript = payload + response_body
+        next_keys = item.crypto.derive_rehandshake_epoch(epoch, dh_ss, k_mlkem, transcript)
+        confirmation = hmac.new(bytes(next_keys.control_confirm_key),
+                                b"rehandshake confirm" + transcript, hashlib.sha256).digest()
+        response = response_body + confirmation
         send_message(item.control, item.crypto.encrypt_control(response, FrameType.REHANDSHAKE_RESPONSE))
         item.crypto.activate_epoch(epoch, next_keys)
 
@@ -863,17 +867,24 @@ class VPNClient:
                 response = self._responses.get(timeout=15)
                 if response is None or self.stop_event.is_set():
                     raise HandshakeError("session closed during rehandshake")
-            expected_len = 4 + 32 + 1088
+            expected_len = 4 + 32 + 1088 + 32
             if len(response) != expected_len:
                 raise HandshakeError("invalid rehandshake response length")
             resp_epoch = struct.unpack("!I", response[:4])[0]
             if resp_epoch != epoch:
                 raise HandshakeError("rehandshake epoch mismatch")
+            response_body = response[:4 + 32 + 1088]
+            server_confirm = response[4 + 32 + 1088:]
             server_dh_public = response[4:36]
-            ct = response[36:]
+            ct = response[36:36 + 1088]
             dh_ss = hybrid.ecc.derive_shared_secret(dh_private, server_dh_public)
             k_mlkem = hybrid.pqc.decapsulate(kem_secret, ct)
-            pending = self.session.derive_rehandshake_epoch(epoch, dh_ss, k_mlkem)
+            transcript = payload + response_body
+            pending = self.session.derive_rehandshake_epoch(epoch, dh_ss, k_mlkem, transcript)
+            expected_confirm = hmac.new(bytes(pending.control_confirm_key),
+                                        b"rehandshake confirm" + transcript, hashlib.sha256).digest()
+            if not hmac.compare_digest(server_confirm, expected_confirm):
+                raise HandshakeError("rehandshake key confirmation failed")
             self.rekey_state = RekeyState.ACTIVATING
             self.session.activate_epoch(epoch, pending)
             pending = None

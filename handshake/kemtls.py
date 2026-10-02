@@ -565,7 +565,8 @@ class HandshakeSession:
             return _derive_secrets(seed, context)
 
     def derive_rehandshake_epoch(self, epoch: int, dh_shared_secret: bytes,
-                                  kem_shared_secret: bytes) -> TrafficSecrets:
+                                  kem_shared_secret: bytes,
+                                  transcript: bytes) -> TrafficSecrets:
         with self._epoch_lock:
             if self._data_send_cipher is None:
                 raise HandshakeError("session closed")
@@ -573,7 +574,10 @@ class HandshakeSession:
                 raise HandshakeError("invalid rehandshake epoch")
             if len(dh_shared_secret) != 32 or len(kem_shared_secret) != 32:
                 raise HandshakeError("invalid rehandshake shared secrets")
-            context = self.session_id + epoch.to_bytes(4, "big")
+            if not transcript:
+                raise HandshakeError("empty rehandshake transcript")
+            transcript_hash = hashlib.sha256(transcript).digest()
+            context = self.session_id + epoch.to_bytes(4, "big") + transcript_hash
             ikm = (bytes(self.secrets.rekey_secret) + dh_shared_secret
                    + kem_shared_secret + epoch.to_bytes(4, "big"))
             seed = hashlib.sha256(ikm).digest()
