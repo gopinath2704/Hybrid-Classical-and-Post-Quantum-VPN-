@@ -19,6 +19,13 @@
  *   adversary strictly more power (security under KEM-only implies
  *   security under DH + KEM).
  *
+ *   Transcript binding: the KDF context includes h(request, response),
+ *   matching kemtls.py's SHA-256(request || response_body).
+ *
+ *   Key confirmation: the server appends mac(cck(new_master),
+ *   <'rehandshake confirm', request, response_body>). The client
+ *   pattern-matches it, modelling the HMAC-SHA256 check in runtime.py.
+ *
  *   Passive channel: for the passive-adversary lemma, re-handshake
  *   messages are delivered via direct channel facts (Ch_C2S / Ch_S2C),
  *   preventing modification. The adversary can still observe messages
@@ -45,7 +52,9 @@ functions:
   kem_dec/2,
   kdf/2,
   c2s/1,
-  s2c/1
+  s2c/1,
+  cck/1,
+  mac/2
 
 equations:
   kem_dec(sk, kem_enc(kem_pk(sk), ss)) = ss
@@ -94,25 +103,31 @@ rule RH_Client_Init:
     St_RH_C($C, $S, sid, old_master, ~ekR, ~epoch) ]
 
 rule RH_Server_Respond:
-  let ct_rh = kem_enc(eph_pkR, ~k_rh)
+  let req = <sid, eph_pkR, epoch>
+      ct_rh = kem_enc(eph_pkR, ~k_rh)
+      resp_body = <sid, ct_rh, epoch>
       new_master = kdf(h(<old_master, 'rk'>),
-                       <~k_rh, h(<sid, 'rehandshake', epoch>)>)
+                       <~k_rh, h(<sid, 'rehandshake', epoch, req, resp_body>)>)
+      confirm = mac(cck(new_master), <'rehandshake confirm', req, resp_body>)
   in
   [ SessionS($S, $C, sid, old_master),
-    In(<sid, eph_pkR, epoch>),
+    In(req),
     Fr(~k_rh) ]
   --[ RH_Server($S, $C, sid, c2s(new_master), s2c(new_master)),
       RH_SessionKey($S, $C, sid, c2s(new_master), s2c(new_master)) ]->
-  [ Out(<sid, ct_rh, epoch>),
+  [ Out(<resp_body, confirm>),
     PostSessionS($S, $C, sid, new_master) ]
 
 rule RH_Client_Complete:
   let k_rh = kem_dec(~ekR, ct_rh)
+      req = <sid, kem_pk(~ekR), epoch>
+      resp_body = <sid, ct_rh, epoch>
       new_master = kdf(h(<old_master, 'rk'>),
-                       <k_rh, h(<sid, 'rehandshake', epoch>)>)
+                       <k_rh, h(<sid, 'rehandshake', epoch, req, resp_body>)>)
+      expected_confirm = mac(cck(new_master), <'rehandshake confirm', req, resp_body>)
   in
   [ St_RH_C($C, $S, sid, old_master, ~ekR, epoch),
-    In(<sid, ct_rh, epoch>) ]
+    In(<resp_body, expected_confirm>) ]
   --[ RH_Client($C, $S, sid, c2s(new_master), s2c(new_master)),
       RH_SessionKey($C, $S, sid, c2s(new_master), s2c(new_master)) ]->
   [ PostSessionC($C, $S, sid, new_master) ]
@@ -137,27 +152,32 @@ rule RH_P_Client_Init:
     St_RH_PC($C, $S, sid, old_master, ~ekR, ~epoch) ]
 
 rule RH_P_Server_Respond:
-  let ct_rh = kem_enc(eph_pkR, ~k_rh)
+  let req = <sid, eph_pkR, epoch>
+      ct_rh = kem_enc(eph_pkR, ~k_rh)
+      resp_body = <sid, ct_rh, epoch>
       new_master = kdf(h(<old_master, 'rk'>),
-                       <~k_rh, h(<sid, 'rehandshake', epoch>)>)
-      resp = <sid, ct_rh, epoch>
+                       <~k_rh, h(<sid, 'rehandshake', epoch, req, resp_body>)>)
+      confirm = mac(cck(new_master), <'rehandshake confirm', req, resp_body>)
   in
   [ SessionS($S, $C, sid, old_master),
-    Ch_C2S($C, $S, <sid, eph_pkR, epoch>),
+    Ch_C2S($C, $S, req),
     Fr(~k_rh) ]
   --[ RH_P_Server($S, $C, sid, c2s(new_master), s2c(new_master)),
       RH_P_SessionKey($S, $C, sid, c2s(new_master), s2c(new_master)) ]->
-  [ Ch_S2C($S, $C, resp),
-    Out(resp),
+  [ Ch_S2C($S, $C, <resp_body, confirm>),
+    Out(<resp_body, confirm>),
     PostSessionS($S, $C, sid, new_master) ]
 
 rule RH_P_Client_Complete:
   let k_rh = kem_dec(~ekR, ct_rh)
+      req = <sid, kem_pk(~ekR), epoch>
+      resp_body = <sid, ct_rh, epoch>
       new_master = kdf(h(<old_master, 'rk'>),
-                       <k_rh, h(<sid, 'rehandshake', epoch>)>)
+                       <k_rh, h(<sid, 'rehandshake', epoch, req, resp_body>)>)
+      expected_confirm = mac(cck(new_master), <'rehandshake confirm', req, resp_body>)
   in
   [ St_RH_PC($C, $S, sid, old_master, ~ekR, epoch),
-    Ch_S2C($S, $C, <sid, ct_rh, epoch>) ]
+    Ch_S2C($S, $C, <resp_body, expected_confirm>) ]
   --[ RH_P_Client($C, $S, sid, c2s(new_master), s2c(new_master)),
       RH_P_SessionKey($C, $S, sid, c2s(new_master), s2c(new_master)) ]->
   [ PostSessionC($C, $S, sid, new_master) ]
@@ -183,6 +203,19 @@ lemma passive_rehandshake_completes:
 /* ══════════════════════════════════════════════════════════════════════
  * Post-Compromise Security lemmas
  * ══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Re-handshake agreement: if the client completes a re-handshake and
+ * there is no full epoch compromise, then the server participated with
+ * the same keys. This is the property the confirmation HMAC provides.
+ */
+lemma rh_client_agrees:
+  "All C S sid k1 k2 #i.
+     RH_Client(C, S, sid, k1, k2) @ #i &
+     not (Ex C2 S2 sid2 #r. EpochLeak(C2, S2, sid2) @ #r)
+   ==>
+     (Ex #j. RH_Server(S, C, sid, k1, k2) @ #j & #j < #i)"
+
 
 /*
  * Control-key-only compromise: adversary has old data keys (c2s/s2c)

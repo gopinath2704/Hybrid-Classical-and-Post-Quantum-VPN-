@@ -6,10 +6,13 @@ pkgdesc='Hybrid classical and post-quantum research VPN client for Linux'
 arch=('x86_64')
 url='https://github.com/gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-'
 license=('custom')
+# liboqs 0.16.0 and liboqs-python are required but not packaged by Arch.
+# Install before building: sudo bash scripts/install-liboqs.sh /usr/local
+# then: pip install liboqs-python==0.16.0
 depends=('python>=3.14' 'python-argon2-cffi' 'python-cryptography' 'python-fastapi' 'uvicorn' 'pyside6' 'iproute2' 'nftables')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 source=("${pkgname}-${pkgver}.tar.gz")
-sha256sums=('3314c54af3d1820f23c212e3b4b936610df6380d87f83587269585e125b0cf8d')
+sha256sums=('2d7980821a78bc9c0cf4db60464a6a44edb6de6949027d68ef40cab373db8feb')
 
 build() {
   cd "${srcdir}/${pkgname}-${pkgver}"

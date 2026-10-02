@@ -12,7 +12,7 @@ PQVPN separates an authenticated TCP control plane from an encrypted UDP data pl
 6. One server TUN and UDP listener serve all clients. Maps connect compact session IDs, client VPN addresses, endpoints, and traffic-key state.
 7. Client TUN packets become AES-GCM DATA frames. The server decrypts them into `pqvpn0`; Linux forwarding and the project-specific nftables masquerade route them to WAN. Return packets are selected by inner destination, encrypted, and injected into the client TUN.
 
-Every record header is AAD, including its DATA/CONTROL channel. Each channel and direction has an independent key, nonce base, send counter, and receive state. Sequence allocation plus encryption is atomic. DATA uses a locked 128-packet replay window; ordered CONTROL requires exactly the next sequence. TCP control rekey is confirmed under the old epoch before either side installs matching successor material.
+Every record header is AAD, including its DATA/CONTROL channel. Each channel and direction has an independent key, nonce base, send counter, and receive state. Sequence allocation plus encryption is atomic. DATA uses a locked 128-packet replay window; ordered CONTROL requires exactly the next sequence. TCP control rekey and re-handshake use one-way explicit key confirmation: the server proves possession of the new keys to the client before the client activates. The client's possession is confirmed implicitly by its first valid frame under the new epoch. On a failed check the client closes the session.
 
 Production never falls back to socket-pipe TUN. Emulation requires `--dev-emulated-tun`. Host changes are transactional on the client; server firewall helpers own isolated nftables tables and do not flush user rules.
 
@@ -214,7 +214,7 @@ key material from both sides. The exchange uses `REHANDSHAKE_REQUEST` and
 Client                                              Server
 REHANDSHAKE_REQUEST: epoch(4) || X25519_eph_pub(32) || ML-KEM_eph_pub(1184)
                                 ───────────────►
-                    REHANDSHAKE_RESPONSE: epoch(4) || X25519_eph_pub(32) || ct(1088)
+REHANDSHAKE_RESPONSE: epoch(4) || X25519_eph_pub(32) || ct(1088) || confirm(32)
                                 ◄───────────────
 ```
 
@@ -222,7 +222,11 @@ Both sides compute: `dh_ss = X25519(local_priv, peer_pub)` and
 `k_mlkem = KEM.Decaps(sk, ct)` or `ct, k_mlkem = KEM.Encaps(pk)`.
 
 New epoch secrets: `seed = SHA-256(old_rekey_secret || dh_ss || k_mlkem || epoch)`,
-then HKDF expansion with `session_id || epoch` as context.
+then HKDF expansion with `session_id || epoch || SHA-256(request || response_body)`
+as context. The server appends a key confirmation HMAC:
+`confirm = HMAC-SHA256(new_control_confirm_key, "rehandshake confirm" || request || response_body)`.
+The client verifies this in constant time before activating the new epoch; on
+mismatch it tears the session down.
 
 Fresh X25519 + ML-KEM material restores secrecy against a **passive** adversary
 after full epoch-state compromise, and against an **active** adversary who learned
@@ -238,6 +242,12 @@ the active-attacker limitation.
 Re-handshake is configurable via `rehandshake_interval` (seconds, default 0 =
 disabled). It uses the same locking and epoch-switch logic as rekey, so there is
 no packet-loss window during activation.
+
+**Breaking change:** the `REHANDSHAKE_RESPONSE` grew from 1,124 to 1,156 bytes
+(32-byte confirmation HMAC appended). Re-handshake requires both peers to run
+this version or later. Mismatched peers fail closed with "invalid rehandshake
+response length". Re-handshake is off by default, so the impact is limited to
+deployments that have explicitly enabled it.
 
 ### Stateless cookie (DoS resistance)
 

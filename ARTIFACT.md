@@ -108,9 +108,9 @@ Latency and throughput numbers vary with hardware.
 
 ## Formal verification
 
-The Tamarin Prover models verify 12 security lemmas for the v3 protocol across
+The Tamarin Prover models verify 13 security lemmas for the v3 protocol across
 two theories: `formal/pqvpn_v3.spthy` (handshake, 7 lemmas) and
-`formal/pqvpn_v3_pcs.spthy` (post-compromise security, 5 lemmas). Splitting the
+`formal/pqvpn_v3_pcs.spthy` (post-compromise security, 6 lemmas). Splitting the
 model avoids Tamarin state-space explosion while keeping the composition sound:
 the handshake theory proves key establishment; the PCS theory proves re-handshake
 recovery given an established session.
@@ -135,7 +135,7 @@ brew install tamarin-prover
 
 # Or directly:
 tamarin-prover --prove formal/pqvpn_v3.spthy          # handshake (7 lemmas)
-tamarin-prover --heuristic=S --prove formal/pqvpn_v3_pcs.spthy  # PCS (5 lemmas)
+tamarin-prover --heuristic=S --prove formal/pqvpn_v3_pcs.spthy  # PCS (6 lemmas)
 
 # Interactive exploration (opens a web UI):
 tamarin-prover interactive formal/pqvpn_v3.spthy
@@ -167,12 +167,25 @@ limitation.
 |---|---|---|---|
 | `rehandshake_completes` | exists-trace | Sanity: an active re-handshake trace exists | verified |
 | `passive_rehandshake_completes` | exists-trace | Sanity: a passive re-handshake trace exists | verified |
+| `rh_client_agrees` | all-traces | Key confirmation: client agrees with server on new keys (no epoch leak) | verified |
 | `pcs_control_keys_only` | all-traces | Control-key-only compromise: new keys stay secret | verified |
 | `pcs_passive_after_epoch_compromise` | all-traces | Full epoch compromise + passive adversary: new keys stay secret | verified |
 | `attack_active_after_epoch_compromise` | exists-trace | Active adversary with full epoch state can complete re-handshake (known limitation) | verified |
 
-Recorded results are in `formal/results/`. Run `./scripts/verify_formal.sh` to
-reproduce; the script fails if any all-traces lemma is falsified or any expected
+### Recorded run
+
+| Theory | Date | Tamarin | Maude | Heuristic | Time | Result |
+|---|---|---|---|---|---|---|
+| `pqvpn_v3.spthy` | 2026-10-02 | 1.12.0 | 3.5.1 | default | 20.9 s | 7/7 verified |
+| `pqvpn_v3_pcs.spthy` | 2026-10-02 | 1.12.0 | 3.5.1 | `S` | 3.5 s | 6/6 verified |
+
+Raw output: `formal/results/verify-2026-10-02.txt` (combined),
+`formal/results/handshake-verify.txt`, `formal/results/pcs-verify.txt`.
+`formal/results/baseline-2026-10-02.txt` preserves the pre-fix model output
+(with `pcs_recovery` incomplete) for comparison.
+
+Results are in `formal/results/`. Run `./scripts/verify_formal.sh` to
+reproduce; the script fails if any lemma is not verified or any expected
 lemma is missing.
 
 ### Model structure
@@ -203,11 +216,15 @@ master = kdf3(hs, <k_s, k_c>, transcript)   -- authenticated master secret
   for the passive-adversary lemma, avoiding case-split explosion
 - **Single re-handshake:** `PostSession` facts (not consumed by any rule) replace
   `Session` facts after re-handshake, preventing unbounded term nesting
+- **Transcript binding:** KDF context includes `h(<sid, 'rehandshake', epoch, req, resp_body>)`
+- **Key confirmation:** Server sends `mac(cck(new_master), <'rehandshake confirm', req, resp_body>)`;
+  client pattern-matches it before activating
 
 Re-handshake key derivation (matches `kemtls.py`):
 
 ```
-new_master = kdf(h(<old_master, 'rk'>), <k_rh, h(<sid, 'rehandshake', epoch>)>)
+new_master = kdf(h(<old_master, 'rk'>), <k_rh, h(<sid, 'rehandshake', epoch, req, resp_body>)>)
+confirm    = mac(cck(new_master), <'rehandshake confirm', req, resp_body>)
 ```
 
 ### Assumptions

@@ -43,6 +43,7 @@ declare -A HS_LEMMAS=(
 declare -A PCS_LEMMAS=(
   [rehandshake_completes]="exists-trace"
   [passive_rehandshake_completes]="exists-trace"
+  [rh_client_agrees]="all-traces"
   [pcs_control_keys_only]="all-traces"
   [pcs_passive_after_epoch_compromise]="all-traces"
   [attack_active_after_epoch_compromise]="exists-trace"
@@ -63,27 +64,23 @@ check_results() {
     local output_file="$1"
     shift
     local -n expected_lemmas=$1
+    local -A found_lemmas
 
-    if grep -q "analysis incomplete" "$output_file"; then
-        echo "FAIL: one or more lemmas have incomplete analysis" >&2
-        FAIL=1
-    fi
-
-    if grep -q "falsified" "$output_file"; then
-        while IFS= read -r line; do
-            lemma=$(echo "$line" | grep -oP '\S+(?=\s.*falsified)')
-            if [[ -n "$lemma" ]]; then
-                kind="${expected_lemmas[$lemma]:-}"
-                if [[ "$kind" != "exists-trace" ]]; then
-                    echo "FAIL: $lemma falsified (expected verified)" >&2
-                    FAIL=1
-                fi
-            fi
-        done < <(grep "falsified" "$output_file")
-    fi
+    while IFS= read -r line; do
+        local name kind result
+        name=$(echo "$line" | sed -E 's/^\s+(\w+) \(.*/\1/')
+        kind=$(echo "$line" | sed -E 's/.*\(([a-z-]+)\).*/\1/')
+        result=$(echo "$line" | sed -E 's/.*\): (\w+).*/\1/')
+        [[ -z "$name" || -z "$result" ]] && continue
+        found_lemmas[$name]="$result"
+        if [[ "$result" != "verified" ]]; then
+            echo "FAIL: $name ($kind): $result (expected verified)" >&2
+            FAIL=1
+        fi
+    done < <(grep -P '^\s+\w+ \((all-traces|exists-trace)\): ' "$output_file")
 
     for lemma in "${!expected_lemmas[@]}"; do
-        if ! grep -q "$lemma" "$output_file"; then
+        if [[ -z "${found_lemmas[$lemma]:-}" ]]; then
             echo "FAIL: expected lemma '$lemma' not found in output" >&2
             FAIL=1
         fi
@@ -103,7 +100,7 @@ check_results "$HS_OUT" HS_LEMMAS
 rm -f "$HS_OUT"
 
 # ── PCS ────────────────────────────────────────────────────────────────
-echo "═══ PCS Model (5 lemmas) ═══"
+echo "═══ PCS Model (6 lemmas) ═══"
 echo "Model: $PCS_MODEL"
 echo ""
 
@@ -123,4 +120,4 @@ if [[ $FAIL -ne 0 ]]; then
     exit 1
 fi
 
-echo "All 12 lemmas verified as expected. Results saved to $OUTPUT"
+echo "All 13 lemmas verified as expected. Results saved to $OUTPUT"

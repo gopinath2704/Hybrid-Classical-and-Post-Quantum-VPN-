@@ -1,8 +1,9 @@
 Description: Let debian/control own distribution runtime dependencies
  The upstream Python project pins PyPI release versions. Ubuntu 26.04 supplies
- compatible Argon2, cryptography, and the PQ-VPN-specific pinned liboqs packages under
- distribution package names, so retaining the PyPI requirements would make
- dh_python3 emit unsatisfiable PyPI-version dependencies.
+ compatible Argon2 and cryptography under distribution package names, so
+ retaining the PyPI requirements would make dh_python3 emit unsatisfiable
+ PyPI-version dependencies. liboqs and its Python binding are not in Debian
+ repos and must be installed manually (see docs/deployment.md).
 Author: PQ-VPN research project <noreply@example.invalid>
 Forwarded: not-needed
 Last-Update: 2026-09-19
