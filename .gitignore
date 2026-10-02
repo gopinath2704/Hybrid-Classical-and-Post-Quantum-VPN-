@@ -43,6 +43,8 @@ htmlcov/
 # Reproducible benchmark outputs
 benchmarks/results/
 results/
+# Keep formal verification results (evidence for the paper)
+!formal/results/
 
 config/*.lock
 

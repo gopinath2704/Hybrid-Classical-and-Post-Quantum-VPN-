@@ -473,7 +473,7 @@ validation or a complete audit of external system libraries/loader configuration
 
 Status: **Deployable research/prototype PQ-VPN**. Use a separate Linux client after
 native and root-namespace validation on a disposable VM. Routed IPv6, a kill switch,
-dynamic authenticated PMTU, and post-compromise hybrid rekey remain future work.
+dynamic authenticated PMTU, and active-adversary post-compromise recovery remain future work.
 
 Use the tested CPython 3.14.7, liboqs-python 0.16.0 and native liboqs 0.16.0 baseline.
 Install native liboqs explicitly using the [server guide](deployment.md)

@@ -1,0 +1,2566 @@
+maude tool: 'maude'
+ checking version: 3.5.1. OK.
+ checking installation: OK.
+[Theory PQVPN_v3] Theory loaded
+[Theory PQVPN_v3] Theory translated
+[Theory PQVPN_v3] Derivation checks started
+[Theory PQVPN_v3] Derivation checks ended
+[Theory PQVPN_v3] Theory closed
+[Saturating Sources] Step 1 (Max 5)
+[Saturating Sources] Done
+theory PQVPN_v3
+
+begin
+
+// Function signature and definition of the equational theory E
+
+builtins: diffie-hellman
+functions: c2s/1, cf_key/1, fst/1, h/1, kdf/2, kdf3/3, kem_dec/2,
+           kem_enc/2, kem_pk/1, mac/2, pair/2, s2c/1, sf_key/1, snd/1
+equations:
+    fst(<x.1, x.2>) = x.1,
+    kem_dec(sk, kem_enc(kem_pk(sk), ss)) = ss,
+    snd(<x.1, x.2>) = x.2
+
+rule (modulo E) Server_LTK:
+   [ Fr( ~sk ) ]
+  --[ ServerLTK( $S, kem_pk(~sk) ) ]->
+   [
+   !Ltk( $S, ~sk, 'server' ), !Pk( $S, kem_pk(~sk), 'server' ),
+   Out( kem_pk(~sk) )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Client_LTK:
+   [ Fr( ~sk ) ]
+  --[ ClientLTK( $C, kem_pk(~sk) ) ]->
+   [
+   !Ltk( $C, ~sk, 'client' ), !Pk( $C, kem_pk(~sk), 'client' ),
+   Out( kem_pk(~sk) )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Reveal_LTK:
+   [ !Ltk( $A, sk, role ) ] --[ Reveal( $A ) ]-> [ Out( sk ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) C1_Hello:
+   [
+   !Ltk( $C, ~skC, 'client' ), !Pk( $S, pkS, 'server' ), Fr( ~rc ),
+   Fr( ~sid ), Fr( ~x ), Fr( ~ekC )
+   ]
+  --[ C1( $C, $S, ~sid ) ]->
+   [
+   Out( <~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC))> ),
+   St_C1( $C, $S, ~skC, pkS, ~rc, ~sid, ~x, ~ekC )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) S1_Hello:
+   [
+   !Ltk( $S, ~skS, 'server' ), !Pk( $C, pkC, 'client' ),
+   In( <rc, sid, gx, eph_pkC, idC> ), Fr( ~rs ), Fr( ~y ), Fr( ~k_eph ),
+   Fr( ~k_c )
+   ]
+  --[ Eq( idC, h(pkC) ), S1( $S, $C, sid ) ]->
+   [
+   Out( <~rs, sid, 'g'^~y, kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), 
+         kem_enc(pkC, ~k_c)>
+   ),
+   St_S1( $S, $C, ~skS, pkC, rc, sid, ~rs, gx^~y, ~k_eph, ~k_c,
+          h(<rc, sid, gx, eph_pkC, h(pkC), ~rs, sid, 'g'^~y, 
+             kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(pkC, ~k_c)>)
+   )
+   ]
+
+  /*
+  rule (modulo AC) S1_Hello:
+     [
+     !Ltk( $S, ~skS, 'server' ), !Pk( $C, pkC, 'client' ),
+     In( <rc, sid, gx, eph_pkC, idC> ), Fr( ~rs ), Fr( ~y ), Fr( ~k_eph ),
+     Fr( ~k_c )
+     ]
+    --[ Eq( idC, h(pkC) ), S1( $S, $C, sid ) ]->
+     [
+     Out( <~rs, sid, 'g'^~y, kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), 
+           kem_enc(pkC, ~k_c)>
+     ),
+     St_S1( $S, $C, ~skS, pkC, rc, sid, ~rs, z, ~k_eph, ~k_c,
+            h(<rc, sid, gx, eph_pkC, h(pkC), ~rs, sid, 'g'^~y, 
+               kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(pkC, ~k_c)>)
+     )
+     ]
+    variants (modulo AC)
+    1. ~y    = ~y.21
+       gx    = gx.23
+       z     = gx.23^~y.21
+    
+    2. ~y    = ~y.86
+       gx    = x.163^x.164
+       z     = x.163^(~y.86*x.164)
+    
+    3. gx    = DH_neutral
+       z     = DH_neutral
+  */
+
+rule (modulo E) C2_KeyExchange:
+   [
+   St_C1( $C, $S, ~skC, pkS, rc, sid, ~x, ~ekC ),
+   In( <rs, sid, gy, ct_eph, idS, ct_C> ), Fr( ~k_s )
+   ]
+  --[
+  Eq( idS, h(pkS) ), C2( $C, $S, sid ),
+  Running( $C, $S,
+           <'client', sid, 
+            c2s(kdf3(kdf(<gy^~x, kem_dec(~ekC, ct_eph)>, 'hs'),
+                     <~k_s, kem_dec(~skC, ct_C)>,
+                     h(<rc, sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, sid, gy, ct_eph, 
+                        idS, ct_C>))), 
+            s2c(kdf3(kdf(<gy^~x, kem_dec(~ekC, ct_eph)>, 'hs'),
+                     <~k_s, kem_dec(~skC, ct_C)>,
+                     h(<rc, sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, sid, gy, ct_eph, 
+                        idS, ct_C>)))
+           >
+  )
+  ]->
+   [
+   Out( <kem_enc(pkS, ~k_s), 
+         mac(cf_key(kdf3(kdf(<gy^~x, kem_dec(~ekC, ct_eph)>, 'hs'),
+                         <~k_s, kem_dec(~skC, ct_C)>,
+                         h(<rc, sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, sid, gy, ct_eph, 
+                            idS, ct_C>))),
+             h(<
+                h(<rc, sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, sid, gy, ct_eph, 
+                   idS, ct_C>), 
+                kem_enc(pkS, ~k_s)>))
+        >
+   ),
+   St_C2( $C, $S, sid,
+          kdf3(kdf(<gy^~x, kem_dec(~ekC, ct_eph)>, 'hs'),
+               <~k_s, kem_dec(~skC, ct_C)>,
+               h(<rc, sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, sid, gy, ct_eph, 
+                  idS, ct_C>)),
+          h(<
+             h(<rc, sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, sid, gy, ct_eph, 
+                idS, ct_C>), 
+             kem_enc(pkS, ~k_s)>)
+   )
+   ]
+
+  /*
+  rule (modulo AC) C2_KeyExchange:
+     [
+     St_C1( $C, $S, ~skC, pkS, rc, sid, ~x, ~ekC ),
+     In( <rs, sid, gy, ct_eph, idS, ct_C> ), Fr( ~k_s )
+     ]
+    --[
+    Eq( idS, h(pkS) ), C2( $C, $S, sid ),
+    Running( $C, $S,
+             <'client', sid, 
+              c2s(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                       h(<rc, sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, sid, gy, ct_eph, 
+                          idS, ct_C>))), 
+              s2c(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                       h(<rc, sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, sid, gy, ct_eph, 
+                          idS, ct_C>)))
+             >
+    )
+    ]->
+     [
+     Out( <kem_enc(pkS, ~k_s), 
+           mac(cf_key(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                           h(<rc, sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, sid, gy, ct_eph, 
+                              idS, ct_C>))),
+               h(<
+                  h(<rc, sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, sid, gy, ct_eph, 
+                     idS, ct_C>), 
+                  kem_enc(pkS, ~k_s)>))
+          >
+     ),
+     St_C2( $C, $S, sid,
+            kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                 h(<rc, sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, sid, gy, ct_eph, 
+                    idS, ct_C>)),
+            h(<
+               h(<rc, sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, sid, gy, ct_eph, 
+                  idS, ct_C>), 
+               kem_enc(pkS, ~k_s)>)
+     )
+     ]
+    variants (modulo AC)
+     1. ~ekC  = ~ekC.25
+        ~skC  = ~skC.27
+        ct_C  = ct_C.29
+        ct_eph
+              = ct_eph.30
+        gy    = DH_neutral
+        z     = DH_neutral
+        z.1   = kem_dec(~ekC.25, ct_eph.30)
+        z.2   = kem_dec(~skC.27, ct_C.29)
+    
+     2. ~ekC  = ~ekC.26
+        ~skC  = ~skC.28
+        ~x    = ~x.29
+        ct_C  = ct_C.30
+        ct_eph
+              = ct_eph.31
+        gy    = gy.32
+        z     = gy.32^~x.29
+        z.1   = kem_dec(~ekC.26, ct_eph.31)
+        z.2   = kem_dec(~skC.28, ct_C.30)
+    
+     3. ~ekC  = ~ekC.32
+        ~skC  = ~skC.34
+        ~x    = ~x.35
+        ct_C  = ct_C.36
+        ct_eph
+              = ct_eph.37
+        gy    = z.44^inv(~x.35)
+        z     = z.44
+        z.1   = kem_dec(~ekC.32, ct_eph.37)
+        z.2   = kem_dec(~skC.34, ct_C.36)
+    
+     4. ~ekC  = ~ekC.33
+        ~skC  = ~skC.35
+        ~x    = ~x.36
+        ct_C  = ct_C.37
+        ct_eph
+              = kem_enc(kem_pk(~ekC.33), z.46)
+        gy    = gy.39
+        z     = gy.39^~x.36
+        z.1   = z.46
+        z.2   = kem_dec(~skC.35, ct_C.37)
+    
+     5. ~ekC  = ~ekC.33
+        ~skC  = ~skC.35
+        ~x    = ~x.36
+        ct_C  = ct_C.37
+        ct_eph
+              = kem_enc(kem_pk(~ekC.33), z.46)
+        gy    = z.45^inv(~x.36)
+        z     = z.45
+        z.1   = z.46
+        z.2   = kem_dec(~skC.35, ct_C.37)
+    
+     6. ~ekC  = ~ekC.33
+        ~skC  = ~skC.35
+        ct_C  = ct_C.37
+        ct_eph
+              = kem_enc(kem_pk(~ekC.33), z.46)
+        gy    = DH_neutral
+        z     = DH_neutral
+        z.1   = z.46
+        z.2   = kem_dec(~skC.35, ct_C.37)
+    
+     7. ~ekC  = ~ekC.35
+        ~skC  = ~skC.37
+        ~x    = ~x.38
+        ct_C  = kem_enc(kem_pk(~skC.37), z.50)
+        ct_eph
+              = ct_eph.40
+        gy    = gy.41
+        z     = gy.41^~x.38
+        z.1   = kem_dec(~ekC.35, ct_eph.40)
+        z.2   = z.50
+    
+     8. ~ekC  = ~ekC.35
+        ~skC  = ~skC.37
+        ~x    = ~x.38
+        ct_C  = kem_enc(kem_pk(~skC.37), z.50)
+        ct_eph
+              = ct_eph.40
+        gy    = z.47^inv(~x.38)
+        z     = z.47
+        z.1   = kem_dec(~ekC.35, ct_eph.40)
+        z.2   = z.50
+    
+     9. ~ekC  = ~ekC.35
+        ~skC  = ~skC.37
+        ~x    = ~x.38
+        ct_C  = kem_enc(kem_pk(~skC.37), z.50)
+        ct_eph
+              = kem_enc(kem_pk(~ekC.35), z.48)
+        gy    = gy.41
+        z     = gy.41^~x.38
+        z.1   = z.48
+        z.2   = z.50
+    
+    10. ~ekC  = ~ekC.35
+        ~skC  = ~skC.37
+        ~x    = ~x.38
+        ct_C  = kem_enc(kem_pk(~skC.37), z.50)
+        ct_eph
+              = kem_enc(kem_pk(~ekC.35), z.48)
+        gy    = z.47^inv(~x.38)
+        z     = z.47
+        z.1   = z.48
+        z.2   = z.50
+    
+    11. ~ekC  = ~ekC.35
+        ~skC  = ~skC.37
+        ct_C  = kem_enc(kem_pk(~skC.37), z.50)
+        ct_eph
+              = ct_eph.40
+        gy    = DH_neutral
+        z     = DH_neutral
+        z.1   = kem_dec(~ekC.35, ct_eph.40)
+        z.2   = z.50
+    
+    12. ~ekC  = ~ekC.35
+        ~skC  = ~skC.37
+        ct_C  = kem_enc(kem_pk(~skC.37), z.50)
+        ct_eph
+              = kem_enc(kem_pk(~ekC.35), z.48)
+        gy    = DH_neutral
+        z     = DH_neutral
+        z.1   = z.48
+        z.2   = z.50
+    
+    13. ~ekC  = ~ekC.122
+        ~skC  = ~skC.124
+        ~x    = ~x.125
+        ct_C  = ct_C.126
+        ct_eph
+              = ct_eph.127
+        gy    = x.239^x.240
+        z     = x.239^(~x.125*x.240)
+        z.1   = kem_dec(~ekC.122, ct_eph.127)
+        z.2   = kem_dec(~skC.124, ct_C.126)
+    
+    14. ~ekC  = ~ekC.125
+        ~skC  = ~skC.127
+        ~x    = ~x.128
+        ct_C  = ct_C.129
+        ct_eph
+              = ct_eph.130
+        gy    = x.245^inv((~x.128*x.246))
+        z     = x.245^inv(x.246)
+        z.1   = kem_dec(~ekC.125, ct_eph.130)
+        z.2   = kem_dec(~skC.127, ct_C.129)
+    
+    15. ~ekC  = ~ekC.125
+        ~skC  = ~skC.127
+        ~x    = ~x.128
+        ct_C  = ct_C.129
+        ct_eph
+              = ct_eph.130
+        gy    = x.245^(x.246*inv(~x.128))
+        z     = x.245^x.246
+        z.1   = kem_dec(~ekC.125, ct_eph.130)
+        z.2   = kem_dec(~skC.127, ct_C.129)
+    
+    16. ~ekC  = ~ekC.126
+        ~skC  = ~skC.128
+        ~x    = ~x.129
+        ct_C  = ct_C.130
+        ct_eph
+              = ct_eph.131
+        gy    = x.246^(x.247*inv((~x.129*x.248)))
+        z     = x.246^(x.247*inv(x.248))
+        z.1   = kem_dec(~ekC.126, ct_eph.131)
+        z.2   = kem_dec(~skC.128, ct_C.130)
+    
+    17. ~ekC  = ~ekC.126
+        ~skC  = ~skC.128
+        ~x    = ~x.129
+        ct_C  = kem_enc(kem_pk(~skC.128), z.141)
+        ct_eph
+              = ct_eph.131
+        gy    = x.247^x.248
+        z     = x.247^(~x.129*x.248)
+        z.1   = kem_dec(~ekC.126, ct_eph.131)
+        z.2   = z.141
+    
+    18. ~ekC  = ~ekC.126
+        ~skC  = ~skC.128
+        ~x    = ~x.129
+        ct_C  = kem_enc(kem_pk(~skC.128), z.141)
+        ct_eph
+              = ct_eph.131
+        gy    = x.247^inv((~x.129*x.248))
+        z     = x.247^inv(x.248)
+        z.1   = kem_dec(~ekC.126, ct_eph.131)
+        z.2   = z.141
+    
+    19. ~ekC  = ~ekC.126
+        ~skC  = ~skC.128
+        ~x    = ~x.129
+        ct_C  = kem_enc(kem_pk(~skC.128), z.141)
+        ct_eph
+              = ct_eph.131
+        gy    = x.247^(x.248*inv(~x.129))
+        z     = x.247^x.248
+        z.1   = kem_dec(~ekC.126, ct_eph.131)
+        z.2   = z.141
+    
+    20. ~ekC  = ~ekC.127
+        ~skC  = ~skC.129
+        ~x    = ~x.130
+        ct_C  = kem_enc(kem_pk(~skC.129), z.142)
+        ct_eph
+              = ct_eph.132
+        gy    = x.248^(x.249*inv((~x.130*x.250)))
+        z     = x.248^(x.249*inv(x.250))
+        z.1   = kem_dec(~ekC.127, ct_eph.132)
+        z.2   = z.142
+    
+    21. ~ekC  = ~ekC.128
+        ~skC  = ~skC.130
+        ~x    = ~x.131
+        ct_C  = ct_C.132
+        ct_eph
+              = kem_enc(kem_pk(~ekC.128), z.141)
+        gy    = x.251^x.252
+        z     = x.251^(~x.131*x.252)
+        z.1   = z.141
+        z.2   = kem_dec(~skC.130, ct_C.132)
+    
+    22. ~ekC  = ~ekC.128
+        ~skC  = ~skC.130
+        ~x    = ~x.131
+        ct_C  = ct_C.132
+        ct_eph
+              = kem_enc(kem_pk(~ekC.128), z.141)
+        gy    = x.251^inv((~x.131*x.252))
+        z     = x.251^inv(x.252)
+        z.1   = z.141
+        z.2   = kem_dec(~skC.130, ct_C.132)
+    
+    23. ~ekC  = ~ekC.128
+        ~skC  = ~skC.130
+        ~x    = ~x.131
+        ct_C  = ct_C.132
+        ct_eph
+              = kem_enc(kem_pk(~ekC.128), z.141)
+        gy    = x.251^(x.252*inv(~x.131))
+        z     = x.251^x.252
+        z.1   = z.141
+        z.2   = kem_dec(~skC.130, ct_C.132)
+    
+    24. ~ekC  = ~ekC.128
+        ~skC  = ~skC.130
+        ~x    = ~x.131
+        ct_C  = kem_enc(kem_pk(~skC.130), z.143)
+        ct_eph
+              = kem_enc(kem_pk(~ekC.128), z.141)
+        gy    = x.251^x.252
+        z     = x.251^(~x.131*x.252)
+        z.1   = z.141
+        z.2   = z.143
+    
+    25. ~ekC  = ~ekC.128
+        ~skC  = ~skC.130
+        ~x    = ~x.131
+        ct_C  = kem_enc(kem_pk(~skC.130), z.143)
+        ct_eph
+              = kem_enc(kem_pk(~ekC.128), z.141)
+        gy    = x.251^inv((~x.131*x.252))
+        z     = x.251^inv(x.252)
+        z.1   = z.141
+        z.2   = z.143
+    
+    26. ~ekC  = ~ekC.128
+        ~skC  = ~skC.130
+        ~x    = ~x.131
+        ct_C  = kem_enc(kem_pk(~skC.130), z.143)
+        ct_eph
+              = kem_enc(kem_pk(~ekC.128), z.141)
+        gy    = x.251^(x.252*inv(~x.131))
+        z     = x.251^x.252
+        z.1   = z.141
+        z.2   = z.143
+    
+    27. ~ekC  = ~ekC.129
+        ~skC  = ~skC.131
+        ~x    = ~x.132
+        ct_C  = ct_C.133
+        ct_eph
+              = kem_enc(kem_pk(~ekC.129), z.142)
+        gy    = x.252^(x.253*inv((~x.132*x.254)))
+        z     = x.252^(x.253*inv(x.254))
+        z.1   = z.142
+        z.2   = kem_dec(~skC.131, ct_C.133)
+    
+    28. ~ekC  = ~ekC.129
+        ~skC  = ~skC.131
+        ~x    = ~x.132
+        ct_C  = kem_enc(kem_pk(~skC.131), z.144)
+        ct_eph
+              = kem_enc(kem_pk(~ekC.129), z.142)
+        gy    = x.252^(x.253*inv((~x.132*x.254)))
+        z     = x.252^(x.253*inv(x.254))
+        z.1   = z.142
+        z.2   = z.144
+  */
+
+rule (modulo E) S2_Finished:
+   [
+   St_S1( $S, $C, ~skS, pkC, rc, sid, rs, dhss, k_eph, k_c, t1 ),
+   In( <ct_S, cfmac> )
+   ]
+  --[
+  Eq( cfmac,
+      mac(cf_key(kdf3(kdf(<dhss, k_eph>, 'hs'), <kem_dec(~skS, ct_S), k_c>,
+                      t1)),
+          h(<t1, ct_S>))
+  ),
+  S2( $S, $C, sid ),
+  Running( $S, $C,
+           <'server', sid, 
+            c2s(kdf3(kdf(<dhss, k_eph>, 'hs'), <kem_dec(~skS, ct_S), k_c>, t1)), 
+            s2c(kdf3(kdf(<dhss, k_eph>, 'hs'), <kem_dec(~skS, ct_S), k_c>, t1))>
+  ),
+  Commit( $S, $C,
+          <'client', sid, 
+           c2s(kdf3(kdf(<dhss, k_eph>, 'hs'), <kem_dec(~skS, ct_S), k_c>, t1)), 
+           s2c(kdf3(kdf(<dhss, k_eph>, 'hs'), <kem_dec(~skS, ct_S), k_c>, t1))>
+  ),
+  SessionKey( $S, $C, sid,
+              c2s(kdf3(kdf(<dhss, k_eph>, 'hs'), <kem_dec(~skS, ct_S), k_c>, t1)),
+              s2c(kdf3(kdf(<dhss, k_eph>, 'hs'), <kem_dec(~skS, ct_S), k_c>, t1))
+  )
+  ]->
+   [
+   Out( mac(sf_key(kdf3(kdf(<dhss, k_eph>, 'hs'),
+                        <kem_dec(~skS, ct_S), k_c>, t1)),
+            h(<h(<t1, ct_S>), 
+               mac(cf_key(kdf3(kdf(<dhss, k_eph>, 'hs'), <kem_dec(~skS, ct_S), k_c>,
+                               t1)),
+                   h(<t1, ct_S>))
+              >))
+   )
+   ]
+
+  /*
+  rule (modulo AC) S2_Finished:
+     [
+     St_S1( $S, $C, ~skS, pkC, rc, sid, rs, dhss, k_eph, k_c, t1 ),
+     In( <ct_S, cfmac> )
+     ]
+    --[
+    Eq( cfmac,
+        mac(cf_key(kdf3(kdf(<dhss, k_eph>, 'hs'), <z, k_c>, t1)), h(<t1, ct_S>))
+    ),
+    S2( $S, $C, sid ),
+    Running( $S, $C,
+             <'server', sid, c2s(kdf3(kdf(<dhss, k_eph>, 'hs'), <z, k_c>, t1)), 
+              s2c(kdf3(kdf(<dhss, k_eph>, 'hs'), <z, k_c>, t1))>
+    ),
+    Commit( $S, $C,
+            <'client', sid, c2s(kdf3(kdf(<dhss, k_eph>, 'hs'), <z, k_c>, t1)), 
+             s2c(kdf3(kdf(<dhss, k_eph>, 'hs'), <z, k_c>, t1))>
+    ),
+    SessionKey( $S, $C, sid,
+                c2s(kdf3(kdf(<dhss, k_eph>, 'hs'), <z, k_c>, t1)),
+                s2c(kdf3(kdf(<dhss, k_eph>, 'hs'), <z, k_c>, t1))
+    )
+    ]->
+     [
+     Out( mac(sf_key(kdf3(kdf(<dhss, k_eph>, 'hs'), <z, k_c>, t1)),
+              h(<h(<t1, ct_S>), 
+                 mac(cf_key(kdf3(kdf(<dhss, k_eph>, 'hs'), <z, k_c>, t1)), h(<t1, ct_S>))
+                >))
+     )
+     ]
+    variants (modulo AC)
+    1. ~skS  = ~skS.19
+       ct_S  = ct_S.21
+       z     = kem_dec(~skS.19, ct_S.21)
+    
+    2. ~skS  = ~skS.29
+       ct_S  = kem_enc(kem_pk(~skS.29), z.41)
+       z     = z.41
+  */
+
+rule (modulo E) C3_Complete:
+   [ St_C2( $C, $S, sid, master, t2 ), In( sfmac ) ]
+  --[
+  Eq( sfmac, mac(sf_key(master), h(<t2, mac(cf_key(master), t2)>)) ),
+  C3( $C, $S, sid ),
+  Commit( $C, $S, <'server', sid, c2s(master), s2c(master)> ),
+  SessionKey( $C, $S, sid, c2s(master), s2c(master) )
+  ]->
+   [ ]
+
+  /* has exactly the trivial AC variant */
+
+restriction Equality:
+  "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
+  // safety formula
+
+  /*
+  expanded formula:
+  "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
+  */
+
+lemma protocol_completes:
+  exists-trace
+  "∃ C S sid k1 k2 #i #j.
+    (Commit( C, S, <'server', sid, k1, k2> ) @ #i) ∧
+    (Commit( S, C, <'client', sid, k1, k2> ) @ #j)"
+/*
+guarded formula characterizing all satisfying traces:
+"∃ C S sid k1 k2 #i #j.
+  (Commit( C, S, <'server', sid, k1, k2> ) @ #i) ∧
+  (Commit( S, C, <'client', sid, k1, k2> ) @ #j)"
+*/
+simplify
+solve( Commit( C, S, <'server', sid, k1, k2> ) @ #i )
+  case C3_Complete
+  solve( St_C2( $C, $S, sid, master, t2 ) ▶₀ #i )
+    case C2_KeyExchange
+    solve( Commit( $S, $C,
+                   <'client', ~sid, 
+                    c2s(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                             h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                ct_eph, h(kem_pk(~sk)), ct_C>))), 
+                    s2c(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                             h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                ct_eph, h(kem_pk(~sk)), ct_C>)))
+                   >
+           ) @ #j )
+      case S2_Finished
+      solve( St_S1( $S, $C, ~skS, pkC, rc.1, ~sid, rs.1, z, z.1, z.2,
+                    h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                       ct_eph, h(kem_pk(~sk)), ct_C>)
+             ) ▶₀ #j )
+        case S1_Hello
+        solve( !KU( ~sid ) @ #vk.4 )
+          case C1_Hello
+          solve( !KU( ~rc ) @ #vk.17 )
+            case C1_Hello
+            solve( !KU( ~rs ) @ #vk.7 )
+              case S1_Hello
+              solve( !KU( mac(sf_key(kdf3(kdf(<'g'^(~x*~y), ~k_eph>, 'hs'),
+                                          <~k_s, ~k_c>,
+                                          h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), ~rs, ~sid, 
+                                             'g'^~y, kem_enc(kem_pk(~ekC), ~k_eph), h(kem_pk(~sk)), 
+                                             kem_enc(kem_pk(~skC), ~k_c)>))),
+                              h(<
+                                 h(<
+                                    h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), ~rs, ~sid, 'g'^~y, 
+                                       kem_enc(kem_pk(~ekC), ~k_eph), h(kem_pk(~sk)), 
+                                       kem_enc(kem_pk(~skC), ~k_c)>), 
+                                    kem_enc(kem_pk(~sk), ~k_s)>), 
+                                 mac(cf_key(kdf3(kdf(<'g'^(~x*~y), ~k_eph>, 'hs'), <~k_s, ~k_c>,
+                                                 h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), ~rs, 
+                                                    ~sid, 'g'^~y, kem_enc(kem_pk(~ekC), ~k_eph), 
+                                                    h(kem_pk(~sk)), kem_enc(kem_pk(~skC), ~k_c)>))),
+                                     h(<
+                                        h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), ~rs, ~sid, 
+                                           'g'^~y, kem_enc(kem_pk(~ekC), ~k_eph), h(kem_pk(~sk)), 
+                                           kem_enc(kem_pk(~skC), ~k_c)>), 
+                                        kem_enc(kem_pk(~sk), ~k_s)>))
+                                >))
+                     ) @ #vk.7 )
+                case S2_Finished
+                solve( !KU( h(kem_pk(~sk)) ) @ #vk.13 )
+                  case S1_Hello
+                  solve( splitEqs(4) )
+                    case split_case_1
+                    solve( !KU( h(kem_pk(~sk.1)) ) @ #vk.31 )
+                      case C1_Hello
+                      solve( !KU( kem_enc(kem_pk(~sk), ~k_s) ) @ #vk.17 )
+                        case C2_KeyExchange
+                        solve( !KU( mac(cf_key(kdf3(kdf(<'g'^(~x*~y), ~k_eph>, 'hs'),
+                                                    <~k_s, ~k_c>,
+                                                    h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), ~rs, 
+                                                       ~sid, 'g'^~y, kem_enc(kem_pk(~ekC), ~k_eph), 
+                                                       h(kem_pk(~sk)), kem_enc(kem_pk(~skC), ~k_c)>))),
+                                        h(<
+                                           h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), ~rs, ~sid, 
+                                              'g'^~y, kem_enc(kem_pk(~ekC), ~k_eph), h(kem_pk(~sk)), 
+                                              kem_enc(kem_pk(~skC), ~k_c)>), 
+                                           kem_enc(kem_pk(~sk), ~k_s)>))
+                               ) @ #vk.19 )
+                          case C2_KeyExchange
+                          solve( !KU( 'g'^~x ) @ #vk.22 )
+                            case C1_Hello
+                            solve( !KU( kem_pk(~ekC) ) @ #vk.25 )
+                              case C1_Hello
+                              solve( !KU( h(kem_pk(~skC)) ) @ #vk.27 )
+                                case C1_Hello
+                                solve( !KU( 'g'^~y ) @ #vk.25 )
+                                  case S1_Hello
+                                  solve( !KU( kem_enc(kem_pk(~ekC), ~k_eph) ) @ #vk.26 )
+                                    case S1_Hello
+                                    solve( !KU( kem_enc(kem_pk(~skC), ~k_c) ) @ #vk.27 )
+                                      case S1_Hello
+                                      SOLVED // trace found
+                                    qed
+                                  qed
+                                qed
+                              qed
+                            qed
+                          qed
+                        qed
+                      qed
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+qed
+
+lemma session_key_secrecy:
+  all-traces
+  "∀ S C sid k1 k2 #i.
+    (((SessionKey( S, C, sid, k1, k2 ) @ #i) ∧ (¬(∃ #r. Reveal( S ) @ #r))) ∧
+     (¬(∃ #r. Reveal( C ) @ #r))) ⇒
+    ((¬(∃ #k. K( k1 ) @ #k)) ∧ (¬(∃ #k. K( k2 ) @ #k)))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ S C sid k1 k2 #i.
+  (SessionKey( S, C, sid, k1, k2 ) @ #i)
+ ∧
+  (∀ #r. (Reveal( S ) @ #r) ⇒ ⊥) ∧
+  (∀ #r. (Reveal( C ) @ #r) ⇒ ⊥) ∧
+  (((∃ #k. (K( k1 ) @ #k)) ∨ (∃ #k. (K( k2 ) @ #k))))"
+*/
+simplify
+solve( (∃ #k. (K( k1 ) @ #k))  ∥ (∃ #k. (K( k2 ) @ #k)) )
+  case case_1
+  solve( SessionKey( S, C, sid, k1, k2 ) @ #i )
+    case C3_Complete
+    solve( St_C2( $C, $S, sid, master, t2 ) ▶₀ #i )
+      case C2_KeyExchange
+      solve( !KU( c2s(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                           h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                              ct_eph, h(kem_pk(~sk)), ct_C>)))
+             ) @ #vk )
+        case c_c2s
+        solve( !KU( kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                         h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                            ct_eph, h(kem_pk(~sk)), ct_C>))
+               ) @ #vk.13 )
+          case c_kdf3
+          solve( !KU( ~k_s ) @ #vk.17 )
+            case C2_KeyExchange
+            solve( !KU( ~sk ) @ #vk.19 )
+              case Reveal_LTK
+              by contradiction /* from formulas */
+            qed
+          qed
+        qed
+      qed
+    qed
+  next
+    case S2_Finished
+    solve( St_S1( $S, $C, ~skS, pkC, rc, sid, rs, dhss, k_eph, k_c, t1
+           ) ▶₀ #i )
+      case S1_Hello
+      solve( splitEqs(0) )
+        case split_case_1
+        solve( splitEqs(1) )
+          case split_case_1
+          solve( !KU( c2s(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'),
+                               <kem_dec(~skS, ct_S), ~k_c>,
+                               h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_c2s
+            solve( !KU( kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_2
+          solve( !KU( c2s(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'),
+                               <kem_dec(~skS, ct_S), ~k_c>,
+                               h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_c2s
+            solve( !KU( kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'),
+                             <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_3
+          solve( !KU( c2s(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                               <kem_dec(~skS, ct_S), ~k_c>,
+                               h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_c2s
+            solve( !KU( kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                             <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      next
+        case split_case_2
+        solve( splitEqs(1) )
+          case split_case_1
+          solve( !KU( c2s(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                               h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_c2s
+            solve( !KU( kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_2
+          solve( !KU( c2s(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'), <z, ~k_c>,
+                               h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_c2s
+            solve( !KU( kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_3
+          solve( !KU( c2s(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                               h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_c2s
+            solve( !KU( kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+next
+  case case_2
+  solve( SessionKey( S, C, sid, k1, k2 ) @ #i )
+    case C3_Complete
+    solve( St_C2( $C, $S, sid, master, t2 ) ▶₀ #i )
+      case C2_KeyExchange
+      solve( !KU( s2c(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                           h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                              ct_eph, h(kem_pk(~sk)), ct_C>)))
+             ) @ #vk )
+        case c_s2c
+        solve( !KU( kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                         h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                            ct_eph, h(kem_pk(~sk)), ct_C>))
+               ) @ #vk.13 )
+          case c_kdf3
+          solve( !KU( ~k_s ) @ #vk.17 )
+            case C2_KeyExchange
+            solve( !KU( ~sk ) @ #vk.19 )
+              case Reveal_LTK
+              by contradiction /* from formulas */
+            qed
+          qed
+        qed
+      qed
+    qed
+  next
+    case S2_Finished
+    solve( St_S1( $S, $C, ~skS, pkC, rc, sid, rs, dhss, k_eph, k_c, t1
+           ) ▶₀ #i )
+      case S1_Hello
+      solve( splitEqs(0) )
+        case split_case_1
+        solve( splitEqs(1) )
+          case split_case_1
+          solve( !KU( s2c(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'),
+                               <kem_dec(~skS, ct_S), ~k_c>,
+                               h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_s2c
+            solve( !KU( kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_2
+          solve( !KU( s2c(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'),
+                               <kem_dec(~skS, ct_S), ~k_c>,
+                               h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_s2c
+            solve( !KU( kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'),
+                             <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_3
+          solve( !KU( s2c(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                               <kem_dec(~skS, ct_S), ~k_c>,
+                               h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_s2c
+            solve( !KU( kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                             <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      next
+        case split_case_2
+        solve( splitEqs(1) )
+          case split_case_1
+          solve( !KU( s2c(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                               h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_s2c
+            solve( !KU( kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_2
+          solve( !KU( s2c(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'), <z, ~k_c>,
+                               h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_s2c
+            solve( !KU( kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_3
+          solve( !KU( s2c(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                               h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_s2c
+            solve( !KU( kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+qed
+
+lemma forward_secrecy:
+  all-traces
+  "∀ S C sid k1 k2 #i.
+    (((SessionKey( S, C, sid, k1, k2 ) @ #i) ∧
+      (∀ #r. (Reveal( S ) @ #r) ⇒ (#i < #r))) ∧
+     (∀ #r. (Reveal( C ) @ #r) ⇒ (#i < #r))) ⇒
+    ((¬(∃ #k. K( k1 ) @ #k)) ∧ (¬(∃ #k. K( k2 ) @ #k)))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ S C sid k1 k2 #i.
+  (SessionKey( S, C, sid, k1, k2 ) @ #i)
+ ∧
+  (∀ #r. (Reveal( S ) @ #r) ⇒ #i < #r) ∧
+  (∀ #r. (Reveal( C ) @ #r) ⇒ #i < #r) ∧
+  (((∃ #k. (K( k1 ) @ #k)) ∨ (∃ #k. (K( k2 ) @ #k))))"
+*/
+simplify
+solve( (∃ #k. (K( k1 ) @ #k))  ∥ (∃ #k. (K( k2 ) @ #k)) )
+  case case_1
+  solve( SessionKey( S, C, sid, k1, k2 ) @ #i )
+    case C3_Complete
+    solve( St_C2( $C, $S, sid, master, t2 ) ▶₀ #i )
+      case C2_KeyExchange
+      solve( !KU( c2s(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                           h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                              ct_eph, h(kem_pk(~sk)), ct_C>)))
+             ) @ #vk )
+        case c_c2s
+        solve( !KU( kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                         h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                            ct_eph, h(kem_pk(~sk)), ct_C>))
+               ) @ #vk.13 )
+          case c_kdf3
+          solve( !KU( ~k_s ) @ #vk.17 )
+            case C2_KeyExchange
+            solve( !KU( ~sk ) @ #vk.19 )
+              case Reveal_LTK
+              solve( !KU( mac(sf_key(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                                          h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                             ct_eph, h(kem_pk(~sk)), ct_C>))),
+                              h(<
+                                 h(<
+                                    h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                       ct_eph, h(kem_pk(~sk)), ct_C>), 
+                                    kem_enc(kem_pk(~sk), ~k_s)>), 
+                                 mac(cf_key(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                                                 h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, 
+                                                    ~sid, gy, ct_eph, h(kem_pk(~sk)), ct_C>))),
+                                     h(<
+                                        h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                           ct_eph, h(kem_pk(~sk)), ct_C>), 
+                                        kem_enc(kem_pk(~sk), ~k_s)>))
+                                >))
+                     ) @ #vk.5 )
+                case S2_Finished
+                solve( !KU( ~k_c ) @ #vk.22 )
+                  case S1_Hello
+                  solve( !KU( ~skC ) @ #vk.31 )
+                    case Reveal_LTK
+                    solve( !KU( kdf(<'g'^(~x*~y), ~k_eph>, 'hs') ) @ #vk.23 )
+                      case c_kdf
+                      solve( !KU( ~k_eph ) @ #vk.35 )
+                        case S1_Hello
+                        by solve( !KU( ~ekC ) @ #vk.36 )
+                      qed
+                    qed
+                  qed
+                qed
+              next
+                case c_mac
+                solve( !KU( sf_key(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                                        h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                           ct_eph, h(kem_pk(~sk)), ct_C>)))
+                       ) @ #vk.20 )
+                  case c_sf_key
+                  by contradiction /* cyclic */
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    qed
+  next
+    case S2_Finished
+    solve( St_S1( $S, $C, ~skS, pkC, rc, sid, rs, dhss, k_eph, k_c, t1
+           ) ▶₀ #i )
+      case S1_Hello
+      solve( splitEqs(0) )
+        case split_case_1
+        solve( splitEqs(1) )
+          case split_case_1
+          solve( !KU( c2s(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'),
+                               <kem_dec(~skS, ct_S), ~k_c>,
+                               h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_c2s
+            solve( !KU( kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  solve( !KU( kdf(<gx^~y, ~k_eph>, 'hs') ) @ #vk.17 )
+                    case c_kdf
+                    solve( !KU( ~k_eph ) @ #vk.23 )
+                      case S1_Hello
+                      solve( !KU( kem_dec(~skS, ct_S) ) @ #vk.20 )
+                        case c_kem_dec
+                        solve( !KU( ~skS ) @ #vk.25 )
+                          case Reveal_LTK
+                          solve( !KU( mac(cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'),
+                                                      <kem_dec(~skS, ct_S), ~k_c>,
+                                                      h(<rc, sid, gx, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                                         'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                         h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))),
+                                          h(<
+                                             h(<rc, sid, gx, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                                kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                                kem_enc(kem_pk(~sk), ~k_c)>), 
+                                             ct_S>))
+                                 ) @ #vk.12 )
+                            case c_mac
+                            solve( !KU( cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'),
+                                                    <kem_dec(~skS, ct_S), ~k_c>,
+                                                    h(<rc, sid, gx, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                                       'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                       h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                                   ) @ #vk.26 )
+                              case c_cf_key
+                              by contradiction /* cyclic */
+                            qed
+                          qed
+                        qed
+                      qed
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_2
+          solve( !KU( c2s(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'),
+                               <kem_dec(~skS, ct_S), ~k_c>,
+                               h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_c2s
+            solve( !KU( kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'),
+                             <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  solve( !KU( kdf(<x^(~y*x.1), ~k_eph>, 'hs') ) @ #vk.17 )
+                    case c_kdf
+                    solve( !KU( ~k_eph ) @ #vk.23 )
+                      case S1_Hello
+                      solve( !KU( kem_dec(~skS, ct_S) ) @ #vk.20 )
+                        case c_kem_dec
+                        solve( !KU( ~skS ) @ #vk.25 )
+                          case Reveal_LTK
+                          solve( !KU( x^(~y*x.1) ) @ #vk.24 )
+                            case C1_Hello_case_1
+                            by solve( !KU( ~y ) @ #vk.26 )
+                          next
+                            case C1_Hello_case_2
+                            by solve( !KU( ~y ) @ #vk.27 )
+                          next
+                            case S1_Hello_case_1
+                            by solve( !KU( ~y ) @ #vk.35 )
+                          next
+                            case S1_Hello_case_2
+                            by solve( !KU( ~y ) @ #vk.36 )
+                          next
+                            case S1_Hello_case_3
+                            solve( !KU( mac(cf_key(kdf3(kdf(<'g'^(~y*x), ~k_eph>, 'hs'),
+                                                        <kem_dec(~skS, ct_S), ~k_c>,
+                                                        h(<rc, sid, 'g'^x, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, 
+                                                           sid, 'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                           h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))),
+                                            h(<
+                                               h(<rc, sid, 'g'^x, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                                  'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                                  kem_enc(kem_pk(~sk), ~k_c)>), 
+                                               ct_S>))
+                                   ) @ #vk.13 )
+                              case c_mac
+                              solve( !KU( cf_key(kdf3(kdf(<'g'^(~y*x), ~k_eph>, 'hs'),
+                                                      <kem_dec(~skS, ct_S), ~k_c>,
+                                                      h(<rc, sid, 'g'^x, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, 
+                                                         sid, 'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                         h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                                     ) @ #vk.27 )
+                                case c_cf_key
+                                by contradiction /* cyclic */
+                              qed
+                            qed
+                          next
+                            case c_exp
+                            by solve( !KU( ~y ) @ #vk.28 )
+                          qed
+                        qed
+                      qed
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_3
+          solve( !KU( c2s(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                               <kem_dec(~skS, ct_S), ~k_c>,
+                               h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_c2s
+            solve( !KU( kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                             <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  solve( !KU( kdf(<DH_neutral, ~k_eph>, 'hs') ) @ #vk.17 )
+                    case c_kdf
+                    solve( !KU( ~k_eph ) @ #vk.22 )
+                      case S1_Hello
+                      solve( !KU( kem_dec(~skS, ct_S) ) @ #vk.21 )
+                        case c_kem_dec
+                        solve( !KU( ~skS ) @ #vk.24 )
+                          case Reveal_LTK
+                          solve( !KU( mac(cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                                                      <kem_dec(~skS, ct_S), ~k_c>,
+                                                      h(<rc, sid, DH_neutral, kem_pk(sk.1), h(kem_pk(~sk)), 
+                                                         ~rs, sid, 'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                         h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))),
+                                          h(<
+                                             h(<rc, sid, DH_neutral, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                                'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                                kem_enc(kem_pk(~sk), ~k_c)>), 
+                                             ct_S>))
+                                 ) @ #vk.12 )
+                            case c_mac
+                            solve( !KU( cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                                                    <kem_dec(~skS, ct_S), ~k_c>,
+                                                    h(<rc, sid, DH_neutral, kem_pk(sk.1), h(kem_pk(~sk)), 
+                                                       ~rs, sid, 'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                       h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                                   ) @ #vk.25 )
+                              case c_cf_key
+                              by contradiction /* cyclic */
+                            qed
+                          qed
+                        qed
+                      qed
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        qed
+      next
+        case split_case_2
+        solve( splitEqs(1) )
+          case split_case_1
+          solve( !KU( c2s(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                               h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_c2s
+            solve( !KU( kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  solve( !KU( kdf(<gx^~y, ~k_eph>, 'hs') ) @ #vk.17 )
+                    case c_kdf
+                    solve( !KU( ~k_eph ) @ #vk.23 )
+                      case S1_Hello
+                      solve( !KU( mac(cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                                                  h(<rc, sid, gx, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                                     'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                                     kem_enc(kem_pk(~sk), ~k_c)>))),
+                                      h(<
+                                         h(<rc, sid, gx, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                            kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                            kem_enc(kem_pk(~sk), ~k_c)>), 
+                                         kem_enc(kem_pk(~skS), z)>))
+                             ) @ #vk.9 )
+                        case c_mac
+                        solve( !KU( cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                                                h(<rc, sid, gx, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                                   'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                                   kem_enc(kem_pk(~sk), ~k_c)>)))
+                               ) @ #vk.25 )
+                          case c_cf_key
+                          by contradiction /* cyclic */
+                        qed
+                      qed
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_2
+          solve( !KU( c2s(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'), <z, ~k_c>,
+                               h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_c2s
+            solve( !KU( kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  solve( !KU( kdf(<x^(~y*x.1), ~k_eph>, 'hs') ) @ #vk.17 )
+                    case c_kdf
+                    solve( !KU( ~k_eph ) @ #vk.23 )
+                      case S1_Hello
+                      solve( !KU( x^(~y*x.1) ) @ #vk.23 )
+                        case C1_Hello_case_1
+                        by solve( !KU( ~y ) @ #vk.25 )
+                      next
+                        case C1_Hello_case_2
+                        by solve( !KU( ~y ) @ #vk.26 )
+                      next
+                        case S1_Hello_case_1
+                        by solve( !KU( ~y ) @ #vk.34 )
+                      next
+                        case S1_Hello_case_2
+                        by solve( !KU( ~y ) @ #vk.35 )
+                      next
+                        case S1_Hello_case_3
+                        solve( !KU( mac(cf_key(kdf3(kdf(<'g'^(~y*x), ~k_eph>, 'hs'), <z, ~k_c>,
+                                                    h(<rc, sid, 'g'^x, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, 
+                                                       sid, 'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                       h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))),
+                                        h(<
+                                           h(<rc, sid, 'g'^x, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                              kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                              kem_enc(kem_pk(~sk), ~k_c)>), 
+                                           kem_enc(kem_pk(~skS), z)>))
+                               ) @ #vk.11 )
+                          case C2_KeyExchange
+                          solve( !KU( ~k_s ) @ #vk.30 )
+                            case C2_KeyExchange
+                            by solve( !KU( ~ekC ) @ #vk.32 )
+                          qed
+                        next
+                          case c_mac
+                          solve( !KU( cf_key(kdf3(kdf(<'g'^(~y*x), ~k_eph>, 'hs'), <z, ~k_c>,
+                                                  h(<rc, sid, 'g'^x, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                                     'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                                     kem_enc(kem_pk(~sk), ~k_c)>)))
+                                 ) @ #vk.26 )
+                            case c_cf_key
+                            by contradiction /* cyclic */
+                          qed
+                        qed
+                      next
+                        case c_exp
+                        by solve( !KU( ~y ) @ #vk.27 )
+                      qed
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_3
+          solve( !KU( c2s(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                               h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_c2s
+            solve( !KU( kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  solve( !KU( kdf(<DH_neutral, ~k_eph>, 'hs') ) @ #vk.17 )
+                    case c_kdf
+                    solve( !KU( ~k_eph ) @ #vk.22 )
+                      case S1_Hello
+                      solve( !KU( mac(cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                                                  h(<rc, sid, DH_neutral, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, 
+                                                     sid, 'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                     h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))),
+                                      h(<
+                                         h(<rc, sid, DH_neutral, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                            'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                            kem_enc(kem_pk(~sk), ~k_c)>), 
+                                         kem_enc(kem_pk(~skS), z)>))
+                             ) @ #vk.9 )
+                        case c_mac
+                        solve( !KU( cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                                                h(<rc, sid, DH_neutral, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, 
+                                                   sid, 'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                   h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                               ) @ #vk.24 )
+                          case c_cf_key
+                          by contradiction /* cyclic */
+                        qed
+                      qed
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+next
+  case case_2
+  solve( SessionKey( S, C, sid, k1, k2 ) @ #i )
+    case C3_Complete
+    solve( St_C2( $C, $S, sid, master, t2 ) ▶₀ #i )
+      case C2_KeyExchange
+      solve( !KU( s2c(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                           h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                              ct_eph, h(kem_pk(~sk)), ct_C>)))
+             ) @ #vk )
+        case c_s2c
+        solve( !KU( kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                         h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                            ct_eph, h(kem_pk(~sk)), ct_C>))
+               ) @ #vk.13 )
+          case c_kdf3
+          solve( !KU( ~k_s ) @ #vk.17 )
+            case C2_KeyExchange
+            solve( !KU( ~sk ) @ #vk.19 )
+              case Reveal_LTK
+              solve( !KU( mac(sf_key(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                                          h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                             ct_eph, h(kem_pk(~sk)), ct_C>))),
+                              h(<
+                                 h(<
+                                    h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                       ct_eph, h(kem_pk(~sk)), ct_C>), 
+                                    kem_enc(kem_pk(~sk), ~k_s)>), 
+                                 mac(cf_key(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                                                 h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, 
+                                                    ~sid, gy, ct_eph, h(kem_pk(~sk)), ct_C>))),
+                                     h(<
+                                        h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                           ct_eph, h(kem_pk(~sk)), ct_C>), 
+                                        kem_enc(kem_pk(~sk), ~k_s)>))
+                                >))
+                     ) @ #vk.5 )
+                case S2_Finished
+                solve( !KU( ~k_c ) @ #vk.22 )
+                  case S1_Hello
+                  solve( !KU( ~skC ) @ #vk.31 )
+                    case Reveal_LTK
+                    solve( !KU( kdf(<'g'^(~x*~y), ~k_eph>, 'hs') ) @ #vk.23 )
+                      case c_kdf
+                      solve( !KU( ~k_eph ) @ #vk.35 )
+                        case S1_Hello
+                        by solve( !KU( ~ekC ) @ #vk.36 )
+                      qed
+                    qed
+                  qed
+                qed
+              next
+                case c_mac
+                solve( !KU( sf_key(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                                        h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                           ct_eph, h(kem_pk(~sk)), ct_C>)))
+                       ) @ #vk.20 )
+                  case c_sf_key
+                  by contradiction /* cyclic */
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    qed
+  next
+    case S2_Finished
+    solve( St_S1( $S, $C, ~skS, pkC, rc, sid, rs, dhss, k_eph, k_c, t1
+           ) ▶₀ #i )
+      case S1_Hello
+      solve( splitEqs(0) )
+        case split_case_1
+        solve( splitEqs(1) )
+          case split_case_1
+          solve( !KU( s2c(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'),
+                               <kem_dec(~skS, ct_S), ~k_c>,
+                               h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_s2c
+            solve( !KU( kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  solve( !KU( kdf(<gx^~y, ~k_eph>, 'hs') ) @ #vk.17 )
+                    case c_kdf
+                    solve( !KU( ~k_eph ) @ #vk.23 )
+                      case S1_Hello
+                      solve( !KU( kem_dec(~skS, ct_S) ) @ #vk.20 )
+                        case c_kem_dec
+                        solve( !KU( ~skS ) @ #vk.25 )
+                          case Reveal_LTK
+                          solve( !KU( mac(cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'),
+                                                      <kem_dec(~skS, ct_S), ~k_c>,
+                                                      h(<rc, sid, gx, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                                         'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                         h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))),
+                                          h(<
+                                             h(<rc, sid, gx, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                                kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                                kem_enc(kem_pk(~sk), ~k_c)>), 
+                                             ct_S>))
+                                 ) @ #vk.12 )
+                            case c_mac
+                            solve( !KU( cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'),
+                                                    <kem_dec(~skS, ct_S), ~k_c>,
+                                                    h(<rc, sid, gx, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                                       'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                       h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                                   ) @ #vk.26 )
+                              case c_cf_key
+                              by contradiction /* cyclic */
+                            qed
+                          qed
+                        qed
+                      qed
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_2
+          solve( !KU( s2c(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'),
+                               <kem_dec(~skS, ct_S), ~k_c>,
+                               h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_s2c
+            solve( !KU( kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'),
+                             <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  solve( !KU( kdf(<x^(~y*x.1), ~k_eph>, 'hs') ) @ #vk.17 )
+                    case c_kdf
+                    solve( !KU( ~k_eph ) @ #vk.23 )
+                      case S1_Hello
+                      solve( !KU( kem_dec(~skS, ct_S) ) @ #vk.20 )
+                        case c_kem_dec
+                        solve( !KU( ~skS ) @ #vk.25 )
+                          case Reveal_LTK
+                          solve( !KU( x^(~y*x.1) ) @ #vk.24 )
+                            case C1_Hello_case_1
+                            by solve( !KU( ~y ) @ #vk.26 )
+                          next
+                            case C1_Hello_case_2
+                            by solve( !KU( ~y ) @ #vk.27 )
+                          next
+                            case S1_Hello_case_1
+                            by solve( !KU( ~y ) @ #vk.35 )
+                          next
+                            case S1_Hello_case_2
+                            by solve( !KU( ~y ) @ #vk.36 )
+                          next
+                            case S1_Hello_case_3
+                            solve( !KU( mac(cf_key(kdf3(kdf(<'g'^(~y*x), ~k_eph>, 'hs'),
+                                                        <kem_dec(~skS, ct_S), ~k_c>,
+                                                        h(<rc, sid, 'g'^x, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, 
+                                                           sid, 'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                           h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))),
+                                            h(<
+                                               h(<rc, sid, 'g'^x, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                                  'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                                  kem_enc(kem_pk(~sk), ~k_c)>), 
+                                               ct_S>))
+                                   ) @ #vk.13 )
+                              case c_mac
+                              solve( !KU( cf_key(kdf3(kdf(<'g'^(~y*x), ~k_eph>, 'hs'),
+                                                      <kem_dec(~skS, ct_S), ~k_c>,
+                                                      h(<rc, sid, 'g'^x, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, 
+                                                         sid, 'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                         h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                                     ) @ #vk.27 )
+                                case c_cf_key
+                                by contradiction /* cyclic */
+                              qed
+                            qed
+                          next
+                            case c_exp
+                            by solve( !KU( ~y ) @ #vk.28 )
+                          qed
+                        qed
+                      qed
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_3
+          solve( !KU( s2c(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                               <kem_dec(~skS, ct_S), ~k_c>,
+                               h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_s2c
+            solve( !KU( kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                             <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  solve( !KU( kdf(<DH_neutral, ~k_eph>, 'hs') ) @ #vk.17 )
+                    case c_kdf
+                    solve( !KU( ~k_eph ) @ #vk.22 )
+                      case S1_Hello
+                      solve( !KU( kem_dec(~skS, ct_S) ) @ #vk.21 )
+                        case c_kem_dec
+                        solve( !KU( ~skS ) @ #vk.24 )
+                          case Reveal_LTK
+                          solve( !KU( mac(cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                                                      <kem_dec(~skS, ct_S), ~k_c>,
+                                                      h(<rc, sid, DH_neutral, kem_pk(sk.1), h(kem_pk(~sk)), 
+                                                         ~rs, sid, 'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                         h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))),
+                                          h(<
+                                             h(<rc, sid, DH_neutral, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                                'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                                kem_enc(kem_pk(~sk), ~k_c)>), 
+                                             ct_S>))
+                                 ) @ #vk.12 )
+                            case c_mac
+                            solve( !KU( cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                                                    <kem_dec(~skS, ct_S), ~k_c>,
+                                                    h(<rc, sid, DH_neutral, kem_pk(sk.1), h(kem_pk(~sk)), 
+                                                       ~rs, sid, 'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                       h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                                   ) @ #vk.25 )
+                              case c_cf_key
+                              by contradiction /* cyclic */
+                            qed
+                          qed
+                        qed
+                      qed
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        qed
+      next
+        case split_case_2
+        solve( splitEqs(1) )
+          case split_case_1
+          solve( !KU( s2c(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                               h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_s2c
+            solve( !KU( kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  solve( !KU( kdf(<gx^~y, ~k_eph>, 'hs') ) @ #vk.17 )
+                    case c_kdf
+                    solve( !KU( ~k_eph ) @ #vk.23 )
+                      case S1_Hello
+                      solve( !KU( mac(cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                                                  h(<rc, sid, gx, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                                     'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                                     kem_enc(kem_pk(~sk), ~k_c)>))),
+                                      h(<
+                                         h(<rc, sid, gx, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                            kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                            kem_enc(kem_pk(~sk), ~k_c)>), 
+                                         kem_enc(kem_pk(~skS), z)>))
+                             ) @ #vk.9 )
+                        case c_mac
+                        solve( !KU( cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                                                h(<rc, sid, gx, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                                   'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                                   kem_enc(kem_pk(~sk), ~k_c)>)))
+                               ) @ #vk.25 )
+                          case c_cf_key
+                          by contradiction /* cyclic */
+                        qed
+                      qed
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_2
+          solve( !KU( s2c(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'), <z, ~k_c>,
+                               h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_s2c
+            solve( !KU( kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  solve( !KU( kdf(<x^(~y*x.1), ~k_eph>, 'hs') ) @ #vk.17 )
+                    case c_kdf
+                    solve( !KU( ~k_eph ) @ #vk.23 )
+                      case S1_Hello
+                      solve( !KU( x^(~y*x.1) ) @ #vk.23 )
+                        case C1_Hello_case_1
+                        by solve( !KU( ~y ) @ #vk.25 )
+                      next
+                        case C1_Hello_case_2
+                        by solve( !KU( ~y ) @ #vk.26 )
+                      next
+                        case S1_Hello_case_1
+                        by solve( !KU( ~y ) @ #vk.34 )
+                      next
+                        case S1_Hello_case_2
+                        by solve( !KU( ~y ) @ #vk.35 )
+                      next
+                        case S1_Hello_case_3
+                        solve( !KU( mac(cf_key(kdf3(kdf(<'g'^(~y*x), ~k_eph>, 'hs'), <z, ~k_c>,
+                                                    h(<rc, sid, 'g'^x, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, 
+                                                       sid, 'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                       h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))),
+                                        h(<
+                                           h(<rc, sid, 'g'^x, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                              kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                              kem_enc(kem_pk(~sk), ~k_c)>), 
+                                           kem_enc(kem_pk(~skS), z)>))
+                               ) @ #vk.11 )
+                          case C2_KeyExchange
+                          solve( !KU( ~k_s ) @ #vk.30 )
+                            case C2_KeyExchange
+                            by solve( !KU( ~ekC ) @ #vk.32 )
+                          qed
+                        next
+                          case c_mac
+                          solve( !KU( cf_key(kdf3(kdf(<'g'^(~y*x), ~k_eph>, 'hs'), <z, ~k_c>,
+                                                  h(<rc, sid, 'g'^x, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                                     'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                                     kem_enc(kem_pk(~sk), ~k_c)>)))
+                                 ) @ #vk.26 )
+                            case c_cf_key
+                            by contradiction /* cyclic */
+                          qed
+                        qed
+                      next
+                        case c_exp
+                        by solve( !KU( ~y ) @ #vk.27 )
+                      qed
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        next
+          case split_case_3
+          solve( !KU( s2c(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                               h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                  kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk )
+            case c_s2c
+            solve( !KU( kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.13 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.18 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.19 )
+                  case Reveal_LTK
+                  solve( !KU( kdf(<DH_neutral, ~k_eph>, 'hs') ) @ #vk.17 )
+                    case c_kdf
+                    solve( !KU( ~k_eph ) @ #vk.22 )
+                      case S1_Hello
+                      solve( !KU( mac(cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                                                  h(<rc, sid, DH_neutral, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, 
+                                                     sid, 'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                     h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))),
+                                      h(<
+                                         h(<rc, sid, DH_neutral, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, sid, 
+                                            'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), h(kem_pk(~skS)), 
+                                            kem_enc(kem_pk(~sk), ~k_c)>), 
+                                         kem_enc(kem_pk(~skS), z)>))
+                             ) @ #vk.9 )
+                        case c_mac
+                        solve( !KU( cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                                                h(<rc, sid, DH_neutral, kem_pk(sk.1), h(kem_pk(~sk)), ~rs, 
+                                                   sid, 'g'^~y, kem_enc(kem_pk(sk.1), ~k_eph), 
+                                                   h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                               ) @ #vk.24 )
+                          case c_cf_key
+                          by contradiction /* cyclic */
+                        qed
+                      qed
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+qed
+
+lemma server_auth:
+  all-traces
+  "∀ C S sid k1 k2 #i.
+    ((Commit( C, S, <'server', sid, k1, k2> ) @ #i) ∧
+     (¬(∃ #r. Reveal( S ) @ #r))) ⇒
+    (∃ #j. (Running( S, C, <'server', sid, k1, k2> ) @ #j) ∧ (#j < #i))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ C S sid k1 k2 #i.
+  (Commit( C, S, <'server', sid, k1, k2> ) @ #i)
+ ∧
+  (∀ #r. (Reveal( S ) @ #r) ⇒ ⊥) ∧
+  (∀ #j. (Running( S, C, <'server', sid, k1, k2> ) @ #j) ⇒ ¬(#j < #i))"
+*/
+simplify
+solve( Commit( C, S, <'server', sid, k1, k2> ) @ #i )
+  case C3_Complete
+  solve( St_C2( $C, $S, sid, master, t2 ) ▶₀ #i )
+    case C2_KeyExchange
+    solve( !KU( mac(sf_key(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                                h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                   ct_eph, h(kem_pk(~sk)), ct_C>))),
+                    h(<
+                       h(<
+                          h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                             ct_eph, h(kem_pk(~sk)), ct_C>), 
+                          kem_enc(kem_pk(~sk), ~k_s)>), 
+                       mac(cf_key(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                                       h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                          ct_eph, h(kem_pk(~sk)), ct_C>))),
+                           h(<
+                              h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                 ct_eph, h(kem_pk(~sk)), ct_C>), 
+                              kem_enc(kem_pk(~sk), ~k_s)>))
+                      >))
+           ) @ #vk )
+      case S2_Finished
+      by contradiction /* from formulas */
+    next
+      case c_mac
+      solve( !KU( sf_key(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                              h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                 ct_eph, h(kem_pk(~sk)), ct_C>)))
+             ) @ #vk.12 )
+        case c_sf_key
+        solve( !KU( kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                         h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                            ct_eph, h(kem_pk(~sk)), ct_C>))
+               ) @ #vk.14 )
+          case c_kdf3
+          solve( !KU( ~k_s ) @ #vk.18 )
+            case C2_KeyExchange
+            solve( !KU( ~sk ) @ #vk.20 )
+              case Reveal_LTK
+              by contradiction /* from formulas */
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+qed
+
+lemma client_auth:
+  all-traces
+  "∀ S C sid k1 k2 #i.
+    ((Commit( S, C, <'client', sid, k1, k2> ) @ #i) ∧
+     (¬(∃ #r. Reveal( C ) @ #r))) ⇒
+    (∃ #j. (Running( C, S, <'client', sid, k1, k2> ) @ #j) ∧ (#j < #i))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ S C sid k1 k2 #i.
+  (Commit( S, C, <'client', sid, k1, k2> ) @ #i)
+ ∧
+  (∀ #r. (Reveal( C ) @ #r) ⇒ ⊥) ∧
+  (∀ #j. (Running( C, S, <'client', sid, k1, k2> ) @ #j) ⇒ ¬(#j < #i))"
+*/
+simplify
+solve( Commit( S, C, <'client', sid, k1, k2> ) @ #i )
+  case S2_Finished
+  solve( St_S1( $S, $C, ~skS, pkC, rc, sid, rs, dhss, k_eph, k_c, t1
+         ) ▶₀ #i )
+    case S1_Hello
+    solve( splitEqs(0) )
+      case split_case_1
+      solve( splitEqs(1) )
+        case split_case_1
+        solve( !KU( mac(cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'),
+                                    <kem_dec(~skS, ct_S), ~k_c>,
+                                    h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                       kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)
+                                      >))),
+                        h(<
+                           h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                              kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>), 
+                           ct_S>))
+               ) @ #vk.2 )
+          case c_mac
+          solve( !KU( cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'),
+                                  <kem_dec(~skS, ct_S), ~k_c>,
+                                  h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                     kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk.12 )
+            case c_cf_key
+            solve( !KU( kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.14 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.19 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.20 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      next
+        case split_case_2
+        solve( !KU( mac(cf_key(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'),
+                                    <kem_dec(~skS, ct_S), ~k_c>,
+                                    h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                       kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)
+                                      >))),
+                        h(<
+                           h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                              kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>), 
+                           ct_S>))
+               ) @ #vk.2 )
+          case c_mac
+          solve( !KU( cf_key(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'),
+                                  <kem_dec(~skS, ct_S), ~k_c>,
+                                  h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                     kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk.12 )
+            case c_cf_key
+            solve( !KU( kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'),
+                             <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.14 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.19 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.20 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      next
+        case split_case_3
+        solve( !KU( mac(cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                                    <kem_dec(~skS, ct_S), ~k_c>,
+                                    h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                       kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)
+                                      >))),
+                        h(<
+                           h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                              kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>), 
+                           ct_S>))
+               ) @ #vk.2 )
+          case c_mac
+          solve( !KU( cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                                  <kem_dec(~skS, ct_S), ~k_c>,
+                                  h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                     kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk.12 )
+            case c_cf_key
+            solve( !KU( kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                             <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.14 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.19 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.20 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    next
+      case split_case_2
+      solve( splitEqs(1) )
+        case split_case_1
+        solve( !KU( mac(cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                                    h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                       kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)
+                                      >))),
+                        h(<
+                           h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                              kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>), 
+                           kem_enc(kem_pk(~skS), z)>))
+               ) @ #vk.2 )
+          case c_mac
+          solve( !KU( cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                                  h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                     kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk.12 )
+            case c_cf_key
+            solve( !KU( kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.14 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.19 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.20 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      next
+        case split_case_2
+        solve( !KU( mac(cf_key(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'), <z, ~k_c>,
+                                    h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                       kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)
+                                      >))),
+                        h(<
+                           h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                              kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>), 
+                           kem_enc(kem_pk(~skS), z)>))
+               ) @ #vk.2 )
+          case C2_KeyExchange
+          by contradiction /* from formulas */
+        next
+          case c_mac
+          solve( !KU( cf_key(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'), <z, ~k_c>,
+                                  h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                     kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk.12 )
+            case c_cf_key
+            solve( !KU( kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.14 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.19 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.20 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      next
+        case split_case_3
+        solve( !KU( mac(cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                                    h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                       kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)
+                                      >))),
+                        h(<
+                           h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                              kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>), 
+                           kem_enc(kem_pk(~skS), z)>))
+               ) @ #vk.2 )
+          case c_mac
+          solve( !KU( cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                                  h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                     kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk.12 )
+            case c_cf_key
+            solve( !KU( kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.14 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.19 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.20 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+qed
+
+lemma kci_resistance_client:
+  all-traces
+  "∀ C S sid k1 k2 #i.
+    ((Commit( C, S, <'server', sid, k1, k2> ) @ #i) ∧
+     (¬(∃ #r. Reveal( S ) @ #r))) ⇒
+    (∃ #j. Commit( S, C, <'client', sid, k1, k2> ) @ #j)"
+/*
+guarded formula characterizing all counter-examples:
+"∃ C S sid k1 k2 #i.
+  (Commit( C, S, <'server', sid, k1, k2> ) @ #i)
+ ∧
+  (∀ #r. (Reveal( S ) @ #r) ⇒ ⊥) ∧
+  (∀ #j. (Commit( S, C, <'client', sid, k1, k2> ) @ #j) ⇒ ⊥)"
+*/
+simplify
+solve( Commit( C, S, <'server', sid, k1, k2> ) @ #i )
+  case C3_Complete
+  solve( St_C2( $C, $S, sid, master, t2 ) ▶₀ #i )
+    case C2_KeyExchange
+    solve( !KU( mac(sf_key(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                                h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                   ct_eph, h(kem_pk(~sk)), ct_C>))),
+                    h(<
+                       h(<
+                          h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                             ct_eph, h(kem_pk(~sk)), ct_C>), 
+                          kem_enc(kem_pk(~sk), ~k_s)>), 
+                       mac(cf_key(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                                       h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                          ct_eph, h(kem_pk(~sk)), ct_C>))),
+                           h(<
+                              h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                 ct_eph, h(kem_pk(~sk)), ct_C>), 
+                              kem_enc(kem_pk(~sk), ~k_s)>))
+                      >))
+           ) @ #vk )
+      case S2_Finished
+      by contradiction /* from formulas */
+    next
+      case c_mac
+      solve( !KU( sf_key(kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                              h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                                 ct_eph, h(kem_pk(~sk)), ct_C>)))
+             ) @ #vk.12 )
+        case c_sf_key
+        solve( !KU( kdf3(kdf(<z, z.1>, 'hs'), <~k_s, z.2>,
+                         h(<~rc, ~sid, 'g'^~x, kem_pk(~ekC), h(kem_pk(~skC)), rs, ~sid, gy, 
+                            ct_eph, h(kem_pk(~sk)), ct_C>))
+               ) @ #vk.14 )
+          case c_kdf3
+          solve( !KU( ~k_s ) @ #vk.18 )
+            case C2_KeyExchange
+            solve( !KU( ~sk ) @ #vk.20 )
+              case Reveal_LTK
+              by contradiction /* from formulas */
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+qed
+
+lemma kci_resistance_server:
+  all-traces
+  "∀ S C sid k1 k2 #i.
+    ((Commit( S, C, <'client', sid, k1, k2> ) @ #i) ∧
+     (¬(∃ #r. Reveal( C ) @ #r))) ⇒
+    (∃ #j. Running( C, S, <'client', sid, k1, k2> ) @ #j)"
+/*
+guarded formula characterizing all counter-examples:
+"∃ S C sid k1 k2 #i.
+  (Commit( S, C, <'client', sid, k1, k2> ) @ #i)
+ ∧
+  (∀ #r. (Reveal( C ) @ #r) ⇒ ⊥) ∧
+  (∀ #j. (Running( C, S, <'client', sid, k1, k2> ) @ #j) ⇒ ⊥)"
+*/
+simplify
+solve( Commit( S, C, <'client', sid, k1, k2> ) @ #i )
+  case S2_Finished
+  solve( St_S1( $S, $C, ~skS, pkC, rc, sid, rs, dhss, k_eph, k_c, t1
+         ) ▶₀ #i )
+    case S1_Hello
+    solve( splitEqs(0) )
+      case split_case_1
+      solve( splitEqs(1) )
+        case split_case_1
+        solve( !KU( mac(cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'),
+                                    <kem_dec(~skS, ct_S), ~k_c>,
+                                    h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                       kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)
+                                      >))),
+                        h(<
+                           h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                              kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>), 
+                           ct_S>))
+               ) @ #vk.2 )
+          case c_mac
+          solve( !KU( cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'),
+                                  <kem_dec(~skS, ct_S), ~k_c>,
+                                  h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                     kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk.12 )
+            case c_cf_key
+            solve( !KU( kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.14 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.19 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.20 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      next
+        case split_case_2
+        solve( !KU( mac(cf_key(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'),
+                                    <kem_dec(~skS, ct_S), ~k_c>,
+                                    h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                       kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)
+                                      >))),
+                        h(<
+                           h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                              kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>), 
+                           ct_S>))
+               ) @ #vk.2 )
+          case c_mac
+          solve( !KU( cf_key(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'),
+                                  <kem_dec(~skS, ct_S), ~k_c>,
+                                  h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                     kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk.12 )
+            case c_cf_key
+            solve( !KU( kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'),
+                             <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.14 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.19 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.20 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      next
+        case split_case_3
+        solve( !KU( mac(cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                                    <kem_dec(~skS, ct_S), ~k_c>,
+                                    h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                       kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)
+                                      >))),
+                        h(<
+                           h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                              kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>), 
+                           ct_S>))
+               ) @ #vk.2 )
+          case c_mac
+          solve( !KU( cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                                  <kem_dec(~skS, ct_S), ~k_c>,
+                                  h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                     kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk.12 )
+            case c_cf_key
+            solve( !KU( kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'),
+                             <kem_dec(~skS, ct_S), ~k_c>,
+                             h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.14 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.19 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.20 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    next
+      case split_case_2
+      solve( splitEqs(1) )
+        case split_case_1
+        solve( !KU( mac(cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                                    h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                       kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)
+                                      >))),
+                        h(<
+                           h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                              kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>), 
+                           kem_enc(kem_pk(~skS), z)>))
+               ) @ #vk.2 )
+          case c_mac
+          solve( !KU( cf_key(kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                                  h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                     kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk.12 )
+            case c_cf_key
+            solve( !KU( kdf3(kdf(<gx^~y, ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, gx, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.14 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.19 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.20 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      next
+        case split_case_2
+        solve( !KU( mac(cf_key(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'), <z, ~k_c>,
+                                    h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                       kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)
+                                      >))),
+                        h(<
+                           h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                              kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>), 
+                           kem_enc(kem_pk(~skS), z)>))
+               ) @ #vk.2 )
+          case C2_KeyExchange
+          by contradiction /* from formulas */
+        next
+          case c_mac
+          solve( !KU( cf_key(kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'), <z, ~k_c>,
+                                  h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                     kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk.12 )
+            case c_cf_key
+            solve( !KU( kdf3(kdf(<x^(~y*x.1), ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, x^x.1, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.14 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.19 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.20 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      next
+        case split_case_3
+        solve( !KU( mac(cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                                    h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                       kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)
+                                      >))),
+                        h(<
+                           h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                              kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>), 
+                           kem_enc(kem_pk(~skS), z)>))
+               ) @ #vk.2 )
+          case c_mac
+          solve( !KU( cf_key(kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                                  h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                     kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>)))
+                 ) @ #vk.12 )
+            case c_cf_key
+            solve( !KU( kdf3(kdf(<DH_neutral, ~k_eph>, 'hs'), <z, ~k_c>,
+                             h(<rc, sid, DH_neutral, eph_pkC, h(kem_pk(~sk)), ~rs, sid, 'g'^~y, 
+                                kem_enc(eph_pkC, ~k_eph), h(kem_pk(~skS)), kem_enc(kem_pk(~sk), ~k_c)>))
+                   ) @ #vk.14 )
+              case c_kdf3
+              solve( !KU( ~k_c ) @ #vk.19 )
+                case S1_Hello
+                solve( !KU( ~sk ) @ #vk.20 )
+                  case Reveal_LTK
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+qed
+
+/* All wellformedness checks were successful. */
+
+/*
+Generated from:
+Tamarin version 1.12.0
+Maude version 3.5.1
+Git revision: 82780bbaf3328a45f624ddb41e51bf75425f851c (with uncommited changes), branch: master
+Compiled at: 2026-03-07 14:22:39.174278293 UTC
+*/
+
+end
+
+==============================================================================
+summary of summaries:
+
+analyzed: formal/pqvpn_v3.spthy
+
+  processing time: 20.87s
+  
+  protocol_completes (exists-trace): verified (21 steps)
+  session_key_secrecy (all-traces): verified (84 steps)
+  forward_secrecy (all-traces): verified (186 steps)
+  server_auth (all-traces): verified (10 steps)
+  client_auth (all-traces): verified (43 steps)
+  kci_resistance_client (all-traces): verified (10 steps)
+  kci_resistance_server (all-traces): verified (43 steps)
+
+==============================================================================

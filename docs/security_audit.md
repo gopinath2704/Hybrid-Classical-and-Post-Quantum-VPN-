@@ -383,8 +383,10 @@ Remaining gates/limitations: root namespace execution; real systemd activation a
 client DNS restoration; Docker runtime (raw entrypoints require explicit firewall
 setup and client DNS provisioning); real VPS + real Linux client validation;
 independent review of the custom KEMTLS-inspired protocol; classical Ed25519 client
-authentication; epoch key evolution without post-compromise recovery; incomplete
-routed IPv6, dynamic authenticated PMTU and kill switch. Python key wiping remains
+authentication; re-handshake provides post-compromise recovery against passive
+adversaries after full state compromise (active adversary with full epoch state
+including rekey secret is a stated limitation); incomplete routed IPv6, dynamic
+authenticated PMTU and kill switch. Python key wiping remains
 best-effort. Passing these checks does not establish production suitability.
 
 ## Pre-VPS hardening — 2026-09-07
@@ -512,9 +514,10 @@ tests, native validation, static checks and doctors are rerun after the final fi
 edits before the local commit/tag. Historical counts remain intact in git history.
 
 Remaining limitations: custom protocol lacks independent review; Ed25519 client
-identity proof is classical; epoch rekey provides key evolution rather than
-post-compromise recovery; routed IPv6, dynamic authenticated PMTU and general kill
-switch remain incomplete. Root namespaces, native systemd, real client DNS and
+identity proof is classical; re-handshake provides post-compromise recovery
+against passive adversaries (active adversary with full epoch state is not
+recovered from); routed IPv6, dynamic authenticated PMTU and general kill switch
+remain incomplete. Root namespaces, native systemd, real client DNS and
 **REAL VPS + SEPARATE REAL LINUX CLIENT** remain the next validation gates.
 
 ## Privileged systemd execution trust boundary

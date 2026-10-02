@@ -1,0 +1,232 @@
+/*
+ * PQVPN v3 Tamarin Model — Post-Compromise Security (Re-handshake)
+ *
+ * Companion to pqvpn_v3.spthy (handshake). This theory bootstraps
+ * session state from a completed handshake and verifies that the
+ * re-handshake protocol recovers security after epoch compromise.
+ *
+ * Modelling decisions:
+ *
+ *   Bootstrap: the handshake is abstracted as a rule that creates
+ *   session state with a fresh master secret. Two variants model the
+ *   two compromise levels:
+ *     - ControlLeak: adversary gets data keys (c2s/s2c) only
+ *     - EpochLeak:   adversary also gets the rekey secret h(<master,'rk'>)
+ *
+ *   KEM-only re-handshake: the real protocol uses X25519 + ML-KEM-768.
+ *   Modelling only KEM is a sound abstraction for secrecy properties:
+ *   DH adds an independent shared secret, so KEM-only gives the
+ *   adversary strictly more power (security under KEM-only implies
+ *   security under DH + KEM).
+ *
+ *   Passive channel: for the passive-adversary lemma, re-handshake
+ *   messages are delivered via direct channel facts (Ch_C2S / Ch_S2C),
+ *   preventing modification. The adversary can still observe messages
+ *   via Out(). This is structurally equivalent to the passivity
+ *   formula (∀ x. PassiveReceive(x) → ∃ PassiveSend(x)) but avoids
+ *   the case-split explosion that formula causes in Tamarin.
+ *
+ *   Single re-handshake: PostSession facts (not consumed by any rule)
+ *   replace Session facts after re-handshake, preventing unbounded
+ *   chaining that would create infinite term nesting.
+ *
+ * NOT modelled: timing, transport ordering, fragmentation, MTU,
+ * rate limiting, denial of service, implementation bugs, side channels.
+ */
+
+theory PQVPN_v3_PCS
+begin
+
+builtins: hashing
+
+functions:
+  kem_pk/1,
+  kem_enc/2,
+  kem_dec/2,
+  kdf/2,
+  c2s/1,
+  s2c/1
+
+equations:
+  kem_dec(sk, kem_enc(kem_pk(sk), ss)) = ss
+
+
+/* ══════════════════════════════════════════════════════════════════════
+ * Bootstrapped session state (abstracts a completed handshake)
+ *
+ * ControlLeak: adversary gets old data keys only (models traffic
+ *   key compromise without full epoch state).
+ * EpochLeak: adversary gets data keys AND the rekey secret (models
+ *   full epoch state compromise including rekey_secret).
+ * ══════════════════════════════════════════════════════════════════════ */
+
+rule Bootstrap_Control:
+  [ Fr(~sid), Fr(~master) ]
+  --[ ControlLeak($C, $S, ~sid) ]->
+  [ SessionC($C, $S, ~sid, ~master),
+    SessionS($S, $C, ~sid, ~master),
+    Out(c2s(~master)),
+    Out(s2c(~master)) ]
+
+rule Bootstrap_Epoch:
+  [ Fr(~sid), Fr(~master) ]
+  --[ EpochLeak($C, $S, ~sid) ]->
+  [ SessionC($C, $S, ~sid, ~master),
+    SessionS($S, $C, ~sid, ~master),
+    Out(c2s(~master)),
+    Out(s2c(~master)),
+    Out(h(<~master, 'rk'>)) ]
+
+
+/* ══════════════════════════════════════════════════════════════════════
+ * Active-adversary re-handshake (standard DY channel via In/Out)
+ *
+ * The adversary can intercept, modify, and inject messages.
+ * ══════════════════════════════════════════════════════════════════════ */
+
+rule RH_Client_Init:
+  let req = <sid, kem_pk(~ekR), ~epoch>
+  in
+  [ SessionC($C, $S, sid, old_master),
+    Fr(~ekR), Fr(~epoch) ]
+  -->
+  [ Out(req),
+    St_RH_C($C, $S, sid, old_master, ~ekR, ~epoch) ]
+
+rule RH_Server_Respond:
+  let ct_rh = kem_enc(eph_pkR, ~k_rh)
+      new_master = kdf(h(<old_master, 'rk'>),
+                       <~k_rh, h(<sid, 'rehandshake', epoch>)>)
+  in
+  [ SessionS($S, $C, sid, old_master),
+    In(<sid, eph_pkR, epoch>),
+    Fr(~k_rh) ]
+  --[ RH_Server($S, $C, sid, c2s(new_master), s2c(new_master)),
+      RH_SessionKey($S, $C, sid, c2s(new_master), s2c(new_master)) ]->
+  [ Out(<sid, ct_rh, epoch>),
+    PostSessionS($S, $C, sid, new_master) ]
+
+rule RH_Client_Complete:
+  let k_rh = kem_dec(~ekR, ct_rh)
+      new_master = kdf(h(<old_master, 'rk'>),
+                       <k_rh, h(<sid, 'rehandshake', epoch>)>)
+  in
+  [ St_RH_C($C, $S, sid, old_master, ~ekR, epoch),
+    In(<sid, ct_rh, epoch>) ]
+  --[ RH_Client($C, $S, sid, c2s(new_master), s2c(new_master)),
+      RH_SessionKey($C, $S, sid, c2s(new_master), s2c(new_master)) ]->
+  [ PostSessionC($C, $S, sid, new_master) ]
+
+
+/* ══════════════════════════════════════════════════════════════════════
+ * Passive-adversary re-handshake (direct channel facts)
+ *
+ * Messages are delivered faithfully via Ch_C2S / Ch_S2C facts.
+ * The adversary can still observe messages (via Out) but cannot
+ * modify, delay, or inject them.
+ * ══════════════════════════════════════════════════════════════════════ */
+
+rule RH_P_Client_Init:
+  let req = <sid, kem_pk(~ekR), ~epoch>
+  in
+  [ SessionC($C, $S, sid, old_master),
+    Fr(~ekR), Fr(~epoch) ]
+  -->
+  [ Ch_C2S($C, $S, req),
+    Out(req),
+    St_RH_PC($C, $S, sid, old_master, ~ekR, ~epoch) ]
+
+rule RH_P_Server_Respond:
+  let ct_rh = kem_enc(eph_pkR, ~k_rh)
+      new_master = kdf(h(<old_master, 'rk'>),
+                       <~k_rh, h(<sid, 'rehandshake', epoch>)>)
+      resp = <sid, ct_rh, epoch>
+  in
+  [ SessionS($S, $C, sid, old_master),
+    Ch_C2S($C, $S, <sid, eph_pkR, epoch>),
+    Fr(~k_rh) ]
+  --[ RH_P_Server($S, $C, sid, c2s(new_master), s2c(new_master)),
+      RH_P_SessionKey($S, $C, sid, c2s(new_master), s2c(new_master)) ]->
+  [ Ch_S2C($S, $C, resp),
+    Out(resp),
+    PostSessionS($S, $C, sid, new_master) ]
+
+rule RH_P_Client_Complete:
+  let k_rh = kem_dec(~ekR, ct_rh)
+      new_master = kdf(h(<old_master, 'rk'>),
+                       <k_rh, h(<sid, 'rehandshake', epoch>)>)
+  in
+  [ St_RH_PC($C, $S, sid, old_master, ~ekR, epoch),
+    Ch_S2C($S, $C, <sid, ct_rh, epoch>) ]
+  --[ RH_P_Client($C, $S, sid, c2s(new_master), s2c(new_master)),
+      RH_P_SessionKey($C, $S, sid, c2s(new_master), s2c(new_master)) ]->
+  [ PostSessionC($C, $S, sid, new_master) ]
+
+
+/* ══════════════════════════════════════════════════════════════════════
+ * Sanity lemmas
+ * ══════════════════════════════════════════════════════════════════════ */
+
+lemma rehandshake_completes:
+  exists-trace
+  "Ex C S sid k1 k2 #i #j.
+     RH_Client(C, S, sid, k1, k2) @ #i &
+     RH_Server(S, C, sid, k1, k2) @ #j"
+
+lemma passive_rehandshake_completes:
+  exists-trace
+  "Ex C S sid k1 k2 #i #j.
+     RH_P_Client(C, S, sid, k1, k2) @ #i &
+     RH_P_Server(S, C, sid, k1, k2) @ #j"
+
+
+/* ══════════════════════════════════════════════════════════════════════
+ * Post-Compromise Security lemmas
+ * ══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Control-key-only compromise: adversary has old data keys (c2s/s2c)
+ * via ControlLeak or EpochLeak, but NOT the rekey secret. Active
+ * adversary (DY) — can modify re-handshake messages. New epoch keys
+ * stay secret because the rekey secret is needed to compute them.
+ *
+ * Note: the lemma excludes EpochLeak universally, so only
+ * Bootstrap_Control traces apply. RevealControl on old data keys is
+ * implicitly modelled by the Bootstrap's Out(c2s/s2c).
+ */
+lemma pcs_control_keys_only:
+  "All S C sid k1 k2 #i.
+     RH_SessionKey(S, C, sid, k1, k2) @ #i &
+     not (Ex C2 S2 sid2 #r. EpochLeak(C2, S2, sid2) @ #r)
+   ==>
+     not (Ex #k. K(k1) @ #k) &
+     not (Ex #k. K(k2) @ #k)"
+
+/*
+ * Full epoch compromise, passive adversary: adversary has old data
+ * keys AND the rekey secret (via EpochLeak or ControlLeak). Messages
+ * are delivered faithfully (direct channel). New keys stay secret
+ * because the KEM exchange provides fresh randomness the passive
+ * adversary cannot learn.
+ */
+lemma pcs_passive_after_epoch_compromise:
+  "All S C sid k1 k2 #i.
+     RH_P_SessionKey(S, C, sid, k1, k2) @ #i
+   ==>
+     not (Ex #k. K(k1) @ #k) &
+     not (Ex #k. K(k2) @ #k)"
+
+/*
+ * Attack: active adversary with full epoch state (rekey secret via
+ * EpochLeak) CAN learn new keys by MITMing the re-handshake.
+ * (exists-trace; verified = attack found = documents the known
+ * limitation of the protocol)
+ */
+lemma attack_active_after_epoch_compromise:
+  exists-trace
+  "Ex S C sid k1 k2 #i #r #k.
+     RH_SessionKey(S, C, sid, k1, k2) @ #i &
+     EpochLeak(S, C, sid) @ #r &
+     K(k1) @ #k"
+
+end

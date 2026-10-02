@@ -700,8 +700,9 @@ def test_rehandshake_epoch_derives_new_keys(v3_identities):
     ct, k_enc = hybrid.pqc.encapsulate(kem_pk)
     k_dec = hybrid.pqc.decapsulate(kem_sk, ct)
     assert k_enc == k_dec
-    cn = c.derive_rehandshake_epoch(1, dh_ss_c, k_enc)
-    sn = s.derive_rehandshake_epoch(1, dh_ss_s, k_dec)
+    transcript = dh_pub_c + dh_pub_s + ct
+    cn = c.derive_rehandshake_epoch(1, dh_ss_c, k_enc, transcript)
+    sn = s.derive_rehandshake_epoch(1, dh_ss_s, k_dec, transcript)
     c.activate_epoch(1, cn)
     s.activate_epoch(1, sn)
     assert s.decrypt_frame(c.encrypt_frame(b"post-rh"))[1] == b"post-rh"
@@ -720,8 +721,9 @@ def test_rehandshake_old_epoch_rejected(v3_identities):
     kem_sk, kem_pk = hybrid.pqc.generate_keypair()
     ct, k = hybrid.pqc.encapsulate(kem_pk)
     k2 = hybrid.pqc.decapsulate(kem_sk, ct)
-    cn = c.derive_rehandshake_epoch(1, dh_ss, k)
-    sn = s.derive_rehandshake_epoch(1, dh_ss2, k2)
+    transcript = dh_pub + dh_pub2 + ct
+    cn = c.derive_rehandshake_epoch(1, dh_ss, k, transcript)
+    sn = s.derive_rehandshake_epoch(1, dh_ss2, k2, transcript)
     c.activate_epoch(1, cn)
     s.activate_epoch(1, sn)
     with pytest.raises(HandshakeError):
@@ -732,16 +734,16 @@ def test_rehandshake_old_epoch_rejected(v3_identities):
 def test_rehandshake_wrong_epoch_rejected(v3_identities):
     c, s = exchange_v3(v3_identities)
     with pytest.raises(HandshakeError, match="invalid rehandshake epoch"):
-        c.derive_rehandshake_epoch(5, os.urandom(32), os.urandom(32))
+        c.derive_rehandshake_epoch(5, os.urandom(32), os.urandom(32), b"transcript")
 
 
 @pytest.mark.mock_pqc
 def test_rehandshake_bad_secret_length_rejected(v3_identities):
     c, _ = exchange_v3(v3_identities)
     with pytest.raises(HandshakeError, match="invalid rehandshake shared secrets"):
-        c.derive_rehandshake_epoch(1, os.urandom(16), os.urandom(32))
+        c.derive_rehandshake_epoch(1, os.urandom(16), os.urandom(32), b"transcript")
     with pytest.raises(HandshakeError, match="invalid rehandshake shared secrets"):
-        c.derive_rehandshake_epoch(1, os.urandom(32), os.urandom(16))
+        c.derive_rehandshake_epoch(1, os.urandom(32), os.urandom(16), b"transcript")
 
 
 @pytest.mark.mock_pqc
@@ -756,8 +758,9 @@ def test_rehandshake_multiple_epochs(v3_identities):
         kem_sk, kem_pk = hybrid.pqc.generate_keypair()
         ct, k = hybrid.pqc.encapsulate(kem_pk)
         k2 = hybrid.pqc.decapsulate(kem_sk, ct)
-        cn = c.derive_rehandshake_epoch(epoch, dh_ss_c, k)
-        sn = s.derive_rehandshake_epoch(epoch, dh_ss_s, k2)
+        transcript = dh_pub_c + dh_pub_s + ct
+        cn = c.derive_rehandshake_epoch(epoch, dh_ss_c, k, transcript)
+        sn = s.derive_rehandshake_epoch(epoch, dh_ss_s, k2, transcript)
         c.activate_epoch(epoch, cn)
         s.activate_epoch(epoch, sn)
     msg = f"epoch-{epoch}".encode()
@@ -778,8 +781,9 @@ def test_rehandshake_pcs_recovery(v3_identities):
     kem_sk, kem_pk = hybrid.pqc.generate_keypair()
     ct, k = hybrid.pqc.encapsulate(kem_pk)
     k2 = hybrid.pqc.decapsulate(kem_sk, ct)
-    cn = c.derive_rehandshake_epoch(1, dh_ss_c, k)
-    sn = s.derive_rehandshake_epoch(1, dh_ss_s, k2)
+    transcript = dh_pub_c + dh_pub_s + ct
+    cn = c.derive_rehandshake_epoch(1, dh_ss_c, k, transcript)
+    sn = s.derive_rehandshake_epoch(1, dh_ss_s, k2, transcript)
     c.activate_epoch(1, cn)
     s.activate_epoch(1, sn)
     assert bytes(c.secrets.client_to_server_key) != leaked_c2s
@@ -804,11 +808,88 @@ def test_rehandshake_after_rekey(v3_identities):
     kem_sk, kem_pk = hybrid.pqc.generate_keypair()
     ct, k = hybrid.pqc.encapsulate(kem_pk)
     k2 = hybrid.pqc.decapsulate(kem_sk, ct)
-    cn2 = c.derive_rehandshake_epoch(2, dh_ss_c, k)
-    sn2 = s.derive_rehandshake_epoch(2, dh_ss_s, k2)
+    transcript = dh_pub_c + dh_pub_s + ct
+    cn2 = c.derive_rehandshake_epoch(2, dh_ss_c, k, transcript)
+    sn2 = s.derive_rehandshake_epoch(2, dh_ss_s, k2, transcript)
     c.activate_epoch(2, cn2)
     s.activate_epoch(2, sn2)
     assert s.decrypt_frame(c.encrypt_frame(b"post-rekey-rh"))[1] == b"post-rekey-rh"
+
+
+@pytest.mark.mock_pqc
+def test_rehandshake_empty_transcript_rejected(v3_identities):
+    c, _ = exchange_v3(v3_identities)
+    with pytest.raises(HandshakeError, match="empty rehandshake transcript"):
+        c.derive_rehandshake_epoch(1, os.urandom(32), os.urandom(32), b"")
+
+
+@pytest.mark.mock_pqc
+def test_rehandshake_wrong_rekey_secret_yields_different_keys(v3_identities):
+    """A forged request under old control keys but wrong rekey_secret produces mismatched keys."""
+    c, s = exchange_v3(v3_identities)
+    hybrid = HybridKEM("ML-KEM-768")
+    dh_priv_c, dh_pub_c = hybrid.ecc.generate_keypair()
+    dh_priv_s, dh_pub_s = hybrid.ecc.generate_keypair()
+    dh_ss_c = hybrid.ecc.derive_shared_secret(dh_priv_c, dh_pub_s)
+    dh_ss_s = hybrid.ecc.derive_shared_secret(dh_priv_s, dh_pub_c)
+    kem_sk, kem_pk = hybrid.pqc.generate_keypair()
+    ct, k = hybrid.pqc.encapsulate(kem_pk)
+    k2 = hybrid.pqc.decapsulate(kem_sk, ct)
+    transcript = dh_pub_c + dh_pub_s + ct
+    cn = c.derive_rehandshake_epoch(1, dh_ss_c, k, transcript)
+    # Corrupt rekey_secret on server side before deriving
+    s.secrets.rekey_secret = bytearray(os.urandom(32))
+    sn = s.derive_rehandshake_epoch(1, dh_ss_s, k2, transcript)
+    c.activate_epoch(1, cn)
+    s.activate_epoch(1, sn)
+    # Keys differ: decryption must fail
+    with pytest.raises(HandshakeError):
+        s.decrypt_frame(c.encrypt_frame(b"wrong-secret"))
+
+
+@pytest.mark.mock_pqc
+def test_rehandshake_tampered_dh_public_key_yields_different_keys(v3_identities):
+    """Tampered DH public key produces mismatched shared secrets and keys."""
+    c, s = exchange_v3(v3_identities)
+    hybrid = HybridKEM("ML-KEM-768")
+    dh_priv_c, dh_pub_c = hybrid.ecc.generate_keypair()
+    dh_priv_s, dh_pub_s = hybrid.ecc.generate_keypair()
+    dh_ss_c = hybrid.ecc.derive_shared_secret(dh_priv_c, dh_pub_s)
+    # Server uses a different (tampered) client DH pub
+    tampered_pub = os.urandom(32)
+    dh_ss_s = hybrid.ecc.derive_shared_secret(dh_priv_s, tampered_pub)
+    kem_sk, kem_pk = hybrid.pqc.generate_keypair()
+    ct, k = hybrid.pqc.encapsulate(kem_pk)
+    k2 = hybrid.pqc.decapsulate(kem_sk, ct)
+    transcript = dh_pub_c + dh_pub_s + ct
+    cn = c.derive_rehandshake_epoch(1, dh_ss_c, k, transcript)
+    sn = s.derive_rehandshake_epoch(1, dh_ss_s, k2, transcript)
+    c.activate_epoch(1, cn)
+    s.activate_epoch(1, sn)
+    with pytest.raises(HandshakeError):
+        s.decrypt_frame(c.encrypt_frame(b"tampered-dh"))
+
+
+@pytest.mark.mock_pqc
+def test_rehandshake_transcript_mismatch_yields_different_keys(v3_identities):
+    """Mismatched transcripts produce different epoch keys even with same shared secrets."""
+    c, s = exchange_v3(v3_identities)
+    hybrid = HybridKEM("ML-KEM-768")
+    dh_priv_c, dh_pub_c = hybrid.ecc.generate_keypair()
+    dh_priv_s, dh_pub_s = hybrid.ecc.generate_keypair()
+    dh_ss_c = hybrid.ecc.derive_shared_secret(dh_priv_c, dh_pub_s)
+    dh_ss_s = hybrid.ecc.derive_shared_secret(dh_priv_s, dh_pub_c)
+    kem_sk, kem_pk = hybrid.pqc.generate_keypair()
+    ct, k = hybrid.pqc.encapsulate(kem_pk)
+    k2 = hybrid.pqc.decapsulate(kem_sk, ct)
+    transcript_c = dh_pub_c + dh_pub_s + ct
+    transcript_s = dh_pub_c + dh_pub_s + ct + b"\x00"  # one extra byte
+    cn = c.derive_rehandshake_epoch(1, dh_ss_c, k, transcript_c)
+    sn = s.derive_rehandshake_epoch(1, dh_ss_s, k2, transcript_s)
+    c.activate_epoch(1, cn)
+    s.activate_epoch(1, sn)
+    with pytest.raises(HandshakeError):
+        s.decrypt_frame(c.encrypt_frame(b"transcript-mismatch"))
 
 
 # ─── Cookie / DoS Resistance Tests ─────────────────────────────────────────
