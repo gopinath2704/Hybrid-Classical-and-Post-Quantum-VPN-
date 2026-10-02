@@ -19,27 +19,23 @@ from app.client import (
     ClientService, ConnectionState, MAX_IPC_MESSAGE, ipc_recv, ipc_send,
 )
 from vpn import cli
-from vpn.enrollment import (
+from vpn.identity import (
+    AuthorizedClients,
     EnrollmentError,
     EnrollmentRequest,
     MAX_ENROLLMENT_SIZE,
-    load_enrollment,
-    parse_enrollment,
-    write_enrollment,
-)
-from vpn.identity import (
-    AuthorizedClients,
-    client_public_identity,
-    ensure_client_identity,
-    fingerprint,
-)
-from vpn.profiles import (
     MAX_PROFILE_SIZE,
     MAX_PROFILES,
     ProfileError,
     ProfileStore,
     ServerProfile,
+    client_public_identity,
+    ensure_client_identity,
+    fingerprint,
+    load_enrollment,
+    parse_enrollment,
     parse_profile,
+    write_enrollment,
 )
 
 
@@ -431,7 +427,7 @@ def test_packaging_foundation_has_safe_launcher_and_managed_service():
     root = Path(__file__).parents[1]
     desktop = (root / "packaging/common/pqvpn.desktop").read_text()
     service = (root / "packaging/common/pqvpn-client.service").read_text()
-    deploy_service = (root / "deploy/pqvpn-client.service").read_text()
+    deploy_service = (root / "packaging/common/pqvpn-client-deploy.service").read_text()
     arch = (root / "packaging/arch/PKGBUILD").read_text()
     liboqs_arch = (root / "packaging/arch/liboqs-pqvpn/PKGBUILD").read_text()
     python_oqs_arch = (

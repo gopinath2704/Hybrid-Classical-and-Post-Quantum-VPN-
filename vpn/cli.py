@@ -1,24 +1,251 @@
-"""Provisioning and Linux VPN client/server command line."""
+"""Provisioning, diagnostics, and Linux VPN client/server command line."""
 from __future__ import annotations
 
 import argparse
 import base64
+import ipaddress
+import json
 import logging
+import os
+import pwd
+import re
+import shutil
 import signal
+import socket
+import stat
+import subprocess
 import sys
 from pathlib import Path
 
-from crypto.hybrid_crypto import get_crypto_status
+from crypto.hybrid_crypto import PQCProvider, _OQS_AVAILABLE, _oqs_module, get_crypto_status
 from vpn.accounts import DEFAULT_ACCOUNT_DATABASE, DEVICE_STATUSES, AccountError, AccountStore
 from vpn.config import load_client_config, load_server_config, validate_client
-from vpn.enrollment import (
-    EnrollmentRequest,
-    load_ed25519_public_key,
-    load_enrollment,
-    write_enrollment,
+from vpn.identity import (
+    AuthorizedClients, EnrollmentRequest, fingerprint, generate_client_identity,
+    generate_client_identity_kem, generate_server_identity,
+    load_client_private, load_client_public_key, load_ed25519_public_key,
+    load_enrollment, validate_server_identity, write_enrollment,
 )
-from vpn.identity import AuthorizedClients, generate_client_identity, generate_server_identity
+from vpn.network import connectivity, effective_policy
 from vpn.runtime import VPNClient, VPNServer
+
+
+def command(*args):
+    return subprocess.run(args, check=True, capture_output=True, text=True, timeout=5).stdout
+
+
+def overlapping_routes(routes, subnet):
+    network = ipaddress.IPv4Network(subnet)
+    conflicts = []
+    for route in routes:
+        destination = route.get('dst', 'default')
+        if destination == 'default': continue
+        try: other = ipaddress.IPv4Network(destination, strict=False)
+        except ValueError: continue
+        if other.overlaps(network): conflicts.append(f"{destination} dev {route.get('dev', '?')}")
+    return conflicts
+
+
+def readable_as(path, username):
+    account = pwd.getpwnam(username)
+    groups = os.getgrouplist(username, account.pw_gid)
+    target = Path(path).resolve(strict=True)
+    for entry in [*reversed(target.parents), target]:
+        info = entry.stat()
+        bits = (info.st_mode >> 6 if info.st_uid == account.pw_uid else
+                info.st_mode >> 3 if info.st_gid in groups else info.st_mode)
+        required = 1 if entry.is_dir() else 4
+        if not bits & required: return False
+    return True
+
+
+PRODUCTION_ROOT = Path('/opt/pqvpn')
+
+
+def production_deployment(config_path):
+    """Apply the packaged systemd layout only to production diagnostics."""
+    return (Path(config_path).absolute().is_relative_to('/etc/pqvpn') or
+            Path(__file__).resolve().is_relative_to(PRODUCTION_ROOT) or
+            Path(sys.executable).absolute().is_relative_to(PRODUCTION_ROOT))
+
+
+def privileged_code_permissions(root=PRODUCTION_ROOT):
+    """Audit the code/venv tree, symlink targets and replacement-capable parents."""
+    root = Path(root).absolute()
+    for required in ('scripts/server-network.sh',
+                     'vpn/network.py', 'handshake', 'crypto', '.venv/bin/python'):
+        (root / required).stat()
+    seen = set()
+
+    def inspect(path):
+        info = path.lstat()
+        if info.st_uid != 0:
+            raise ValueError(f'{path}: privileged code must be root-owned')
+        if not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022:
+            raise ValueError(f'{path}: privileged code is group/world writable')
+        if stat.S_ISLNK(info.st_mode):
+            visit(resolve_trusted_link(path))
+        elif stat.S_ISDIR(info.st_mode):
+            for child in sorted(path.iterdir()):
+                visit(child)
+        elif not stat.S_ISREG(info.st_mode):
+            raise ValueError(f'{path}: unexpected privileged code file type')
+
+    def resolve_trusted_link(path):
+        pending = list(path.parts[1:])
+        current = Path(path.anchor)
+        links = 0
+        while pending:
+            part = pending.pop(0)
+            if part == '..':
+                current = current.parent
+                continue
+            candidate = current / part
+            info = candidate.lstat()
+            if info.st_uid != 0:
+                raise ValueError(f'{candidate}: privileged code must be root-owned')
+            if stat.S_ISLNK(info.st_mode):
+                links += 1
+                if links > 40:
+                    raise ValueError(f'{path}: excessive or cyclic symlinks')
+                target = Path(os.readlink(candidate))
+                if target.is_absolute():
+                    current = Path(target.anchor)
+                    pending = list(target.parts[1:]) + pending
+                else:
+                    pending = list(target.parts) + pending
+            else:
+                inspect_metadata(candidate)
+                current = candidate
+        return current
+
+    def inspect_metadata(path):
+        info = path.stat()
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError(f'{path}: privileged code ancestor must be root-owned and not group/world writable')
+
+    def visit(path):
+        if path in seen:
+            return
+        seen.add(path)
+        inspect(path)
+
+    for parent in reversed(root.parents):
+        inspect_metadata(parent)
+    visit(root)
+    return f'{root}: root-owned code/venv, no group/world writes; symlink targets and ancestors checked'
+
+
+def doctor_run(role, config_path):
+    rows = []
+    def report(level, label, detail=''):
+        rows.append((level, label, detail))
+    def check(label, function):
+        try:
+            detail = function()
+            if detail is False: raise ValueError('check failed')
+            report('PASS', label, '' if detail is None or detail is True else str(detail))
+        except Exception as exc:
+            report('FAIL', label, str(exc))
+    if role == 'server':
+        if production_deployment(config_path):
+            check('Privileged systemd code ownership', privileged_code_permissions)
+        else:
+            report('PASS', 'Privileged systemd code ownership',
+                   'not applicable: development paths; production /opt/pqvpn not audited')
+    check('Python minimum runtime version (3.11)', lambda: sys.version_info >= (3, 11))
+    report('PASS' if sys.version_info[:3] == (3, 14, 7) else 'WARN',
+           'Python tested baseline', '3.14.7; other versions require fresh validation')
+    def native():
+        if not _OQS_AVAILABLE: raise ValueError('native ML-KEM-768 is unavailable; install liboqs explicitly')
+        if os.environ.get('ALLOW_MOCK_PQC') == '1': raise ValueError('unset ALLOW_MOCK_PQC for deployment')
+        provider = PQCProvider()
+        secret, public = provider.generate_keypair()
+        ct, a = provider.encapsulate(public)
+        if provider.decapsulate(secret, ct) != a or not provider.is_quantum_safe: raise ValueError('native self-test failed')
+        return f'Python {sys.version.split()[0]}, liboqs-python {_oqs_module.oqs_python_version()}, liboqs {_oqs_module.oqs_version()}'
+    check('Native ML-KEM-768 / no mock / self-test', native)
+    try:
+        cfg = (load_server_config if role == 'server' else load_client_config)(config_path)
+        report('PASS', 'Configuration')
+    except Exception as exc:
+        report('FAIL', 'Configuration', str(exc))
+        cfg = None
+    check('Linux TUN device', lambda: stat.S_ISCHR(Path('/dev/net/tun').stat().st_mode))
+    for executable in (('ip', 'nft', 'sysctl', 'ss') if role == 'server' else ('ip',)):
+        check(f'{executable} executable', lambda executable=executable: bool(shutil.which(executable)))
+    if cfg:
+        subnet = cfg.vpn_subnet if role == 'server' else cfg.expected_vpn_subnet
+        def routes():
+            conflicts = overlapping_routes(json.loads(command('ip', '-j', '-4', 'route', 'show', 'table', 'all')), subnet)
+            for interface in json.loads(command('ip', '-j', '-4', 'addr', 'show')):
+                for address in interface.get('addr_info', []):
+                    cidr = f"{address['local']}/{address['prefixlen']}"
+                    if ipaddress.IPv4Network(cidr, strict=False).overlaps(ipaddress.IPv4Network(subnet)):
+                        conflicts.append(f"{cidr} on {interface['ifname']}")
+            if conflicts: raise ValueError('VPN subnet overlaps: ' + ', '.join(conflicts))
+            return f'no visible route/interface conflicts with {subnet}'
+        check('VPN subnet collisions (including visible container routes)', routes)
+        if role == 'server':
+            check('Server identity pair and private permissions', lambda: bool(validate_server_identity(Path(cfg.server_identity_private_key), Path(cfg.server_identity_public_key))))
+            def database():
+                db = AuthorizedClients(Path(cfg.authorized_clients_file))._load(required=True, subnet=cfg.vpn_subnet, server_ip=cfg.server_vpn_ip)
+                return f"{len(db['clients'])} validated records"
+            check('Authorized client database', database)
+            def wan():
+                default = json.loads(command('ip', '-j', '-4', 'route', 'show', 'default'))
+                if not default: raise ValueError('no default IPv4 route')
+                name = cfg.outbound_interface or default[0]['dev']
+                command('ip', 'link', 'show', 'dev', name)
+                return name
+            check('Default IPv4 route and WAN interface', wan)
+            def forwarding():
+                value = command('sysctl', '-n', 'net.ipv4.ip_forward').strip()
+                if value != '1' and not cfg.manage_ip_forward: raise ValueError('forwarding disabled while manage_ip_forward=false')
+                return f'{value}; manage_ip_forward={cfg.manage_ip_forward}'
+            check('IP forwarding state', forwarding)
+            for protocol, port in [('tcp', cfg.control_port), ('udp', cfg.udp_port)]:
+                def available(protocol=protocol, port=port):
+                    output = command('ss', '-H', '-ln' + ('t' if protocol == 'tcp' else 'u'))
+                    if any(re.search(rf':{port}$', line.split()[3]) for line in output.splitlines() if len(line.split()) >= 4):
+                        raise ValueError(f'{protocol}/{port} already in use')
+                    return f'{protocol}/{port} appears available (read-only snapshot)'
+                check(f'{protocol} listener availability', available)
+            for path in [config_path, cfg.server_identity_private_key, cfg.server_identity_public_key, cfg.authorized_clients_file]:
+                check(f'{cfg.service_user} can read {path}', lambda path=path: readable_as(path, cfg.service_user))
+            report('WARN', 'External provider/host firewall requires operator verification',
+                   f'allow {cfg.control_port}/TCP and {cfg.udp_port}/UDP; keep 8000 private; restrict SSH administrator sources; inspect ss -lntup and nft list ruleset')
+        else:
+            policy = effective_policy(cfg.full_tunnel, cfg.ipv6_policy)
+            def ipv6_policy():
+                visible = connectivity(command)
+                if policy == 'fail' and visible:
+                    raise ValueError('IPv6 connectivity exists: ' + '; '.join(visible))
+                if policy == 'block' and not shutil.which('nft'):
+                    raise ValueError('ipv6_policy=block requires nft')
+                return f'{policy}; {len(visible)} visible IPv6 routes/addresses (read-only snapshot)'
+            if cfg.full_tunnel or cfg.ipv6_policy is not None:
+                check('IPv6 leak policy', ipv6_policy)
+            if policy == 'allow':
+                report('WARN', 'IPv6 bypass explicitly permitted' if cfg.ipv6_policy else 'Split-tunnel IPv6 outside VPN scope',
+                       'IPv6 traffic is not protected by PQVPN')
+            def server_pin():
+                public = Path(cfg.server_identity_public_key).read_bytes()
+                if len(public) != 1184: raise ValueError('server public key must be 1184 bytes')
+                if not re.fullmatch('[0-9a-fA-F]{64}', cfg.server_identity_fingerprint): raise ValueError('server fingerprint must be exactly 64 hex characters')
+                if fingerprint(public) != cfg.server_identity_fingerprint.lower(): raise ValueError('server fingerprint mismatch')
+            check('Provisioned server identity and pin', server_pin)
+            check('Client private identity and permissions', lambda: bool(load_client_private(Path(cfg.client_identity_private_key))))
+            if cfg.dns_mode == 'none': report('WARN', 'DNS explicitly unmanaged', 'DNS may bypass the VPN')
+            else: check('systemd-resolved DNS manager', lambda: bool(shutil.which('resolvectl')) and bool(command('resolvectl', 'status')))
+            def resolve():
+                address = socket.gethostbyname(cfg.server_host)
+                command('ip', '-4', 'route', 'get', address)
+                return address
+            check('Server hostname resolves and IPv4 route exists', resolve)
+    for level, label, detail in rows:
+        print(f'{level} {label}' + (f': {detail}' if detail else ''))
+    return 1 if any(level == 'FAIL' for level, _, _ in rows) else 0
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -41,6 +268,7 @@ def _parser() -> argparse.ArgumentParser:
     generate_key = key_actions.add_parser("generate")
     generate_key.add_argument("--private", default="config/client_identity_private.key")
     generate_key.add_argument("--public", default="config/client_identity_public.key")
+    generate_key.add_argument("--kem", action="store_true", help="generate ML-KEM-768 identity for v3 protocol")
 
     client = commands.add_parser("client")
     client_actions = client.add_subparsers(dest="action", required=True)
@@ -186,27 +414,31 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     if args.command == "doctor":
-        from vpn.doctor import run
-        raise SystemExit(run(args.role, args.config))
+        raise SystemExit(doctor_run(args.role, args.config))
     if args.command == "identity":
         result = generate_server_identity(Path(args.private), Path(args.public))
         print(f"server identity fingerprint: {result}")
         return
     if args.command == "client-key":
-        result = generate_client_identity(Path(args.private), Path(args.public))
-        print(f"client identity fingerprint: {result}")
+        if args.kem:
+            result = generate_client_identity_kem(Path(args.private), Path(args.public))
+            print(f"client ML-KEM-768 identity fingerprint: {result}")
+        else:
+            result = generate_client_identity(Path(args.private), Path(args.public))
+            print(f"client identity fingerprint: {result}")
         return
     if args.command == "client" and args.action == "authorize":
         candidate = Path(args.public_key)
-        raw = candidate.read_bytes() if candidate.exists() else base64.b64decode(
-            args.public_key, validate=True
-        )
+        if candidate.exists():
+            raw = candidate.read_bytes()
+        else:
+            raw = base64.b64decode(args.public_key, validate=True)
         print(AuthorizedClients(Path(args.database)).authorize(
             raw, args.client_id, args.vpn_ip
         ))
         return
     if args.command == "client" and args.action == "enrollment-request":
-        public_key = load_ed25519_public_key(Path(args.public_key))
+        public_key = load_client_public_key(Path(args.public_key))
         request = EnrollmentRequest.create(args.client_id, public_key)
         write_enrollment(Path(args.output), request)
         print("Enrollment request created")

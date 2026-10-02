@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 
-from crypto.hybrid_crypto import HybridKEM, KeyManager, _secure_zero
+from crypto.hybrid_crypto import HybridKEM, KeyManager, PQSignatureProvider, MLDSA44_PARAMS, _secure_zero
 from vpn.identity import fingerprint, verify_client_signature
 
 MAGIC = 0x4856
@@ -43,6 +43,8 @@ class MessageType(enum.IntEnum):
     SERVER_HELLO = 2
     CLIENT_KEY_EXCHANGE = 3
     SERVER_FINISHED = 4
+    COOKIE_CHALLENGE = 5
+    COOKIE_RESPONSE = 6
     HANDSHAKE_ERROR = 0xFF
 
 
@@ -57,6 +59,8 @@ class FrameType(enum.IntEnum):
     REKEY_REQUEST = 8
     REKEY_RESPONSE = 9
     ERROR = 10
+    REHANDSHAKE_REQUEST = 11
+    REHANDSHAKE_RESPONSE = 12
 
 
 class Direction(enum.IntEnum):
@@ -73,19 +77,19 @@ class HandshakeError(Exception):
     pass
 
 
-def _pack_header(msg_type: MessageType, payload_length: int) -> bytes:
+def _pack_header(msg_type: MessageType, payload_length: int, version: int = PROTOCOL_VERSION) -> bytes:
     if payload_length <= 0 or payload_length > MAX_HANDSHAKE_MESSAGE - HEADER_SIZE:
         raise HandshakeError("invalid handshake payload length")
-    return struct.pack(HEADER_FORMAT, MAGIC, PROTOCOL_VERSION, int(msg_type), payload_length)
+    return struct.pack(HEADER_FORMAT, MAGIC, version, int(msg_type), payload_length)
 
 
-def _unpack_header(data: bytes) -> tuple[int, int, int, int]:
+def _unpack_header(data: bytes, version: int = PROTOCOL_VERSION) -> tuple[int, int, int, int]:
     if len(data) < HEADER_SIZE:
         raise HandshakeError(f"Header too short: expected {HEADER_SIZE} bytes, got {len(data)}")
-    magic, version, msg_type, length = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
+    magic, ver, msg_type, length = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
     if magic != MAGIC:
         raise HandshakeError("Invalid magic")
-    if version != PROTOCOL_VERSION:
+    if ver != version:
         raise HandshakeError("Unsupported version")
     if length <= 0 or length > MAX_HANDSHAKE_MESSAGE - HEADER_SIZE:
         raise HandshakeError("invalid handshake payload length")
@@ -95,11 +99,11 @@ def _unpack_header(data: bytes) -> tuple[int, int, int, int]:
         MessageType(msg_type)
     except ValueError as exc:
         raise HandshakeError("unexpected handshake message type") from exc
-    return magic, version, msg_type, length
+    return magic, ver, msg_type, length
 
 
-def _fixed(data: bytes, wanted: MessageType, expected: int) -> bytes:
-    _, _, msg_type, length = _unpack_header(data)
+def _fixed(data: bytes, wanted: MessageType, expected: int, version: int = PROTOCOL_VERSION) -> bytes:
+    _, _, msg_type, length = _unpack_header(data, version)
     if msg_type != wanted:
         raise HandshakeError(f"Expected {wanted.name}")
     if length != expected:
@@ -192,6 +196,91 @@ class ServerFinished:
         return cls(_fixed(data, MessageType.SERVER_FINISHED, 32))
 
 
+COOKIE_SIZE = 32
+COOKIE_BUCKET_SECONDS = 120
+
+
+class CookieProtector:
+    """Stateless HMAC cookie for DoS resistance (WireGuard/DTLS pattern)."""
+
+    def __init__(self, bucket_seconds: int = COOKIE_BUCKET_SECONDS) -> None:
+        self._bucket = bucket_seconds
+        self._secret = os.urandom(32)
+        self._prev_secret = os.urandom(32)
+        self._rotated_at = time.monotonic()
+
+    def _rotate_if_needed(self) -> None:
+        now = time.monotonic()
+        if now - self._rotated_at >= self._bucket:
+            self._prev_secret = self._secret
+            self._secret = os.urandom(32)
+            self._rotated_at = now
+
+    def _bucket_id(self) -> int:
+        return int(time.monotonic()) // self._bucket
+
+    def _mac(self, secret: bytes, client_ip: str, client_port: int, bucket_id: int) -> bytes:
+        msg = client_ip.encode() + struct.pack("!HQ", client_port, bucket_id)
+        return hmac.new(secret, msg, hashlib.sha256).digest()
+
+    def generate(self, client_ip: str, client_port: int) -> bytes:
+        self._rotate_if_needed()
+        return self._mac(self._secret, client_ip, client_port, self._bucket_id())
+
+    def verify(self, cookie: bytes, client_ip: str, client_port: int) -> bool:
+        if len(cookie) != COOKIE_SIZE:
+            return False
+        self._rotate_if_needed()
+        bid = self._bucket_id()
+        if hmac.compare_digest(cookie, self._mac(self._secret, client_ip, client_port, bid)):
+            return True
+        for b in (bid, bid - 1):
+            if hmac.compare_digest(cookie, self._mac(self._prev_secret, client_ip, client_port, b)):
+                return True
+        return False
+
+
+def pack_cookie_challenge(cookie: bytes, version: int = PROTOCOL_VERSION) -> bytes:
+    if len(cookie) != COOKIE_SIZE:
+        raise HandshakeError("invalid cookie size")
+    fmt = HEADER_FORMAT
+    return struct.pack(fmt, MAGIC, version, int(MessageType.COOKIE_CHALLENGE), COOKIE_SIZE) + cookie
+
+
+def unpack_cookie_challenge(data: bytes) -> bytes:
+    if len(data) < HEADER_SIZE:
+        raise HandshakeError("cookie challenge too short")
+    magic, version, msg_type, length = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
+    if magic != MAGIC:
+        raise HandshakeError("Invalid magic")
+    if msg_type != MessageType.COOKIE_CHALLENGE:
+        raise HandshakeError("expected COOKIE_CHALLENGE")
+    if length != COOKIE_SIZE:
+        raise HandshakeError("invalid cookie challenge length")
+    return data[HEADER_SIZE:HEADER_SIZE + COOKIE_SIZE]
+
+
+def pack_cookie_response(cookie: bytes, client_hello: bytes, version: int = PROTOCOL_VERSION) -> bytes:
+    if len(cookie) != COOKIE_SIZE:
+        raise HandshakeError("invalid cookie size")
+    payload = cookie + client_hello
+    return struct.pack(HEADER_FORMAT, MAGIC, version, int(MessageType.COOKIE_RESPONSE), len(payload)) + payload
+
+
+def unpack_cookie_response(data: bytes) -> tuple[bytes, bytes]:
+    if len(data) < HEADER_SIZE:
+        raise HandshakeError("cookie response too short")
+    magic, version, msg_type, length = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
+    if magic != MAGIC:
+        raise HandshakeError("Invalid magic")
+    if msg_type != MessageType.COOKIE_RESPONSE:
+        raise HandshakeError("expected COOKIE_RESPONSE")
+    payload = data[HEADER_SIZE:HEADER_SIZE + length]
+    if len(payload) < COOKIE_SIZE + HEADER_SIZE:
+        raise HandshakeError("cookie response payload too short")
+    return payload[:COOKIE_SIZE], payload[COOKIE_SIZE:]
+
+
 class TranscriptHasher:
     def __init__(self) -> None:
         self._hash = hashlib.sha256()
@@ -263,7 +352,6 @@ class TrafficSecrets:
     rekey_secret: bytearray
     control_confirm_key: bytearray
 
-    # Read-only compatibility aliases used by older callers.
     @property
     def client_to_server_key(self): return self.data_c2s_key
     @property
@@ -348,6 +436,7 @@ class HandshakeSession:
     client_id: str = ""
     established_at: float = field(default_factory=time.time)
     epoch: int = 0
+    protocol_version: int = field(default=PROTOCOL_VERSION)
     _data_send_sequence: int = field(default=0, repr=False)
     _control_send_sequence: int = field(default=0, repr=False)
     _control_receive_sequence: int = field(default=0, repr=False)
@@ -394,7 +483,7 @@ class HandshakeSession:
             sequence = self._data_send_sequence if channel == Channel.DATA else self._control_send_sequence
             if sequence == MAX_SEQUENCE:
                 raise HandshakeError("sequence exhausted; rekey required")
-            header = struct.pack(DATA_HEADER_FORMAT, DATA_MAGIC, PROTOCOL_VERSION, int(channel), int(frame_type),
+            header = struct.pack(DATA_HEADER_FORMAT, DATA_MAGIC, self.protocol_version, int(channel), int(frame_type),
                                  int(self.send_direction), self.session_id[:8], self.epoch, sequence)
             cipher = self._data_send_cipher if channel == Channel.DATA else self._control_send_cipher
             nonce_base = self._data_send_nonce_base if channel == Channel.DATA else self._control_send_nonce_base
@@ -406,12 +495,16 @@ class HandshakeSession:
             return result
 
     def encrypt_frame(self, plaintext: bytes, frame_type: FrameType = FrameType.DATA) -> bytes:
-        if frame_type in {FrameType.CONFIG, FrameType.REKEY_REQUEST, FrameType.REKEY_RESPONSE, FrameType.CLOSE, FrameType.ERROR}:
+        if frame_type in {FrameType.CONFIG, FrameType.REKEY_REQUEST, FrameType.REKEY_RESPONSE,
+                         FrameType.REHANDSHAKE_REQUEST, FrameType.REHANDSHAKE_RESPONSE,
+                         FrameType.CLOSE, FrameType.ERROR}:
             raise HandshakeError("control frame type requires encrypt_control")
         return self._encrypt(plaintext, frame_type, Channel.DATA)
 
     def encrypt_control(self, plaintext: bytes, frame_type: FrameType) -> bytes:
-        if frame_type not in {FrameType.CONFIG, FrameType.REKEY_REQUEST, FrameType.REKEY_RESPONSE, FrameType.CLOSE, FrameType.ERROR}:
+        if frame_type not in {FrameType.CONFIG, FrameType.REKEY_REQUEST, FrameType.REKEY_RESPONSE,
+                              FrameType.REHANDSHAKE_REQUEST, FrameType.REHANDSHAKE_RESPONSE,
+                              FrameType.CLOSE, FrameType.ERROR}:
             raise HandshakeError("data frame type requires encrypt_frame")
         return self._encrypt(plaintext, frame_type, Channel.CONTROL)
 
@@ -420,7 +513,7 @@ class HandshakeSession:
             raise HandshakeError("Frame too short")
         header = frame[:DATA_HEADER_SIZE]
         magic, version, wire_channel, wire_type, direction, session_id, epoch, sequence = struct.unpack(DATA_HEADER_FORMAT, header)
-        if magic != DATA_MAGIC or version != PROTOCOL_VERSION or wire_channel != channel:
+        if magic != DATA_MAGIC or version != self.protocol_version or wire_channel != channel:
             raise HandshakeError("invalid record protocol or channel")
         try:
             frame_type = FrameType(wire_type)
@@ -429,7 +522,6 @@ class HandshakeSession:
         if expected_type is not None and frame_type != expected_type:
             raise HandshakeError("unexpected frame type")
         if channel == Channel.DATA:
-            # Eligibility, AEAD authentication, and commit are one critical section.
             with self._data_receive_lock:
                 if session_id != self.session_id[:8] or epoch != self.epoch or direction != self.recv_direction:
                     raise HandshakeError("wrong session, epoch, or direction")
@@ -472,8 +564,22 @@ class HandshakeSession:
             seed = _expand(bytes(self.secrets.rekey_secret), b"epoch", context, 32)
             return _derive_secrets(seed, context)
 
+    def derive_rehandshake_epoch(self, epoch: int, dh_shared_secret: bytes,
+                                  kem_shared_secret: bytes) -> TrafficSecrets:
+        with self._epoch_lock:
+            if self._data_send_cipher is None:
+                raise HandshakeError("session closed")
+            if epoch != self.epoch + 1:
+                raise HandshakeError("invalid rehandshake epoch")
+            if len(dh_shared_secret) != 32 or len(kem_shared_secret) != 32:
+                raise HandshakeError("invalid rehandshake shared secrets")
+            context = self.session_id + epoch.to_bytes(4, "big")
+            ikm = (bytes(self.secrets.rekey_secret) + dh_shared_secret
+                   + kem_shared_secret + epoch.to_bytes(4, "big"))
+            seed = hashlib.sha256(ikm).digest()
+            return _derive_secrets(seed, context)
+
     def activate_epoch(self, epoch: int, secrets: TrafficSecrets) -> None:
-        # Stop both channels while installing keys and resetting all independent counters.
         with self._epoch_lock, self._data_send_lock, self._data_receive_lock, self._control_send_lock, self._control_receive_lock:
             if self._data_send_cipher is None:
                 raise HandshakeError("session closed")
@@ -490,8 +596,6 @@ class HandshakeSession:
             old.wipe()
 
     def secure_wipe(self) -> None:
-        # Global order: epoch, DATA send, DATA receive, CONTROL send, CONTROL receive.
-        # Record operations never acquire epoch while holding a record lock.
         with self._epoch_lock, self._data_send_lock, self._data_receive_lock, self._control_send_lock, self._control_receive_lock:
             self.secrets.wipe()
             self._data_send_cipher = self._data_recv_cipher = None
@@ -631,4 +735,527 @@ class KEMTLSServer:
         self._state = HandshakeState.ESTABLISHED
         session = HandshakeSession(self.ch.session_id, schedule, self.ch.client_random,
                                    self.server_random, "server", self.authz.get("client_id", ""))
+        return finished, session
+
+
+PROTOCOL_VERSION_V3 = 0x30
+PROTOCOL_NAME_V3 = b"PQVPN-KEMTLS-v3"
+
+
+
+
+@dataclass(frozen=True)
+class ClientHelloV3:
+    client_random: bytes
+    session_id: bytes
+    ecc_public_key: bytes
+    pqc_public_key: bytes
+    client_identity_hash: bytes
+    SIZE = 1312
+
+    def pack(self) -> bytes:
+        _fields(client_random=(self.client_random, 32), session_id=(self.session_id, 32),
+                ecc_public_key=(self.ecc_public_key, 32), pqc_public_key=(self.pqc_public_key, 1184),
+                client_identity_hash=(self.client_identity_hash, 32))
+        payload = (self.client_random + self.session_id + self.ecc_public_key
+                   + self.pqc_public_key + self.client_identity_hash)
+        return _pack_header(MessageType.CLIENT_HELLO, len(payload), PROTOCOL_VERSION_V3) + payload
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "ClientHelloV3":
+        payload = _fixed(data, MessageType.CLIENT_HELLO, cls.SIZE, PROTOCOL_VERSION_V3)
+        return cls(payload[:32], payload[32:64], payload[64:96],
+                   payload[96:1280], payload[1280:])
+
+
+@dataclass(frozen=True)
+class ServerHelloV3:
+    server_random: bytes
+    session_id: bytes
+    ecc_public_key: bytes
+    pqc_ciphertext: bytes
+    identity_id: bytes
+    client_ciphertext: bytes
+    SIZE = 2304
+
+    def pack(self) -> bytes:
+        _fields(server_random=(self.server_random, 32), session_id=(self.session_id, 32),
+                ecc_public_key=(self.ecc_public_key, 32), pqc_ciphertext=(self.pqc_ciphertext, 1088),
+                identity_id=(self.identity_id, 32), client_ciphertext=(self.client_ciphertext, 1088))
+        payload = (self.server_random + self.session_id + self.ecc_public_key
+                   + self.pqc_ciphertext + self.identity_id + self.client_ciphertext)
+        return _pack_header(MessageType.SERVER_HELLO, len(payload), PROTOCOL_VERSION_V3) + payload
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "ServerHelloV3":
+        payload = _fixed(data, MessageType.SERVER_HELLO, cls.SIZE, PROTOCOL_VERSION_V3)
+        return cls(payload[:32], payload[32:64], payload[64:96],
+                   payload[96:1184], payload[1184:1216], payload[1216:])
+
+
+@dataclass(frozen=True)
+class ClientKeyExchangeV3:
+    server_ciphertext: bytes
+    finished_mac: bytes
+    SIZE = 1120
+
+    def pack(self) -> bytes:
+        _fields(server_ciphertext=(self.server_ciphertext, 1088),
+                finished_mac=(self.finished_mac, 32))
+        payload = self.server_ciphertext + self.finished_mac
+        return _pack_header(MessageType.CLIENT_KEY_EXCHANGE, len(payload), PROTOCOL_VERSION_V3) + payload
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "ClientKeyExchangeV3":
+        payload = _fixed(data, MessageType.CLIENT_KEY_EXCHANGE, cls.SIZE, PROTOCOL_VERSION_V3)
+        return cls(payload[:1088], payload[1088:])
+
+
+class ServerFinishedV3:
+    def __init__(self, finished_mac: bytes):
+        self.finished_mac = finished_mac
+
+    def pack(self) -> bytes:
+        _fields(finished_mac=(self.finished_mac, 32))
+        return _pack_header(MessageType.SERVER_FINISHED, 32, PROTOCOL_VERSION_V3) + self.finished_mac
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "ServerFinishedV3":
+        return cls(_fixed(data, MessageType.SERVER_FINISHED, 32, PROTOCOL_VERSION_V3))
+
+
+def derive_schedule_v3(hybrid_input: bytes, static_input: bytes,
+                       client_random: bytes, server_random: bytes,
+                       session_id: bytes, transcript_hash: bytes) -> TrafficSecrets:
+    context = (PROTOCOL_NAME_V3 + bytes([PROTOCOL_VERSION_V3])
+               + b"|X25519|ML-KEM-768|AES-256-GCM|"
+               + session_id + client_random + server_random + transcript_hash)
+    salt = hashlib.sha256(b"pqvpn extract" + client_random + server_random + session_id).digest()
+    km = KeyManager()
+    handshake_secret = km.derive_key(hybrid_input, salt=salt, info=b"pqvpn v3 handshake secret")
+    auth_salt = hashlib.sha256(handshake_secret + transcript_hash).digest()
+    master = km.derive_key(handshake_secret + static_input, salt=auth_salt,
+                           info=b"pqvpn v3 authenticated master")
+    return _derive_secrets(master, context)
+
+
+class KEMTLSClientV3:
+    def __init__(self, server_identity_public: bytes, server_fingerprint: str,
+                 client_static_secret: bytes, client_static_public: bytes,
+                 allow_mock_pqc: bool = False) -> None:
+        expected = fingerprint(server_identity_public)
+        if len(server_identity_public) != 1184 or not hmac.compare_digest(expected, server_fingerprint.lower()):
+            raise HandshakeError("server identity fingerprint mismatch")
+        if len(client_static_secret) != 2400 or len(client_static_public) != 1184:
+            raise HandshakeError("invalid client ML-KEM-768 identity")
+        self.server_identity_public = server_identity_public
+        self.server_identity_id = bytes.fromhex(expected)
+        self.client_static_secret = client_static_secret
+        self.client_static_public = client_static_public
+        self.client_identity_hash = bytes.fromhex(fingerprint(client_static_public))
+        self._hybrid = HybridKEM("ML-KEM-768", allow_mock_pqc)
+        self._state = HandshakeState.IDLE
+        self._transcript = TranscriptHasher()
+
+    @property
+    def state(self): return self._state
+
+    def initiate_handshake(self) -> bytes:
+        if self._state != HandshakeState.IDLE:
+            raise HandshakeError("Cannot initiate handshake")
+        self.keys = self._hybrid.generate_keypairs()
+        self.client_random, self.session_id = os.urandom(32), os.urandom(32)
+        wire = ClientHelloV3(self.client_random, self.session_id, self.keys.ecc_public,
+                             self.keys.pqc_public, self.client_identity_hash).pack()
+        self._transcript.update(wire)
+        self._state = HandshakeState.CLIENT_HELLO_SENT
+        return wire
+
+    def process_server_hello(self, wire: bytes) -> bytes:
+        if self._state != HandshakeState.CLIENT_HELLO_SENT:
+            raise HandshakeError("Cannot process ServerHello")
+        hello = ServerHelloV3.unpack(wire)
+        if hello.session_id != self.session_id:
+            raise HandshakeError("Session ID mismatch")
+        if not hmac.compare_digest(hello.identity_id, self.server_identity_id):
+            raise HandshakeError("server identity substitution detected")
+        self._transcript.update(wire)
+        self.server_random = hello.server_random
+
+        ecc_ss = self._hybrid.ecc.derive_shared_secret(self.keys.ecc_private, hello.ecc_public_key)
+        k_eph = self._hybrid.pqc.decapsulate(self.keys.pqc_secret, hello.pqc_ciphertext)
+        k_c = self._hybrid.pqc.decapsulate(self.client_static_secret, hello.client_ciphertext)
+        server_ct, k_s = self._hybrid.pqc.encapsulate(self.server_identity_public)
+
+        digest = self._transcript.digest()
+        self.schedule = derive_schedule_v3(
+            ecc_ss + k_eph, k_s + k_c,
+            self.client_random, self.server_random, self.session_id, digest)
+
+        finished = _compute_finished_mac(
+            hashlib.sha256(digest + server_ct).digest(),
+            bytes(self.schedule.client_finished_key), _CLIENT_FINISHED_LABEL)
+        exchange = ClientKeyExchangeV3(server_ct, finished).pack()
+        self._transcript.update(exchange)
+        self._state = HandshakeState.KEY_EXCHANGE_SENT
+        return exchange
+
+    def process_server_finished(self, wire: bytes) -> HandshakeSession:
+        if self._state != HandshakeState.KEY_EXCHANGE_SENT:
+            raise HandshakeError("Cannot process ServerFinished")
+        finished = ServerFinishedV3.unpack(wire)
+        if not _verify_finished_mac(self._transcript.digest(),
+                                    bytes(self.schedule.server_finished_key),
+                                    _SERVER_FINISHED_LABEL, finished.finished_mac):
+            self._state = HandshakeState.FAILED
+            raise HandshakeError("Server Finished MAC verification failed")
+        self._transcript.update(wire)
+        self._state = HandshakeState.ESTABLISHED
+        return HandshakeSession(self.session_id, self.schedule,
+                                self.client_random, self.server_random, "client",
+                                protocol_version=PROTOCOL_VERSION_V3)
+
+
+class KEMTLSServerV3:
+    def __init__(self, server_identity_secret: bytes, server_identity_public: bytes,
+                 find_client_kem_key: Callable[[str], tuple[bytes, dict] | None],
+                 allow_mock_pqc: bool = False) -> None:
+        if len(server_identity_public) != 1184:
+            raise ValueError("invalid server identity public key")
+        self.identity_secret = server_identity_secret
+        self.identity_public = server_identity_public
+        self.identity_id = bytes.fromhex(fingerprint(server_identity_public))
+        self.find_client_kem_key = find_client_kem_key
+        self._hybrid = HybridKEM("ML-KEM-768", allow_mock_pqc)
+        self._state = HandshakeState.IDLE
+        self._transcript = TranscriptHasher()
+
+    @property
+    def state(self): return self._state
+
+    def process_client_hello(self, wire: bytes) -> bytes:
+        if self._state != HandshakeState.IDLE:
+            raise HandshakeError("Cannot process ClientHello")
+        hello = ClientHelloV3.unpack(wire)
+        result = self.find_client_kem_key(hello.client_identity_hash.hex())
+        if result is None:
+            self._state = HandshakeState.FAILED
+            raise HandshakeError("unauthorized client")
+        client_kem_public, self.authz = result
+        if len(client_kem_public) != 1184:
+            self._state = HandshakeState.FAILED
+            raise HandshakeError("invalid client ML-KEM public key in store")
+        if not hmac.compare_digest(bytes.fromhex(fingerprint(client_kem_public)),
+                                   hello.client_identity_hash):
+            self._state = HandshakeState.FAILED
+            raise HandshakeError("client identity hash mismatch")
+        self.ch = hello
+        self.client_kem_public = client_kem_public
+        self._transcript.update(wire)
+
+        self.server_ecc_private, server_ecc_public = self._hybrid.ecc.generate_keypair()
+        self.server_random = os.urandom(32)
+        self.ecc_ss = self._hybrid.ecc.derive_shared_secret(self.server_ecc_private, hello.ecc_public_key)
+        eph_ct, self.k_eph = self._hybrid.pqc.encapsulate(hello.pqc_public_key)
+        client_ct, self.k_c = self._hybrid.pqc.encapsulate(client_kem_public)
+
+        response = ServerHelloV3(self.server_random, hello.session_id, server_ecc_public,
+                                 eph_ct, self.identity_id, client_ct).pack()
+        self._transcript.update(response)
+        self._state = HandshakeState.SERVER_HELLO_SENT
+        return response
+
+    def process_client_key_exchange(self, wire: bytes) -> tuple[bytes, HandshakeSession]:
+        if self._state != HandshakeState.SERVER_HELLO_SENT:
+            raise HandshakeError("Cannot process ClientKeyExchange")
+        exchange = ClientKeyExchangeV3.unpack(wire)
+        digest = self._transcript.digest()
+
+        k_s = self._hybrid.pqc.decapsulate(self.identity_secret, exchange.server_ciphertext)
+        schedule = derive_schedule_v3(
+            self.ecc_ss + self.k_eph, k_s + self.k_c,
+            self.ch.client_random, self.server_random, self.ch.session_id, digest)
+
+        if not _verify_finished_mac(
+                hashlib.sha256(digest + exchange.server_ciphertext).digest(),
+                bytes(schedule.client_finished_key), _CLIENT_FINISHED_LABEL,
+                exchange.finished_mac):
+            self._state = HandshakeState.FAILED
+            raise HandshakeError("Client Finished MAC verification failed")
+
+        self._transcript.update(wire)
+        finished = ServerFinishedV3(_compute_finished_mac(
+            self._transcript.digest(),
+            bytes(schedule.server_finished_key), _SERVER_FINISHED_LABEL)).pack()
+        self._transcript.update(finished)
+        self._state = HandshakeState.ESTABLISHED
+        session = HandshakeSession(self.ch.session_id, schedule, self.ch.client_random,
+                                   self.server_random, "server", self.authz.get("client_id", ""),
+                                   protocol_version=PROTOCOL_VERSION_V3)
+        return finished, session
+
+
+PROTOCOL_VERSION_V3_MLDSA = 0x31
+PROTOCOL_NAME_V3_MLDSA = b"PQVPN-MLDSA-v3"
+MLDSA_SIG_SIZE = MLDSA44_PARAMS["signature_length"]  # 2420
+
+
+
+
+@dataclass(frozen=True)
+class ClientHelloMLDSA:
+    client_random: bytes
+    session_id: bytes
+    ecc_public_key: bytes
+    pqc_public_key: bytes
+    client_identity_hash: bytes
+    SIZE = 1312
+
+    def pack(self) -> bytes:
+        _fields(client_random=(self.client_random, 32), session_id=(self.session_id, 32),
+                ecc_public_key=(self.ecc_public_key, 32), pqc_public_key=(self.pqc_public_key, 1184),
+                client_identity_hash=(self.client_identity_hash, 32))
+        payload = (self.client_random + self.session_id + self.ecc_public_key
+                   + self.pqc_public_key + self.client_identity_hash)
+        return _pack_header(MessageType.CLIENT_HELLO, len(payload), PROTOCOL_VERSION_V3_MLDSA) + payload
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "ClientHelloMLDSA":
+        payload = _fixed(data, MessageType.CLIENT_HELLO, cls.SIZE, PROTOCOL_VERSION_V3_MLDSA)
+        return cls(payload[:32], payload[32:64], payload[64:96],
+                   payload[96:1280], payload[1280:])
+
+
+@dataclass(frozen=True)
+class ServerHelloMLDSA:
+    server_random: bytes
+    session_id: bytes
+    ecc_public_key: bytes
+    pqc_ciphertext: bytes
+    identity_id: bytes
+    SIZE = 1216
+
+    def pack(self) -> bytes:
+        _fields(server_random=(self.server_random, 32), session_id=(self.session_id, 32),
+                ecc_public_key=(self.ecc_public_key, 32), pqc_ciphertext=(self.pqc_ciphertext, 1088),
+                identity_id=(self.identity_id, 32))
+        payload = (self.server_random + self.session_id + self.ecc_public_key
+                   + self.pqc_ciphertext + self.identity_id)
+        return _pack_header(MessageType.SERVER_HELLO, len(payload), PROTOCOL_VERSION_V3_MLDSA) + payload
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "ServerHelloMLDSA":
+        payload = _fixed(data, MessageType.SERVER_HELLO, cls.SIZE, PROTOCOL_VERSION_V3_MLDSA)
+        return cls(payload[:32], payload[32:64], payload[64:96],
+                   payload[96:1184], payload[1184:])
+
+
+@dataclass(frozen=True)
+class ClientKeyExchangeMLDSA:
+    server_ciphertext: bytes
+    mldsa_signature: bytes
+    finished_mac: bytes
+    SIZE = 3540
+
+    def pack(self) -> bytes:
+        _fields(server_ciphertext=(self.server_ciphertext, 1088),
+                mldsa_signature=(self.mldsa_signature, MLDSA_SIG_SIZE),
+                finished_mac=(self.finished_mac, 32))
+        payload = self.server_ciphertext + self.mldsa_signature + self.finished_mac
+        return _pack_header(MessageType.CLIENT_KEY_EXCHANGE, len(payload), PROTOCOL_VERSION_V3_MLDSA) + payload
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "ClientKeyExchangeMLDSA":
+        payload = _fixed(data, MessageType.CLIENT_KEY_EXCHANGE, cls.SIZE, PROTOCOL_VERSION_V3_MLDSA)
+        return cls(payload[:1088], payload[1088:3508], payload[3508:])
+
+
+class ServerFinishedMLDSA:
+    def __init__(self, finished_mac: bytes):
+        self.finished_mac = finished_mac
+
+    def pack(self) -> bytes:
+        _fields(finished_mac=(self.finished_mac, 32))
+        return _pack_header(MessageType.SERVER_FINISHED, 32, PROTOCOL_VERSION_V3_MLDSA) + self.finished_mac
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "ServerFinishedMLDSA":
+        return cls(_fixed(data, MessageType.SERVER_FINISHED, 32, PROTOCOL_VERSION_V3_MLDSA))
+
+
+def derive_schedule_mldsa(hybrid_input: bytes, client_random: bytes, server_random: bytes,
+                          session_id: bytes, transcript_hash: bytes) -> TrafficSecrets:
+    context = (PROTOCOL_NAME_V3_MLDSA + bytes([PROTOCOL_VERSION_V3_MLDSA])
+               + b"|X25519|ML-KEM-768|ML-DSA-44|AES-256-GCM|"
+               + session_id + client_random + server_random + transcript_hash)
+    salt = hashlib.sha256(b"pqvpn extract" + client_random + server_random + session_id).digest()
+    master = KeyManager().derive_key(hybrid_input, salt=salt, info=b"pqvpn mldsa master secret")
+    return _derive_secrets(master, context)
+
+
+class KEMTLSClientMLDSA:
+    def __init__(self, server_identity_public: bytes, server_fingerprint: str,
+                 client_sig_secret: bytes, client_sig_public: bytes,
+                 allow_mock_pqc: bool = False) -> None:
+        expected = fingerprint(server_identity_public)
+        if len(server_identity_public) != 1184 or not hmac.compare_digest(expected, server_fingerprint.lower()):
+            raise HandshakeError("server identity fingerprint mismatch")
+        if len(client_sig_secret) != MLDSA44_PARAMS["secret_key_length"]:
+            raise HandshakeError("invalid client ML-DSA-44 secret key")
+        if len(client_sig_public) != MLDSA44_PARAMS["public_key_length"]:
+            raise HandshakeError("invalid client ML-DSA-44 public key")
+        self.server_identity_public = server_identity_public
+        self.server_identity_id = bytes.fromhex(expected)
+        self.client_sig_secret = client_sig_secret
+        self.client_sig_public = client_sig_public
+        self.client_identity_hash = bytes.fromhex(fingerprint(client_sig_public))
+        self._hybrid = HybridKEM("ML-KEM-768", allow_mock_pqc)
+        self._sig = PQSignatureProvider(allow_mock=allow_mock_pqc)
+        self._state = HandshakeState.IDLE
+        self._transcript = TranscriptHasher()
+
+    @property
+    def state(self): return self._state
+
+    def initiate_handshake(self) -> bytes:
+        if self._state != HandshakeState.IDLE:
+            raise HandshakeError("Cannot initiate handshake")
+        self.keys = self._hybrid.generate_keypairs()
+        self.client_random, self.session_id = os.urandom(32), os.urandom(32)
+        wire = ClientHelloMLDSA(self.client_random, self.session_id, self.keys.ecc_public,
+                                self.keys.pqc_public, self.client_identity_hash).pack()
+        self._transcript.update(wire)
+        self._state = HandshakeState.CLIENT_HELLO_SENT
+        return wire
+
+    def process_server_hello(self, wire: bytes) -> bytes:
+        if self._state != HandshakeState.CLIENT_HELLO_SENT:
+            raise HandshakeError("Cannot process ServerHello")
+        hello = ServerHelloMLDSA.unpack(wire)
+        if hello.session_id != self.session_id:
+            raise HandshakeError("Session ID mismatch")
+        if not hmac.compare_digest(hello.identity_id, self.server_identity_id):
+            raise HandshakeError("server identity substitution detected")
+        self._transcript.update(wire)
+        self.server_random = hello.server_random
+
+        ecc_ss = self._hybrid.ecc.derive_shared_secret(self.keys.ecc_private, hello.ecc_public_key)
+        k_eph = self._hybrid.pqc.decapsulate(self.keys.pqc_secret, hello.pqc_ciphertext)
+        server_ct, k_s = self._hybrid.pqc.encapsulate(self.server_identity_public)
+
+        digest = self._transcript.digest()
+        self.schedule = derive_schedule_mldsa(
+            ecc_ss + k_eph + k_s,
+            self.client_random, self.server_random, self.session_id, digest)
+
+        sign_data = PROTOCOL_NAME_V3_MLDSA + b" client proof " + digest + server_ct
+        signature = self._sig.sign(self.client_sig_secret, sign_data)
+
+        partial = server_ct + signature
+        finished = _compute_finished_mac(
+            hashlib.sha256(digest + partial).digest(),
+            bytes(self.schedule.client_finished_key), _CLIENT_FINISHED_LABEL)
+        exchange = ClientKeyExchangeMLDSA(server_ct, signature, finished).pack()
+        self._transcript.update(exchange)
+        self._state = HandshakeState.KEY_EXCHANGE_SENT
+        return exchange
+
+    def process_server_finished(self, wire: bytes) -> HandshakeSession:
+        if self._state != HandshakeState.KEY_EXCHANGE_SENT:
+            raise HandshakeError("Cannot process ServerFinished")
+        finished = ServerFinishedMLDSA.unpack(wire)
+        if not _verify_finished_mac(self._transcript.digest(),
+                                    bytes(self.schedule.server_finished_key),
+                                    _SERVER_FINISHED_LABEL, finished.finished_mac):
+            self._state = HandshakeState.FAILED
+            raise HandshakeError("Server Finished MAC verification failed")
+        self._transcript.update(wire)
+        self._state = HandshakeState.ESTABLISHED
+        return HandshakeSession(self.session_id, self.schedule,
+                                self.client_random, self.server_random, "client",
+                                protocol_version=PROTOCOL_VERSION_V3_MLDSA)
+
+
+class KEMTLSServerMLDSA:
+    def __init__(self, server_identity_secret: bytes, server_identity_public: bytes,
+                 find_client_sig_key: Callable[[str], tuple[bytes, dict] | None],
+                 allow_mock_pqc: bool = False) -> None:
+        if len(server_identity_public) != 1184:
+            raise ValueError("invalid server identity public key")
+        self.identity_secret = server_identity_secret
+        self.identity_public = server_identity_public
+        self.identity_id = bytes.fromhex(fingerprint(server_identity_public))
+        self.find_client_sig_key = find_client_sig_key
+        self._hybrid = HybridKEM("ML-KEM-768", allow_mock_pqc)
+        self._sig = PQSignatureProvider(allow_mock=allow_mock_pqc)
+        self._state = HandshakeState.IDLE
+        self._transcript = TranscriptHasher()
+
+    @property
+    def state(self): return self._state
+
+    def process_client_hello(self, wire: bytes) -> bytes:
+        if self._state != HandshakeState.IDLE:
+            raise HandshakeError("Cannot process ClientHello")
+        hello = ClientHelloMLDSA.unpack(wire)
+        result = self.find_client_sig_key(hello.client_identity_hash.hex())
+        if result is None:
+            self._state = HandshakeState.FAILED
+            raise HandshakeError("unauthorized client")
+        client_sig_public, self.authz = result
+        if len(client_sig_public) != MLDSA44_PARAMS["public_key_length"]:
+            self._state = HandshakeState.FAILED
+            raise HandshakeError("invalid client ML-DSA-44 public key in store")
+        if not hmac.compare_digest(bytes.fromhex(fingerprint(client_sig_public)),
+                                   hello.client_identity_hash):
+            self._state = HandshakeState.FAILED
+            raise HandshakeError("client identity hash mismatch")
+        self.ch = hello
+        self.client_sig_public = client_sig_public
+        self._transcript.update(wire)
+
+        self.server_ecc_private, server_ecc_public = self._hybrid.ecc.generate_keypair()
+        self.server_random = os.urandom(32)
+        self.ecc_ss = self._hybrid.ecc.derive_shared_secret(self.server_ecc_private, hello.ecc_public_key)
+        eph_ct, self.k_eph = self._hybrid.pqc.encapsulate(hello.pqc_public_key)
+
+        response = ServerHelloMLDSA(self.server_random, hello.session_id, server_ecc_public,
+                                    eph_ct, self.identity_id).pack()
+        self._transcript.update(response)
+        self._state = HandshakeState.SERVER_HELLO_SENT
+        return response
+
+    def process_client_key_exchange(self, wire: bytes) -> tuple[bytes, HandshakeSession]:
+        if self._state != HandshakeState.SERVER_HELLO_SENT:
+            raise HandshakeError("Cannot process ClientKeyExchange")
+        exchange = ClientKeyExchangeMLDSA.unpack(wire)
+        digest = self._transcript.digest()
+
+        k_s = self._hybrid.pqc.decapsulate(self.identity_secret, exchange.server_ciphertext)
+        schedule = derive_schedule_mldsa(
+            self.ecc_ss + self.k_eph + k_s,
+            self.ch.client_random, self.server_random, self.ch.session_id, digest)
+
+        sign_data = PROTOCOL_NAME_V3_MLDSA + b" client proof " + digest + exchange.server_ciphertext
+        if not self._sig.verify(self.client_sig_public, sign_data, exchange.mldsa_signature):
+            self._state = HandshakeState.FAILED
+            raise HandshakeError("client ML-DSA-44 signature verification failed")
+
+        partial = exchange.server_ciphertext + exchange.mldsa_signature
+        if not _verify_finished_mac(
+                hashlib.sha256(digest + partial).digest(),
+                bytes(schedule.client_finished_key), _CLIENT_FINISHED_LABEL,
+                exchange.finished_mac):
+            self._state = HandshakeState.FAILED
+            raise HandshakeError("Client Finished MAC verification failed")
+
+        self._transcript.update(wire)
+        finished = ServerFinishedMLDSA(_compute_finished_mac(
+            self._transcript.digest(),
+            bytes(schedule.server_finished_key), _SERVER_FINISHED_LABEL)).pack()
+        self._transcript.update(finished)
+        self._state = HandshakeState.ESTABLISHED
+        session = HandshakeSession(self.ch.session_id, schedule, self.ch.client_random,
+                                   self.server_random, "server", self.authz.get("client_id", ""),
+                                   protocol_version=PROTOCOL_VERSION_V3_MLDSA)
         return finished, session

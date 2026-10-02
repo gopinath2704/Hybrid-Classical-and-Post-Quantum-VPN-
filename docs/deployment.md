@@ -10,7 +10,7 @@ client. Privileged namespace, systemd, and VPS results must be recorded separate
 ## Exact tested dependencies
 
 The recorded baseline is CPython **3.14.7**, **liboqs-python 0.16.0**, native
-**liboqs 0.16.0**, Linux x86_64. `deploy/versions.txt` records the versions;
+**liboqs 0.16.0**, Linux x86_64. `VERSIONS.txt` records the versions;
 `constraints-tested.txt` pins every Python dependency in the test environment.
 Install `.` for the daemon or CLI, `.[desktop]` for the PySide6 GUI, and `.[dev]`
 for validation and benchmarks. Always pass `-c constraints-tested.txt`
@@ -48,7 +48,7 @@ The installed desktop client uses service-owned managed state. Install the updat
 unit, start it separately, and launch the GUI only as the normal desktop user:
 
 ```bash
-sudo install -o root -g root -m 0644 deploy/pqvpn-client.service /etc/systemd/system/pqvpn-client.service
+sudo install -o root -g root -m 0644 packaging/common/pqvpn-client-deploy.service /etc/systemd/system/pqvpn-client.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now pqvpn-client.service
 systemctl status pqvpn-client.service
@@ -366,7 +366,7 @@ the UDP port comes from authenticated server CONFIG (`server_udp_port` was remov
 ## Start systemd only after the VM gate
 
 ```bash
-sudo cp deploy/pqvpn-server.service /etc/systemd/system/
+sudo cp packaging/common/pqvpn-server.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now pqvpn-server
 sudo journalctl -u pqvpn-server -f
@@ -423,7 +423,7 @@ manager is supplied or the operator explicitly chooses `dns_mode="none"`. Do not
 
 `liboqs 0.16.0` is pinned to full source commit
 `5a1a854b0dc9f2141bdc771c555ee60c37950183` in `scripts/install-liboqs.sh` and
-`deploy/versions.txt`. The helper clones tag 0.16.0 and compares HEAD with that
+`VERSIONS.txt`. The helper clones tag 0.16.0 and compares HEAD with that
 commit before running CMake; any mismatch fails. It never selects latest/main.
 The Python binding remains 0.16.0 and every Python dependency version remains unchanged.
 
@@ -436,7 +436,7 @@ dependency-validation pass, not an untested upgrade.
 
 This pass built the verified revision in a temporary prefix with only ML-KEM-768
 enabled and ran native tests and complete regressions against that loaded library.
-`deploy/versions.txt` records compiler/build options and the tested binary digest.
+`VERSIONS.txt` records compiler/build options and the tested binary digest.
 The installer keeps its broader default algorithm build; the validation does not
 certify unused algorithms or an OS image. The prior installed library exposed the
 same 0.16.0 version but lacked a source provenance record. Python versions are pinned
@@ -925,7 +925,7 @@ using `/opt/pqvpn/.venv/bin/python`; ExecStopPost runs server cleanup. Start it 
 the documented commands, which therefore perform setup before starting the daemon:
 
 ```bash
-sudo cp deploy/pqvpn-server.service /etc/systemd/system/
+sudo cp packaging/common/pqvpn-server.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now pqvpn-server
 sudo systemctl status pqvpn-server

@@ -7,25 +7,34 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+_VALID_SUITES = {"v2-ed25519", "v3-kem", "v3-mldsa"}
+
 @dataclass
 class ServerConfig:
     listen_host:str="0.0.0.0"; control_port:int=51820; udp_port:int=51820
     vpn_subnet:str="10.8.0.0/24"; server_vpn_ip:str="10.8.0.1"; tun_name:str="pqvpn0"; mtu:int=1380
     outbound_interface:str=""; dns_servers:list[str]=field(default_factory=lambda:["1.1.1.1","9.9.9.9"])
-    max_clients:int=64; handshake_timeout:int=10; idle_timeout:int=300; session_timeout:int=86400; rekey_interval:int=3600
+    max_clients:int=64; handshake_timeout:int=10; idle_timeout:int=300; session_timeout:int=86400; rekey_interval:int=3600; rehandshake_interval:int=0
     connections_per_source:int=10; rate_limit_window:float=60.0
     server_identity_private_key:str="config/server_identity_private.key"; server_identity_public_key:str="config/server_identity_public.key"
     authorized_clients_file:str="config/authorized_clients.json"
+    protocol_version:int=2
+    cookie_mode:str="off"
+    cookie_threshold:int=10
     dev_emulated_tun:bool=False
     allowed_forward_networks:list[str]=field(default_factory=list)
     allow_server_ping:bool=True
     manage_ip_forward:bool=True
     service_user:str="pqvpn"
+    experimental_suite:str=""
 @dataclass
 class ClientConfig:
     server_host:str="127.0.0.1"; server_control_port:int=51820
     server_identity_public_key:str="config/server_identity_public.key"; server_identity_fingerprint:str=""
-    client_identity_private_key:str="config/client_identity_private.key"; full_tunnel:bool=True
+    client_identity_private_key:str="config/client_identity_private.key"
+    client_identity_public_key:str="config/client_identity_public.key"
+    protocol_version:int=2
+    full_tunnel:bool=True
     split_tunnel:list[str]=field(default_factory=list); dns_servers:list[str]=field(default_factory=list); kill_switch:bool=False
     tun_name:str="pqvpn0"; dev_emulated_tun:bool=False
     ping_interval:float=5.0; ping_timeout:float=4.0; dead_peer_timeout:float=30.0
@@ -34,6 +43,7 @@ class ClientConfig:
     expected_vpn_subnet:str="10.8.0.0/24"
     # Omitted: block in full mode, leave unrelated IPv6 alone in split mode.
     ipv6_policy:str|None=None
+    experimental_suite:str=""
 def _load(path, section, cls):
     config_path=Path(path).resolve()
     values=tomllib.loads(config_path.read_text(encoding="utf-8")).get(section,{})
@@ -41,7 +51,7 @@ def _load(path, section, cls):
     unknown=set(values)-known
     if unknown: raise ValueError(f"unknown {section} config fields: {sorted(unknown)}")
     file_fields=("server_identity_private_key","server_identity_public_key","authorized_clients_file",
-                 "client_identity_private_key")
+                 "client_identity_private_key","client_identity_public_key")
     for name in file_fields:
         if name in known:
             # Omitted paths use the standard filename next to the TOML, too.
@@ -96,6 +106,11 @@ def validate_server(cfg: ServerConfig, *, test_ports=False) -> None:
     if not isinstance(cfg.service_user, str) or not re.fullmatch(r'[a-z_][a-z0-9_-]*', cfg.service_user):
         raise ValueError('service_user must be a valid account name')
     if not isinstance(cfg.listen_host, str) or not cfg.listen_host: raise ValueError('listen_host must be nonempty')
+    if cfg.protocol_version not in (2, 3): raise ValueError('protocol_version must be 2 or 3')
+    if cfg.cookie_mode not in ('off', 'under_load', 'always'): raise ValueError('cookie_mode must be off, under_load, or always')
+    number(cfg.cookie_threshold, 'cookie_threshold', 1, integer=True)
+    if cfg.experimental_suite and cfg.experimental_suite not in _VALID_SUITES:
+        raise ValueError(f'experimental_suite must be one of {sorted(_VALID_SUITES)} or empty')
 
 
 def validate_client(cfg: ClientConfig) -> None:
@@ -118,3 +133,6 @@ def validate_client(cfg: ClientConfig) -> None:
             raise ValueError('invalid DNS routing domain')
     for name in ('full_tunnel', 'kill_switch', 'dev_emulated_tun'):
         if type(getattr(cfg, name)) is not bool: raise ValueError(f'{name} must be boolean')
+    if cfg.protocol_version not in (2, 3): raise ValueError('protocol_version must be 2 or 3')
+    if cfg.experimental_suite and cfg.experimental_suite not in _VALID_SUITES:
+        raise ValueError(f'experimental_suite must be one of {sorted(_VALID_SUITES)} or empty')

@@ -214,7 +214,7 @@ Status: Confirmed; remediation in progress.
 
 Severity: High  
 Component: Docker/VPS deployment  
-File/function: `Dockerfile`, `docker-compose.yml`, `deploy/pqvpn-server.service`, `scripts/server-network.sh`
+File/function: `Dockerfile`, `docker-compose.yml`, `packaging/common/pqvpn-server.service`, `scripts/server-network.sh`
 Problem: Host forwarding/NAT is not configured, management is publicly mapped, source is bind-mounted over the image, static client IP is injected, and no systemd/native deployment exists.  
 Impact: `docker compose up` does not satisfy Internet-routing requirements and exposes an unsafe controller.  
 Attack/failure scenario: Operator deploys advertised configuration and obtains neither safe routing nor a protected management plane.  
@@ -431,7 +431,7 @@ retained. No changes were made to `handshake/kemtls.py` or `crypto/hybrid_crypto
 | Native ML-KEM marker, separately | PASS: 2 passed, 243 deselected; `ALLOW_MOCK_PQC=0` |
 | Python / liboqs-python / native liboqs | 3.14.7 / 0.16.0 / 0.16.0 |
 | Native source commit | `5a1a854b0dc9f2141bdc771c555ee60c37950183` |
-| Native provenance | PASS: exact upstream tag/checkout verified, ML-KEM-only shared library built; loaded path verified in `/proc/self/maps`; options/digest in `deploy/versions.txt` |
+| Native provenance | PASS: exact upstream tag/checkout verified, ML-KEM-only shared library built; loaded path verified in `/proc/self/maps`; options/digest in `VERSIONS.txt` |
 | Compileall | PASS: crypto, handshake, vpn, app, benchmarks, tests |
 | Setup shell syntax | PASS |
 | Cleanup shell syntax | PASS |

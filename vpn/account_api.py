@@ -1,9 +1,4 @@
-"""Dedicated HTTPS account-authentication and device-binding API.
-
-Account sessions identify a user only. Binding a device records its public
-identity under an account. Neither authorizes a device or alters the VPN
-data-plane authorization store; that remains an explicit administrator action.
-"""
+"""Dedicated HTTPS account-authentication and device-binding API."""
 from __future__ import annotations
 
 import argparse

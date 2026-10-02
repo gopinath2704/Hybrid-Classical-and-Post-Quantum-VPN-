@@ -13,7 +13,7 @@ from unittest.mock import Mock
 import pytest
 import vpn.network as ipv6
 import vpn.runtime as runtime
-import vpn.doctor as doctor
+import vpn.cli as doctor
 from vpn.config import ClientConfig
 from vpn.config import validate_client, load_client_config
 from vpn.network import TUNMode
@@ -221,7 +221,7 @@ def test_doctor_ipv6_is_read_only(tmp_path,monkeypatch,capsys,policy,connected6,
         return ''
     monkeypatch.setattr(doctor,'command',command)
     monkeypatch.setattr(doctor.shutil,'which',lambda _: '/usr/bin/tool')
-    doctor.run('client',p)
+    doctor.doctor_run('client',p)
     out=capsys.readouterr().out
     assert ('WARN IPv6 bypass explicitly permitted' if level=='WARN' else f'{level} IPv6 leak policy') in out
     assert any('-6' in call and 'addr' in call for call in calls)
@@ -287,7 +287,7 @@ def test_native_installer_verifies_commit_before_build(tmp_path,match):
     import re
     source=Path('scripts/install-liboqs.sh').read_text()
     commit=re.search(r'^LIBOQS_COMMIT=([0-9a-f]{40})$',source,re.M)[1]
-    assert f'liboqs-source-commit={commit}' in Path('deploy/versions.txt').read_text()
+    assert f'liboqs-source-commit={commit}' in Path('VERSIONS.txt').read_text()
     bin=tmp_path/'bin';bin.mkdir()
     script='''#!/usr/bin/env python3
 import os,sys,pathlib

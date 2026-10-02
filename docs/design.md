@@ -16,7 +16,7 @@ Every record header is AAD, including its DATA/CONTROL channel. Each channel and
 
 Production never falls back to socket-pipe TUN. Emulation requires `--dev-emulated-tun`. Host changes are transactional on the client; server firewall helpers own isolated nftables tables and do not flush user rules.
 
-Current limitations are tracked in `progress.md`: IPv4 routing is implemented; IPv6 forwarding/data-route coverage, optional kill switch, dynamic PMTU discovery, stateless pre-PQ cookies, and fresh hybrid post-compromise recovery remain future work. The root namespace integration marker requires a privileged Linux runner and is not evidence until executed there.
+Current limitations are tracked in `progress.md`: IPv4 routing is implemented; IPv6 forwarding/data-route coverage, optional kill switch, and dynamic PMTU discovery remain future work. Post-compromise security via hybrid re-handshake and stateless DoS-resistance cookies are implemented in v3. The root namespace integration marker requires a privileged Linux runner and is not evidence until executed there.
 
 ## Deployment and diagnostics
 
@@ -132,7 +132,7 @@ Authorized-client revocation affects future ClientHello authorization. Existing
 sessions and already-authorized handshakes are not actively terminated. Server restart
 terminates all sessions; no live reload/remote termination mechanism is implemented.
 Native source provenance is pinned to the exact 0.16.0 commit in
-`deploy/versions.txt`; cryptographic components and versions are unchanged.
+`VERSIONS.txt`; cryptographic components and versions are unchanged.
 
 ## Cryptographic and Protocol Design
 ### Protocol v2
@@ -179,12 +179,129 @@ After the TCP handshake the server sends encrypted CONFIG. The client sends an e
 
 Rekey request payload is `next_epoch:u32 || nonce:32`. The server returns `next_epoch || HMAC(control_key, label || request)`, encrypted under the current epoch, then both activate independently derived next-epoch directional material. Replayed/non-monotonic epochs are rejected. This hash-based rekey is key rotation, not post-compromise security.
 
+### Protocol v3
+
+v3 (`0x30`) replaces classical Ed25519 client authentication with ML-KEM-768
+static key mutual authentication. Both sides authenticate by encapsulating to
+the peer's pre-shared static ML-KEM key; only the true key owner can
+decapsulate and derive the Finished MAC. Design decision: `docs/decisions/D1-client-auth-flow.md`.
+
+Suite: X25519, ML-KEM-768, HKDF-SHA256, ML-KEM-768 client identities, AES-256-GCM.
+No signatures in the handshake.
+
+- ClientHelloV3: random(32), session ID(32), ephemeral X25519 public(32), ephemeral ML-KEM public(1184), SHA-256 of client static ML-KEM public(32).
+- ServerHelloV3: random(32), echoed session ID(32), ephemeral X25519 public(32), ML-KEM ciphertext to client ephemeral(1088), SHA-256 identity identifier(32), ML-KEM ciphertext to client static key(1088).
+- ClientKeyExchangeV3: ciphertext to server static identity key(1088), client Finished(32). No signature.
+- ServerFinishedV3: server Finished(32).
+
+Wire sizes: ClientHelloV3 1,318 B, ServerHelloV3 2,310 B, ClientKeyExchangeV3 1,126 B, ServerFinishedV3 38 B: **4,792 B total** (+1,024 B vs v2).
+
+Key schedule: two-stage HKDF. Ephemeral handshake secret from X25519_ss + K_eph; authenticated master secret from K_S + K_C + transcript. Same label/channel separation as v2.
+
+v2 remains fully functional; `protocol_version` in config selects v2 or v3.
+
+### Hybrid re-handshake (post-compromise security)
+
+v2's hash-based rekey derives successors from the prior `rekey_secret` plus a public
+nonce. It provides key evolution, not post-compromise recovery: compromise of the
+current rekey secret exposes future epochs.
+
+v3 adds a hybrid re-handshake that restores secrecy by contributing fresh ephemeral
+key material from both sides. The exchange uses `REHANDSHAKE_REQUEST` and
+`REHANDSHAKE_RESPONSE` CONTROL frames over the existing encrypted control channel:
+
+```
+Client                                              Server
+REHANDSHAKE_REQUEST: epoch(4) || X25519_eph_pub(32) || ML-KEM_eph_pub(1184)
+                                ───────────────►
+                    REHANDSHAKE_RESPONSE: epoch(4) || X25519_eph_pub(32) || ct(1088)
+                                ◄───────────────
+```
+
+Both sides compute: `dh_ss = X25519(local_priv, peer_pub)` and
+`k_mlkem = KEM.Decaps(sk, ct)` or `ct, k_mlkem = KEM.Encaps(pk)`.
+
+New epoch secrets: `seed = SHA-256(old_rekey_secret || dh_ss || k_mlkem || epoch)`,
+then HKDF expansion with `session_id || epoch` as context.
+
+Fresh X25519 + ML-KEM material means that even if an attacker has compromised
+all prior session state, the new epoch keys are secret as long as either the CDH
+or KEM assumption holds. The `pcs_recovery` lemma in the Tamarin model
+(`formal/pqvpn_v3.spthy`) verifies this property.
+
+Re-handshake is configurable via `rehandshake_interval` (seconds, default 0 =
+disabled). It uses the same locking and epoch-switch logic as rekey, so there is
+no packet-loss window during activation.
+
+### Stateless cookie (DoS resistance)
+
+ML-KEM decapsulation on unauthenticated input lets an attacker burn server CPU.
+A stateless HMAC cookie (WireGuard/DTLS pattern) gates expensive cryptographic
+work behind a source-address verification round-trip.
+
+```
+Client                                              Server
+ClientHello
+                                ───────────────►
+                      COOKIE_CHALLENGE: cookie(32)
+                                ◄───────────────
+COOKIE_RESPONSE: cookie(32) || original ClientHello
+                                ───────────────►
+                                    (normal handshake proceeds)
+```
+
+Cookie = `HMAC-SHA256(rotating_server_secret, client_ip || port || time_bucket)`.
+The server secret rotates every 120 seconds; verification accepts both the current
+and previous secret/bucket pair for graceful rotation. The server performs **no
+KEM work and keeps no per-connection state** until the cookie is validated.
+
+Configuration: `cookie_mode` = `off` (default) / `under_load` / `always`.
+In `under_load` mode, challenges are issued when the number of pending handshakes
+exceeds `cookie_threshold` (default 10). The cookie adds one round-trip to the
+handshake but is transparent to the client — it automatically wraps and resends.
+
+Works with both v2 and v3 protocols.
+
+### Protocol v3-mldsa (comparison suite)
+
+v3-mldsa (`0x31`) is an experimental comparison suite that replaces v3-kem's KEM-based
+client authentication with ML-DSA-44 (Dilithium) signatures. Server authentication
+remains ML-KEM-768 static key possession (same as v2/v3). This provides a fair
+same-codebase comparison: both v3-kem and v3-mldsa are fully post-quantum, but
+v3-mldsa uses the traditional signature approach while v3-kem is signature-free.
+
+Suite: X25519, ML-KEM-768, ML-DSA-44, HKDF-SHA256, AES-256-GCM.
+
+- ClientHelloMLDSA: random(32), session ID(32), ephemeral X25519 public(32), ephemeral ML-KEM public(1184), SHA-256 of client ML-DSA-44 public(32).
+- ServerHelloMLDSA: random(32), session ID(32), ephemeral X25519 public(32), ML-KEM ciphertext to client ephemeral(1088), identity ID(32). No ct_C.
+- ClientKeyExchangeMLDSA: ciphertext to server static key(1088), ML-DSA-44 signature(2420), Finished(32).
+- ServerFinishedMLDSA: server Finished(32).
+
+Wire sizes: ClientHello 1,318 B, ServerHello 1,222 B, ClientKeyExchange 3,546 B, ServerFinished 38 B: **6,124 B total** (+1,332 B vs v3-kem).
+
+The larger wire total demonstrates the bandwidth cost of PQ signatures vs KEM-based
+authentication. ML-DSA-44 signatures are 2,420 B vs ML-KEM-768 ciphertexts at 1,088 B,
+and v3-mldsa also loses the server-to-client ct_C savings since the server no longer
+needs to encapsulate to the client's static key.
+
+Key schedule: single-stage. Mixes ephemeral DH + ephemeral KEM + static KEM to server.
+No bidirectional static KEM secrets (unlike v3-kem which mixes K_S + K_C).
+
+Selectable via `experimental_suite = "v3-mldsa"` in config or `--suite v3-mldsa` in benchmarks.
+
 ### Authentication boundary
 
-PQVPN KEMTLS-inspired v2 is a custom protocol, not standardized KEMTLS.
-Static ML-KEM-768 authenticates the server; X25519 + ML-KEM-768 establish
+**v2:** Static ML-KEM-768 authenticates the server; X25519 + ML-KEM-768 establish
 hybrid session keys. Ed25519 authenticates clients and is classical, not
 post-quantum. This is not fully post-quantum mutual authentication.
+
+**v3:** Fully post-quantum mutual authentication. Both server and client
+authenticate via ML-KEM-768 static key possession proofs. No classical
+signatures remain in the handshake. A Tamarin Prover model
+(`formal/pqvpn_v3.spthy`) verifies session key secrecy, forward secrecy,
+injective server/client authentication, and KCI resistance under a
+Dolev-Yao adversary with independent long-term key compromise.
+
 Status: deployable research/prototype PQ-VPN. Passing automated and live validation
 does not revise the custom-protocol or assurance limitations.
 
@@ -228,7 +345,9 @@ ML-KEM mock mode is explicitly insecure and is limited to development/test opera
 
 The custom protocol has not received independent cryptographic review or a formal proof. Ed25519 authenticates clients while the server uses a static ML-KEM possession proof. Long-term server identity compromise permits impersonation and may affect recordings involving that static KEM contribution; ephemeral X25519 and one client-ephemeral ML-KEM exchange remain separate inputs. A second bidirectional ephemeral ML-KEM exchange was removed because it duplicated the ephemeral PQ role rather than authentication; this judgment requires independent review.
 
-Frequent epoch rekey derives successors from the prior `rekey_secret` plus a public nonce. It provides key evolution, not post-compromise recovery: compromise of the current rekey secret plus observation/decryption of the rekey records can expose future epochs. A fresh hybrid X25519 + ML-KEM refresh for long-lived sessions remains future work.
+Frequent epoch rekey derives successors from the prior `rekey_secret` plus a public nonce. It provides key evolution, not post-compromise recovery: compromise of the current rekey secret plus observation/decryption of the rekey records can expose future epochs. v3 adds a hybrid re-handshake that mixes fresh X25519 + ML-KEM ephemeral material to restore secrecy after state compromise (see *Hybrid re-handshake* above).
+
+The data plane is a Python userspace packet loop (TUN ↔ UDP AES-256-GCM). Profiling shows ~10 µs per packet (~100k pps), with Python overhead (nonce XOR, struct, locks) accounting for 2–3× the raw AES-GCM cost (~0.9 µs). This is comparable to OpenVPN (C userspace, ~5–15 µs) but far slower than WireGuard (kernel, ~0.3 µs). The research contribution is the handshake and control plane; throughput is reported as a functional check with the limitation stated openly. Decision: `docs/decisions/D6-data-plane.md`.
 
 Python cannot guarantee erasure of all secret copies. Mutable long-lived buffers are overwritten on rekey/disconnect as best-effort in-process zeroization; interpreter, library, allocator, swap, and core-dump copies may remain.
 
@@ -294,3 +413,29 @@ or bypass the policy. Real kernel enforcement still requires namespace validatio
 Revocation rejects new authentication; it does not retroactively invalidate active
 sessions or in-progress handshakes already authorized. Restart the server to terminate
 all sessions immediately. Ordinary idle/absolute expiry remains unchanged.
+
+## Benchmarking and measurement harness
+
+`python -m benchmarks --all --profile <name>` runs the full benchmark suite (handshake
+latency, throughput, packet overhead, charts) and writes raw JSON/CSV to
+`results/<date>-<commit>/`. Every result row includes the git commit, protocol version,
+liboqs version, CPU model, and iteration count. Handshake statistics report median, p95,
+p99, standard deviation, and separate client/server CPU time.
+
+Eight network profiles are defined for `tc netem` emulation:
+
+| Profile | RTT (ms) | Loss (%) | MTU |
+|---|---|---|---|
+| lan | 0 | 0 | 1500 |
+| metro | 50 | 0 | 1500 |
+| continent | 200 | 0 | 1500 |
+| lossy-1 | 50 | 1 | 1500 |
+| lossy-5 | 50 | 5 | 1500 |
+| mtu-1280 | 50 | 0 | 1280 |
+| mtu-1400 | 50 | 0 | 1400 |
+| worst | 200 | 5 | 1280 |
+
+The `lan` profile runs in-process without network namespaces. Other profiles require
+root and use `scripts/bench_netem.sh` to create isolated namespaces with `tc netem`
+rules applied to both ends of a veth pair. The v2 baseline is tagged as
+`v2-research-baseline` and frozen for comparison with later protocol versions.

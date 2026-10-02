@@ -13,7 +13,7 @@ import pytest
 from vpn.config import ServerConfig, ClientConfig, validate_server, validate_client, load_client_config
 from vpn.identity import AuthorizedClients, generate_server_identity, generate_client_identity, validate_server_identity, load_client_private
 from vpn.network import render, DENIED
-from vpn.doctor import overlapping_routes
+from vpn.cli import overlapping_routes
 import vpn.runtime as runtime
 
 
@@ -248,7 +248,7 @@ def staged_privileged_tree(tmp_path, monkeypatch):
     ('vpn', 0, 1001, 0o775),
 ])
 def test_privileged_code_rejects_unsafe_metadata(staged_privileged_tree, relative, uid, gid, mode):
-    from vpn.doctor import privileged_code_permissions
+    from vpn.cli import privileged_code_permissions
     import stat
     root, overrides = staged_privileged_tree
     target = root / relative
@@ -259,13 +259,13 @@ def test_privileged_code_rejects_unsafe_metadata(staged_privileged_tree, relativ
 
 
 def test_privileged_root_owned_code_and_venv_pass(staged_privileged_tree):
-    from vpn.doctor import privileged_code_permissions
+    from vpn.cli import privileged_code_permissions
     root, _ = staged_privileged_tree
     assert 'root-owned code/venv' in privileged_code_permissions(root)
 
 
 def test_privileged_interpreter_symlink_target_and_parent(staged_privileged_tree):
-    from vpn.doctor import privileged_code_permissions
+    from vpn.cli import privileged_code_permissions
     import stat
     root, overrides = staged_privileged_tree
     interpreter = root / '.venv/bin/python'
@@ -285,7 +285,7 @@ def test_privileged_interpreter_symlink_target_and_parent(staged_privileged_tree
 
 
 def test_privileged_missing_interpreter_fails(staged_privileged_tree):
-    from vpn.doctor import privileged_code_permissions
+    from vpn.cli import privileged_code_permissions
     root, _ = staged_privileged_tree
     (root / '.venv/bin/python').unlink()
     with pytest.raises(FileNotFoundError):
@@ -293,7 +293,7 @@ def test_privileged_missing_interpreter_fails(staged_privileged_tree):
 
 
 def test_doctor_production_scope(monkeypatch, tmp_path):
-    import vpn.doctor as doctor
+    import vpn.cli as doctor
     monkeypatch.setattr(doctor, '__file__', str(tmp_path / 'vpn/doctor.py'))
     monkeypatch.setattr(doctor.sys, 'executable', '/usr/bin/python')
     assert not doctor.production_deployment(tmp_path / 'server.toml')
@@ -303,18 +303,18 @@ def test_doctor_production_scope(monkeypatch, tmp_path):
 
 
 def test_doctor_reports_privileged_code_failure(monkeypatch, tmp_path, capsys):
-    import vpn.doctor as doctor
+    import vpn.cli as doctor
     monkeypatch.setattr(doctor, 'production_deployment', lambda _: True)
     def unsafe():
         raise ValueError('server-network.sh: privileged code is group/world writable')
     monkeypatch.setattr(doctor, 'privileged_code_permissions', unsafe)
     monkeypatch.setattr(doctor, '_OQS_AVAILABLE', False)
-    assert doctor.run('server', tmp_path / 'missing.toml') == 1
+    assert doctor.doctor_run('server', tmp_path / 'missing.toml') == 1
     assert 'FAIL Privileged systemd code ownership' in capsys.readouterr().out
 
 
 def test_deployment_documents_preserve_systemd_boundary():
-    unit = Path('deploy/pqvpn-server.service').read_text()
+    unit = Path('packaging/common/pqvpn-server.service').read_text()
     for directive in ('User=pqvpn', 'Group=pqvpn', 'CapabilityBoundingSet=CAP_NET_ADMIN',
                       'ExecStartPre=+/opt/pqvpn/scripts/server-network.sh setup',
                       'ExecStopPost=+/opt/pqvpn/scripts/server-network.sh cleanup'):
@@ -335,7 +335,7 @@ def test_deployment_documents_preserve_systemd_boundary():
 
 
 def test_privileged_intermediate_symlink_is_audited(staged_privileged_tree):
-    from vpn.doctor import privileged_code_permissions
+    from vpn.cli import privileged_code_permissions
     root, overrides = staged_privileged_tree
     interpreter = root / '.venv/bin/python'
     interpreter.unlink()
@@ -349,7 +349,7 @@ def test_privileged_intermediate_symlink_is_audited(staged_privileged_tree):
     with pytest.raises(ValueError, match='root-owned'):
         privileged_code_permissions(root)
 def test_client_service_unit_exists():
-    unit = Path('deploy/pqvpn-client.service').read_text()
+    unit = Path('packaging/common/pqvpn-client-deploy.service').read_text()
     assert 'app.client --service' in unit
     assert 'CAP_NET_ADMIN' in unit
     assert 'RuntimeDirectory=pqvpn' in unit
@@ -358,7 +358,7 @@ def test_client_service_unit_exists():
 """Benchmark output coverage restored with v2 sizes and overhead."""
 from benchmarks import HandshakeBenchmark,ThroughputBenchmark,PacketOverheadAnalyzer
 def test_handshake_benchmark_output(tmp_path):
-    result=HandshakeBenchmark(iterations=1,warmup_runs=0,results_dir=tmp_path).run_all();assert "Hybrid (X25519 + ML-KEM-768)" in result;assert (tmp_path/"handshake_results.json").exists()
+    result=HandshakeBenchmark(iterations=1,warmup_runs=0,results_dir=tmp_path).run_all();assert "Hybrid (X25519 + ML-KEM-768)" in result["suites"];assert (tmp_path/"handshake_results.json").exists();assert "environment" in result
 def test_throughput_benchmark_frame_size(tmp_path):
     result=ThroughputBenchmark(iterations=2,results_dir=tmp_path).benchmark_payload_size(512);assert result.frame_size_bytes==512+42 and result.throughput_mbps>0
 def test_packet_overhead_output(tmp_path):
@@ -368,7 +368,7 @@ def test_packet_overhead_output(tmp_path):
     analyzer.run_all();assert (tmp_path/"packet_capture_results.json").exists()
 
 
-import vpn.doctor as doctor
+import vpn.cli as doctor
 
 @pytest.mark.parametrize('version,baseline_level', [((3, 14, 7), 'PASS'), ((3, 11, 0), 'WARN')])
 def test_doctor_is_read_only_and_reports_failures(monkeypatch, tmp_path, capsys, version, baseline_level):
@@ -384,7 +384,7 @@ def test_doctor_is_read_only_and_reports_failures(monkeypatch, tmp_path, capsys,
     monkeypatch.setattr(doctor,'command',command)
     monkeypatch.setattr(doctor,'_OQS_AVAILABLE',False)
     monkeypatch.setattr(doctor.sys,'version_info',version)
-    assert doctor.run('server',config)==1
+    assert doctor.doctor_run('server',config)==1
     output=capsys.readouterr().out
     assert 'FAIL Native ML-KEM' in output and 'External provider/host firewall' in output
     assert 'PASS Python minimum runtime version (3.11)' in output

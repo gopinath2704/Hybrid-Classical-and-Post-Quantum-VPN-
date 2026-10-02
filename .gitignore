@@ -42,6 +42,7 @@ htmlcov/
 
 # Reproducible benchmark outputs
 benchmarks/results/
+results/
 
 config/*.lock
 

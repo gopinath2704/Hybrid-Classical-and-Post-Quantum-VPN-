@@ -22,10 +22,13 @@ from pathlib import Path
 
 from crypto.hybrid_crypto import PQCUnavailableError
 from handshake.kemtls import (Channel, DATA_HEADER_FORMAT, DATA_HEADER_SIZE, DATA_MAGIC,
-    FrameType, HandshakeError, HandshakeSession, KEMTLSClient, KEMTLSServer, PROTOCOL_VERSION)
+    FrameType, HandshakeError, HandshakeSession, KEMTLSClient, KEMTLSServer, PROTOCOL_VERSION,
+    KEMTLSClientV3, KEMTLSServerV3, PROTOCOL_VERSION_V3, HEADER_SIZE, HEADER_FORMAT, MAGIC,
+    MessageType, CookieProtector, pack_cookie_challenge, unpack_cookie_challenge,
+    pack_cookie_response, unpack_cookie_response)
 from vpn.config import ClientConfig, ServerConfig, validate_server, validate_client
 from vpn.network import NetworkQualityMonitor, TUNInterface, TUNMode
-from vpn.identity import AuthorizedClients, load_client_private, validate_server_identity
+from vpn.identity import AuthorizedClients, load_client_kem_private, load_client_private, read_private, validate_server_identity
 from vpn.network import IPv6Guard, effective_policy, preflight as ipv6_preflight
 
 logger = logging.getLogger("pqvpn.runtime")
@@ -312,6 +315,9 @@ class VPNServer:
         self.pool.reserved = {item['assigned_ip']: item['client_id'] for item in records['clients'] if item.get('assigned_ip')}
         self._data_thread = None
         self._client_threads: list[threading.Thread] = []
+        self._cookie = CookieProtector() if config.cookie_mode != "off" else None
+        self._pending_handshakes = 0
+        self._pending_lock = threading.Lock()
 
     def start(self) -> None:
         try:
@@ -351,12 +357,27 @@ class VPNServer:
         finally:
             self._close_listeners()
 
+    def _needs_cookie(self) -> bool:
+        if self._cookie is None:
+            return False
+        if self.cfg.cookie_mode == "always":
+            return True
+        with self._pending_lock:
+            return self._pending_handshakes >= self.cfg.cookie_threshold
+
     def _client(self, connection: socket.socket, address: tuple[str, int]) -> None:
         item = None
+        with self._pending_lock:
+            self._pending_handshakes += 1
         try:
             connection.settimeout(self.cfg.handshake_timeout)
-            handshake = KEMTLSServer(self.identity_secret, self.identity_public, self.auth.find)
-            send_message(connection, handshake.process_client_hello(recv_message(connection)))
+            first_msg = recv_message(connection)
+            client_hello_wire = self._cookie_gate(connection, address, first_msg)
+            if self.cfg.protocol_version == 3:
+                handshake = KEMTLSServerV3(self.identity_secret, self.identity_public, self.auth.find_by_fingerprint)
+            else:
+                handshake = KEMTLSServer(self.identity_secret, self.identity_public, self.auth.find)
+            send_message(connection, handshake.process_client_hello(client_hello_wire))
             finished, session = handshake.process_client_key_exchange(recv_message(connection))
             send_message(connection, finished)
             vpn_ip = self.pool.allocate(session.client_id, handshake.authz.get("assigned_ip"))
@@ -365,7 +386,8 @@ class VPNServer:
             config = json.dumps({"session_id": session.session_id.hex(), "client_vpn_ip": vpn_ip,
                 "server_vpn_ip": self.cfg.server_vpn_ip, "prefix": ipaddress.ip_network(self.cfg.vpn_subnet).prefixlen,
                 "udp_port": self.cfg.udp_port, "mtu": self.cfg.mtu, "routes": ["0.0.0.0/1", "128.0.0.0/1"],
-                "dns": self.cfg.dns_servers, "epoch": session.epoch, "rekey_interval": self.cfg.rekey_interval}).encode()
+                "dns": self.cfg.dns_servers, "epoch": session.epoch, "rekey_interval": self.cfg.rekey_interval,
+                "rehandshake_interval": self.cfg.rehandshake_interval}).encode()
             send_message(connection, session.encrypt_control(config, FrameType.CONFIG))
             connection.settimeout(self.cfg.handshake_timeout)
             while not self.stop_event.is_set():
@@ -387,6 +409,10 @@ class VPNServer:
                 if frame_type == FrameType.REKEY_REQUEST:
                     with self.sessions.lock:
                         self._rekey_server(item, payload)
+                        item.touch()
+                elif frame_type == FrameType.REHANDSHAKE_REQUEST:
+                    with self.sessions.lock:
+                        self._rehandshake_server(item, payload)
                         item.touch()
                 elif frame_type not in {FrameType.ERROR}:
                     raise HandshakeError("unexpected control message")
@@ -413,6 +439,34 @@ class VPNServer:
                     item.crypto.secure_wipe()
             connection.close()
             self.slots.release()
+            with self._pending_lock:
+                self._pending_handshakes = max(0, self._pending_handshakes - 1)
+
+    def _cookie_gate(self, connection: socket.socket, address: tuple[str, int], first_msg: bytes) -> bytes:
+        """Return the ClientHello wire bytes, issuing a cookie challenge if needed."""
+        if not self._needs_cookie():
+            return first_msg
+        if len(first_msg) < HEADER_SIZE:
+            raise HandshakeError("message too short for cookie gate")
+        _, _, msg_type, _ = struct.unpack(HEADER_FORMAT, first_msg[:HEADER_SIZE])
+        if msg_type == MessageType.COOKIE_RESPONSE:
+            cookie, client_hello = unpack_cookie_response(first_msg)
+            if not self._cookie.verify(cookie, address[0], address[1]):
+                raise HandshakeError("invalid or expired cookie")
+            return client_hello
+        version = PROTOCOL_VERSION_V3 if self.cfg.protocol_version == 3 else PROTOCOL_VERSION
+        cookie = self._cookie.generate(address[0], address[1])
+        send_message(connection, pack_cookie_challenge(cookie, version))
+        response = recv_message(connection)
+        if len(response) < HEADER_SIZE:
+            raise HandshakeError("cookie response too short")
+        _, _, resp_type, _ = struct.unpack(HEADER_FORMAT, response[:HEADER_SIZE])
+        if resp_type != MessageType.COOKIE_RESPONSE:
+            raise HandshakeError("expected COOKIE_RESPONSE after challenge")
+        resp_cookie, client_hello = unpack_cookie_response(response)
+        if not self._cookie.verify(resp_cookie, address[0], address[1]):
+            raise HandshakeError("invalid or expired cookie")
+        return client_hello
 
     def _rekey_server(self, item: ServerSession, payload: bytes) -> None:
         if len(payload) != 36:
@@ -422,6 +476,23 @@ class VPNServer:
         confirmation = hmac.new(bytes(item.crypto.secrets.control_confirm_key),
                                 b"rekey response" + payload, hashlib.sha256).digest()
         send_message(item.control, item.crypto.encrypt_control(payload[:4] + confirmation, FrameType.REKEY_RESPONSE))
+        item.crypto.activate_epoch(epoch, next_keys)
+
+    def _rehandshake_server(self, item: ServerSession, payload: bytes) -> None:
+        from crypto.hybrid_crypto import HybridKEM
+        expected_len = 4 + 32 + 1184
+        if len(payload) != expected_len:
+            raise HandshakeError("invalid rehandshake request")
+        epoch = struct.unpack("!I", payload[:4])[0]
+        client_dh_pub = payload[4:36]
+        client_kem_pub = payload[36:]
+        hybrid = HybridKEM("ML-KEM-768")
+        server_dh_private, server_dh_public = hybrid.ecc.generate_keypair()
+        dh_ss = hybrid.ecc.derive_shared_secret(server_dh_private, client_dh_pub)
+        ct, k_mlkem = hybrid.pqc.encapsulate(client_kem_pub)
+        next_keys = item.crypto.derive_rehandshake_epoch(epoch, dh_ss, k_mlkem)
+        response = struct.pack("!I", epoch) + server_dh_public + ct
+        send_message(item.control, item.crypto.encrypt_control(response, FrameType.REHANDSHAKE_RESPONSE))
         item.crypto.activate_epoch(epoch, next_keys)
 
     def _data_loop(self) -> None:
@@ -521,6 +592,7 @@ class VPNClient:
         self._rekey_lock = threading.Lock()
         self.rekey_state = RekeyState.IDLE
         self.next_rekey = None
+        self.next_rehandshake = None
         self.state = "DISCONNECTED"
         self.error = ""
         self._cleanup_lock = threading.Lock()
@@ -547,12 +619,27 @@ class VPNClient:
             if not self.cfg.dev_emulated_tun:
                 ipv6_preflight(effective_policy(self.cfg.full_tunnel, self.cfg.ipv6_policy))
             identity = Path(self.cfg.server_identity_public_key).read_bytes()
-            private = load_client_private(Path(self.cfg.client_identity_private_key))
             self.server_ip = socket.gethostbyname(self.cfg.server_host)
             self.control = socket.create_connection((self.server_ip, self.cfg.server_control_port), timeout=10)
-            handshake = KEMTLSClient(identity, self.cfg.server_identity_fingerprint, private)
-            send_message(self.control, handshake.initiate_handshake())
-            send_message(self.control, handshake.process_server_hello(recv_message(self.control)))
+            if self.cfg.protocol_version == 3:
+                client_secret = load_client_kem_private(Path(self.cfg.client_identity_private_key))
+                client_public = Path(self.cfg.client_identity_public_key).read_bytes()
+                handshake = KEMTLSClientV3(identity, self.cfg.server_identity_fingerprint,
+                                           client_secret, client_public)
+            else:
+                private = load_client_private(Path(self.cfg.client_identity_private_key))
+                handshake = KEMTLSClient(identity, self.cfg.server_identity_fingerprint, private)
+            client_hello_wire = handshake.initiate_handshake()
+            send_message(self.control, client_hello_wire)
+            server_reply = recv_message(self.control)
+            if len(server_reply) >= HEADER_SIZE:
+                _, _, reply_type, _ = struct.unpack(HEADER_FORMAT, server_reply[:HEADER_SIZE])
+                if reply_type == MessageType.COOKIE_CHALLENGE:
+                    cookie = unpack_cookie_challenge(server_reply)
+                    version = PROTOCOL_VERSION_V3 if self.cfg.protocol_version == 3 else PROTOCOL_VERSION
+                    send_message(self.control, pack_cookie_response(cookie, client_hello_wire, version))
+                    server_reply = recv_message(self.control)
+            send_message(self.control, handshake.process_server_hello(server_reply))
             self.session = handshake.process_server_finished(recv_message(self.control))
             _, payload = self.session.decrypt_control(recv_message(self.control), FrameType.CONFIG)
             self.tunnel = json.loads(payload)
@@ -583,6 +670,8 @@ class VPNClient:
             self.udp.setblocking(False)
             interval = int(self.tunnel.get("rekey_interval", 0))
             self.next_rekey = time.monotonic() + interval if interval > 0 else None
+            rh_interval = int(self.tunnel.get("rehandshake_interval", 0))
+            self.next_rehandshake = time.monotonic() + rh_interval if rh_interval > 0 else None
             self._thread = threading.Thread(target=self._loop, daemon=True, name="pqvpn-client-data")
             self.state = "CONNECTED"
             self.control.settimeout(3)
@@ -669,7 +758,7 @@ class VPNClient:
                 if self.stop_event.is_set():
                     return
                 kind, payload = self.session.decrypt_control(frame)
-                if kind != FrameType.REKEY_RESPONSE or self.rekey_state == RekeyState.IDLE:
+                if kind not in (FrameType.REKEY_RESPONSE, FrameType.REHANDSHAKE_RESPONSE) or self.rekey_state == RekeyState.IDLE:
                     raise HandshakeError("server closed session" if kind == FrameType.CLOSE else "control session failure")
                 self._epoch_ready.clear()
                 self._responses.put_nowait(payload)
@@ -679,7 +768,9 @@ class VPNClient:
 
     def _schedule_rekey(self) -> None:
         while not self.stop_event.wait(0.2):
-            self._maybe_auto_rekey(time.monotonic())
+            now = time.monotonic()
+            self._maybe_auto_rekey(now)
+            self._maybe_auto_rehandshake(now)
 
     def _maybe_auto_rekey(self, now: float) -> bool:
         if self.next_rekey is None or now < self.next_rekey or self._rekey_lock.locked():
@@ -691,6 +782,18 @@ class VPNClient:
             self._fail("automatic rekey failed")
         finally:
             self.next_rekey = now + int(self.tunnel["rekey_interval"])
+        return True
+
+    def _maybe_auto_rehandshake(self, now: float) -> bool:
+        if self.next_rehandshake is None or now < self.next_rehandshake or self._rekey_lock.locked():
+            return False
+        try:
+            self.rehandshake()
+        except Exception as exc:
+            logger.warning("automatic rehandshake failed: %s", exc)
+            self._fail("automatic rehandshake failed")
+        finally:
+            self.next_rehandshake = now + int(self.tunnel["rehandshake_interval"])
         return True
 
     def rekey(self) -> None:
@@ -732,6 +835,59 @@ class VPNClient:
             self._rekey_lock.release()
             if failed:
                 self._fail("rekey negotiation failed")
+
+    def rehandshake(self) -> None:
+        """PCS re-handshake: fresh X25519 + ML-KEM ephemeral material."""
+        from crypto.hybrid_crypto import HybridKEM
+        if not self._rekey_lock.acquire(blocking=False):
+            raise HandshakeError("rekey/rehandshake already in progress")
+        pending = None
+        failed = False
+        try:
+            if self.rekey_state != RekeyState.IDLE:
+                raise HandshakeError("rekey/rehandshake already in progress")
+            self.rekey_state = RekeyState.REQUESTED
+            epoch = self.session.epoch + 1
+            hybrid = HybridKEM("ML-KEM-768")
+            dh_private, dh_public = hybrid.ecc.generate_keypair()
+            kem_secret, kem_public = hybrid.pqc.generate_keypair()
+            payload = struct.pack("!I", epoch) + dh_public + kem_public
+            self.rekey_state = RekeyState.WAITING_CONFIRMATION
+            with self._control_write_lock:
+                send_message(self.control, self.session.encrypt_control(
+                    payload, FrameType.REHANDSHAKE_REQUEST))
+            if self._control_thread is None:
+                _, response = self.session.decrypt_control(
+                    recv_message(self.control), FrameType.REHANDSHAKE_RESPONSE)
+            else:
+                response = self._responses.get(timeout=15)
+                if response is None or self.stop_event.is_set():
+                    raise HandshakeError("session closed during rehandshake")
+            expected_len = 4 + 32 + 1088
+            if len(response) != expected_len:
+                raise HandshakeError("invalid rehandshake response length")
+            resp_epoch = struct.unpack("!I", response[:4])[0]
+            if resp_epoch != epoch:
+                raise HandshakeError("rehandshake epoch mismatch")
+            server_dh_public = response[4:36]
+            ct = response[36:]
+            dh_ss = hybrid.ecc.derive_shared_secret(dh_private, server_dh_public)
+            k_mlkem = hybrid.pqc.decapsulate(kem_secret, ct)
+            pending = self.session.derive_rehandshake_epoch(epoch, dh_ss, k_mlkem)
+            self.rekey_state = RekeyState.ACTIVATING
+            self.session.activate_epoch(epoch, pending)
+            pending = None
+        except Exception:
+            failed = True
+            raise
+        finally:
+            if pending:
+                pending.wipe()
+            self._epoch_ready.set()
+            self.rekey_state = RekeyState.IDLE
+            self._rekey_lock.release()
+            if failed:
+                self._fail("rehandshake negotiation failed")
 
     def disconnect(self) -> None:
         self._cleanup(send_close=True)

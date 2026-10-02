@@ -119,7 +119,7 @@ See [docs/deployment.md](docs/deployment.md) for the full server deployment guid
 ## Running the server
 
 ### Option 1: Systemd service (Recommended for background / VM deployment)
-Install and manage the server with systemd (unit template at `deploy/pqvpn-server.service`):
+Install and manage the server with systemd (unit template at `packaging/common/pqvpn-server.service`):
 
 ```bash
 # Start the server service
@@ -168,7 +168,7 @@ sudo .venv/bin/python -m app.client --service
 .venv/bin/python -m app.client
 ```
 
-For production, use the systemd unit: `deploy/pqvpn-client.service`.
+For production, use the systemd unit: `packaging/common/pqvpn-client-deploy.service`.
 
 The installed desktop workflow uses managed state. Development remains compatible
 through an explicit, unambiguous legacy configuration:
@@ -228,7 +228,7 @@ vpn/
   profiles.py         Strict .pqvpn profiles and atomic profile store
   runtime.py          VPNClient and VPNServer runtimes
 config/               Default client/server TOML
-deploy/               Systemd units, version provenance
+VERSIONS.txt          Tested runtime and native source versions
 tests/                Pytest suite
 docs/                 Design, deployment, security audit
 packaging/            Arch, Debian, desktop entry, icon, and package service

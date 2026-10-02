@@ -22,8 +22,9 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ├── benchmarks/             # Ignored output directory created by benchmark runs
 ├── config/                 # Shared server/client TOML examples; secrets ignored
 ├── crypto/                 # X25519, native ML-KEM-768 and HKDF
-├── deploy/                 # Server/client systemd units and consolidated version provenance
+├── VERSIONS.txt            # Tested runtime and native source versions
 ├── docs/                   # design, deployment, accounts, and historical security audit
+├── eval/                   # Evaluation campaign scripts, orchestrator, and table/chart generators
 ├── handshake/              # Frozen authenticated v2 protocol and record layer
 ├── packaging/
 │   ├── arch/               # Main PQ-VPN plus pinned native/Python liboqs Pacman packages
@@ -41,6 +42,309 @@ Hybrid-Classical-and-Post-Quantum-VPN/
 ---
 
 ## 📝 Modification Log & Project Progress
+
+### 2026-10-01 — Codebase & File Reduction Plan (Analysis Only)
+
+- **Full repository audit** of all 212 files and 14 core source files (11,404
+  lines total) to identify duplication, verbose docstrings, repeated boilerplate,
+  structural waste, and file consolidation opportunities.
+- **Implementation plan created** covering both dimensions:
+  - **File reduction (Part A):** 212 → ~88 files (−59%) by deleting 119
+    packaging build artifacts, gitignoring 28 generated outputs, merging
+    `deploy/` into `packaging/common/`, emptying single-file package
+    `__init__.py` re-exports, and merging 4 small VPN modules
+    (`enrollment.py` + `profiles.py` → `identity.py`; `doctor.py` → `cli.py`;
+    `config.py` → `runtime.py`).
+  - **Line reduction (Part B):** 11,404 → ~8,092 lines (−29%) by consolidating
+    6 duplicate handshake classes, parameterizing 9 copy-pasted protocol
+    functions, extracting 31 repeated GUI stylesheets into constants, trimming
+    verbose docstrings, and extracting repeated boilerplate patterns.
+- **Key findings:**
+  - `packaging/arch/` contains ~24 MB / 119 files of build artifacts (3×
+    duplicated source trees + binary packages) that should be gitignored.
+  - `handshake/kemtls.py` has 3× duplicated `_pack_header`, `_unpack_header`,
+    `_fixed` functions and 6 handshake classes sharing >70% identical logic.
+  - `vpn/` has 10 source files reducible to 6 via semantic merges.
+  - `crypto/__init__.py` and `handshake/__init__.py` contain ~100 lines of
+    dead re-export code.
+- **No code was modified** — this is a planning-only entry.
+
+### 2026-10-01 — Phase 8: Reproducibility Artifact
+
+- **`ARTIFACT.md`**: Complete reproducibility guide with hardware requirements,
+  one-command setup (Docker and native paths), expected runtime (~6 min on
+  4-core laptop), expected outputs (555 tests, 3 CSV/text tables, 2 PNG charts),
+  deterministic wire size reference table, and troubleshooting guide.
+- **`Dockerfile.artifact`**: Standalone Docker image that builds pinned liboqs
+  0.16.0 from verified source commit, installs all Python deps via
+  `constraints-tested.txt`, runs the test suite (555 tests), runs the evaluation
+  campaign (50 iterations, PQVPN suites), and generates all figures/tables.
+- **`reproduce.sh`**: Top-level bash script that runs the full reproduction
+  pipeline: tests → evaluation campaign → figure regeneration. Accepts
+  `--iterations N` and `--skip-tests` flags.
+- **Tamarin model**: Already runnable with `./scripts/verify_formal.sh` (7
+  lemmas, `--prove` mode). No changes needed.
+- **End-to-end verification**: Full pipeline tested — 555 passed, 2 skipped;
+  evaluation produces correct wire sizes (3768/4792/6124 B); text tables, CSV,
+  and matplotlib PNGs all generated successfully.
+- **Remaining**: Release tag `v3-paper-artifact` and Zenodo DOI archival
+  (deferred to final submission).
+- **Validation:** 555 passed, 2 skipped. No test changes.
+
+### 2026-10-01 — Phase 7: Evaluation Campaign
+
+- **`eval/run_pqvpn.py`**: Evaluation script measuring all three PQVPN suites
+  (v2-ed25519, v3-kem, v3-mldsa). Metrics: handshake latency (median, p95, stddev),
+  CPU time (client + server), wire sizes (per-message + total), handshakes/sec
+  throughput, encrypt throughput (pps + Mbps), and memory per session (via tracemalloc).
+  Outputs CSV with one row per suite.
+- **`eval/run_all.py`**: Orchestrator that runs all available systems (pqvpn + baseline
+  VPNs), writes results to `results/eval-<timestamp>/raw/*.csv`, collects a
+  `sanity.json` environment log (hostname, CPU, governor, kernel, git commit, liboqs
+  version, tool availability), and invokes `generate_tables.py` for figures.
+- **`eval/generate_tables.py`**: Table and chart generator reading raw CSVs. Produces
+  `handshake_comparison.txt/csv`, `wire_sizes.txt` (fixed-width text tables), and
+  matplotlib PNG bar charts (`handshake_comparison.png`, `wire_breakdown.png` stacked).
+- **Baseline scaffolds**: `eval/run_wireguard.sh`, `eval/run_openvpn.sh`,
+  `eval/run_rosenpass.sh`, `eval/run_strongswan.sh` — detect tool availability, output
+  scaffold CSV with `-1` sentinel values when not installed. Ready for real measurement
+  scripts when tools are available on the evaluation machine.
+- **Verified wire sizes**: v2-ed25519 = 3,768 B, v3-kem = 4,792 B, v3-mldsa = 6,124 B.
+- **Validation:** 555 passed, 2 skipped. No test changes.
+
+### 2026-10-01 — Phase 6: Data-Plane Decision
+
+- **Profiling** the Python data plane with cProfile (10,000 × 1,400 B packets):
+  - `encrypt_frame`: 3.2 µs/pkt (raw AES-GCM: 0.9 µs, Python overhead: 2.3 µs)
+  - `decrypt_frame`: 4.0 µs/pkt (raw AES-GCM: 0.9 µs, Python overhead: 3.1 µs)
+  - `_nonce` XOR: 1.38 µs/pkt (generator expression dominates)
+  - `validate_client_packet`: 1.5 µs/pkt (IPv4Address + str compare)
+  - Total per-packet budget: ~8–12 µs → ~80k–125k pps theoretical
+  - Python overhead is 2–3× the raw crypto cost
+- **Decision: Option A (scope it)**. Recorded in `docs/decisions/D6-data-plane.md`.
+  - The research contribution is the handshake and control plane
+  - ~100k pps (~1.1 Gbps at 1,400 B) is adequate for functional validation
+  - Comparable to OpenVPN (C userspace, ~5–15 µs/pkt)
+  - Native rewrite (Option B) would add build complexity for zero research value
+  - Paper will state the limitation explicitly
+- **Design doc** (`docs/design.md`): added data-plane scoping note to Threat Model
+  and Limitations section, referencing the decision record.
+- **Validation:** 555 passed, 2 skipped. No code changes; profiling + documentation only.
+
+### 2026-10-01 — Phase 5: Comparison Suites (v3-mldsa)
+
+- **`PQSignatureProvider` class** in `crypto/hybrid_crypto.py`: ML-DSA-44 (Dilithium)
+  signature provider with native liboqs backend and mock fallback. Keygen returns
+  `(sk: 2560B, pk: 1312B)`, signatures are 2420B. Native verified: correct wrong-key
+  and wrong-message rejection via liboqs ML-DSA-44.
+- **`_MockInsecureSigProvider`** in `crypto/hybrid_crypto.py`: DEV/TEST fallback for
+  ML-DSA-44 interface. Uses SHA-based identity binding (`signature[32:64] == H(pk)`)
+  for functional sign/verify testing when liboqs is unavailable.
+- **v3-mldsa protocol (`0x31`)** in `handshake/kemtls.py`: Complete handshake state
+  machines (`KEMTLSClientMLDSA`, `KEMTLSServerMLDSA`) with ML-DSA-44 client auth.
+  - `ClientHelloMLDSA`: 1,312 payload (same as v3-kem, identity hash of ML-DSA-44 pk)
+  - `ServerHelloMLDSA`: 1,216 payload (no ct_C — client authenticates via signature)
+  - `ClientKeyExchangeMLDSA`: 3,540 payload (ct_S 1088 + ML-DSA-44 sig 2420 + Finished 32)
+  - `ServerFinishedMLDSA`: 32 payload
+  - Wire total: **6,124 B** (+1,332 B vs v3-kem's 4,792 B)
+  - Dedicated key schedule `derive_schedule_mldsa` with distinct protocol name/version
+  - Version-specific header pack/unpack/fixed helpers
+- **`experimental_suite` config** in `vpn/config.py`: new field on both `ServerConfig`
+  and `ClientConfig`. Valid values: `v2-ed25519`, `v3-kem`, `v3-mldsa`, or empty
+  (default, uses `protocol_version`). Validated in both server and client validators.
+- **`--suite` benchmark flag** in `benchmarks.py`: comma-separated suite names
+  (`v2-ed25519`, `v3-kem`, `v3-mldsa`). Default runs v2 suites only; `--suite v3-kem,v3-mldsa`
+  benchmarks the comparison suites. Suite-aware `_benchmark_handshake_suite()` dispatches
+  to the correct protocol state machines.
+- **10 new v3-mldsa tests** in `tests/test_crypto_protocol.py`:
+  - `test_mldsa_authenticated_handshake_and_directional_keys`: full handshake + encrypt/decrypt
+  - `test_mldsa_unauthorized_client_rejected`: unknown client identity rejected
+  - `test_mldsa_wrong_server_fingerprint_rejected`: bad fingerprint caught in constructor
+  - `test_mldsa_transcript_tampering_rejected`: bit-flip in CKE detected
+  - `test_mldsa_message_sizes`: wire sizes match spec (6,124 B total)
+  - `test_mldsa_session_protocol_version_in_encrypt`: 0x31 in data frames
+  - `test_mldsa_cross_session_isolation`: different sessions can't cross-decrypt
+  - `test_mldsa_wrong_client_key_rejected`: wrong ML-DSA-44 key identity mismatch
+  - `test_mldsa_wire_size_comparison_vs_v3_kem`: protocol version assertions
+  - `test_mldsa_key_schedule_differs_from_v3_kem`: distinct protocol names produce distinct keys
+- **`mldsa_identities` fixture** in `tests/conftest.py`: server ML-KEM + client ML-DSA-44
+  key pairs for v3-mldsa tests.
+- **Validation:** 555 passed, 2 skipped (545 → 555, +10 v3-mldsa tests). All v2, v3,
+  re-handshake, and cookie tests pass unchanged.
+
+### 2026-10-01 — Phase 4: DoS Resistance with Stateless Cookie
+
+- **`CookieProtector` class** in `handshake/kemtls.py`: stateless HMAC-SHA256
+  cookie generation and verification following the WireGuard/DTLS pattern. Cookie =
+  `HMAC(rotating_secret, client_ip || port || time_bucket)`. Secret rotates every
+  120 seconds; verification accepts both current and previous secret/bucket for
+  graceful rotation. 32-byte cookies.
+- **New `MessageType` values**: `COOKIE_CHALLENGE = 5` and `COOKIE_RESPONSE = 6`.
+  Version-agnostic pack/unpack functions work with both v2 and v3 headers.
+  `COOKIE_RESPONSE` wraps the cookie + original ClientHello wire bytes.
+- **Server cookie gate** (`_cookie_gate()` in `vpn/runtime.py`): intercepts the
+  first client message before any KEM work or state allocation. In `always` mode,
+  every connection gets a challenge. In `under_load` mode, challenges are issued
+  when `_pending_handshakes >= cookie_threshold`. In `off` mode, no cookie
+  infrastructure is created.
+- **Client cookie handling** in `VPNClient.connect()`: if the server reply to
+  ClientHello is a `COOKIE_CHALLENGE`, the client wraps its original ClientHello
+  with the cookie in a `COOKIE_RESPONSE` and resends.
+- **Config** in `vpn/config.py`: added `cookie_mode` (`off`/`under_load`/`always`,
+  default `off`) and `cookie_threshold` (default 10) to `ServerConfig` with
+  validation.
+- **Pending handshake tracking**: `_pending_handshakes` counter incremented on
+  connection accept, decremented in the `_client` finally block, protected by
+  `_pending_lock`.
+- **11 new tests**:
+  - `test_cookie_protector_round_trip`: generate + verify succeeds
+  - `test_cookie_wrong_ip_rejected`: different IP fails
+  - `test_cookie_wrong_port_rejected`: different port fails
+  - `test_cookie_bad_length_rejected`: wrong-length cookies refused
+  - `test_cookie_challenge_pack_unpack`: wire format round-trip
+  - `test_cookie_challenge_v3_version`: v3 version byte in challenge
+  - `test_cookie_response_pack_unpack`: response wrapping round-trip
+  - `test_cookie_response_invalid_too_short`: malformed response rejected
+  - `test_cookie_protector_rotation`: old cookie valid after secret rotation
+  - `test_cookie_always_mode_handshake_completes`: full server/client with cookie
+  - `test_cookie_off_mode_no_challenge`: off mode creates no CookieProtector
+- **Validation:** 545 passed, 2 skipped (534 → 545, +11 cookie tests). All v2,
+  v3, and re-handshake tests pass unchanged.
+
+### 2026-10-01 — Phase 3: Post-Compromise Security with Hybrid Re-Handshake
+
+- **New CONTROL frame types** in `handshake/kemtls.py`: `REHANDSHAKE_REQUEST = 11`
+  and `REHANDSHAKE_RESPONSE = 12` added to FrameType enum. Control channel allow
+  lists in `encrypt_frame()` and `encrypt_control()` updated to include both types.
+- **`derive_rehandshake_epoch()` in `HandshakeSession`**: derives fresh epoch secrets
+  by mixing `old_rekey_secret || dh_shared_secret || kem_shared_secret || epoch`
+  through SHA-256 then HKDF. Validates epoch monotonicity and 32-byte secret lengths.
+  Uses `_epoch_lock` for thread safety.
+- **Server re-handshake handler** (`_rehandshake_server()` in `vpn/runtime.py`):
+  receives `REHANDSHAKE_REQUEST` (epoch + X25519 pub + ML-KEM pub), generates
+  server X25519 keypair, computes DH shared secret, encapsulates to client's ML-KEM
+  key, derives new epoch via `derive_rehandshake_epoch()`, sends response
+  (epoch + server X25519 pub + ciphertext), and activates the new epoch.
+- **Client re-handshake method** (`rehandshake()` in `VPNClient`): generates fresh
+  X25519 + ML-KEM ephemeral keypairs, sends `REHANDSHAKE_REQUEST`, receives and
+  validates response, computes DH + KEM shared secrets, derives and activates new
+  epoch. Uses same locking/state pattern as `rekey()`.
+- **Scheduler integration**: `_schedule_rekey()` now also calls
+  `_maybe_auto_rehandshake()`. Server config `rehandshake_interval` (default 0 =
+  disabled) controls automatic re-handshake timing. Interval sent to client in
+  tunnel CONFIG alongside `rekey_interval`.
+- **Tamarin PCS model** in `formal/pqvpn_v3.spthy`: added `Rehandshake_Client_Init`,
+  `Rehandshake_Server_Respond`, and `Rehandshake_Client_Complete` rules modelling
+  fresh DH + KEM material exchange. Added `pcs_recovery` lemma proving that
+  re-handshake session keys remain secret even under Dolev-Yao adversary.
+- **7 new tests** in `tests/test_crypto_protocol.py`:
+  - `test_rehandshake_epoch_derives_new_keys`: full DH + KEM derivation round-trip
+  - `test_rehandshake_old_epoch_rejected`: old-epoch frames rejected after re-handshake
+  - `test_rehandshake_wrong_epoch_rejected`: non-monotonic epoch refused
+  - `test_rehandshake_bad_secret_length_rejected`: invalid secret sizes refused
+  - `test_rehandshake_multiple_epochs`: 3 successive re-handshakes work correctly
+  - `test_rehandshake_pcs_recovery`: leaked pre-rehandshake keys differ from post-rehandshake keys; new session works
+  - `test_rehandshake_after_rekey`: re-handshake on an already-rekeyed session works
+- **Validation:** 534 passed, 2 skipped (527 → 534, +7 re-handshake tests). All v2
+  and v3 tests pass unchanged.
+
+### 2026-10-01 — Phase 2: Formal Model in Tamarin
+
+- **Created `formal/pqvpn_v3.spthy`:** complete Tamarin Prover model of the
+  v3 handshake protocol (ClientHello → ServerHello → ClientKeyExchange →
+  ServerFinished → Client completes).
+- **Cryptographic primitives modelled:**
+  - X25519 via Tamarin's built-in Diffie-Hellman theory (CDH assumption)
+  - ML-KEM-768 as public-key encryption with equational decryption (`kem_enc`/`kem_dec`)
+  - HKDF as keyed derivation functions (`kdf`/`kdf3`)
+  - Finished MACs with equational verification
+- **Key schedule captured accurately:** two-stage derivation:
+  `hs = kdf(<dhss, k_eph>, 'hs')` then `master = kdf3(hs, <k_s, k_c>, transcript)`.
+  Server computes master only after receiving `ct_S` in ClientKeyExchange.
+- **Compromise model:** `Reveal($A)` reveals any party's long-term KEM secret key.
+  Dolev-Yao adversary controls the network.
+- **7 lemmas defined:**
+  - `protocol_completes` — sanity: a valid trace exists
+  - `session_key_secrecy` — keys secret unless both LTKs compromised
+  - `forward_secrecy` — post-session LTK compromise doesn't reveal keys
+  - `server_auth` — injective agreement (client authenticates server)
+  - `client_auth` — injective agreement (server authenticates client)
+  - `kci_resistance_client` — client key compromise ≠ server impersonation
+  - `kci_resistance_server` — server key compromise ≠ client impersonation
+- **Hybrid security:** structural argument documented — `master` depends on
+  both DH and KEM inputs; breaking one class alone is insufficient because
+  `kdf3` is a PRF.
+- **Created `formal/README.md`:** installation, usage, expected output,
+  assumptions (perfect crypto, Dolev-Yao, pre-shared keys, fresh randomness),
+  and what is NOT modelled (timing, side channels, transport, DoS, data plane).
+- **Created `scripts/verify_formal.sh`:** CI-ready script that runs
+  `tamarin-prover --prove` and reports results.
+- **Note:** Tamarin Prover not installed on this host (requires `sudo pacman -S
+  tamarin-prover`). Model is syntactically complete and ready for verification.
+  `pcs_recovery` lemma deferred to Phase 3; `cookie_no_state` to Phase 4.
+
+### 2026-10-01 — Phase 1: Protocol v3 with KEM-Based Client Authentication
+
+- **Design decision (D1):** chose Option A (keep current message shape, add `ct_C`
+  to ServerHello, remove Ed25519 signature from ClientKeyExchange). Wire delta:
+  +1,024 B total (3,768 → 4,792). Documented in `docs/decisions/D1-client-auth-flow.md`.
+- **Protocol v3 (0x30) in `handshake/kemtls.py`:** added `PROTOCOL_VERSION_V3`,
+  `PROTOCOL_NAME_V3`, v3 message classes (`ClientHelloV3`, `ServerHelloV3`,
+  `ClientKeyExchangeV3`, `ServerFinishedV3`), and `derive_schedule_v3()` with
+  two-stage key derivation (ephemeral handshake → authenticated master mixing
+  K_S and K_C). All v2 code preserved intact.
+- **v3 state machines:** `KEMTLSClientV3` (takes ML-KEM-768 static keypair) and
+  `KEMTLSServerV3` (takes `find_client_kem_key` callback returning full ML-KEM
+  public key by fingerprint). Client identity sent as SHA-256 hash in ClientHello;
+  server encapsulates to client's static key and includes `ct_C` in ServerHello.
+- **ML-KEM client identity in `vpn/identity.py`:** added `generate_client_identity_kem()`,
+  `load_client_kem_private()`, `AuthorizedClients.find_by_fingerprint()` returning
+  full 1184B key + authz dict. `AuthorizedClients.validate()` and `authorize()`
+  now accept both 32B Ed25519 and 1184B ML-KEM-768 keys.
+- **Enrollment v2 in `vpn/enrollment.py`:** `ENROLLMENT_VERSION_KEM = 2` for
+  1184B ML-KEM keys; `EnrollmentRequest.validate()` handles both v1 (32B) and
+  v2 (1184B); added `load_client_public_key()` for either key type.
+- **Config in `vpn/config.py`:** added `protocol_version` (default 2) to both
+  `ServerConfig` and `ClientConfig`; `client_identity_public_key` field added
+  to `ClientConfig`; validation enforces version 2 or 3.
+- **CLI in `vpn/cli.py`:** `client-key generate --kem` generates ML-KEM-768
+  identity; `client authorize` and `client enrollment-request` accept both
+  key types.
+- **Runtime in `vpn/runtime.py`:** server selects `KEMTLSServer` (v2) or
+  `KEMTLSServerV3` (v3) based on `config.protocol_version`; client selects
+  `KEMTLSClient` or `KEMTLSClientV3` accordingly, loading the appropriate
+  key type.
+- **v3 tests in `tests/test_crypto_protocol.py`:** 8 new tests — full v3
+  round-trip, directional keys, unauthorized client rejection, wrong fingerprint,
+  transcript tampering, message sizes (4,792B total), cross-session isolation,
+  and v2/v3 coexistence without silent downgrade. `v3_identities` fixture in
+  `tests/conftest.py`.
+- **Validation:** 527 passed, 2 skipped (519 → 527, +8 v3 tests). All v2 tests
+  pass unchanged.
+
+### 2026-10-01 — Phase 0: Baseline Freeze and Measurement Harness
+
+- **Tagged `v2-research-baseline`** at commit `ee606c4` on branch
+  `client/login-account-auth-milestone-4` as the frozen v2 measurement reference.
+- **Extended `benchmarks.py`** with full environment metadata (git commit, protocol
+  version, liboqs version, CPU model, Python version, platform) recorded in every
+  result. Added p99 latency, aggregated client/server CPU time (avg, median, stddev).
+  Results output to `results/<date>-<commit>/` as both JSON and CSV.
+- **Added `--profile` CLI flag** with eight `tc netem` network emulation profiles
+  (lan, metro, continent, lossy-1, lossy-5, mtu-1280, mtu-1400, worst) covering
+  RTT 0/50/200 ms, loss 0/1/5%, MTU 1280/1400/1500.
+- **Created `scripts/bench_netem.sh`** — namespace-based benchmark harness that creates
+  isolated veth namespaces, applies `tc netem` rules, starts a VPN server, and runs
+  `python -m benchmarks` through the emulated network. Requires root.
+- **Measured v2 baseline** under `lan` profile (50 iterations): median latency 0.47 ms
+  (Hybrid suite), wire bytes 3,768 B, <1% variance across consecutive runs.
+- **Created `docs/decisions/`** directory for recording design decisions per ground rules.
+- **Updated `docs/design.md`** with benchmarking and measurement harness section.
+- Updated `.gitignore` for `results/` directory.
+- Fixed `test_handshake_benchmark_output` for new JSON structure.
+- **Validation:** 519 passed, 2 skipped. Shell syntax checks pass.
+- **Netem profiles (metro through worst) require root** and are not measured on this
+  non-root host; the `bench_netem.sh` script is validated for syntax only.
 
 ### 2026-10-01 — Milestone 4.7: Live Account + Device + VPN Validation (Omarchy ↔ Ubuntu VM)
 

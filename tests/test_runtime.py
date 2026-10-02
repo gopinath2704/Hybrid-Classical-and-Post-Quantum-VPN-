@@ -229,7 +229,7 @@ def test_setup_uses_nondefault_toml(tmp_path):
     rules = render(cfg, cfg.outbound_interface)
     assert '10.50.0.0/24' in rules and 'shadowvpn0' in rules and 'uplink0' in rules
     assert '10.8.0.0/24' not in rules
-    assert 'server-network.sh setup /etc/pqvpn/server.toml' in Path('deploy/pqvpn-server.service').read_text()
+    assert 'server-network.sh setup /etc/pqvpn/server.toml' in Path('packaging/common/pqvpn-server.service').read_text()
 
 
 def test_server_session_timeout_disconnects_client(tmp_path):
@@ -592,3 +592,62 @@ def test_manual_and_automatic_rekey_during_authenticated_traffic(connected):
     until(lambda:client.session is not None and client.session.epoch>=3,5)
     assert client.state=='CONNECTED'
     until(lambda:next(iter(server.sessions.by_id.values())).crypto.epoch==client.session.epoch)
+
+
+def test_cookie_always_mode_handshake_completes(tmp_path):
+    fp = generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
+    generate_client_identity(tmp_path/'client.key', tmp_path/'client.pub')
+    AuthorizedClients(tmp_path/'clients.json').authorize((tmp_path/'client.pub').read_bytes(), 'cookie-test')
+    server = runtime.VPNServer(ServerConfig(listen_host='127.0.0.1', control_port=0, udp_port=0,
+        server_identity_private_key=str(tmp_path/'server.key'), server_identity_public_key=str(tmp_path/'server.pub'),
+        authorized_clients_file=str(tmp_path/'clients.json'), dev_emulated_tun=True,
+        cookie_mode='always', idle_timeout=5, rekey_interval=0))
+    worker = threading.Thread(target=server.start)
+    worker.start()
+    client = None
+    try:
+        until(lambda: server._data_thread is not None and server._data_thread.is_alive())
+        server.cfg.udp_port = server.udp.getsockname()[1]
+        client = runtime.VPNClient(ClientConfig(server_host='127.0.0.1',
+            server_control_port=server.tcp.getsockname()[1],
+            server_identity_public_key=str(tmp_path/'server.pub'), server_identity_fingerprint=fp,
+            client_identity_private_key=str(tmp_path/'client.key'), dev_emulated_tun=True,
+            full_tunnel=False))
+        client.PING_INITIAL_DELAY = .1
+        client.PING_INTERVAL = .5
+        tunnel = client.connect()
+        assert client.state == 'CONNECTED'
+        assert tunnel['client_vpn_ip']
+    finally:
+        if client: client.disconnect()
+        server.stop(); worker.join(3)
+    assert not worker.is_alive()
+
+
+def test_cookie_off_mode_no_challenge(tmp_path):
+    fp = generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
+    generate_client_identity(tmp_path/'client.key', tmp_path/'client.pub')
+    AuthorizedClients(tmp_path/'clients.json').authorize((tmp_path/'client.pub').read_bytes(), 'no-cookie')
+    server = runtime.VPNServer(ServerConfig(listen_host='127.0.0.1', control_port=0, udp_port=0,
+        server_identity_private_key=str(tmp_path/'server.key'), server_identity_public_key=str(tmp_path/'server.pub'),
+        authorized_clients_file=str(tmp_path/'clients.json'), dev_emulated_tun=True,
+        cookie_mode='off', idle_timeout=5, rekey_interval=0))
+    assert server._cookie is None
+    worker = threading.Thread(target=server.start)
+    worker.start()
+    client = None
+    try:
+        until(lambda: server._data_thread is not None and server._data_thread.is_alive())
+        server.cfg.udp_port = server.udp.getsockname()[1]
+        client = runtime.VPNClient(ClientConfig(server_host='127.0.0.1',
+            server_control_port=server.tcp.getsockname()[1],
+            server_identity_public_key=str(tmp_path/'server.pub'), server_identity_fingerprint=fp,
+            client_identity_private_key=str(tmp_path/'client.key'), dev_emulated_tun=True,
+            full_tunnel=False))
+        client.PING_INITIAL_DELAY = .1
+        client.PING_INTERVAL = .5
+        tunnel = client.connect()
+        assert client.state == 'CONNECTED'
+    finally:
+        if client: client.disconnect()
+        server.stop(); worker.join(3)

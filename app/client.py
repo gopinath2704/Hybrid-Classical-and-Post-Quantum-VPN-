@@ -1,16 +1,4 @@
-"""
-PQ-VPN Desktop Client — GUI and Privileged Service.
-
-Single-file implementation providing:
-  1. PySide6 desktop GUI (runs as normal user)
-  2. Privileged client service (runs as root/CAP_NET_ADMIN via systemd)
-  3. Local Unix-domain-socket IPC with peer credential authorization
-
-Usage:
-    python -m app.client                        # Launch GUI
-    python -m app.client --service              # Launch privileged service
-    python -m app.client --service --config P   # Service with custom config
-"""
+"""PQ-VPN Desktop Client — PySide6 GUI, privileged service, and Unix IPC."""
 from __future__ import annotations
 
 import argparse
@@ -30,10 +18,6 @@ import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 APP_VERSION = "2.0.0"
 MAX_IPC_MESSAGE = 16384
@@ -66,10 +50,6 @@ def _socket_path() -> Path:
         return _RUNTIME_DIR / "client.sock"
     return _FALLBACK_DIR / "pqvpn-client.sock"
 
-
-# ---------------------------------------------------------------------------
-# Connection state model
-# ---------------------------------------------------------------------------
 
 class ConnectionState(enum.Enum):
     DISCONNECTED = "DISCONNECTED"
@@ -133,10 +113,6 @@ class ClientStatus:
         return cls(**json.loads(data))
 
 
-# ---------------------------------------------------------------------------
-# IPC framing helpers (shared by GUI client and service)
-# ---------------------------------------------------------------------------
-
 def ipc_send(sock: socket.socket, payload: dict) -> None:
     """Send a length-prefixed JSON message. Raises on oversized payloads."""
     raw = json.dumps(payload).encode("utf-8")
@@ -168,10 +144,6 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
     return bytes(buf)
 
 
-# ---------------------------------------------------------------------------
-# Peer credential check (Linux SO_PEERCRED)
-# ---------------------------------------------------------------------------
-
 def get_peer_uid(sock: socket.socket) -> int | None:
     """Return the UID of the connected peer using SO_PEERCRED (Linux)."""
     try:
@@ -183,18 +155,8 @@ def get_peer_uid(sock: socket.socket) -> int | None:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# PRIVILEGED CLIENT SERVICE
-# ═══════════════════════════════════════════════════════════════════════════
-
 class ClientService:
-    """
-    Privileged daemon managing VPNClient via local IPC.
-
-    Listens on a Unix domain socket and accepts bounded lifecycle and onboarding
-    commands from the desktop GUI. Only one VPN connection is active at a time;
-    conflicting operations are serialized.
-    """
+    """Privileged daemon managing VPNClient via local IPC."""
 
     ALLOWED_UIDS: set[int] | None = None  # None = any local user (dev mode)
 
@@ -209,7 +171,7 @@ class ClientService:
         self.client_public_path = self.identity_dir / "client_identity_public.key"
         self.profile_store = None
         if self.managed_mode:
-            from vpn.profiles import ProfileStore
+            from vpn.identity import ProfileStore
             self.profile_store = ProfileStore(self.state_dir / "profiles")
         self._vpn: object | None = None  # VPNClient instance
         self._config: object | None = None
@@ -381,7 +343,7 @@ class ClientService:
             return {"error": "operation in progress"}
         try:
             self._require_profile_mutation_state()
-            from vpn.profiles import parse_profile
+            from vpn.identity import parse_profile
             profile = parse_profile(content)
             self.profile_store.import_profile(profile, replace=replace)
             self._validate_config()
@@ -427,7 +389,7 @@ class ClientService:
         self._require_managed()
         if not isinstance(client_id, str):
             raise ValueError("client_id must be a string")
-        from vpn.enrollment import EnrollmentRequest
+        from vpn.identity import EnrollmentRequest
         from vpn.identity import client_public_identity
         public, _ = client_public_identity(self.client_private_path, self.client_public_path)
         request = EnrollmentRequest.create(client_id, public)
@@ -800,10 +762,6 @@ class ClientService:
             self._lock.release()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# IPC CLIENT (used by the GUI to talk to the service)
-# ═══════════════════════════════════════════════════════════════════════════
-
 class IPCClient:
     """Non-privileged IPC client for communicating with the service."""
 
@@ -871,14 +829,6 @@ class IPCClient:
         return self.send_command("EXPORT_ENROLLMENT_REQUEST", client_id=client_id)
 
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ACCOUNT API CLIENT AND MEMORY-ONLY SESSION (MILESTONE 4)
-# ═══════════════════════════════════════════════════════════════════════════
-#
-# Uses only standard-library HTTP/TLS so no runtime dependency reaches the Arch
-# or Debian packages.  Account sessions identify a user only.  They never
-# authorize a device or alter the VPN data-plane authorization store.
 
 DEFAULT_ACCOUNT_API_URL = "http://127.0.0.1:8443"
 ACCOUNT_API_TIMEOUT = 10.0
@@ -1110,11 +1060,7 @@ def account_ux_state(
     device: dict | None,
     vpn_state: str,
 ) -> tuple[str, str, str, str]:
-    """Combine account, device, and VPN state into one (key, title, detail, tone).
-
-    Purely informational: the tunnel is authorized only by ``AuthorizedClients``
-    on the server, so the account state never gates Connect.
-    """
+    """Combine account, device, and VPN state into one (key, title, detail, tone)."""
     if vpn_state == ConnectionState.CONNECTED.value:
         return "vpn_connected", "VPN connected", "Encrypted tunnel is active.", "green"
     if vpn_state in {ConnectionState.CONNECTING.value, ConnectionState.DISCONNECTING.value}:
@@ -1149,11 +1095,7 @@ def account_ux_state(
 
 
 def public_device_identity(setup: object) -> tuple[str, str]:
-    """Extract and verify the managed public identity from a SETUP_STATUS reply.
-
-    Only the base64 public key and its SHA-256 fingerprint ever leave the
-    client; the private key stays inside the privileged service.
-    """
+    """Extract and verify the managed public identity from a SETUP_STATUS reply."""
     import hashlib
 
     identity = setup.get("setup") if isinstance(setup, dict) else None
@@ -1201,11 +1143,7 @@ class SessionState(enum.Enum):
 
 
 class AccountSession:
-    """Thread-safe, memory-only session container.
-
-    The bearer token is never written to disk, passed through IPC, or included
-    in ``repr``/``str`` output.
-    """
+    """Thread-safe, memory-only session container (token never written to disk)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -1266,10 +1204,6 @@ class AccountSession:
 
     __str__ = __repr__
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# PYSIDE6 GUI — DESKTOP MILESTONE 3
-# ═══════════════════════════════════════════════════════════════════════════
 
 # PySide6 remains optional for service-only deployments.  Keeping these imports
 # guarded means the privileged service never needs to initialize a GUI stack.
@@ -1344,6 +1278,39 @@ def truncate_fingerprint(value: str | None) -> str:
 
 
 if PYSIDE6_AVAILABLE:
+    _PRIMARY_BTN_STYLE = f"""
+        QPushButton {{
+            min-height: 22px;
+            background: {GUI_COLORS['green']}; color: #06110B;
+            border: 1px solid {GUI_COLORS['green']}; border-radius: 9px;
+            padding: 10px 22px; font-size: 13px; font-weight: 700;
+        }}
+        QPushButton:hover {{ background: #2EE88A; border-color: #2EE88A; }}
+        QPushButton:disabled {{
+            background: #10151B; color: {GUI_COLORS['muted']};
+            border-color: {GUI_COLORS['border_soft']};
+        }}
+    """
+    _LINK_BTN_STYLE = f"""
+        QPushButton {{
+            background: transparent; border: none; color: {GUI_COLORS['cyan']};
+            font-size: 12px; font-weight: 550; padding: 8px 0px;
+        }}
+        QPushButton:hover {{ color: #7FD9E8; }}
+    """
+    _DANGER_BTN_STYLE = f"""
+        QPushButton {{
+            min-height: 22px;
+            background: #2A171B; color: {GUI_COLORS['red']};
+            border: 1px solid #63303A; border-radius: 9px;
+            padding: 10px 22px; font-size: 12px; font-weight: 700;
+        }}
+        QPushButton:hover {{ border-color: {GUI_COLORS['red']}; }}
+        QPushButton:disabled {{
+            background: #10151B; color: {GUI_COLORS['muted']};
+            border-color: {GUI_COLORS['border_soft']};
+        }}
+    """
     MILESTONE2_STYLESHEET = f"""
         QMainWindow, QWidget#root {{
             background-color: {GUI_COLORS['background']};
@@ -1762,7 +1729,7 @@ if PYSIDE6_AVAILABLE:
                     elif command == "ensure_identity":
                         self.action_finished.emit(command, self.ipc.ensure_identity())
                     elif command == "import_profile":
-                        from vpn.profiles import load_profile
+                        from vpn.identity import load_profile
                         content = load_profile(Path(str(payload))).to_json()
                         self.action_finished.emit(command, self.ipc.import_profile(content))
                     elif command == "select_profile":
@@ -1776,7 +1743,7 @@ if PYSIDE6_AVAILABLE:
                             client_id, output = str(payload), None
                         result = self.ipc.enrollment_request(client_id)
                         if output is not None and "error" not in result:
-                            from vpn.enrollment import parse_enrollment, write_enrollment
+                            from vpn.identity import parse_enrollment, write_enrollment
                             request = parse_enrollment(result.get("content", ""))
                             write_enrollment(Path(output), request)
                             result["output"] = str(output)
@@ -1803,11 +1770,7 @@ if PYSIDE6_AVAILABLE:
 
 
     class _AccountWorker(QObject):
-        """Background worker that serializes blocking account API calls.
-
-        Each submitted callable runs off the GUI thread; its outcome arrives as
-        ``finished(op, ok, data, message, status_code, retry_after)``.
-        """
+        """Background worker that serializes blocking account API calls."""
 
         finished = Signal(str, bool, object, str, int, int)
 
@@ -2286,31 +2249,13 @@ if PYSIDE6_AVAILABLE:
             self.login_btn = QPushButton("Sign In")
             self.login_btn.setCursor(Qt.PointingHandCursor)
             self.login_btn.setFixedWidth(140)
-            self.login_btn.setStyleSheet(f"""
-                QPushButton {{
-                    min-height: 22px;
-                    background: {GUI_COLORS['green']}; color: #06110B;
-                    border: 1px solid {GUI_COLORS['green']}; border-radius: 9px;
-                    padding: 10px 22px; font-size: 13px; font-weight: 700;
-                }}
-                QPushButton:hover {{ background: #2EE88A; border-color: #2EE88A; }}
-                QPushButton:disabled {{
-                    background: #10151B; color: {GUI_COLORS['muted']};
-                    border-color: {GUI_COLORS['border_soft']};
-                }}
-            """)
+            self.login_btn.setStyleSheet(_PRIMARY_BTN_STYLE)
             self.login_btn.clicked.connect(self._on_login_clicked)
             self.login_password.returnPressed.connect(self._on_login_clicked)
 
             self.login_register_link = QPushButton("Need an account? Register")
             self.login_register_link.setCursor(Qt.PointingHandCursor)
-            self.login_register_link.setStyleSheet(f"""
-                QPushButton {{
-                    background: transparent; border: none; color: {GUI_COLORS['cyan']};
-                    font-size: 12px; font-weight: 550; padding: 8px 0px;
-                }}
-                QPushButton:hover {{ color: #7FD9E8; }}
-            """)
+            self.login_register_link.setStyleSheet(_LINK_BTN_STYLE)
             self.login_register_link.clicked.connect(self._show_register_view)
             login_actions.addWidget(self.login_btn)
             login_actions.addWidget(self.login_register_link)
@@ -2370,31 +2315,13 @@ if PYSIDE6_AVAILABLE:
             self.register_btn = QPushButton("Create Account")
             self.register_btn.setCursor(Qt.PointingHandCursor)
             self.register_btn.setFixedWidth(180)
-            self.register_btn.setStyleSheet(f"""
-                QPushButton {{
-                    min-height: 22px;
-                    background: {GUI_COLORS['green']}; color: #06110B;
-                    border: 1px solid {GUI_COLORS['green']}; border-radius: 9px;
-                    padding: 10px 22px; font-size: 13px; font-weight: 700;
-                }}
-                QPushButton:hover {{ background: #2EE88A; border-color: #2EE88A; }}
-                QPushButton:disabled {{
-                    background: #10151B; color: {GUI_COLORS['muted']};
-                    border-color: {GUI_COLORS['border_soft']};
-                }}
-            """)
+            self.register_btn.setStyleSheet(_PRIMARY_BTN_STYLE)
             self.register_btn.clicked.connect(self._on_register_clicked)
             self.register_confirm.returnPressed.connect(self._on_register_clicked)
 
             self.register_back_link = QPushButton("Already have an account? Sign In")
             self.register_back_link.setCursor(Qt.PointingHandCursor)
-            self.register_back_link.setStyleSheet(f"""
-                QPushButton {{
-                    background: transparent; border: none; color: {GUI_COLORS['cyan']};
-                    font-size: 12px; font-weight: 550; padding: 8px 0px;
-                }}
-                QPushButton:hover {{ color: #7FD9E8; }}
-            """)
+            self.register_back_link.setStyleSheet(_LINK_BTN_STYLE)
             self.register_back_link.clicked.connect(self._show_login_view)
             register_actions.addWidget(self.register_btn)
             register_actions.addWidget(self.register_back_link)
@@ -2447,19 +2374,7 @@ if PYSIDE6_AVAILABLE:
             self.signout_btn = QPushButton("Sign Out")
             self.signout_btn.setCursor(Qt.PointingHandCursor)
             self.signout_btn.setFixedWidth(140)
-            self.signout_btn.setStyleSheet(f"""
-                QPushButton {{
-                    min-height: 22px;
-                    background: #2A171B; color: {GUI_COLORS['red']};
-                    border: 1px solid #63303A; border-radius: 9px;
-                    padding: 10px 22px; font-size: 12px; font-weight: 700;
-                }}
-                QPushButton:hover {{ border-color: {GUI_COLORS['red']}; }}
-                QPushButton:disabled {{
-                    background: #10151B; color: {GUI_COLORS['muted']};
-                    border-color: {GUI_COLORS['border_soft']};
-                }}
-            """)
+            self.signout_btn.setStyleSheet(_DANGER_BTN_STYLE)
             self.signout_btn.clicked.connect(self._on_logout_clicked)
             signout_row.addWidget(self.signout_btn)
             signout_row.addStretch(1)
@@ -3566,10 +3481,6 @@ else:
         )
         raise SystemExit(1)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
     parser = argparse.ArgumentParser(

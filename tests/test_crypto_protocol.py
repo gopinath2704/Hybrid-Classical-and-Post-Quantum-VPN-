@@ -575,3 +575,444 @@ def test_cross_channel_ciphertext_rejected(identities):
     client,server=exchange(identities)
     with pytest.raises(HandshakeError,match="channel"):server.decrypt_control(client.encrypt_frame(b"data"))
     with pytest.raises(HandshakeError,match="channel"):server.decrypt_frame(client.encrypt_control(b"control",FrameType.CONFIG))
+
+
+# --- v3 Protocol Tests ---
+from handshake.kemtls import (
+    KEMTLSClientV3, KEMTLSServerV3, PROTOCOL_VERSION_V3,
+    ClientHelloV3, ServerHelloV3, ClientKeyExchangeV3, ServerFinishedV3,
+    derive_schedule_v3,
+)
+
+
+def exchange_v3(ids, authorized=True):
+    sk, pk, csk, cpk = ids
+    fp = fingerprint(cpk)
+    def find_client(fp_hex):
+        if not authorized:
+            return None
+        if fp_hex == fp:
+            return cpk, {"client_id": "alice"}
+        return None
+    c = KEMTLSClientV3(pk, fingerprint(pk), csk, cpk, allow_mock_pqc=True)
+    s = KEMTLSServerV3(sk, pk, find_client, allow_mock_pqc=True)
+    ch = c.initiate_handshake()
+    sh = s.process_client_hello(ch)
+    cke = c.process_server_hello(sh)
+    sf, ss = s.process_client_key_exchange(cke)
+    cs = c.process_server_finished(sf)
+    return cs, ss
+
+
+@pytest.mark.mock_pqc
+def test_v3_authenticated_handshake_and_directional_keys(v3_identities):
+    c, s = exchange_v3(v3_identities)
+    assert c.session_id == s.session_id
+    assert c.protocol_version == PROTOCOL_VERSION_V3
+    assert s.protocol_version == PROTOCOL_VERSION_V3
+    assert c.secrets.client_to_server_key != c.secrets.server_to_client_key
+    typ, p = s.decrypt_frame(c.encrypt_frame(b"request"))
+    assert typ == FrameType.DATA and p == b"request"
+    typ, p = c.decrypt_frame(s.encrypt_frame(b"response"))
+    assert p == b"response"
+
+
+def test_v3_unauthorized_client_rejected(v3_identities):
+    sk, pk, csk, cpk = v3_identities
+    c = KEMTLSClientV3(pk, fingerprint(pk), csk, cpk, allow_mock_pqc=True)
+    s = KEMTLSServerV3(sk, pk, lambda _: None, allow_mock_pqc=True)
+    with pytest.raises(HandshakeError, match="unauthorized"):
+        s.process_client_hello(c.initiate_handshake())
+
+
+def test_v3_wrong_server_fingerprint_rejected(v3_identities):
+    _, pk, csk, cpk = v3_identities
+    with pytest.raises(HandshakeError, match="fingerprint"):
+        KEMTLSClientV3(pk, "00" * 32, csk, cpk, allow_mock_pqc=True)
+
+
+def test_v3_transcript_tampering_rejected(v3_identities):
+    sk, pk, csk, cpk = v3_identities
+    fp = fingerprint(cpk)
+    c = KEMTLSClientV3(pk, fingerprint(pk), csk, cpk, allow_mock_pqc=True)
+    s = KEMTLSServerV3(sk, pk, lambda h: (cpk, {"client_id": "a"}) if h == fp else None, allow_mock_pqc=True)
+    ch = c.initiate_handshake()
+    sh = s.process_client_hello(ch)
+    cke = bytearray(c.process_server_hello(sh))
+    cke[-40] ^= 1
+    with pytest.raises(HandshakeError):
+        s.process_client_key_exchange(bytes(cke))
+
+
+def test_v3_message_sizes(v3_identities):
+    sk, pk, csk, cpk = v3_identities
+    fp = fingerprint(cpk)
+    c = KEMTLSClientV3(pk, fingerprint(pk), csk, cpk, allow_mock_pqc=True)
+    s = KEMTLSServerV3(sk, pk, lambda h: (cpk, {"client_id": "a"}) if h == fp else None, allow_mock_pqc=True)
+    ch = c.initiate_handshake()
+    sh = s.process_client_hello(ch)
+    cke = c.process_server_hello(sh)
+    sf, _ = s.process_client_key_exchange(cke)
+    assert len(ch) == ClientHelloV3.SIZE + 6
+    assert len(sh) == ServerHelloV3.SIZE + 6
+    assert len(cke) == ClientKeyExchangeV3.SIZE + 6
+    total = len(ch) + len(sh) + len(cke) + len(sf)
+    assert total == 4792
+
+
+def test_v3_session_protocol_version_in_encrypt(v3_identities):
+    c, s = exchange_v3(v3_identities)
+    frame = c.encrypt_frame(b"v3-data")
+    assert frame[0:2] == DATA_MAGIC
+    typ, p = s.decrypt_frame(frame)
+    assert p == b"v3-data"
+
+
+def test_v3_cross_session_isolation(v3_identities):
+    c1, s1 = exchange_v3(v3_identities)
+    c2, _ = exchange_v3(v3_identities)
+    with pytest.raises(HandshakeError):
+        s1.decrypt_frame(c2.encrypt_frame(b"wrong"))
+
+
+def test_v2_still_works_alongside_v3(identities, v3_identities):
+    """v2 and v3 both work independently; no silent downgrade."""
+    c2, s2 = exchange(identities)
+    c3, s3 = exchange_v3(v3_identities)
+    assert c2.protocol_version == 0x20
+    assert c3.protocol_version == PROTOCOL_VERSION_V3
+    assert s2.decrypt_frame(c2.encrypt_frame(b"v2"))[1] == b"v2"
+    assert s3.decrypt_frame(c3.encrypt_frame(b"v3"))[1] == b"v3"
+
+
+# ─── Re-handshake / Post-Compromise Security Tests ─────────────────────────
+
+@pytest.mark.mock_pqc
+def test_rehandshake_epoch_derives_new_keys(v3_identities):
+    c, s = exchange_v3(v3_identities)
+    hybrid = HybridKEM("ML-KEM-768")
+    dh_priv_c, dh_pub_c = hybrid.ecc.generate_keypair()
+    dh_priv_s, dh_pub_s = hybrid.ecc.generate_keypair()
+    dh_ss_c = hybrid.ecc.derive_shared_secret(dh_priv_c, dh_pub_s)
+    dh_ss_s = hybrid.ecc.derive_shared_secret(dh_priv_s, dh_pub_c)
+    assert dh_ss_c == dh_ss_s
+    kem_sk, kem_pk = hybrid.pqc.generate_keypair()
+    ct, k_enc = hybrid.pqc.encapsulate(kem_pk)
+    k_dec = hybrid.pqc.decapsulate(kem_sk, ct)
+    assert k_enc == k_dec
+    cn = c.derive_rehandshake_epoch(1, dh_ss_c, k_enc)
+    sn = s.derive_rehandshake_epoch(1, dh_ss_s, k_dec)
+    c.activate_epoch(1, cn)
+    s.activate_epoch(1, sn)
+    assert s.decrypt_frame(c.encrypt_frame(b"post-rh"))[1] == b"post-rh"
+    assert c.decrypt_frame(s.encrypt_frame(b"reply"))[1] == b"reply"
+
+
+@pytest.mark.mock_pqc
+def test_rehandshake_old_epoch_rejected(v3_identities):
+    c, s = exchange_v3(v3_identities)
+    old_frame = c.encrypt_frame(b"before")
+    hybrid = HybridKEM("ML-KEM-768")
+    dh_priv, dh_pub = hybrid.ecc.generate_keypair()
+    dh_priv2, dh_pub2 = hybrid.ecc.generate_keypair()
+    dh_ss = hybrid.ecc.derive_shared_secret(dh_priv, dh_pub2)
+    dh_ss2 = hybrid.ecc.derive_shared_secret(dh_priv2, dh_pub)
+    kem_sk, kem_pk = hybrid.pqc.generate_keypair()
+    ct, k = hybrid.pqc.encapsulate(kem_pk)
+    k2 = hybrid.pqc.decapsulate(kem_sk, ct)
+    cn = c.derive_rehandshake_epoch(1, dh_ss, k)
+    sn = s.derive_rehandshake_epoch(1, dh_ss2, k2)
+    c.activate_epoch(1, cn)
+    s.activate_epoch(1, sn)
+    with pytest.raises(HandshakeError):
+        s.decrypt_frame(old_frame)
+
+
+@pytest.mark.mock_pqc
+def test_rehandshake_wrong_epoch_rejected(v3_identities):
+    c, s = exchange_v3(v3_identities)
+    with pytest.raises(HandshakeError, match="invalid rehandshake epoch"):
+        c.derive_rehandshake_epoch(5, os.urandom(32), os.urandom(32))
+
+
+@pytest.mark.mock_pqc
+def test_rehandshake_bad_secret_length_rejected(v3_identities):
+    c, _ = exchange_v3(v3_identities)
+    with pytest.raises(HandshakeError, match="invalid rehandshake shared secrets"):
+        c.derive_rehandshake_epoch(1, os.urandom(16), os.urandom(32))
+    with pytest.raises(HandshakeError, match="invalid rehandshake shared secrets"):
+        c.derive_rehandshake_epoch(1, os.urandom(32), os.urandom(16))
+
+
+@pytest.mark.mock_pqc
+def test_rehandshake_multiple_epochs(v3_identities):
+    c, s = exchange_v3(v3_identities)
+    hybrid = HybridKEM("ML-KEM-768")
+    for epoch in range(1, 4):
+        dh_priv_c, dh_pub_c = hybrid.ecc.generate_keypair()
+        dh_priv_s, dh_pub_s = hybrid.ecc.generate_keypair()
+        dh_ss_c = hybrid.ecc.derive_shared_secret(dh_priv_c, dh_pub_s)
+        dh_ss_s = hybrid.ecc.derive_shared_secret(dh_priv_s, dh_pub_c)
+        kem_sk, kem_pk = hybrid.pqc.generate_keypair()
+        ct, k = hybrid.pqc.encapsulate(kem_pk)
+        k2 = hybrid.pqc.decapsulate(kem_sk, ct)
+        cn = c.derive_rehandshake_epoch(epoch, dh_ss_c, k)
+        sn = s.derive_rehandshake_epoch(epoch, dh_ss_s, k2)
+        c.activate_epoch(epoch, cn)
+        s.activate_epoch(epoch, sn)
+    msg = f"epoch-{epoch}".encode()
+    assert s.decrypt_frame(c.encrypt_frame(msg))[1] == msg
+
+
+@pytest.mark.mock_pqc
+def test_rehandshake_pcs_recovery(v3_identities):
+    """After state compromise, fresh DH+KEM material restores secrecy."""
+    c, s = exchange_v3(v3_identities)
+    leaked_c2s = bytes(c.secrets.client_to_server_key)
+    leaked_s2c = bytes(s.secrets.server_to_client_key)
+    hybrid = HybridKEM("ML-KEM-768")
+    dh_priv_c, dh_pub_c = hybrid.ecc.generate_keypair()
+    dh_priv_s, dh_pub_s = hybrid.ecc.generate_keypair()
+    dh_ss_c = hybrid.ecc.derive_shared_secret(dh_priv_c, dh_pub_s)
+    dh_ss_s = hybrid.ecc.derive_shared_secret(dh_priv_s, dh_pub_c)
+    kem_sk, kem_pk = hybrid.pqc.generate_keypair()
+    ct, k = hybrid.pqc.encapsulate(kem_pk)
+    k2 = hybrid.pqc.decapsulate(kem_sk, ct)
+    cn = c.derive_rehandshake_epoch(1, dh_ss_c, k)
+    sn = s.derive_rehandshake_epoch(1, dh_ss_s, k2)
+    c.activate_epoch(1, cn)
+    s.activate_epoch(1, sn)
+    assert bytes(c.secrets.client_to_server_key) != leaked_c2s
+    assert bytes(s.secrets.server_to_client_key) != leaked_s2c
+    assert s.decrypt_frame(c.encrypt_frame(b"recovered"))[1] == b"recovered"
+
+
+@pytest.mark.mock_pqc
+def test_rehandshake_after_rekey(v3_identities):
+    """Re-handshake works on an epoch already advanced by rekey."""
+    c, s = exchange_v3(v3_identities)
+    nonce = os.urandom(32)
+    cn = c.derive_next_epoch(1, nonce)
+    sn = s.derive_next_epoch(1, nonce)
+    c.activate_epoch(1, cn)
+    s.activate_epoch(1, sn)
+    hybrid = HybridKEM("ML-KEM-768")
+    dh_priv_c, dh_pub_c = hybrid.ecc.generate_keypair()
+    dh_priv_s, dh_pub_s = hybrid.ecc.generate_keypair()
+    dh_ss_c = hybrid.ecc.derive_shared_secret(dh_priv_c, dh_pub_s)
+    dh_ss_s = hybrid.ecc.derive_shared_secret(dh_priv_s, dh_pub_c)
+    kem_sk, kem_pk = hybrid.pqc.generate_keypair()
+    ct, k = hybrid.pqc.encapsulate(kem_pk)
+    k2 = hybrid.pqc.decapsulate(kem_sk, ct)
+    cn2 = c.derive_rehandshake_epoch(2, dh_ss_c, k)
+    sn2 = s.derive_rehandshake_epoch(2, dh_ss_s, k2)
+    c.activate_epoch(2, cn2)
+    s.activate_epoch(2, sn2)
+    assert s.decrypt_frame(c.encrypt_frame(b"post-rekey-rh"))[1] == b"post-rekey-rh"
+
+
+# ─── Cookie / DoS Resistance Tests ─────────────────────────────────────────
+
+from handshake.kemtls import (
+    CookieProtector, COOKIE_SIZE, pack_cookie_challenge, unpack_cookie_challenge,
+    pack_cookie_response, unpack_cookie_response, PROTOCOL_VERSION_V3,
+)
+
+
+def test_cookie_protector_round_trip():
+    cp = CookieProtector(bucket_seconds=60)
+    cookie = cp.generate("192.168.1.1", 12345)
+    assert len(cookie) == COOKIE_SIZE
+    assert cp.verify(cookie, "192.168.1.1", 12345)
+
+
+def test_cookie_wrong_ip_rejected():
+    cp = CookieProtector(bucket_seconds=60)
+    cookie = cp.generate("192.168.1.1", 12345)
+    assert not cp.verify(cookie, "10.0.0.1", 12345)
+
+
+def test_cookie_wrong_port_rejected():
+    cp = CookieProtector(bucket_seconds=60)
+    cookie = cp.generate("192.168.1.1", 12345)
+    assert not cp.verify(cookie, "192.168.1.1", 54321)
+
+
+def test_cookie_bad_length_rejected():
+    cp = CookieProtector(bucket_seconds=60)
+    assert not cp.verify(b"short", "192.168.1.1", 12345)
+    assert not cp.verify(b"\x00" * 64, "192.168.1.1", 12345)
+
+
+def test_cookie_challenge_pack_unpack():
+    cookie = os.urandom(COOKIE_SIZE)
+    wire = pack_cookie_challenge(cookie)
+    assert unpack_cookie_challenge(wire) == cookie
+
+
+def test_cookie_challenge_v3_version():
+    cookie = os.urandom(COOKIE_SIZE)
+    wire = pack_cookie_challenge(cookie, PROTOCOL_VERSION_V3)
+    assert wire[2] == PROTOCOL_VERSION_V3
+    assert unpack_cookie_challenge(wire) == cookie
+
+
+def test_cookie_response_pack_unpack():
+    cookie = os.urandom(COOKIE_SIZE)
+    ch_wire = ClientHello(os.urandom(32), os.urandom(32), os.urandom(32),
+                          os.urandom(1184), os.urandom(32)).pack()
+    wire = pack_cookie_response(cookie, ch_wire)
+    got_cookie, got_ch = unpack_cookie_response(wire)
+    assert got_cookie == cookie
+    assert got_ch == ch_wire
+
+
+def test_cookie_response_invalid_too_short():
+    cookie = os.urandom(COOKIE_SIZE)
+    with pytest.raises(HandshakeError, match="too short"):
+        unpack_cookie_response(b"\x00" * 4)
+
+
+def test_cookie_protector_rotation():
+    cp = CookieProtector(bucket_seconds=1)
+    cookie = cp.generate("127.0.0.1", 80)
+    assert cp.verify(cookie, "127.0.0.1", 80)
+    cp._rotated_at -= 2
+    new_cookie = cp.generate("127.0.0.1", 80)
+    assert cp.verify(cookie, "127.0.0.1", 80)
+    assert cp.verify(new_cookie, "127.0.0.1", 80)
+
+
+# --- v3-mldsa Protocol Tests (comparison suite) ---
+from handshake.kemtls import (
+    KEMTLSClientMLDSA, KEMTLSServerMLDSA, PROTOCOL_VERSION_V3_MLDSA,
+    ClientHelloMLDSA, ServerHelloMLDSA, ClientKeyExchangeMLDSA, ServerFinishedMLDSA,
+    derive_schedule_mldsa, MLDSA_SIG_SIZE,
+)
+from crypto.hybrid_crypto import PQSignatureProvider, MLDSA44_PARAMS
+
+
+def exchange_mldsa(ids, authorized=True):
+    sk, pk, sig_sk, sig_pk = ids
+    fp = fingerprint(sig_pk)
+    def find_client(fp_hex):
+        if not authorized:
+            return None
+        if fp_hex == fp:
+            return sig_pk, {"client_id": "alice-mldsa"}
+        return None
+    c = KEMTLSClientMLDSA(pk, fingerprint(pk), sig_sk, sig_pk, allow_mock_pqc=True)
+    s = KEMTLSServerMLDSA(sk, pk, find_client, allow_mock_pqc=True)
+    ch = c.initiate_handshake()
+    sh = s.process_client_hello(ch)
+    cke = c.process_server_hello(sh)
+    sf, ss = s.process_client_key_exchange(cke)
+    cs = c.process_server_finished(sf)
+    return cs, ss
+
+
+@pytest.mark.mock_pqc
+def test_mldsa_authenticated_handshake_and_directional_keys(mldsa_identities):
+    c, s = exchange_mldsa(mldsa_identities)
+    assert c.session_id == s.session_id
+    assert c.protocol_version == PROTOCOL_VERSION_V3_MLDSA
+    assert s.protocol_version == PROTOCOL_VERSION_V3_MLDSA
+    assert c.secrets.client_to_server_key != c.secrets.server_to_client_key
+    typ, p = s.decrypt_frame(c.encrypt_frame(b"request"))
+    assert typ == FrameType.DATA and p == b"request"
+    typ, p = c.decrypt_frame(s.encrypt_frame(b"response"))
+    assert p == b"response"
+
+
+def test_mldsa_unauthorized_client_rejected(mldsa_identities):
+    sk, pk, sig_sk, sig_pk = mldsa_identities
+    c = KEMTLSClientMLDSA(pk, fingerprint(pk), sig_sk, sig_pk, allow_mock_pqc=True)
+    s = KEMTLSServerMLDSA(sk, pk, lambda _: None, allow_mock_pqc=True)
+    with pytest.raises(HandshakeError, match="unauthorized"):
+        s.process_client_hello(c.initiate_handshake())
+
+
+def test_mldsa_wrong_server_fingerprint_rejected(mldsa_identities):
+    _, pk, sig_sk, sig_pk = mldsa_identities
+    with pytest.raises(HandshakeError, match="fingerprint"):
+        KEMTLSClientMLDSA(pk, "00" * 32, sig_sk, sig_pk, allow_mock_pqc=True)
+
+
+def test_mldsa_transcript_tampering_rejected(mldsa_identities):
+    sk, pk, sig_sk, sig_pk = mldsa_identities
+    fp = fingerprint(sig_pk)
+    c = KEMTLSClientMLDSA(pk, fingerprint(pk), sig_sk, sig_pk, allow_mock_pqc=True)
+    s = KEMTLSServerMLDSA(sk, pk,
+        lambda h: (sig_pk, {"client_id": "a"}) if h == fp else None,
+        allow_mock_pqc=True)
+    ch = c.initiate_handshake()
+    sh = s.process_client_hello(ch)
+    cke = bytearray(c.process_server_hello(sh))
+    cke[-40] ^= 1
+    with pytest.raises(HandshakeError):
+        s.process_client_key_exchange(bytes(cke))
+
+
+def test_mldsa_message_sizes(mldsa_identities):
+    sk, pk, sig_sk, sig_pk = mldsa_identities
+    fp = fingerprint(sig_pk)
+    c = KEMTLSClientMLDSA(pk, fingerprint(pk), sig_sk, sig_pk, allow_mock_pqc=True)
+    s = KEMTLSServerMLDSA(sk, pk,
+        lambda h: (sig_pk, {"client_id": "a"}) if h == fp else None,
+        allow_mock_pqc=True)
+    ch = c.initiate_handshake()
+    sh = s.process_client_hello(ch)
+    cke = c.process_server_hello(sh)
+    sf, _ = s.process_client_key_exchange(cke)
+    assert len(ch) == ClientHelloMLDSA.SIZE + 6
+    assert len(sh) == ServerHelloMLDSA.SIZE + 6
+    assert len(cke) == ClientKeyExchangeMLDSA.SIZE + 6
+    total = len(ch) + len(sh) + len(cke) + len(sf)
+    assert total == 6124
+
+
+def test_mldsa_session_protocol_version_in_encrypt(mldsa_identities):
+    c, s = exchange_mldsa(mldsa_identities)
+    frame = c.encrypt_frame(b"mldsa-data")
+    assert frame[0:2] == DATA_MAGIC
+    typ, p = s.decrypt_frame(frame)
+    assert p == b"mldsa-data"
+
+
+def test_mldsa_cross_session_isolation(mldsa_identities):
+    c1, s1 = exchange_mldsa(mldsa_identities)
+    c2, _ = exchange_mldsa(mldsa_identities)
+    with pytest.raises(HandshakeError):
+        s1.decrypt_frame(c2.encrypt_frame(b"wrong"))
+
+
+def test_mldsa_wrong_client_key_rejected(mldsa_identities):
+    """Server rejects a client using a different ML-DSA-44 key than the pinned one."""
+    sk, pk, sig_sk, sig_pk = mldsa_identities
+    fp = fingerprint(sig_pk)
+    sig = PQSignatureProvider(allow_mock=True)
+    wrong_sk, wrong_pk = sig.generate_keypair()
+    c = KEMTLSClientMLDSA(pk, fingerprint(pk), wrong_sk, wrong_pk, allow_mock_pqc=True)
+    s = KEMTLSServerMLDSA(sk, pk,
+        lambda h: (sig_pk, {"client_id": "a"}) if h == fp else None,
+        allow_mock_pqc=True)
+    ch = c.initiate_handshake()
+    with pytest.raises(HandshakeError, match="identity hash mismatch|unauthorized"):
+        s.process_client_hello(ch)
+
+
+def test_mldsa_wire_size_comparison_vs_v3_kem(mldsa_identities, v3_identities):
+    """v3-mldsa uses more wire bytes than v3-kem due to larger ML-DSA-44 signatures."""
+    c_m, _ = exchange_mldsa(mldsa_identities)
+    c_k, _ = exchange_v3(v3_identities)
+    assert c_m.protocol_version == PROTOCOL_VERSION_V3_MLDSA
+    assert c_k.protocol_version == PROTOCOL_VERSION_V3
+
+
+def test_mldsa_key_schedule_differs_from_v3_kem():
+    """v3-mldsa and v3-kem produce different keys from the same input due to distinct protocol names."""
+    ikm = os.urandom(96)
+    cr, sr, sid, th = os.urandom(32), os.urandom(32), os.urandom(32), os.urandom(32)
+    s_mldsa = derive_schedule_mldsa(ikm, cr, sr, sid, th)
+    s_v3 = derive_schedule_v3(ikm[:64], ikm[64:], cr, sr, sid, th)
+    assert bytes(s_mldsa.data_c2s_key) != bytes(s_v3.data_c2s_key)

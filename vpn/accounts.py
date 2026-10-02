@@ -1,11 +1,4 @@
-"""Server-side account, device ownership, and session-schema persistence.
-
-This module deliberately does not grant VPN access.  ``AuthorizedClients`` remains
-the independent authority for deciding whether an Ed25519 device may connect.
-A device ``status`` only records the administrator's review decision; the
-explicit administrator command that approves a device is what writes
-``AuthorizedClients``.
-"""
+"""Server-side account, device ownership, and session-schema persistence."""
 from __future__ import annotations
 
 import os
@@ -645,12 +638,7 @@ class AccountStore:
         return verify_password(row["password_hash"], password)
 
     def authenticate_user(self, identifier: str, password: str) -> UserRecord | None:
-        """Authenticate by normalized username or email with a generic failure path.
-
-        Unknown and syntactically invalid identifiers are checked against a
-        precomputed dummy Argon2id hash. A successful check transparently
-        upgrades an old Argon2id hash with a compare-and-update transaction.
-        """
+        """Authenticate by normalized username or email with a generic failure path."""
         normalized: str | None
         try:
             normalized = normalize_email(identifier) if "@" in identifier else normalize_username(identifier)
@@ -845,11 +833,7 @@ class AccountStore:
     def set_device_status(
         self, device_id: int, status: str, *, expected: tuple[str, ...] | None = None
     ) -> DeviceRecord:
-        """Record an administrator review decision.
-
-        ``expected`` makes the change compare-and-set so a concurrent decision is
-        not silently overwritten.  This never edits ``AuthorizedClients``.
-        """
+        """Record an administrator review decision (compare-and-set)."""
         validated_id = _validate_id(device_id, "device ID")
         validated_status = _validate_device_status(status)
         allowed = tuple(_validate_device_status(item) for item in (expected or DEVICE_STATUSES))
