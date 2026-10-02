@@ -892,6 +892,40 @@ def test_rehandshake_transcript_mismatch_yields_different_keys(v3_identities):
         s.decrypt_frame(c.encrypt_frame(b"transcript-mismatch"))
 
 
+@pytest.mark.mock_pqc
+def test_rehandshake_key_confirmation_rejects_flipped_byte(v3_identities):
+    """Flipped confirmation byte must be detected by constant-time compare."""
+    import hmac as hmac_mod
+    import hashlib
+    import struct
+    c, s = exchange_v3(v3_identities)
+    hybrid = HybridKEM("ML-KEM-768")
+    dh_priv_c, dh_pub_c = hybrid.ecc.generate_keypair()
+    dh_priv_s, dh_pub_s = hybrid.ecc.generate_keypair()
+    dh_ss_c = hybrid.ecc.derive_shared_secret(dh_priv_c, dh_pub_s)
+    dh_ss_s = hybrid.ecc.derive_shared_secret(dh_priv_s, dh_pub_c)
+    kem_sk, kem_pk = hybrid.pqc.generate_keypair()
+    ct, k = hybrid.pqc.encapsulate(kem_pk)
+    k2 = hybrid.pqc.decapsulate(kem_sk, ct)
+    request = struct.pack("!I", 1) + dh_pub_c + kem_pk
+    response_body = struct.pack("!I", 1) + dh_pub_s + ct
+    transcript = request + response_body
+    sn = s.derive_rehandshake_epoch(1, dh_ss_s, k2, transcript)
+    confirm = hmac_mod.new(bytes(sn.control_confirm_key),
+                           b"rehandshake confirm" + transcript,
+                           hashlib.sha256).digest()
+    # Correct confirmation verifies
+    cn = c.derive_rehandshake_epoch(1, dh_ss_c, k, transcript)
+    expected = hmac_mod.new(bytes(cn.control_confirm_key),
+                            b"rehandshake confirm" + transcript,
+                            hashlib.sha256).digest()
+    assert hmac_mod.compare_digest(confirm, expected)
+    # Flipped byte must not verify
+    bad_confirm = bytearray(confirm)
+    bad_confirm[0] ^= 0x01
+    assert not hmac_mod.compare_digest(bytes(bad_confirm), expected)
+
+
 # ─── Cookie / DoS Resistance Tests ─────────────────────────────────────────
 
 from handshake.kemtls import (

@@ -19,7 +19,7 @@ PQ-VPN is a deployable research prototype implementing a KEMTLS-inspired custom 
 - **Three protocol variants** — v2 (Ed25519 client auth), v3 (fully PQ mutual auth via ML-KEM), v3-mldsa (ML-DSA-44 comparison)
 - **Post-compromise recovery** — v3 hybrid re-handshake mixes fresh DH + KEM material (passive adversary after full state compromise; active adversary after control-key-only compromise)
 - **DoS resistance** — stateless cookie challenge before resource allocation
-- **Formal model** — Tamarin Prover verifies 12 security lemmas across two theories (secrecy, forward secrecy, mutual auth, KCI resistance, PCS)
+- **Formal model** — Tamarin Prover verifies 13 security lemmas across two theories (secrecy, forward secrecy, mutual auth, KCI resistance, PCS)
 - **Desktop GUI** — PySide6 app with managed identity, multi-profile servers, offline enrollment
 - **Account system** — HTTPS API for login, device binding, and admin approval
 - **Privilege separation** — unprivileged GUI communicates with a CAP_NET_ADMIN service over Unix socket
@@ -269,7 +269,7 @@ constraints-tested.txt   Tested version pins and native validation record
 **Completed through Milestone 4.7:**
 
 - Hybrid KEMTLS-inspired handshake (v2 + v3)
-- Formal Tamarin model with 12 verified security lemmas
+- Formal Tamarin model with 13 verified security lemmas
 - Evaluation campaign with wire-size and latency benchmarks
 - Desktop GUI with managed identity and offline enrollment
 - Account authentication API with device binding and admin approval

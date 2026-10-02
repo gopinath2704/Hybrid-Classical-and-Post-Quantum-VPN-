@@ -14,8 +14,8 @@ begin
 
 // Function signature and definition of the equational theory E
 
-functions: c2s/1, fst/1, h/1, kdf/2, kem_dec/2, kem_enc/2, kem_pk/1,
-           pair/2, s2c/1, snd/1
+functions: c2s/1, cck/1, fst/1, h/1, kdf/2, kem_dec/2, kem_enc/2,
+           kem_pk/1, mac/2, pair/2, s2c/1, snd/1
 equations:
     fst(<x.1, x.2>) = x.1,
     kem_dec(sk, kem_enc(kem_pk(sk), ss)) = ss,
@@ -58,18 +58,47 @@ rule (modulo E) RH_Server_Respond:
    ]
   --[
   RH_Server( $S, $C, sid,
-             c2s(kdf(h(<old_master, 'rk'>), <~k_rh, h(<sid, 'rehandshake', epoch>)>)),
-             s2c(kdf(h(<old_master, 'rk'>), <~k_rh, h(<sid, 'rehandshake', epoch>)>))
+             c2s(kdf(h(<old_master, 'rk'>),
+                     <~k_rh, 
+                      h(<sid, 'rehandshake', epoch, <sid, eph_pkR, epoch>, sid, 
+                         kem_enc(eph_pkR, ~k_rh), epoch>)
+                     >)),
+             s2c(kdf(h(<old_master, 'rk'>),
+                     <~k_rh, 
+                      h(<sid, 'rehandshake', epoch, <sid, eph_pkR, epoch>, sid, 
+                         kem_enc(eph_pkR, ~k_rh), epoch>)
+                     >))
   ),
   RH_SessionKey( $S, $C, sid,
-                 c2s(kdf(h(<old_master, 'rk'>), <~k_rh, h(<sid, 'rehandshake', epoch>)>)),
-                 s2c(kdf(h(<old_master, 'rk'>), <~k_rh, h(<sid, 'rehandshake', epoch>)>))
+                 c2s(kdf(h(<old_master, 'rk'>),
+                         <~k_rh, 
+                          h(<sid, 'rehandshake', epoch, <sid, eph_pkR, epoch>, sid, 
+                             kem_enc(eph_pkR, ~k_rh), epoch>)
+                         >)),
+                 s2c(kdf(h(<old_master, 'rk'>),
+                         <~k_rh, 
+                          h(<sid, 'rehandshake', epoch, <sid, eph_pkR, epoch>, sid, 
+                             kem_enc(eph_pkR, ~k_rh), epoch>)
+                         >))
   )
   ]->
    [
-   Out( <sid, kem_enc(eph_pkR, ~k_rh), epoch> ),
+   Out( <<sid, kem_enc(eph_pkR, ~k_rh), epoch>, 
+         mac(cck(kdf(h(<old_master, 'rk'>),
+                     <~k_rh, 
+                      h(<sid, 'rehandshake', epoch, <sid, eph_pkR, epoch>, sid, 
+                         kem_enc(eph_pkR, ~k_rh), epoch>)
+                     >)),
+             <'rehandshake confirm', <sid, eph_pkR, epoch>, sid, 
+              kem_enc(eph_pkR, ~k_rh), epoch>)
+        >
+   ),
    PostSessionS( $S, $C, sid,
-                 kdf(h(<old_master, 'rk'>), <~k_rh, h(<sid, 'rehandshake', epoch>)>)
+                 kdf(h(<old_master, 'rk'>),
+                     <~k_rh, 
+                      h(<sid, 'rehandshake', epoch, <sid, eph_pkR, epoch>, sid, 
+                         kem_enc(eph_pkR, ~k_rh), epoch>)
+                     >)
    )
    ]
 
@@ -78,26 +107,49 @@ rule (modulo E) RH_Server_Respond:
 rule (modulo E) RH_Client_Complete:
    [
    St_RH_C( $C, $S, sid, old_master, ~ekR, epoch ),
-   In( <sid, ct_rh, epoch> )
+   In( <<sid, ct_rh, epoch>, 
+        mac(cck(kdf(h(<old_master, 'rk'>),
+                    <kem_dec(~ekR, ct_rh), 
+                     h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                        epoch>)
+                    >)),
+            <'rehandshake confirm', <sid, kem_pk(~ekR), epoch>, sid, ct_rh, epoch>)
+       >
+   )
    ]
   --[
   RH_Client( $C, $S, sid,
              c2s(kdf(h(<old_master, 'rk'>),
-                     <kem_dec(~ekR, ct_rh), h(<sid, 'rehandshake', epoch>)>)),
+                     <kem_dec(~ekR, ct_rh), 
+                      h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                         epoch>)
+                     >)),
              s2c(kdf(h(<old_master, 'rk'>),
-                     <kem_dec(~ekR, ct_rh), h(<sid, 'rehandshake', epoch>)>))
+                     <kem_dec(~ekR, ct_rh), 
+                      h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                         epoch>)
+                     >))
   ),
   RH_SessionKey( $C, $S, sid,
                  c2s(kdf(h(<old_master, 'rk'>),
-                         <kem_dec(~ekR, ct_rh), h(<sid, 'rehandshake', epoch>)>)),
+                         <kem_dec(~ekR, ct_rh), 
+                          h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                             epoch>)
+                         >)),
                  s2c(kdf(h(<old_master, 'rk'>),
-                         <kem_dec(~ekR, ct_rh), h(<sid, 'rehandshake', epoch>)>))
+                         <kem_dec(~ekR, ct_rh), 
+                          h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                             epoch>)
+                         >))
   )
   ]->
    [
    PostSessionC( $C, $S, sid,
                  kdf(h(<old_master, 'rk'>),
-                     <kem_dec(~ekR, ct_rh), h(<sid, 'rehandshake', epoch>)>)
+                     <kem_dec(~ekR, ct_rh), 
+                      h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                         epoch>)
+                     >)
    )
    ]
 
@@ -105,21 +157,49 @@ rule (modulo E) RH_Client_Complete:
   rule (modulo AC) RH_Client_Complete:
      [
      St_RH_C( $C, $S, sid, old_master, ~ekR, epoch ),
-     In( <sid, ct_rh, epoch> )
+     In( <<sid, ct_rh, epoch>, 
+          mac(cck(kdf(h(<old_master, 'rk'>),
+                      <z, 
+                       h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                          epoch>)
+                      >)),
+              <'rehandshake confirm', <sid, kem_pk(~ekR), epoch>, sid, ct_rh, epoch>)
+         >
+     )
      ]
     --[
     RH_Client( $C, $S, sid,
-               c2s(kdf(h(<old_master, 'rk'>), <z, h(<sid, 'rehandshake', epoch>)>)),
-               s2c(kdf(h(<old_master, 'rk'>), <z, h(<sid, 'rehandshake', epoch>)>))
+               c2s(kdf(h(<old_master, 'rk'>),
+                       <z, 
+                        h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                           epoch>)
+                       >)),
+               s2c(kdf(h(<old_master, 'rk'>),
+                       <z, 
+                        h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                           epoch>)
+                       >))
     ),
     RH_SessionKey( $C, $S, sid,
-                   c2s(kdf(h(<old_master, 'rk'>), <z, h(<sid, 'rehandshake', epoch>)>)),
-                   s2c(kdf(h(<old_master, 'rk'>), <z, h(<sid, 'rehandshake', epoch>)>))
+                   c2s(kdf(h(<old_master, 'rk'>),
+                           <z, 
+                            h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                               epoch>)
+                           >)),
+                   s2c(kdf(h(<old_master, 'rk'>),
+                           <z, 
+                            h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                               epoch>)
+                           >))
     )
     ]->
      [
      PostSessionC( $C, $S, sid,
-                   kdf(h(<old_master, 'rk'>), <z, h(<sid, 'rehandshake', epoch>)>)
+                   kdf(h(<old_master, 'rk'>),
+                       <z, 
+                        h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                           epoch>)
+                       >)
      )
      ]
     variants (modulo AC)
@@ -150,19 +230,58 @@ rule (modulo E) RH_P_Server_Respond:
    ]
   --[
   RH_P_Server( $S, $C, sid,
-               c2s(kdf(h(<old_master, 'rk'>), <~k_rh, h(<sid, 'rehandshake', epoch>)>)),
-               s2c(kdf(h(<old_master, 'rk'>), <~k_rh, h(<sid, 'rehandshake', epoch>)>))
+               c2s(kdf(h(<old_master, 'rk'>),
+                       <~k_rh, 
+                        h(<sid, 'rehandshake', epoch, <sid, eph_pkR, epoch>, sid, 
+                           kem_enc(eph_pkR, ~k_rh), epoch>)
+                       >)),
+               s2c(kdf(h(<old_master, 'rk'>),
+                       <~k_rh, 
+                        h(<sid, 'rehandshake', epoch, <sid, eph_pkR, epoch>, sid, 
+                           kem_enc(eph_pkR, ~k_rh), epoch>)
+                       >))
   ),
   RH_P_SessionKey( $S, $C, sid,
-                   c2s(kdf(h(<old_master, 'rk'>), <~k_rh, h(<sid, 'rehandshake', epoch>)>)),
-                   s2c(kdf(h(<old_master, 'rk'>), <~k_rh, h(<sid, 'rehandshake', epoch>)>))
+                   c2s(kdf(h(<old_master, 'rk'>),
+                           <~k_rh, 
+                            h(<sid, 'rehandshake', epoch, <sid, eph_pkR, epoch>, sid, 
+                               kem_enc(eph_pkR, ~k_rh), epoch>)
+                           >)),
+                   s2c(kdf(h(<old_master, 'rk'>),
+                           <~k_rh, 
+                            h(<sid, 'rehandshake', epoch, <sid, eph_pkR, epoch>, sid, 
+                               kem_enc(eph_pkR, ~k_rh), epoch>)
+                           >))
   )
   ]->
    [
-   Ch_S2C( $S, $C, <sid, kem_enc(eph_pkR, ~k_rh), epoch> ),
-   Out( <sid, kem_enc(eph_pkR, ~k_rh), epoch> ),
+   Ch_S2C( $S, $C,
+           <<sid, kem_enc(eph_pkR, ~k_rh), epoch>, 
+            mac(cck(kdf(h(<old_master, 'rk'>),
+                        <~k_rh, 
+                         h(<sid, 'rehandshake', epoch, <sid, eph_pkR, epoch>, sid, 
+                            kem_enc(eph_pkR, ~k_rh), epoch>)
+                        >)),
+                <'rehandshake confirm', <sid, eph_pkR, epoch>, sid, 
+                 kem_enc(eph_pkR, ~k_rh), epoch>)
+           >
+   ),
+   Out( <<sid, kem_enc(eph_pkR, ~k_rh), epoch>, 
+         mac(cck(kdf(h(<old_master, 'rk'>),
+                     <~k_rh, 
+                      h(<sid, 'rehandshake', epoch, <sid, eph_pkR, epoch>, sid, 
+                         kem_enc(eph_pkR, ~k_rh), epoch>)
+                     >)),
+             <'rehandshake confirm', <sid, eph_pkR, epoch>, sid, 
+              kem_enc(eph_pkR, ~k_rh), epoch>)
+        >
+   ),
    PostSessionS( $S, $C, sid,
-                 kdf(h(<old_master, 'rk'>), <~k_rh, h(<sid, 'rehandshake', epoch>)>)
+                 kdf(h(<old_master, 'rk'>),
+                     <~k_rh, 
+                      h(<sid, 'rehandshake', epoch, <sid, eph_pkR, epoch>, sid, 
+                         kem_enc(eph_pkR, ~k_rh), epoch>)
+                     >)
    )
    ]
 
@@ -171,26 +290,50 @@ rule (modulo E) RH_P_Server_Respond:
 rule (modulo E) RH_P_Client_Complete:
    [
    St_RH_PC( $C, $S, sid, old_master, ~ekR, epoch ),
-   Ch_S2C( $S, $C, <sid, ct_rh, epoch> )
+   Ch_S2C( $S, $C,
+           <<sid, ct_rh, epoch>, 
+            mac(cck(kdf(h(<old_master, 'rk'>),
+                        <kem_dec(~ekR, ct_rh), 
+                         h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                            epoch>)
+                        >)),
+                <'rehandshake confirm', <sid, kem_pk(~ekR), epoch>, sid, ct_rh, epoch>)
+           >
+   )
    ]
   --[
   RH_P_Client( $C, $S, sid,
                c2s(kdf(h(<old_master, 'rk'>),
-                       <kem_dec(~ekR, ct_rh), h(<sid, 'rehandshake', epoch>)>)),
+                       <kem_dec(~ekR, ct_rh), 
+                        h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                           epoch>)
+                       >)),
                s2c(kdf(h(<old_master, 'rk'>),
-                       <kem_dec(~ekR, ct_rh), h(<sid, 'rehandshake', epoch>)>))
+                       <kem_dec(~ekR, ct_rh), 
+                        h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                           epoch>)
+                       >))
   ),
   RH_P_SessionKey( $C, $S, sid,
                    c2s(kdf(h(<old_master, 'rk'>),
-                           <kem_dec(~ekR, ct_rh), h(<sid, 'rehandshake', epoch>)>)),
+                           <kem_dec(~ekR, ct_rh), 
+                            h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                               epoch>)
+                           >)),
                    s2c(kdf(h(<old_master, 'rk'>),
-                           <kem_dec(~ekR, ct_rh), h(<sid, 'rehandshake', epoch>)>))
+                           <kem_dec(~ekR, ct_rh), 
+                            h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                               epoch>)
+                           >))
   )
   ]->
    [
    PostSessionC( $C, $S, sid,
                  kdf(h(<old_master, 'rk'>),
-                     <kem_dec(~ekR, ct_rh), h(<sid, 'rehandshake', epoch>)>)
+                     <kem_dec(~ekR, ct_rh), 
+                      h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                         epoch>)
+                     >)
    )
    ]
 
@@ -198,21 +341,50 @@ rule (modulo E) RH_P_Client_Complete:
   rule (modulo AC) RH_P_Client_Complete:
      [
      St_RH_PC( $C, $S, sid, old_master, ~ekR, epoch ),
-     Ch_S2C( $S, $C, <sid, ct_rh, epoch> )
+     Ch_S2C( $S, $C,
+             <<sid, ct_rh, epoch>, 
+              mac(cck(kdf(h(<old_master, 'rk'>),
+                          <z, 
+                           h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                              epoch>)
+                          >)),
+                  <'rehandshake confirm', <sid, kem_pk(~ekR), epoch>, sid, ct_rh, epoch>)
+             >
+     )
      ]
     --[
     RH_P_Client( $C, $S, sid,
-                 c2s(kdf(h(<old_master, 'rk'>), <z, h(<sid, 'rehandshake', epoch>)>)),
-                 s2c(kdf(h(<old_master, 'rk'>), <z, h(<sid, 'rehandshake', epoch>)>))
+                 c2s(kdf(h(<old_master, 'rk'>),
+                         <z, 
+                          h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                             epoch>)
+                         >)),
+                 s2c(kdf(h(<old_master, 'rk'>),
+                         <z, 
+                          h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                             epoch>)
+                         >))
     ),
     RH_P_SessionKey( $C, $S, sid,
-                     c2s(kdf(h(<old_master, 'rk'>), <z, h(<sid, 'rehandshake', epoch>)>)),
-                     s2c(kdf(h(<old_master, 'rk'>), <z, h(<sid, 'rehandshake', epoch>)>))
+                     c2s(kdf(h(<old_master, 'rk'>),
+                             <z, 
+                              h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                                 epoch>)
+                             >)),
+                     s2c(kdf(h(<old_master, 'rk'>),
+                             <z, 
+                              h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                                 epoch>)
+                             >))
     )
     ]->
      [
      PostSessionC( $C, $S, sid,
-                   kdf(h(<old_master, 'rk'>), <z, h(<sid, 'rehandshake', epoch>)>)
+                   kdf(h(<old_master, 'rk'>),
+                       <z, 
+                        h(<sid, 'rehandshake', epoch, <sid, kem_pk(~ekR), epoch>, sid, ct_rh, 
+                           epoch>)
+                       >)
      )
      ]
     variants (modulo AC)
@@ -241,15 +413,25 @@ solve( St_RH_C( $C, $S, sid, old_master, ~ekR, epoch ) ▶₀ #i )
   case RH_Client_Init_case_1
   solve( SessionS( $S, $C, ~sid, ~master ) ▶₀ #j )
     case Bootstrap_Control
-    solve( !KU( kem_enc(kem_pk(~ekR), ~k_rh) ) @ #vk.4 )
-      case RH_Server_Respond
-      solve( !KU( ~sid ) @ #vk.2 )
+    solve( !KU( ~sid ) @ #vk.2 )
+      case RH_Client_Init
+      solve( !KU( ~epoch ) @ #vk.6 )
         case RH_Client_Init
-        solve( !KU( ~epoch ) @ #vk.5 )
-          case RH_Client_Init
-          solve( !KU( kem_pk(~ekR) ) @ #vk.7 )
-            case RH_Client_Init
-            SOLVED // trace found
+        solve( !KU( mac(cck(kdf(h(<~master, 'rk'>),
+                                <~k_rh, 
+                                 h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                    kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                                >)),
+                        <'rehandshake confirm', <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                         kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+               ) @ #vk.8 )
+          case RH_Server_Respond
+          solve( !KU( kem_enc(kem_pk(~ekR), ~k_rh) ) @ #vk.8 )
+            case RH_Server_Respond
+            solve( !KU( kem_pk(~ekR) ) @ #vk.9 )
+              case RH_Client_Init
+              SOLVED // trace found
+            qed
           qed
         qed
       qed
@@ -271,11 +453,131 @@ guarded formula characterizing all satisfying traces:
 simplify
 solve( St_RH_PC( $C, $S, sid, old_master, ~ekR, epoch ) ▶₀ #i )
   case RH_P_Client_Init_case_1
-  solve( Ch_S2C( $S, $C, <~sid, kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>
+  solve( Ch_S2C( $S, $C,
+                 <<~sid, kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>, 
+                  mac(cck(kdf(h(<~master, 'rk'>),
+                              <~k_rh, 
+                               h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                  kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                              >)),
+                      <'rehandshake confirm', <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                       kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                 >
          ) ▶₁ #i )
     case RH_P_Server_Respond
     SOLVED // trace found
   qed
+qed
+
+lemma rh_client_agrees:
+  all-traces
+  "∀ C S sid k1 k2 #i.
+    ((RH_Client( C, S, sid, k1, k2 ) @ #i) ∧
+     (¬(∃ C2 S2 sid2 #r. EpochLeak( C2, S2, sid2 ) @ #r))) ⇒
+    (∃ #j. (RH_Server( S, C, sid, k1, k2 ) @ #j) ∧ (#j < #i))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ C S sid k1 k2 #i.
+  (RH_Client( C, S, sid, k1, k2 ) @ #i)
+ ∧
+  (∀ C2 S2 sid2 #r. (EpochLeak( C2, S2, sid2 ) @ #r) ⇒ ⊥) ∧
+  (∀ #j. (RH_Server( S, C, sid, k1, k2 ) @ #j) ⇒ ¬(#j < #i))"
+*/
+simplify
+solve( St_RH_C( $C, $S, sid, old_master, ~ekR, epoch ) ▶₀ #i )
+  case RH_Client_Init_case_1
+  solve( splitEqs(0) )
+    case split_case_1
+    solve( !KU( mac(cck(kdf(h(<~master, 'rk'>),
+                            <kem_dec(~ekR, ct_rh), 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                ct_rh, ~epoch>)
+                            >)),
+                    <'rehandshake confirm', <~sid, kem_pk(~ekR), ~epoch>, ~sid, ct_rh, ~epoch
+                    >)
+           ) @ #vk.6 )
+      case c_mac
+      solve( !KU( cck(kdf(h(<~master, 'rk'>),
+                          <kem_dec(~ekR, ct_rh), 
+                           h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                              ct_rh, ~epoch>)
+                          >))
+             ) @ #vk.10 )
+        case c_cck
+        solve( !KU( kdf(h(<~master, 'rk'>),
+                        <kem_dec(~ekR, ct_rh), 
+                         h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                            ct_rh, ~epoch>)
+                        >)
+               ) @ #vk.14 )
+          case c_kdf
+          solve( !KU( kem_dec(~ekR, ct_rh) ) @ #vk.17 )
+            case c_kem_dec
+            by solve( !KU( ~ekR ) @ #vk.19 )
+          qed
+        qed
+      qed
+    qed
+  next
+    case split_case_2
+    solve( !KU( mac(cck(kdf(h(<~master, 'rk'>),
+                            <z, 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                kem_enc(kem_pk(~ekR), z), ~epoch>)
+                            >)),
+                    <'rehandshake confirm', <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                     kem_enc(kem_pk(~ekR), z), ~epoch>)
+           ) @ #vk.6 )
+      case RH_Server_Respond
+      by contradiction /* from formulas */
+    next
+      case c_mac
+      solve( !KU( cck(kdf(h(<~master, 'rk'>),
+                          <z, 
+                           h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                              kem_enc(kem_pk(~ekR), z), ~epoch>)
+                          >))
+             ) @ #vk.10 )
+        case c_cck
+        solve( !KU( kdf(h(<~master, 'rk'>),
+                        <z, 
+                         h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                            kem_enc(kem_pk(~ekR), z), ~epoch>)
+                        >)
+               ) @ #vk.14 )
+          case c_kdf
+          solve( !KU( kem_enc(kem_pk(~ekR), z) ) @ #vk.10 )
+            case RH_Server_Respond_case_1
+            solve( !KU( ~sid.1 ) @ #vk.21 )
+              case RH_Client_Init
+              solve( !KU( ~k_rh ) @ #vk.20 )
+                case RH_Server_Respond
+                by solve( !KU( ~ekR ) @ #vk.23 )
+              qed
+            next
+              case RH_P_Client_Init
+              solve( !KU( ~k_rh ) @ #vk.20 )
+                case RH_Server_Respond
+                by solve( !KU( ~ekR ) @ #vk.23 )
+              qed
+            qed
+          next
+            case RH_Server_Respond_case_2
+            by contradiction /* from formulas */
+          next
+            case c_kem_enc
+            solve( !KU( h(<~master, 'rk'>) ) @ #vk.15 )
+              case c_h
+              by solve( !KU( ~master ) @ #vk.20 )
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+next
+  case RH_Client_Init_case_2
+  by contradiction /* from formulas */
 qed
 
 lemma pcs_control_keys_only:
@@ -301,53 +603,115 @@ solve( (∃ #k. (K( k1 ) @ #k))  ∥ (∃ #k. (K( k2 ) @ #k)) )
       case RH_Client_Init_case_1
       solve( splitEqs(0) )
         case split_case_1
-        solve( !KU( c2s(kdf(h(<~master, 'rk'>),
-                            <kem_dec(~ekR, ct_rh), h(<~sid, 'rehandshake', ~epoch>)>))
-               ) @ #vk )
-          case c_c2s
-          solve( !KU( kdf(h(<~master, 'rk'>),
-                          <kem_dec(~ekR, ct_rh), h(<~sid, 'rehandshake', ~epoch>)>)
-                 ) @ #vk.6 )
-            case c_kdf
-            solve( !KU( kem_dec(~ekR, ct_rh) ) @ #vk.9 )
-              case c_kem_dec
-              by solve( !KU( ~ekR ) @ #vk.11 )
+        solve( !KU( mac(cck(kdf(h(<~master, 'rk'>),
+                                <kem_dec(~ekR, ct_rh), 
+                                 h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                    ct_rh, ~epoch>)
+                                >)),
+                        <'rehandshake confirm', <~sid, kem_pk(~ekR), ~epoch>, ~sid, ct_rh, ~epoch
+                        >)
+               ) @ #vk.7 )
+          case c_mac
+          solve( !KU( cck(kdf(h(<~master, 'rk'>),
+                              <kem_dec(~ekR, ct_rh), 
+                               h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                  ct_rh, ~epoch>)
+                              >))
+                 ) @ #vk.11 )
+            case c_cck
+            solve( !KU( kdf(h(<~master, 'rk'>),
+                            <kem_dec(~ekR, ct_rh), 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                ct_rh, ~epoch>)
+                            >)
+                   ) @ #vk.15 )
+              case c_kdf
+              solve( !KU( kem_dec(~ekR, ct_rh) ) @ #vk.18 )
+                case c_kem_dec
+                by solve( !KU( ~ekR ) @ #vk.20 )
+              qed
             qed
           qed
         qed
       next
         case split_case_2
-        solve( !KU( c2s(kdf(h(<~master, 'rk'>),
-                            <z, h(<~sid, 'rehandshake', ~epoch>)>))
-               ) @ #vk )
-          case c_c2s
-          solve( !KU( kdf(h(<~master, 'rk'>),
-                          <z, h(<~sid, 'rehandshake', ~epoch>)>)
-                 ) @ #vk.6 )
-            case c_kdf
-            solve( !KU( kem_enc(kem_pk(~ekR), z) ) @ #vk.5 )
-              case RH_Server_Respond_case_1
-              solve( !KU( ~sid.1 ) @ #vk.12 )
-                case RH_Client_Init
-                solve( !KU( ~k_rh ) @ #vk.10 )
-                  case RH_Server_Respond
-                  by solve( !KU( ~ekR ) @ #vk.16 )
-                qed
-              next
-                case RH_P_Client_Init
-                solve( !KU( ~k_rh ) @ #vk.10 )
-                  case RH_Server_Respond
-                  by solve( !KU( ~ekR ) @ #vk.16 )
-                qed
+        solve( !KU( mac(cck(kdf(h(<~master, 'rk'>),
+                                <z, 
+                                 h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                    kem_enc(kem_pk(~ekR), z), ~epoch>)
+                                >)),
+                        <'rehandshake confirm', <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                         kem_enc(kem_pk(~ekR), z), ~epoch>)
+               ) @ #vk.7 )
+          case RH_Server_Respond
+          solve( !KU( c2s(kdf(h(<~master, 'rk'>),
+                              <~k_rh, 
+                               h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                  kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                              >))
+                 ) @ #vk.1 )
+            case c_c2s
+            solve( !KU( kdf(h(<~master, 'rk'>),
+                            <~k_rh, 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                            >)
+                   ) @ #vk.11 )
+              case c_kdf
+              solve( !KU( ~k_rh ) @ #vk.14 )
+                case RH_Server_Respond
+                by solve( !KU( ~ekR ) @ #vk.16 )
               qed
-            next
-              case RH_Server_Respond_case_2
-              by contradiction /* from formulas */
-            next
-              case c_kem_enc
-              solve( !KU( h(<~master, 'rk'>) ) @ #vk.7 )
-                case c_h
-                by solve( !KU( ~master ) @ #vk.13 )
+            qed
+          qed
+        next
+          case c_mac
+          solve( !KU( cck(kdf(h(<~master, 'rk'>),
+                              <z, 
+                               h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                  kem_enc(kem_pk(~ekR), z), ~epoch>)
+                              >))
+                 ) @ #vk.11 )
+            case c_cck
+            solve( !KU( kdf(h(<~master, 'rk'>),
+                            <z, 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                kem_enc(kem_pk(~ekR), z), ~epoch>)
+                            >)
+                   ) @ #vk.15 )
+              case c_kdf
+              solve( !KU( c2s(kdf(h(<~master, 'rk'>),
+                                  <z, 
+                                   h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                      kem_enc(kem_pk(~ekR), z), ~epoch>)
+                                  >))
+                     ) @ #vk.4 )
+                case c_c2s
+                solve( !KU( kem_enc(kem_pk(~ekR), z) ) @ #vk.11 )
+                  case RH_Server_Respond_case_1
+                  solve( !KU( ~sid.1 ) @ #vk.22 )
+                    case RH_Client_Init
+                    solve( !KU( ~k_rh ) @ #vk.21 )
+                      case RH_Server_Respond
+                      by solve( !KU( ~ekR ) @ #vk.24 )
+                    qed
+                  next
+                    case RH_P_Client_Init
+                    solve( !KU( ~k_rh ) @ #vk.21 )
+                      case RH_Server_Respond
+                      by solve( !KU( ~ekR ) @ #vk.24 )
+                    qed
+                  qed
+                next
+                  case RH_Server_Respond_case_2
+                  by contradiction /* from formulas */
+                next
+                  case c_kem_enc
+                  solve( !KU( h(<~master, 'rk'>) ) @ #vk.16 )
+                    case c_h
+                    by solve( !KU( ~master ) @ #vk.21 )
+                  qed
+                qed
               qed
             qed
           qed
@@ -364,11 +728,17 @@ solve( (∃ #k. (K( k1 ) @ #k))  ∥ (∃ #k. (K( k2 ) @ #k)) )
       solve( !KU( ~sid ) @ #vk.2 )
         case RH_Client_Init
         solve( !KU( c2s(kdf(h(<~master, 'rk'>),
-                            <~k_rh, h(<~sid, 'rehandshake', epoch>)>))
+                            <~k_rh, 
+                             h(<~sid, 'rehandshake', epoch, <~sid, eph_pkR, epoch>, ~sid, 
+                                kem_enc(eph_pkR, ~k_rh), epoch>)
+                            >))
                ) @ #vk.1 )
           case c_c2s
           solve( !KU( kdf(h(<~master, 'rk'>),
-                          <~k_rh, h(<~sid, 'rehandshake', epoch>)>)
+                          <~k_rh, 
+                           h(<~sid, 'rehandshake', epoch, <~sid, eph_pkR, epoch>, ~sid, 
+                              kem_enc(eph_pkR, ~k_rh), epoch>)
+                          >)
                  ) @ #vk.6 )
             case c_kdf
             solve( !KU( ~k_rh ) @ #vk.9 )
@@ -383,11 +753,17 @@ solve( (∃ #k. (K( k1 ) @ #k))  ∥ (∃ #k. (K( k2 ) @ #k)) )
       next
         case RH_P_Client_Init
         solve( !KU( c2s(kdf(h(<~master, 'rk'>),
-                            <~k_rh, h(<~sid, 'rehandshake', epoch>)>))
+                            <~k_rh, 
+                             h(<~sid, 'rehandshake', epoch, <~sid, eph_pkR, epoch>, ~sid, 
+                                kem_enc(eph_pkR, ~k_rh), epoch>)
+                            >))
                ) @ #vk.1 )
           case c_c2s
           solve( !KU( kdf(h(<~master, 'rk'>),
-                          <~k_rh, h(<~sid, 'rehandshake', epoch>)>)
+                          <~k_rh, 
+                           h(<~sid, 'rehandshake', epoch, <~sid, eph_pkR, epoch>, ~sid, 
+                              kem_enc(eph_pkR, ~k_rh), epoch>)
+                          >)
                  ) @ #vk.6 )
             case c_kdf
             solve( !KU( ~k_rh ) @ #vk.9 )
@@ -413,53 +789,115 @@ next
       case RH_Client_Init_case_1
       solve( splitEqs(0) )
         case split_case_1
-        solve( !KU( s2c(kdf(h(<~master, 'rk'>),
-                            <kem_dec(~ekR, ct_rh), h(<~sid, 'rehandshake', ~epoch>)>))
-               ) @ #vk )
-          case c_s2c
-          solve( !KU( kdf(h(<~master, 'rk'>),
-                          <kem_dec(~ekR, ct_rh), h(<~sid, 'rehandshake', ~epoch>)>)
-                 ) @ #vk.6 )
-            case c_kdf
-            solve( !KU( kem_dec(~ekR, ct_rh) ) @ #vk.9 )
-              case c_kem_dec
-              by solve( !KU( ~ekR ) @ #vk.11 )
+        solve( !KU( mac(cck(kdf(h(<~master, 'rk'>),
+                                <kem_dec(~ekR, ct_rh), 
+                                 h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                    ct_rh, ~epoch>)
+                                >)),
+                        <'rehandshake confirm', <~sid, kem_pk(~ekR), ~epoch>, ~sid, ct_rh, ~epoch
+                        >)
+               ) @ #vk.7 )
+          case c_mac
+          solve( !KU( cck(kdf(h(<~master, 'rk'>),
+                              <kem_dec(~ekR, ct_rh), 
+                               h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                  ct_rh, ~epoch>)
+                              >))
+                 ) @ #vk.11 )
+            case c_cck
+            solve( !KU( kdf(h(<~master, 'rk'>),
+                            <kem_dec(~ekR, ct_rh), 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                ct_rh, ~epoch>)
+                            >)
+                   ) @ #vk.15 )
+              case c_kdf
+              solve( !KU( kem_dec(~ekR, ct_rh) ) @ #vk.18 )
+                case c_kem_dec
+                by solve( !KU( ~ekR ) @ #vk.20 )
+              qed
             qed
           qed
         qed
       next
         case split_case_2
-        solve( !KU( s2c(kdf(h(<~master, 'rk'>),
-                            <z, h(<~sid, 'rehandshake', ~epoch>)>))
-               ) @ #vk )
-          case c_s2c
-          solve( !KU( kdf(h(<~master, 'rk'>),
-                          <z, h(<~sid, 'rehandshake', ~epoch>)>)
-                 ) @ #vk.6 )
-            case c_kdf
-            solve( !KU( kem_enc(kem_pk(~ekR), z) ) @ #vk.5 )
-              case RH_Server_Respond_case_1
-              solve( !KU( ~sid.1 ) @ #vk.12 )
-                case RH_Client_Init
-                solve( !KU( ~k_rh ) @ #vk.10 )
-                  case RH_Server_Respond
-                  by solve( !KU( ~ekR ) @ #vk.16 )
-                qed
-              next
-                case RH_P_Client_Init
-                solve( !KU( ~k_rh ) @ #vk.10 )
-                  case RH_Server_Respond
-                  by solve( !KU( ~ekR ) @ #vk.16 )
-                qed
+        solve( !KU( mac(cck(kdf(h(<~master, 'rk'>),
+                                <z, 
+                                 h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                    kem_enc(kem_pk(~ekR), z), ~epoch>)
+                                >)),
+                        <'rehandshake confirm', <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                         kem_enc(kem_pk(~ekR), z), ~epoch>)
+               ) @ #vk.7 )
+          case RH_Server_Respond
+          solve( !KU( s2c(kdf(h(<~master, 'rk'>),
+                              <~k_rh, 
+                               h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                  kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                              >))
+                 ) @ #vk.1 )
+            case c_s2c
+            solve( !KU( kdf(h(<~master, 'rk'>),
+                            <~k_rh, 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                            >)
+                   ) @ #vk.11 )
+              case c_kdf
+              solve( !KU( ~k_rh ) @ #vk.14 )
+                case RH_Server_Respond
+                by solve( !KU( ~ekR ) @ #vk.16 )
               qed
-            next
-              case RH_Server_Respond_case_2
-              by contradiction /* from formulas */
-            next
-              case c_kem_enc
-              solve( !KU( h(<~master, 'rk'>) ) @ #vk.7 )
-                case c_h
-                by solve( !KU( ~master ) @ #vk.13 )
+            qed
+          qed
+        next
+          case c_mac
+          solve( !KU( cck(kdf(h(<~master, 'rk'>),
+                              <z, 
+                               h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                  kem_enc(kem_pk(~ekR), z), ~epoch>)
+                              >))
+                 ) @ #vk.11 )
+            case c_cck
+            solve( !KU( kdf(h(<~master, 'rk'>),
+                            <z, 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                kem_enc(kem_pk(~ekR), z), ~epoch>)
+                            >)
+                   ) @ #vk.15 )
+              case c_kdf
+              solve( !KU( s2c(kdf(h(<~master, 'rk'>),
+                                  <z, 
+                                   h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                      kem_enc(kem_pk(~ekR), z), ~epoch>)
+                                  >))
+                     ) @ #vk.4 )
+                case c_s2c
+                solve( !KU( kem_enc(kem_pk(~ekR), z) ) @ #vk.11 )
+                  case RH_Server_Respond_case_1
+                  solve( !KU( ~sid.1 ) @ #vk.22 )
+                    case RH_Client_Init
+                    solve( !KU( ~k_rh ) @ #vk.21 )
+                      case RH_Server_Respond
+                      by solve( !KU( ~ekR ) @ #vk.24 )
+                    qed
+                  next
+                    case RH_P_Client_Init
+                    solve( !KU( ~k_rh ) @ #vk.21 )
+                      case RH_Server_Respond
+                      by solve( !KU( ~ekR ) @ #vk.24 )
+                    qed
+                  qed
+                next
+                  case RH_Server_Respond_case_2
+                  by contradiction /* from formulas */
+                next
+                  case c_kem_enc
+                  solve( !KU( h(<~master, 'rk'>) ) @ #vk.16 )
+                    case c_h
+                    by solve( !KU( ~master ) @ #vk.21 )
+                  qed
+                qed
               qed
             qed
           qed
@@ -476,11 +914,17 @@ next
       solve( !KU( ~sid ) @ #vk.2 )
         case RH_Client_Init
         solve( !KU( s2c(kdf(h(<~master, 'rk'>),
-                            <~k_rh, h(<~sid, 'rehandshake', epoch>)>))
+                            <~k_rh, 
+                             h(<~sid, 'rehandshake', epoch, <~sid, eph_pkR, epoch>, ~sid, 
+                                kem_enc(eph_pkR, ~k_rh), epoch>)
+                            >))
                ) @ #vk.1 )
           case c_s2c
           solve( !KU( kdf(h(<~master, 'rk'>),
-                          <~k_rh, h(<~sid, 'rehandshake', epoch>)>)
+                          <~k_rh, 
+                           h(<~sid, 'rehandshake', epoch, <~sid, eph_pkR, epoch>, ~sid, 
+                              kem_enc(eph_pkR, ~k_rh), epoch>)
+                          >)
                  ) @ #vk.6 )
             case c_kdf
             solve( !KU( ~k_rh ) @ #vk.9 )
@@ -495,11 +939,17 @@ next
       next
         case RH_P_Client_Init
         solve( !KU( s2c(kdf(h(<~master, 'rk'>),
-                            <~k_rh, h(<~sid, 'rehandshake', epoch>)>))
+                            <~k_rh, 
+                             h(<~sid, 'rehandshake', epoch, <~sid, eph_pkR, epoch>, ~sid, 
+                                kem_enc(eph_pkR, ~k_rh), epoch>)
+                            >))
                ) @ #vk.1 )
           case c_s2c
           solve( !KU( kdf(h(<~master, 'rk'>),
-                          <~k_rh, h(<~sid, 'rehandshake', epoch>)>)
+                          <~k_rh, 
+                           h(<~sid, 'rehandshake', epoch, <~sid, eph_pkR, epoch>, ~sid, 
+                              kem_enc(eph_pkR, ~k_rh), epoch>)
+                          >)
                  ) @ #vk.6 )
             case c_kdf
             solve( !KU( ~k_rh ) @ #vk.9 )
@@ -538,17 +988,33 @@ solve( (∃ #k. (K( k1 ) @ #k))  ∥ (∃ #k. (K( k2 ) @ #k)) )
     case RH_P_Client_Complete
     solve( St_RH_PC( $C, $S, sid, old_master, ~ekR, epoch ) ▶₀ #i )
       case RH_P_Client_Init_case_1
-      solve( Ch_S2C( $S, $C, <~sid, ct_rh, ~epoch> ) ▶₁ #i )
+      solve( Ch_S2C( $S, $C,
+                     <<~sid, ct_rh, ~epoch>, 
+                      mac(cck(kdf(h(<~master, 'rk'>),
+                                  <z, 
+                                   h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                      ct_rh, ~epoch>)
+                                  >)),
+                          <'rehandshake confirm', <~sid, kem_pk(~ekR), ~epoch>, ~sid, ct_rh, ~epoch
+                          >)
+                     >
+             ) ▶₁ #i )
         case RH_P_Server_Respond
         solve( !KU( c2s(kdf(h(<~master, 'rk'>),
-                            <~z, h(<~sid, 'rehandshake', ~epoch>)>))
+                            <~k_rh, 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                            >))
                ) @ #vk )
           case c_c2s
           solve( !KU( kdf(h(<~master, 'rk'>),
-                          <~z, h(<~sid, 'rehandshake', ~epoch>)>)
+                          <~k_rh, 
+                           h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                              kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                          >)
                  ) @ #vk.1 )
             case c_kdf
-            solve( !KU( ~z ) @ #vk.4 )
+            solve( !KU( ~k_rh ) @ #vk.4 )
               case RH_P_Server_Respond
               by solve( !KU( ~ekR ) @ #vk.6 )
             qed
@@ -557,17 +1023,33 @@ solve( (∃ #k. (K( k1 ) @ #k))  ∥ (∃ #k. (K( k2 ) @ #k)) )
       qed
     next
       case RH_P_Client_Init_case_2
-      solve( Ch_S2C( $S, $C, <~sid, ct_rh, ~epoch> ) ▶₁ #i )
+      solve( Ch_S2C( $S, $C,
+                     <<~sid, ct_rh, ~epoch>, 
+                      mac(cck(kdf(h(<~master, 'rk'>),
+                                  <z, 
+                                   h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                      ct_rh, ~epoch>)
+                                  >)),
+                          <'rehandshake confirm', <~sid, kem_pk(~ekR), ~epoch>, ~sid, ct_rh, ~epoch
+                          >)
+                     >
+             ) ▶₁ #i )
         case RH_P_Server_Respond
         solve( !KU( c2s(kdf(h(<~master, 'rk'>),
-                            <~z, h(<~sid, 'rehandshake', ~epoch>)>))
+                            <~k_rh, 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                            >))
                ) @ #vk )
           case c_c2s
           solve( !KU( kdf(h(<~master, 'rk'>),
-                          <~z, h(<~sid, 'rehandshake', ~epoch>)>)
+                          <~k_rh, 
+                           h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                              kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                          >)
                  ) @ #vk.1 )
             case c_kdf
-            solve( !KU( ~z ) @ #vk.4 )
+            solve( !KU( ~k_rh ) @ #vk.4 )
               case RH_P_Server_Respond
               by solve( !KU( ~ekR ) @ #vk.6 )
             qed
@@ -582,11 +1064,17 @@ solve( (∃ #k. (K( k1 ) @ #k))  ∥ (∃ #k. (K( k2 ) @ #k)) )
       solve( Ch_C2S( $C, $S, <~sid, eph_pkR, epoch> ) ▶₁ #i )
         case RH_P_Client_Init
         solve( !KU( c2s(kdf(h(<~master, 'rk'>),
-                            <~k_rh, h(<~sid, 'rehandshake', ~epoch>)>))
+                            <~k_rh, 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                            >))
                ) @ #vk )
           case c_c2s
           solve( !KU( kdf(h(<~master, 'rk'>),
-                          <~k_rh, h(<~sid, 'rehandshake', ~epoch>)>)
+                          <~k_rh, 
+                           h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                              kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                          >)
                  ) @ #vk.1 )
             case c_kdf
             solve( !KU( ~k_rh ) @ #vk.4 )
@@ -601,11 +1089,17 @@ solve( (∃ #k. (K( k1 ) @ #k))  ∥ (∃ #k. (K( k2 ) @ #k)) )
       solve( Ch_C2S( $C, $S, <~sid, eph_pkR, epoch> ) ▶₁ #i )
         case RH_P_Client_Init
         solve( !KU( c2s(kdf(h(<~master, 'rk'>),
-                            <~k_rh, h(<~sid, 'rehandshake', ~epoch>)>))
+                            <~k_rh, 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                            >))
                ) @ #vk )
           case c_c2s
           solve( !KU( kdf(h(<~master, 'rk'>),
-                          <~k_rh, h(<~sid, 'rehandshake', ~epoch>)>)
+                          <~k_rh, 
+                           h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                              kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                          >)
                  ) @ #vk.1 )
             case c_kdf
             solve( !KU( ~k_rh ) @ #vk.4 )
@@ -623,17 +1117,33 @@ next
     case RH_P_Client_Complete
     solve( St_RH_PC( $C, $S, sid, old_master, ~ekR, epoch ) ▶₀ #i )
       case RH_P_Client_Init_case_1
-      solve( Ch_S2C( $S, $C, <~sid, ct_rh, ~epoch> ) ▶₁ #i )
+      solve( Ch_S2C( $S, $C,
+                     <<~sid, ct_rh, ~epoch>, 
+                      mac(cck(kdf(h(<~master, 'rk'>),
+                                  <z, 
+                                   h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                      ct_rh, ~epoch>)
+                                  >)),
+                          <'rehandshake confirm', <~sid, kem_pk(~ekR), ~epoch>, ~sid, ct_rh, ~epoch
+                          >)
+                     >
+             ) ▶₁ #i )
         case RH_P_Server_Respond
         solve( !KU( s2c(kdf(h(<~master, 'rk'>),
-                            <~z, h(<~sid, 'rehandshake', ~epoch>)>))
+                            <~k_rh, 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                            >))
                ) @ #vk )
           case c_s2c
           solve( !KU( kdf(h(<~master, 'rk'>),
-                          <~z, h(<~sid, 'rehandshake', ~epoch>)>)
+                          <~k_rh, 
+                           h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                              kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                          >)
                  ) @ #vk.1 )
             case c_kdf
-            solve( !KU( ~z ) @ #vk.4 )
+            solve( !KU( ~k_rh ) @ #vk.4 )
               case RH_P_Server_Respond
               by solve( !KU( ~ekR ) @ #vk.6 )
             qed
@@ -642,17 +1152,33 @@ next
       qed
     next
       case RH_P_Client_Init_case_2
-      solve( Ch_S2C( $S, $C, <~sid, ct_rh, ~epoch> ) ▶₁ #i )
+      solve( Ch_S2C( $S, $C,
+                     <<~sid, ct_rh, ~epoch>, 
+                      mac(cck(kdf(h(<~master, 'rk'>),
+                                  <z, 
+                                   h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                      ct_rh, ~epoch>)
+                                  >)),
+                          <'rehandshake confirm', <~sid, kem_pk(~ekR), ~epoch>, ~sid, ct_rh, ~epoch
+                          >)
+                     >
+             ) ▶₁ #i )
         case RH_P_Server_Respond
         solve( !KU( s2c(kdf(h(<~master, 'rk'>),
-                            <~z, h(<~sid, 'rehandshake', ~epoch>)>))
+                            <~k_rh, 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                            >))
                ) @ #vk )
           case c_s2c
           solve( !KU( kdf(h(<~master, 'rk'>),
-                          <~z, h(<~sid, 'rehandshake', ~epoch>)>)
+                          <~k_rh, 
+                           h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                              kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                          >)
                  ) @ #vk.1 )
             case c_kdf
-            solve( !KU( ~z ) @ #vk.4 )
+            solve( !KU( ~k_rh ) @ #vk.4 )
               case RH_P_Server_Respond
               by solve( !KU( ~ekR ) @ #vk.6 )
             qed
@@ -667,11 +1193,17 @@ next
       solve( Ch_C2S( $C, $S, <~sid, eph_pkR, epoch> ) ▶₁ #i )
         case RH_P_Client_Init
         solve( !KU( s2c(kdf(h(<~master, 'rk'>),
-                            <~k_rh, h(<~sid, 'rehandshake', ~epoch>)>))
+                            <~k_rh, 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                            >))
                ) @ #vk )
           case c_s2c
           solve( !KU( kdf(h(<~master, 'rk'>),
-                          <~k_rh, h(<~sid, 'rehandshake', ~epoch>)>)
+                          <~k_rh, 
+                           h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                              kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                          >)
                  ) @ #vk.1 )
             case c_kdf
             solve( !KU( ~k_rh ) @ #vk.4 )
@@ -686,11 +1218,17 @@ next
       solve( Ch_C2S( $C, $S, <~sid, eph_pkR, epoch> ) ▶₁ #i )
         case RH_P_Client_Init
         solve( !KU( s2c(kdf(h(<~master, 'rk'>),
-                            <~k_rh, h(<~sid, 'rehandshake', ~epoch>)>))
+                            <~k_rh, 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                            >))
                ) @ #vk )
           case c_s2c
           solve( !KU( kdf(h(<~master, 'rk'>),
-                          <~k_rh, h(<~sid, 'rehandshake', ~epoch>)>)
+                          <~k_rh, 
+                           h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                              kem_enc(kem_pk(~ekR), ~k_rh), ~epoch>)
+                          >)
                  ) @ #vk.1 )
             case c_kdf
             solve( !KU( ~k_rh ) @ #vk.4 )
@@ -724,27 +1262,53 @@ solve( RH_SessionKey( $C, $S, ~sid, k1, k2 ) @ #i )
     case RH_Client_Init
     solve( splitEqs(1) )
       case split_case_2
-      solve( !KU( c2s(kdf(h(<~master, 'rk'>),
-                          <z, h(<~sid, 'rehandshake', ~epoch>)>))
-             ) @ #vk )
-        case c_c2s
-        solve( !KU( kdf(h(<~master, 'rk'>),
-                        <z, h(<~sid, 'rehandshake', ~epoch>)>)
-               ) @ #vk.6 )
-          case c_kdf
-          solve( !KU( kem_enc(kem_pk(~ekR), z) ) @ #vk.5 )
-            case c_kem_enc
-            solve( !KU( h(<~sid, 'rehandshake', ~epoch>) ) @ #vk.10 )
-              case c_h
-              solve( !KU( ~sid ) @ #vk.6 )
-                case RH_Client_Init
-                solve( !KU( ~epoch ) @ #vk.9 )
-                  case RH_Client_Init
-                  solve( !KU( h(<~master, 'rk'>) ) @ #vk.11 )
-                    case Bootstrap_Epoch
-                    solve( !KU( kem_pk(~ekR) ) @ #vk.13 )
+      solve( !KU( mac(cck(kdf(h(<~master, 'rk'>),
+                              <z, 
+                               h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                  kem_enc(kem_pk(~ekR), z), ~epoch>)
+                              >)),
+                      <'rehandshake confirm', <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                       kem_enc(kem_pk(~ekR), z), ~epoch>)
+             ) @ #vk.7 )
+        case c_mac
+        solve( !KU( cck(kdf(h(<~master, 'rk'>),
+                            <z, 
+                             h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                kem_enc(kem_pk(~ekR), z), ~epoch>)
+                            >))
+               ) @ #vk.11 )
+          case c_cck
+          solve( !KU( kdf(h(<~master, 'rk'>),
+                          <z, 
+                           h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                              kem_enc(kem_pk(~ekR), z), ~epoch>)
+                          >)
+                 ) @ #vk.15 )
+            case c_kdf
+            solve( !KU( c2s(kdf(h(<~master, 'rk'>),
+                                <z, 
+                                 h(<~sid, 'rehandshake', ~epoch, <~sid, kem_pk(~ekR), ~epoch>, ~sid, 
+                                    kem_enc(kem_pk(~ekR), z), ~epoch>)
+                                >))
+                   ) @ #vk.4 )
+              case c_c2s
+              solve( !KU( kem_enc(kem_pk(~ekR), z) ) @ #vk.11 )
+                case c_kem_enc
+                solve( !KU( h(<~sid, 'rehandshake', ~epoch, 
+                               <~sid, kem_pk(~ekR), ~epoch>, ~sid, kem_enc(kem_pk(~ekR), z), ~epoch>)
+                       ) @ #vk.19 )
+                  case c_h
+                  solve( !KU( ~sid ) @ #vk.12 )
+                    case RH_Client_Init
+                    solve( !KU( ~epoch ) @ #vk.17 )
                       case RH_Client_Init
-                      SOLVED // trace found
+                      solve( !KU( kem_pk(~ekR) ) @ #vk.20 )
+                        case RH_Client_Init
+                        solve( !KU( h(<~master, 'rk'>) ) @ #vk.21 )
+                          case Bootstrap_Epoch
+                          SOLVED // trace found
+                        qed
+                      qed
                     qed
                   qed
                 qed
@@ -774,12 +1338,13 @@ summary of summaries:
 
 analyzed: formal/pqvpn_v3_pcs.spthy
 
-  processing time: 2.19s
+  processing time: 3.48s
   
-  rehandshake_completes (exists-trace): verified (8 steps)
+  rehandshake_completes (exists-trace): verified (9 steps)
   passive_rehandshake_completes (exists-trace): verified (4 steps)
-  pcs_control_keys_only (all-traces): verified (66 steps)
+  rh_client_agrees (all-traces): verified (22 steps)
+  pcs_control_keys_only (all-traces): verified (80 steps)
   pcs_passive_after_epoch_compromise (all-traces): verified (48 steps)
-  attack_active_after_epoch_compromise (exists-trace): verified (13 steps)
+  attack_active_after_epoch_compromise (exists-trace): verified (15 steps)
 
 ==============================================================================
