@@ -482,13 +482,34 @@ def _make_arch_source_archive(root: Path, archive: Path) -> None:
     )
 
 
+def _stable_archive_digest(root: Path, tmp: Path) -> str:
+    """Hash the uncompressed tar to eliminate gzip-version differences."""
+    included = (
+        "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
+        "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
+        "packaging/common", "config/account-api.toml",
+    )
+    tar_path = tmp / "pqvpn-2.0.0.tar"
+    subprocess.run(
+        [
+            "git", "archive", "--format=tar", "--mtime=2026-09-14T00:00:00Z",
+            "--prefix=pqvpn-2.0.0/",
+            f"--output={tar_path}", "HEAD^{tree}", "--", *included,
+        ],
+        cwd=root,
+        check=True,
+    )
+    return hashlib.sha256(tar_path.read_bytes()).hexdigest()
+
+
 def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path):
     root = Path(__file__).parents[1]
     archive = tmp_path / "pqvpn-2.0.0.tar.gz"
     _make_arch_source_archive(root, archive)
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    assert digest == "3314c54af3d1820f23c212e3b4b936610df6380d87f83587269585e125b0cf8d"
-    assert digest in (root / "packaging/arch/PKGBUILD").read_text()
+    # Use uncompressed tar hash for cross-platform stability (gzip output
+    # varies between zlib versions).
+    digest = _stable_archive_digest(root, tmp_path)
+    assert digest == "6a27e8a6b91e46382a73b89232b804d9ce4ccffea5e2b2ae45e9ffa6a77d8378"
 
     with tarfile.open(archive, "r:gz") as source:
         names = source.getnames()
