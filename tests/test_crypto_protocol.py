@@ -998,6 +998,33 @@ def test_cookie_protector_rotation():
     assert cp.verify(new_cookie, "127.0.0.1", 80)
 
 
+def test_cookie_accepted_just_before_and_after_rotation():
+    """Cookie valid across one rotation (between 1x and 2x bucket)."""
+    cp = CookieProtector(bucket_seconds=120)
+    cookie = cp.generate("10.0.0.1", 443)
+    assert cp.verify(cookie, "10.0.0.1", 443)
+    cp._rotated_at -= 121
+    assert cp.verify(cookie, "10.0.0.1", 443)
+
+
+def test_cookie_rejected_after_two_rotations():
+    cp = CookieProtector(bucket_seconds=120)
+    cookie = cp.generate("10.0.0.1", 443)
+    cp._rotated_at -= 121
+    cp._rotate_if_needed()
+    cp._rotated_at -= 121
+    cp._rotate_if_needed()
+    assert not cp.verify(cookie, "10.0.0.1", 443)
+
+
+def test_cookie_no_crash_at_boot_time():
+    """B1 regression: verify near t=0 must return False, never raise."""
+    cp = CookieProtector(bucket_seconds=120)
+    cp._rotated_at = 0.0
+    bad_cookie = os.urandom(COOKIE_SIZE)
+    assert cp.verify(bad_cookie, "1.2.3.4", 9999) is False
+
+
 # --- v3-mldsa Protocol Tests (comparison suite) ---
 from handshake.kemtls import (
     KEMTLSClientMLDSA, KEMTLSServerMLDSA, PROTOCOL_VERSION_V3_MLDSA,

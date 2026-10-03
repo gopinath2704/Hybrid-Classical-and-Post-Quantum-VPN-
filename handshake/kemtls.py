@@ -201,7 +201,7 @@ COOKIE_BUCKET_SECONDS = 120
 
 
 class CookieProtector:
-    """Stateless HMAC cookie for DoS resistance (WireGuard/DTLS pattern)."""
+    """Stateless HMAC cookie for DoS resistance (WireGuard pattern)."""
 
     def __init__(self, bucket_seconds: int = COOKIE_BUCKET_SECONDS) -> None:
         self._bucket = bucket_seconds
@@ -216,26 +216,20 @@ class CookieProtector:
             self._secret = os.urandom(32)
             self._rotated_at = now
 
-    def _bucket_id(self) -> int:
-        return int(time.monotonic()) // self._bucket
-
-    def _mac(self, secret: bytes, client_ip: str, client_port: int, bucket_id: int) -> bytes:
-        msg = client_ip.encode() + struct.pack("!HQ", client_port, bucket_id)
+    def _mac(self, secret: bytes, client_ip: str, client_port: int) -> bytes:
+        msg = client_ip.encode() + struct.pack("!H", client_port)
         return hmac.new(secret, msg, hashlib.sha256).digest()
 
     def generate(self, client_ip: str, client_port: int) -> bytes:
         self._rotate_if_needed()
-        return self._mac(self._secret, client_ip, client_port, self._bucket_id())
+        return self._mac(self._secret, client_ip, client_port)
 
     def verify(self, cookie: bytes, client_ip: str, client_port: int) -> bool:
         if len(cookie) != COOKIE_SIZE:
             return False
         self._rotate_if_needed()
-        bid = self._bucket_id()
-        if hmac.compare_digest(cookie, self._mac(self._secret, client_ip, client_port, bid)):
-            return True
-        for b in (bid, bid - 1):
-            if hmac.compare_digest(cookie, self._mac(self._prev_secret, client_ip, client_port, b)):
+        for secret in (self._secret, self._prev_secret):
+            if hmac.compare_digest(cookie, self._mac(secret, client_ip, client_port)):
                 return True
         return False
 
