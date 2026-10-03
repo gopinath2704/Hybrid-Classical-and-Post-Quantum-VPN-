@@ -508,7 +508,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
     # Use uncompressed tar hash for cross-platform stability (gzip output
     # varies between zlib versions).
     digest = _stable_archive_digest(root, tmp_path)
-    assert digest == "0a78dce7b6b2e42b86350b8fb3228741e43a4fe63f05853e9193c8861a291cbd"
+    assert digest == "cf731d56324d2ead0db9c3ff9089c6abc96e9316742aa5a0d03a368d5e9cba9d"
 
     with tarfile.open(archive, "r:gz") as source:
         names = source.getnames()
