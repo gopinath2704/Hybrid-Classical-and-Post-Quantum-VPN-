@@ -458,14 +458,15 @@ class ClientService:
 
         # Clean up stale socket
         if sock_path.exists():
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 probe.settimeout(1)
                 probe.connect(str(sock_path))
-                probe.close()
                 raise RuntimeError(f"Another service is already listening on {sock_path}")
             except (ConnectionRefusedError, OSError):
                 sock_path.unlink(missing_ok=True)
+            finally:
+                probe.close()
 
         sock_path.parent.mkdir(parents=True, exist_ok=True)
 

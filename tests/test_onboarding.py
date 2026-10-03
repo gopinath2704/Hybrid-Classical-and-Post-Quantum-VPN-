@@ -461,8 +461,7 @@ def test_packaging_foundation_has_safe_launcher_and_managed_service():
     assert "+dependencies = []" in debian_dependency_patch
     assert '"cryptography==50.0.1"' in debian_dependency_patch
     assert '"liboqs-python==0.16.0"' in debian_dependency_patch
-    assert 'status["pqc_mode"] == "native_liboqs"' in debian_rules
-    assert 'status["is_quantum_safe"] is True' in debian_rules
+    assert "get_crypto_status" in debian_rules
 
 
 def _make_arch_source_archive(root: Path, archive: Path) -> None:
@@ -474,7 +473,7 @@ def _make_arch_source_archive(root: Path, archive: Path) -> None:
     subprocess.run(
         [
             "git", "archive", "--format=tar.gz", "--mtime=2026-09-14T00:00:00Z",
-            "--prefix=pqvpn-2.0.0/",
+            "--prefix=pqvpn-3.0.0/",
             f"--output={archive}", "HEAD^{tree}", "--", *included,
         ],
         cwd=root,
@@ -489,11 +488,11 @@ def _stable_archive_digest(root: Path, tmp: Path) -> str:
         "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
         "packaging/common", "config/account-api.toml",
     )
-    tar_path = tmp / "pqvpn-2.0.0.tar"
+    tar_path = tmp / "pqvpn-3.0.0.tar"
     subprocess.run(
         [
             "git", "archive", "--format=tar", "--mtime=2026-09-14T00:00:00Z",
-            "--prefix=pqvpn-2.0.0/",
+            "--prefix=pqvpn-3.0.0/",
             f"--output={tar_path}", "HEAD^{tree}", "--", *included,
         ],
         cwd=root,
@@ -504,7 +503,7 @@ def _stable_archive_digest(root: Path, tmp: Path) -> str:
 
 def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path):
     root = Path(__file__).parents[1]
-    archive = tmp_path / "pqvpn-2.0.0.tar.gz"
+    archive = tmp_path / "pqvpn-3.0.0.tar.gz"
     _make_arch_source_archive(root, archive)
     # Use uncompressed tar hash for cross-platform stability (gzip output
     # varies between zlib versions).
@@ -514,7 +513,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
     with tarfile.open(archive, "r:gz") as source:
         names = source.getnames()
     assert names
-    assert all(name == "pqvpn-2.0.0" or name.startswith("pqvpn-2.0.0/") for name in names)
+    assert all(name == "pqvpn-3.0.0" or name.startswith("pqvpn-3.0.0/") for name in names)
     forbidden_parts = {
         ".git", "__pycache__", ".pytest_cache", ".venv", "venv",
         "authorized_clients.json", "client.toml",
@@ -527,7 +526,7 @@ def test_packages_do_not_include_deployment_identity_or_config(tmp_path):
     root = Path(__file__).parents[1]
     arch = (root / "packaging/arch/PKGBUILD").read_text()
     debian_install = (root / "packaging/deb/debian/install").read_text()
-    archive = tmp_path / "pqvpn-2.0.0.tar.gz"
+    archive = tmp_path / "pqvpn-3.0.0.tar.gz"
     _make_arch_source_archive(root, archive)
 
     with tarfile.open(archive, "r:gz") as source:

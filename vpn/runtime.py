@@ -551,9 +551,6 @@ class VPNServer:
             obj = getattr(self, name, None)
             if obj:
                 try:
-                    if name == "control" and hasattr(obj, "shutdown"):
-                        try: obj.shutdown(socket.SHUT_RDWR)
-                        except OSError: pass
                     obj.close()
                 except OSError: pass
                 setattr(self, name, None)

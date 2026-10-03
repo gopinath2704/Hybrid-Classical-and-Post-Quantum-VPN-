@@ -393,9 +393,18 @@ class TestHybridKEM:
         assert store.count == 0
 import os,struct
 import pytest
-from crypto.hybrid_crypto import PQCProvider,get_crypto_status,_OQS_AVAILABLE
-from handshake.kemtls import *
-from handshake.kemtls import _unpack_header
+from crypto.hybrid_crypto import get_crypto_status,_OQS_AVAILABLE
+from handshake.kemtls import (
+    ClientHello, ClientKeyExchange, CookieProtector, COOKIE_SIZE,
+    DATA_MAGIC, Direction, HandshakeError, KEMTLSClient, KEMTLSServer,
+    MessageType, ServerFinished, ServerHello, TranscriptHasher,
+    pack_cookie_challenge, unpack_cookie_challenge,
+    pack_cookie_response, unpack_cookie_response,
+    PROTOCOL_VERSION_V3, _pack_header, _unpack_header,
+    _compute_finished_mac, _verify_finished_mac,
+    _CLIENT_FINISHED_LABEL, _SERVER_FINISHED_LABEL,
+    DATA_HEADER_FORMAT, DATA_HEADER_SIZE, Channel,
+)
 from vpn.identity import fingerprint
 
 def exchange(ids,authorized=True):
