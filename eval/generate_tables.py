@@ -1,167 +1,201 @@
 #!/usr/bin/env python3
 """Generate comparison tables and figures from raw evaluation CSV data.
 
-Usage:
-    python eval/generate_tables.py --input results/eval-<date>/raw --output results/eval-<date>/figures
+Reads every *.csv in the input directory (unified schema:
+system,profile,metric,run,value,unit), groups by system/profile/metric,
+and reports median with 95% bootstrap CI (10,000 resamples, seed=42).
 
-Reads pqvpn.csv (and baseline CSVs when present) and produces:
-    - handshake_comparison.csv   — side-by-side latency/bytes/CPU table
-    - wire_sizes.csv             — per-message byte breakdown
-    - handshake_comparison.txt   — text table for terminal/paper
-    - figures/*.png              — bar charts (if matplotlib available)
+Outputs:
+    - summary.csv       — aggregated stats
+    - summary.txt       — text table
+    - figures/*.png     — bar charts with error bars
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import math
+import random
 import sys
 from pathlib import Path
 
 
-def load_pqvpn(raw_dir: Path) -> list[dict]:
-    path = raw_dir / "pqvpn.csv"
-    if not path.exists():
-        return []
-    with open(path) as f:
-        return list(csv.DictReader(f))
+def load_all_csv(raw_dir: Path) -> list[dict]:
+    rows = []
+    for csv_path in sorted(raw_dir.glob("*.csv")):
+        with open(csv_path) as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames and set(reader.fieldnames) >= {"system", "profile", "metric", "run", "value", "unit"}:
+                for row in reader:
+                    try:
+                        row["value"] = float(row["value"])
+                        row["run"] = int(row["run"])
+                    except (ValueError, TypeError):
+                        continue
+                    rows.append(row)
+    return rows
 
 
-def text_table(rows: list[dict], columns: list[tuple[str, str, str]]) -> str:
-    """Render a fixed-width text table.
+def bootstrap_ci(values: list[float], n_resamples: int = 10000,
+                 ci: float = 0.95, seed: int = 42) -> tuple[float, float, float]:
+    rng = random.Random(seed)
+    n = len(values)
+    if n == 0:
+        return 0.0, 0.0, 0.0
+    if n == 1:
+        return values[0], values[0], values[0]
 
-    columns: list of (header, dict_key, format_spec)
-    """
-    def _fmt(val: str, fmt: str) -> str:
-        if not val or val in ("-1", "-1.0"):
-            return "n/a"
-        if fmt == "s":
-            return val
-        try:
-            return format(float(val), fmt)
-        except (ValueError, TypeError):
-            return str(val)
+    medians = []
+    for _ in range(n_resamples):
+        sample = [values[rng.randint(0, n - 1)] for _ in range(n)]
+        sample.sort()
+        medians.append(sample[len(sample) // 2])
+    medians.sort()
 
-    widths = [max(len(h), 8) for h, _, _ in columns]
+    alpha = (1 - ci) / 2
+    lo_idx = max(0, int(math.floor(alpha * n_resamples)))
+    hi_idx = min(n_resamples - 1, int(math.ceil((1 - alpha) * n_resamples)) - 1)
+
+    sample_median = sorted(values)[len(values) // 2]
+    return sample_median, medians[lo_idx], medians[hi_idx]
+
+
+def group_data(rows: list[dict]) -> dict[tuple[str, str, str], list[float]]:
+    groups: dict[tuple[str, str, str], list[float]] = {}
     for row in rows:
-        for i, (_, key, fmt) in enumerate(columns):
-            widths[i] = max(widths[i], len(_fmt(row.get(key, ""), fmt)))
+        key = (row["system"], row["profile"], row["metric"])
+        groups.setdefault(key, []).append(row["value"])
+    return groups
 
-    header = "  ".join(h.ljust(w) for (h, _, _), w in zip(columns, widths))
-    sep = "  ".join("─" * w for w in widths)
+
+def generate_summary(groups: dict) -> list[dict]:
+    summary = []
+    for (system, profile, metric), values in sorted(groups.items()):
+        if not values:
+            continue
+        median, ci_lo, ci_hi = bootstrap_ci(values)
+        summary.append({
+            "system": system,
+            "profile": profile,
+            "metric": metric,
+            "n": len(values),
+            "median": round(median, 4),
+            "ci_lo": round(ci_lo, 4),
+            "ci_hi": round(ci_hi, 4),
+        })
+    return summary
+
+
+def text_table(summary: list[dict]) -> str:
+    columns = [
+        ("System", "system", "s", 20),
+        ("Profile", "profile", "s", 12),
+        ("Metric", "metric", "s", 28),
+        ("N", "n", "d", 5),
+        ("Median", "median", ".4f", 12),
+        ("CI Low", "ci_lo", ".4f", 12),
+        ("CI High", "ci_hi", ".4f", 12),
+    ]
+    header = "  ".join(h.ljust(w) for h, _, _, w in columns)
+    sep = "  ".join("-" * w for _, _, _, w in columns)
     lines = [header, sep]
-    for row in rows:
+    for row in summary:
         cells = []
-        for (_, key, fmt), w in zip(columns, widths):
-            cells.append(_fmt(row.get(key, ""), fmt).ljust(w))
+        for _, key, fmt, w in columns:
+            val = row[key]
+            cells.append(format(val, fmt).ljust(w))
         lines.append("  ".join(cells))
     return "\n".join(lines)
 
 
-def generate(raw_dir: Path, out_dir: Path) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    rows = load_pqvpn(raw_dir)
-    if not rows:
-        print("No pqvpn.csv found — nothing to generate", file=sys.stderr)
-        return
-
-    # --- Handshake comparison table ---
-    columns = [
-        ("Suite", "suite", "s"),
-        ("Median (ms)", "median_latency_ms", ".3f"),
-        ("p95 (ms)", "p95_latency_ms", ".3f"),
-        ("σ (ms)", "stddev_latency_ms", ".3f"),
-        ("Client CPU", "median_client_cpu_ms", ".3f"),
-        ("Server CPU", "median_server_cpu_ms", ".3f"),
-        ("Wire (B)", "total_wire_bytes", ".0f"),
-        ("HS/s", "handshakes_per_sec", ".0f"),
-        ("Enc pps", "encrypt_pps", ".0f"),
-        ("Enc Mbps", "encrypt_mbps", ".1f"),
-    ]
-    table = text_table(rows, columns)
-    (out_dir / "handshake_comparison.txt").write_text(table + "\n")
-    print(table)
-
-    # --- Wire size breakdown ---
-    wire_cols = [
-        ("Suite", "suite", "s"),
-        ("CH (B)", "client_hello_bytes", ".0f"),
-        ("SH (B)", "server_hello_bytes", ".0f"),
-        ("CKE (B)", "client_key_exchange_bytes", ".0f"),
-        ("SF (B)", "server_finished_bytes", ".0f"),
-        ("Total (B)", "total_wire_bytes", ".0f"),
-    ]
-    wire_table = text_table(rows, wire_cols)
-    (out_dir / "wire_sizes.txt").write_text(wire_table + "\n")
-    print()
-    print(wire_table)
-
-    # --- CSV copies ---
-    with open(out_dir / "handshake_comparison.csv", "w", newline="") as f:
-        if rows:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            w.writeheader()
-            w.writerows(rows)
-
-    # --- Bar charts (optional) ---
+def generate_figures(summary: list[dict], out_dir: Path) -> None:
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-
-        suites = [r["suite"] for r in rows]
-        latencies = [float(r["median_latency_ms"]) for r in rows]
-        wire = [int(float(r["total_wire_bytes"])) for r in rows]
-        hs_sec = [float(r["handshakes_per_sec"]) for r in rows]
-
-        fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-
-        axes[0].bar(suites, latencies, color=["#2196F3", "#4CAF50", "#FF9800"])
-        axes[0].set_ylabel("Median latency (ms)")
-        axes[0].set_title("Handshake Latency")
-
-        axes[1].bar(suites, wire, color=["#2196F3", "#4CAF50", "#FF9800"])
-        axes[1].set_ylabel("Bytes on wire")
-        axes[1].set_title("Wire Size")
-
-        axes[2].bar(suites, hs_sec, color=["#2196F3", "#4CAF50", "#FF9800"])
-        axes[2].set_ylabel("Handshakes/sec")
-        axes[2].set_title("Server Throughput")
-
-        plt.tight_layout()
-        fig.savefig(out_dir / "handshake_comparison.png", dpi=300)
-        plt.close()
-        print(f"\n  Chart saved to {out_dir / 'handshake_comparison.png'}")
-
-        # Stacked wire size chart
-        fig2, ax2 = plt.subplots(figsize=(8, 5))
-        ch_vals = [int(float(r["client_hello_bytes"])) for r in rows]
-        sh_vals = [int(float(r["server_hello_bytes"])) for r in rows]
-        cke_vals = [int(float(r["client_key_exchange_bytes"])) for r in rows]
-        sf_vals = [int(float(r["server_finished_bytes"])) for r in rows]
-
-        ax2.bar(suites, ch_vals, label="ClientHello", color="#2196F3")
-        ax2.bar(suites, sh_vals, bottom=ch_vals, label="ServerHello", color="#4CAF50")
-        ax2.bar(suites, cke_vals, bottom=[a + b for a, b in zip(ch_vals, sh_vals)],
-                label="ClientKeyExchange", color="#FF9800")
-        ax2.bar(suites, sf_vals,
-                bottom=[a + b + c for a, b, c in zip(ch_vals, sh_vals, cke_vals)],
-                label="ServerFinished", color="#F44336")
-        ax2.set_ylabel("Bytes")
-        ax2.set_title("Handshake Wire Size Breakdown")
-        ax2.legend()
-        plt.tight_layout()
-        fig2.savefig(out_dir / "wire_breakdown.png", dpi=300)
-        plt.close()
-        print(f"  Chart saved to {out_dir / 'wire_breakdown.png'}")
-
     except ImportError:
-        print("\n  matplotlib not available — skipping charts", file=sys.stderr)
+        print("matplotlib not available — skipping charts", file=sys.stderr)
+        return
+
+    latency_rows = [r for r in summary if r["metric"] == "latency_ms"]
+    if latency_rows:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        labels = [f"{r['system']}\n{r['profile']}" for r in latency_rows]
+        medians = [r["median"] for r in latency_rows]
+        lo_err = [r["median"] - r["ci_lo"] for r in latency_rows]
+        hi_err = [r["ci_hi"] - r["median"] for r in latency_rows]
+        ax.bar(range(len(labels)), medians, yerr=[lo_err, hi_err],
+               capsize=4, color="#2196F3", edgecolor="#1565C0")
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, fontsize=8)
+        ax.set_ylabel("Latency (ms)")
+        ax.set_title("Handshake Latency — Median with 95% Bootstrap CI")
+        fig.tight_layout()
+        fig.savefig(out_dir / "latency_comparison.png", dpi=300)
+        plt.close()
+
+    connect_rows = [r for r in summary if r["metric"] == "connect_time_ms"]
+    if connect_rows:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        labels = [f"{r['system']}\n{r['profile']}" for r in connect_rows]
+        medians = [r["median"] for r in connect_rows]
+        lo_err = [r["median"] - r["ci_lo"] for r in connect_rows]
+        hi_err = [r["ci_hi"] - r["median"] for r in connect_rows]
+        ax.bar(range(len(labels)), medians, yerr=[lo_err, hi_err],
+               capsize=4, color="#4CAF50", edgecolor="#2E7D32")
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, fontsize=8)
+        ax.set_ylabel("Connect Time (ms)")
+        ax.set_title("VPN Connect Time — Median with 95% Bootstrap CI")
+        fig.tight_layout()
+        fig.savefig(out_dir / "connect_time_comparison.png", dpi=300)
+        plt.close()
+
+    wire_rows = [r for r in summary if r["metric"] == "total_wire_bytes"]
+    if wire_rows:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        labels = [r["system"] for r in wire_rows]
+        medians = [r["median"] for r in wire_rows]
+        ax.bar(labels, medians, color="#FF9800", edgecolor="#E65100")
+        ax.set_ylabel("Bytes")
+        ax.set_title("Handshake Wire Size")
+        fig.tight_layout()
+        fig.savefig(out_dir / "wire_sizes.png", dpi=300)
+        plt.close()
+
+
+def generate(raw_dir: Path, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = load_all_csv(raw_dir)
+    if not rows:
+        print("No CSV files with unified schema found — nothing to generate",
+              file=sys.stderr)
+        return
+
+    groups = group_data(rows)
+    summary = generate_summary(groups)
+
+    table = text_table(summary)
+    (out_dir / "summary.txt").write_text(table + "\n")
+    print(table)
+
+    with open(out_dir / "summary.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["system", "profile", "metric", "n",
+                                          "median", "ci_lo", "ci_hi"])
+        w.writeheader()
+        w.writerows(summary)
+
+    generate_figures(summary, out_dir)
+    print(f"\nOutput written to {out_dir}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate evaluation tables and figures")
-    parser.add_argument("--input", type=str, required=True, help="Path to raw/ directory")
-    parser.add_argument("--output", type=str, required=True, help="Path to figures/ directory")
+    parser = argparse.ArgumentParser(
+        description="Generate evaluation tables and figures from raw CSV data")
+    parser.add_argument("--input", type=str, required=True,
+                        help="Path to raw/ directory with *.csv files")
+    parser.add_argument("--output", type=str, required=True,
+                        help="Path to output directory for tables and figures")
     args = parser.parse_args()
     generate(Path(args.input), Path(args.output))
 
