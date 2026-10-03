@@ -651,3 +651,52 @@ def test_cookie_off_mode_no_challenge(tmp_path):
     finally:
         if client: client.disconnect()
         server.stop(); worker.join(3)
+
+
+def test_rehandshake_succeeds_and_advances_epoch(connected):
+    server, client = connected
+    client.connect()
+    assert client.session.epoch == 0
+    client.rehandshake()
+    assert client.session.epoch == 1
+    srv_item = next(iter(server.sessions.by_id.values()))
+    until(lambda: srv_item.crypto.epoch == 1)
+    assert client.state == 'CONNECTED'
+
+
+def test_rehandshake_tampered_confirmation_fails_client(connected, monkeypatch):
+    server, client = connected
+    client.connect()
+    original = runtime.VPNServer._rehandshake_server
+
+    def tampered(self, item, payload):
+        import struct as st
+        from crypto.hybrid_crypto import HybridKEM
+        epoch = st.unpack("!I", payload[:4])[0]
+        hybrid = HybridKEM("ML-KEM-768")
+        dh_priv, dh_pub = hybrid.ecc.generate_keypair()
+        dh_ss = hybrid.ecc.derive_shared_secret(dh_priv, payload[4:36])
+        ct, k = hybrid.pqc.encapsulate(payload[36:])
+        body = st.pack("!I", epoch) + dh_pub + ct
+        transcript = payload + body
+        nk = item.crypto.derive_rehandshake_epoch(epoch, dh_ss, k, transcript)
+        bad_confirm = b"\xff" * 32
+        runtime.send_message(item.control, item.crypto.encrypt_control(body + bad_confirm, FrameType.REHANDSHAKE_RESPONSE))
+        nk.wipe()
+
+    monkeypatch.setattr(runtime.VPNServer, '_rehandshake_server', tampered)
+    with pytest.raises(HandshakeError, match="rehandshake key confirmation failed"):
+        client.rehandshake()
+    until(lambda: client.state != 'CONNECTED')
+
+
+def test_rehandshake_after_rekey(connected):
+    server, client = connected
+    client.connect()
+    client.rekey()
+    assert client.session.epoch == 1
+    client.rehandshake()
+    assert client.session.epoch == 2
+    srv_item = next(iter(server.sessions.by_id.values()))
+    until(lambda: srv_item.crypto.epoch == 2)
+    assert client.state == 'CONNECTED'

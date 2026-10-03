@@ -54,10 +54,13 @@ def _require_native_pqc():
 def results_dir() -> Path:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     d = _ROOT / "results" / f"eval-{ts}"
+    return d
+
+
+def ensure_results_dir(d: Path) -> None:
     d.mkdir(parents=True, exist_ok=True)
     (d / "raw").mkdir(exist_ok=True)
     (d / "figures").mkdir(exist_ok=True)
-    return d
 
 
 def collect_sanity() -> dict:
@@ -209,6 +212,7 @@ def main():
     out_dir = results_dir()
     profiles = ([p.strip() for p in args.profiles.split(",")]
                 if args.profiles else list(ALL_PROFILES))
+    dir_created = False
 
     print("=" * 65)
     print("  PQVPN EVALUATION CAMPAIGN")
@@ -218,11 +222,7 @@ def main():
     print("=" * 65)
 
     sanity = collect_sanity()
-    sanity_file = out_dir / "sanity.json"
-    with open(sanity_file, "w") as f:
-        json.dump(sanity, f, indent=2)
-    print(f"\n  Sanity log: {sanity_file}")
-    print(f"  CPU: {sanity.get('cpu_model', sanity['cpu'])} | Governor: {sanity['cpu_governor']}")
+    print(f"\n  CPU: {sanity.get('cpu_model', sanity['cpu'])} | Governor: {sanity['cpu_governor']}")
     print(f"  Kernel: {sanity['kernel']} | git: {sanity['git_commit']}")
     print(f"  pqc_mode: {sanity['pqc_mode']} | liboqs: {sanity['liboqs_version']}")
     print("  Tools: " + ", ".join(
@@ -242,6 +242,12 @@ def main():
             print(f"  [{name}] UNKNOWN — skipping")
             skipped.append(name)
             continue
+        if not dir_created:
+            ensure_results_dir(out_dir)
+            sanity_file = out_dir / "sanity.json"
+            with open(sanity_file, "w") as f:
+                json.dump(sanity, f, indent=2)
+            dir_created = True
         c, f = run_system(name, SYSTEMS[name], args.iterations,
                           args.net_iterations, profiles, out_dir)
         completed.extend(c)
@@ -262,10 +268,17 @@ def main():
     gen_tables = _EVAL / "generate_tables.py"
     if gen_tables.exists() and completed:
         print("\n  Generating tables...")
-        subprocess.run([sys.executable, str(gen_tables), "--input", str(out_dir / "raw"),
-                        "--output", str(out_dir / "figures")],
-                       capture_output=True, text=True)
-        print(f"  Figures:   {out_dir / 'figures'}")
+        r = subprocess.run([sys.executable, str(gen_tables), "--input", str(out_dir / "raw"),
+                            "--output", str(out_dir / "figures")],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"  generate_tables FAILED (exit {r.returncode})")
+            if r.stderr:
+                for line in r.stderr.strip().split("\n")[-3:]:
+                    print(f"    {line}")
+            failed.append("generate_tables")
+        else:
+            print(f"  Figures:   {out_dir / 'figures'}")
 
     # A non-zero exit when any requested unit failed, so CI and callers can
     # tell a partial campaign from a clean one (failures are never silent).

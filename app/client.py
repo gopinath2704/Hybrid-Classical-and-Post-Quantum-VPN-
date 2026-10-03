@@ -458,14 +458,15 @@ class ClientService:
 
         # Clean up stale socket
         if sock_path.exists():
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 probe.settimeout(1)
                 probe.connect(str(sock_path))
-                probe.close()
                 raise RuntimeError(f"Another service is already listening on {sock_path}")
             except (ConnectionRefusedError, OSError):
                 sock_path.unlink(missing_ok=True)
+            finally:
+                probe.close()
 
         sock_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1208,8 +1209,8 @@ class AccountSession:
 # PySide6 remains optional for service-only deployments.  Keeping these imports
 # guarded means the privileged service never needs to initialize a GUI stack.
 try:
-    from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal
-    from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen
+    from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, Signal
+    from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen
     from PySide6.QtWidgets import (
         QApplication,
         QFileDialog,

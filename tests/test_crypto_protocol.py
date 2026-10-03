@@ -393,9 +393,18 @@ class TestHybridKEM:
         assert store.count == 0
 import os,struct
 import pytest
-from crypto.hybrid_crypto import PQCProvider,get_crypto_status,_OQS_AVAILABLE
-from handshake.kemtls import *
-from handshake.kemtls import _unpack_header
+from crypto.hybrid_crypto import get_crypto_status,_OQS_AVAILABLE
+from handshake.kemtls import (
+    ClientHello, ClientKeyExchange, CookieProtector, COOKIE_SIZE,
+    DATA_MAGIC, Direction, HandshakeError, KEMTLSClient, KEMTLSServer,
+    MessageType, ServerFinished, ServerHello, TranscriptHasher,
+    pack_cookie_challenge, unpack_cookie_challenge,
+    pack_cookie_response, unpack_cookie_response,
+    PROTOCOL_VERSION_V3, _pack_header, _unpack_header,
+    _compute_finished_mac, _verify_finished_mac,
+    _CLIENT_FINISHED_LABEL, _SERVER_FINISHED_LABEL,
+    DATA_HEADER_FORMAT, DATA_HEADER_SIZE, Channel,
+)
 from vpn.identity import fingerprint
 
 def exchange(ids,authorized=True):
@@ -996,6 +1005,33 @@ def test_cookie_protector_rotation():
     new_cookie = cp.generate("127.0.0.1", 80)
     assert cp.verify(cookie, "127.0.0.1", 80)
     assert cp.verify(new_cookie, "127.0.0.1", 80)
+
+
+def test_cookie_accepted_just_before_and_after_rotation():
+    """Cookie valid across one rotation (between 1x and 2x bucket)."""
+    cp = CookieProtector(bucket_seconds=120)
+    cookie = cp.generate("10.0.0.1", 443)
+    assert cp.verify(cookie, "10.0.0.1", 443)
+    cp._rotated_at -= 121
+    assert cp.verify(cookie, "10.0.0.1", 443)
+
+
+def test_cookie_rejected_after_two_rotations():
+    cp = CookieProtector(bucket_seconds=120)
+    cookie = cp.generate("10.0.0.1", 443)
+    cp._rotated_at -= 121
+    cp._rotate_if_needed()
+    cp._rotated_at -= 121
+    cp._rotate_if_needed()
+    assert not cp.verify(cookie, "10.0.0.1", 443)
+
+
+def test_cookie_no_crash_at_boot_time():
+    """B1 regression: verify near t=0 must return False, never raise."""
+    cp = CookieProtector(bucket_seconds=120)
+    cp._rotated_at = 0.0
+    bad_cookie = os.urandom(COOKIE_SIZE)
+    assert cp.verify(bad_cookie, "1.2.3.4", 9999) is False
 
 
 # --- v3-mldsa Protocol Tests (comparison suite) ---

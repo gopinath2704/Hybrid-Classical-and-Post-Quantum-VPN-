@@ -1,6 +1,6 @@
 # Maintainer: PQ-VPN research project
 pkgname=pqvpn
-pkgver=2.0.0
+pkgver=3.0.0
 pkgrel=1
 pkgdesc='Hybrid classical and post-quantum research VPN client for Linux'
 arch=('x86_64')
@@ -9,10 +9,10 @@ license=('custom')
 # liboqs 0.16.0 and liboqs-python are required but not packaged by Arch.
 # Install before building: sudo bash scripts/install-liboqs.sh /usr/local
 # then: pip install liboqs-python==0.16.0
-depends=('python>=3.14' 'python-argon2-cffi' 'python-cryptography' 'python-fastapi' 'uvicorn' 'pyside6' 'iproute2' 'nftables')
+depends=('python>=3.11' 'python-argon2-cffi' 'python-cryptography' 'python-fastapi' 'uvicorn' 'pyside6' 'iproute2' 'nftables')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 source=("${pkgname}-${pkgver}.tar.gz")
-sha256sums=('2d7980821a78bc9c0cf4db60464a6a44edb6de6949027d68ef40cab373db8feb')
+sha256sums=('9c665e96470230440084ed403e5112470674d9658ba2ea6ff3bd57646f5c128b')
 
 build() {
   cd "${srcdir}/${pkgname}-${pkgver}"
@@ -30,6 +30,7 @@ package() {
   install -Dm644 packaging/common/pqvpn-account-api.service "${pkgdir}/usr/lib/systemd/system/pqvpn-account-api.service"
   install -Dm644 packaging/common/pqvpn.conf "${pkgdir}/usr/lib/sysusers.d/pqvpn-account.conf"
   install -Dm644 config/account-api.toml "${pkgdir}/etc/pqvpn/account-api.toml"
+  install -Dm755 scripts/install-liboqs.sh "${pkgdir}/usr/share/${pkgname}/install-liboqs.sh"
   install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
   install -Dm644 docs/design.md "${pkgdir}/usr/share/doc/${pkgname}/design.md"
   install -Dm644 docs/deployment.md "${pkgdir}/usr/share/doc/${pkgname}/deployment.md"

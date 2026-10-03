@@ -32,12 +32,20 @@ if [[ "$SKIP_TESTS" == false ]]; then
 fi
 
 echo "--- Step 2: Evaluation campaign ---"
-python eval/run_all.py --iterations "$ITERATIONS" --systems pqvpn
+if ! python eval/run_all.py --iterations "$ITERATIONS" --systems pqvpn; then
+    echo "ERROR: evaluation campaign failed" >&2
+    exit 1
+fi
 echo
 
 LATEST=$(ls -td results/eval-* 2>/dev/null | head -1)
 if [[ -z "$LATEST" ]]; then
     echo "ERROR: no results directory found" >&2
+    exit 1
+fi
+
+if [[ -z "$(ls -A "$LATEST/raw" 2>/dev/null)" ]]; then
+    echo "ERROR: results directory is empty: $LATEST/raw" >&2
     exit 1
 fi
 

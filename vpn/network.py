@@ -6,8 +6,6 @@ from dataclasses import dataclass,field
 from typing import Optional
 # Privileged server nftables policy renderer
 """Render only PQVPN-owned nftables policy; called by the privileged setup helper."""
-import os
-import sys
 import ipaddress
 from vpn.config import ServerConfig, load_server_config, validate_server, interface_name
 
@@ -156,7 +154,6 @@ class NetworkQualityMonitor:
     def get_info(self):return {"window_size":self.window_size,"sample_count":len(self.samples),"avg_rtt_ms":round(self.avg_rtt,3),"min_rtt_ms":round(self.min_rtt,3),"max_rtt_ms":round(self.max_rtt,3),"jitter_ms":round(self.jitter,3),"loss_rate":round(self.loss_rate,4),"probes_sent":self.sent,"probes_received":self.received}
 # IPv6 leak policy and temporary client firewall
 
-import ipaddress
 import json
 import logging
 import secrets
