@@ -8,3 +8,4 @@ README.md usr/share/doc/pqvpn/
 docs/design.md usr/share/doc/pqvpn/
 docs/deployment.md usr/share/doc/pqvpn/
 docs/accounts.md usr/share/doc/pqvpn/
+scripts/install-liboqs.sh usr/share/pqvpn/

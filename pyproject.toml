@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pqvpn"
-version = "2.0.0"
+version = "3.0.0"
 description = "Hybrid X25519 and ML-KEM-768 research VPN"
 readme = "README.md"
 requires-python = ">=3.11"

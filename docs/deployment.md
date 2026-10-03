@@ -181,18 +181,18 @@ the PKGBUILD avoids making its checksum self-referential.
 
 ```bash
 git archive --format=tar.gz --mtime=2026-09-14T00:00:00Z \
-  --prefix=pqvpn-2.0.0/ \
-  --output=packaging/arch/pqvpn-2.0.0.tar.gz 'HEAD^{tree}' -- \
+  --prefix=pqvpn-3.0.0/ \
+  --output=packaging/arch/pqvpn-3.0.0.tar.gz 'HEAD^{tree}' -- \
   app benchmarks.py crypto handshake vpn pyproject.toml README.md \
   docs/design.md docs/deployment.md docs/accounts.md packaging/common \
-  config/account-api.toml
+  config/account-api.toml scripts
 (cd packaging/arch && makepkg --verifysource)
 (cd packaging/arch && makepkg --cleanbuild --syncdeps)
 ```
 
 Archiving `HEAD^{tree}` omits Git's commit-ID PAX header, and the fixed `--mtime`
 makes the archive independent of the final commit timestamp. `git archive` reads
-only committed objects and produces the required `pqvpn-2.0.0/` top-level
+only committed objects and produces the required `pqvpn-3.0.0/` top-level
 directory; it never copies `.git`, the working tree's untracked keys, or user/system
 state. If a later commit changes any allowlisted input, recreate the archive, run
 `(cd packaging/arch && updpkgsums)`, and review and commit the resulting real

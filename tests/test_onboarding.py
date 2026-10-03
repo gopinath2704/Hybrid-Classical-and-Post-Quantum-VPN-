@@ -468,7 +468,7 @@ def _make_arch_source_archive(root: Path, archive: Path) -> None:
     included = (
         "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
         "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
-        "packaging/common", "config/account-api.toml",
+        "packaging/common", "config/account-api.toml", "scripts",
     )
     subprocess.run(
         [
@@ -486,7 +486,7 @@ def _stable_archive_digest(root: Path, tmp: Path) -> str:
     included = (
         "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
         "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
-        "packaging/common", "config/account-api.toml",
+        "packaging/common", "config/account-api.toml", "scripts",
     )
     tar_path = tmp / "pqvpn-3.0.0.tar"
     subprocess.run(
