@@ -22,13 +22,13 @@ meeting the minimum does not validate another Python version.
 The Ubuntu 24.04 Docker examples use distro Python and remain independently
 unvalidated; Compose syntax validation does not establish image/runtime validity.
 
-Install Python 3.14.7 from a trusted distribution/build, plus venv support, git,
+Install Python 3.11+ from a trusted distribution/build, plus venv support, git,
 CMake, Ninja, a C compiler, OpenSSL development headers, iproute2, nftables,
 util-linux (flock), rsync and procps (sysctl). Native liboqs must be installed
 explicitly before importing the application or starting the service:
 
 ```bash
-python3.14 --version  # must report the tested 3.14.7 baseline
+python3 --version  # must report the tested 3.14.7 baseline
 sudo bash scripts/install-liboqs.sh /usr/local
 # The helper verifies the exact 0.16.0 commit, builds a shared library and runs ldconfig.
 ldconfig -p | grep liboqs
@@ -231,7 +231,7 @@ sudo useradd --system --home /opt/pqvpn --shell /usr/sbin/nologin pqvpn
 sudo install -d -o root -g root -m 0755 /opt/pqvpn
 sudo install -d -o root -g pqvpn -m 0750 /etc/pqvpn
 sudo rsync -a --chown=root:root --exclude=.git --exclude=.venv --exclude=venv --exclude=env --exclude=ENV --exclude=__pycache__ --exclude=.pytest_cache ./ /opt/pqvpn/
-sudo python3.14 -m venv /opt/pqvpn/.venv
+sudo python3 -m venv /opt/pqvpn/.venv
 sudo /opt/pqvpn/.venv/bin/python -m pip install -c /opt/pqvpn/constraints-tested.txt /opt/pqvpn
 sudo chown -R root:root /opt/pqvpn
 sudo chmod -R u=rwX,go=rX /opt/pqvpn
@@ -270,7 +270,7 @@ provider policy and hidden networks cannot be inferred from local checks.
 Install dev dependencies in a fresh validation environment with the same Python:
 
 ```bash
-python3.14 -m venv /tmp/pqvpn-validation
+python3 -m venv /tmp/pqvpn-validation
 /tmp/pqvpn-validation/bin/python -m pip install -c constraints-tested.txt '.[dev]'
 ALLOW_MOCK_PQC=0 /tmp/pqvpn-validation/bin/python -m pytest -q -m native_pqc
 sudo -u pqvpn /opt/pqvpn/.venv/bin/python -m vpn.cli doctor server --config /etc/pqvpn/server.toml
@@ -486,7 +486,7 @@ Install native liboqs explicitly using the [server guide](deployment.md)
 before importing the application. Create a fresh environment:
 
 ```bash
-python3.14 -m venv .venv
+python3 -m venv .venv
 .venv/bin/python -m pip install -c constraints-tested.txt .
 .venv/bin/python -m vpn.cli client-key generate
 # Provision server public identity + exact SHA-256 fingerprint securely.
@@ -787,9 +787,9 @@ Use a host with working IPv6 support for the added physical-path leak checks.
 From the clean validated checkout:
 
 ```bash
-python3.14 --version
+python3 --version
 sudo bash scripts/install-liboqs.sh /usr/local
-python3.14 -m venv /tmp/pqvpn-validation
+python3 -m venv /tmp/pqvpn-validation
 /tmp/pqvpn-validation/bin/python -m pip install -c constraints-tested.txt '.[dev]'
 ALLOW_MOCK_PQC=0 /tmp/pqvpn-validation/bin/python -m pytest -q -m native_pqc
 sudo id -u
@@ -823,7 +823,7 @@ sudo useradd --system --home /opt/pqvpn --shell /usr/sbin/nologin pqvpn
 sudo install -d -o root -g root -m 0755 /opt/pqvpn
 sudo install -d -o root -g pqvpn -m 0750 /etc/pqvpn
 sudo rsync -a --chown=root:root --exclude=.git --exclude=.venv --exclude=venv --exclude=env --exclude=ENV --exclude=__pycache__ --exclude=.pytest_cache ./ /opt/pqvpn/
-sudo python3.14 -m venv /opt/pqvpn/.venv
+sudo python3 -m venv /opt/pqvpn/.venv
 sudo /opt/pqvpn/.venv/bin/python -m pip install -c /opt/pqvpn/constraints-tested.txt /opt/pqvpn
 sudo chown -R root:root /opt/pqvpn
 sudo chmod -R u=rwX,go=rX /opt/pqvpn
@@ -844,7 +844,7 @@ record that test configuration separately from the source tag.
 On each client, install the same native revision, then follow the existing client CLI:
 
 ```bash
-python3.14 -m venv .venv
+python3 -m venv .venv
 .venv/bin/python -m pip install -c constraints-tested.txt .
 .venv/bin/python -m vpn.cli client-key generate
 editor config/client.toml
@@ -863,7 +863,7 @@ sudo .venv/bin/python -m vpn.cli client authorize /tmp/bob_public.key --database
 sudo chown root:pqvpn /etc/pqvpn/authorized_clients.json
 sudo chmod 0640 /etc/pqvpn/authorized_clients.json
 sudo -u pqvpn .venv/bin/python -m vpn.cli doctor server --config /etc/pqvpn/server.toml
-python3.14 -m venv /tmp/pqvpn-validation
+python3 -m venv /tmp/pqvpn-validation
 /tmp/pqvpn-validation/bin/python -m pip install -c constraints-tested.txt '.[dev]'
 ALLOW_MOCK_PQC=0 /tmp/pqvpn-validation/bin/python -m pytest -q -m native_pqc
 ```

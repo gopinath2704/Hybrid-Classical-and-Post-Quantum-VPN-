@@ -250,8 +250,9 @@ class PQCProvider:
                 raise PQCUnavailableError(
                     f"Native liboqs is required but not available. "
                     f"Reason: {_OQS_LOAD_ERROR or 'unknown'}. "
-                    f"Install with: sudo bash scripts/install-liboqs.sh /usr/local "
-                    f"&& pip install liboqs-python==0.16.0  — or set "
+                    f"Install with: sudo bash /usr/share/pqvpn/install-liboqs.sh /usr/local "
+                    f"(or scripts/install-liboqs.sh from source), then inside a venv: "
+                    f"pip install liboqs-python==0.16.0  — or set "
                     f"ALLOW_MOCK_PQC=1 for an insecure mock "
                     f"(development/testing only — NO quantum security)."
                 )
