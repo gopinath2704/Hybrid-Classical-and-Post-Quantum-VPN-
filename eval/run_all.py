@@ -18,12 +18,24 @@ import platform
 import shutil
 import subprocess
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _EVAL = _ROOT / "eval"
+
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+
+def _require_native_pqc():
+    from crypto.hybrid_crypto import get_crypto_status
+    status = get_crypto_status()
+    if status["pqc_mode"] != "native_liboqs":
+        print(f"FATAL: pqc_mode={status['pqc_mode']}; native liboqs required.",
+              file=sys.stderr)
+        sys.exit(1)
+    return status
 
 
 def results_dir() -> Path:
@@ -36,6 +48,9 @@ def results_dir() -> Path:
 
 
 def collect_sanity() -> dict:
+    from crypto.hybrid_crypto import get_crypto_status
+    status = get_crypto_status()
+
     info = {
         "timestamp": datetime.now().isoformat(),
         "hostname": platform.node(),
@@ -44,6 +59,7 @@ def collect_sanity() -> dict:
         "arch": platform.machine(),
         "os": platform.platform(),
         "kernel": platform.release(),
+        "pqc_mode": status["pqc_mode"],
     }
     try:
         with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") as f:
@@ -58,7 +74,7 @@ def collect_sanity() -> dict:
         info["git_commit"] = "unknown"
     try:
         import oqs
-        info["liboqs_version"] = getattr(oqs, "__version__", "available")
+        info["liboqs_version"] = oqs.oqs_version() if hasattr(oqs, "oqs_version") else getattr(oqs, "__version__", "available")
     except ImportError:
         info["liboqs_version"] = "unavailable"
     for tool in ("wg", "openvpn", "swanctl", "rosenpass", "iperf3"):
@@ -120,10 +136,12 @@ def main():
                         help="Comma-separated system names (default: all available)")
     args = parser.parse_args()
 
+    _require_native_pqc()
+
     out_dir = results_dir()
 
     print("=" * 65)
-    print(f"  PQVPN EVALUATION CAMPAIGN")
+    print("  PQVPN EVALUATION CAMPAIGN")
     print(f"  Iterations: {args.iterations}  |  Output: {out_dir}")
     print("=" * 65)
 
@@ -133,8 +151,9 @@ def main():
         json.dump(sanity, f, indent=2)
     print(f"\n  Sanity log: {sanity_file}")
     print(f"  CPU: {sanity['cpu']} | Governor: {sanity['cpu_governor']}")
+    print(f"  pqc_mode: {sanity['pqc_mode']}")
     print(f"  liboqs: {sanity['liboqs_version']}")
-    print(f"  Tools: " + ", ".join(
+    print("  Tools: " + ", ".join(
         f"{t}={'yes' if sanity[f'has_{t}'] else 'no'}"
         for t in ("wg", "openvpn", "swanctl", "rosenpass", "iperf3")
     ))
@@ -168,7 +187,7 @@ def main():
 
     gen_tables = _EVAL / "generate_tables.py"
     if gen_tables.exists() and completed:
-        print(f"\n  Generating tables...")
+        print("\n  Generating tables...")
         subprocess.run([sys.executable, str(gen_tables), "--input", str(out_dir / "raw"),
                         "--output", str(out_dir / "figures")],
                        capture_output=True, text=True)
