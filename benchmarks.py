@@ -21,7 +21,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from crypto.hybrid_crypto import ECCProvider, PQCProvider, HybridKEM, KeyManager
+from crypto.hybrid_crypto import ECCProvider, PQCProvider, HybridKEM, KeyManager, get_crypto_status
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from vpn.identity import fingerprint
 from handshake.kemtls import (
@@ -96,6 +96,15 @@ def _git_commit() -> str:
         return "unknown"
 
 
+def require_native_pqc():
+    status = get_crypto_status()
+    if status["pqc_mode"] != "native_liboqs":
+        print(f"FATAL: pqc_mode={status['pqc_mode']}; native liboqs required "
+              f"for trustworthy benchmarks.", file=sys.stderr)
+        sys.exit(1)
+    return status
+
+
 def _liboqs_version() -> str:
     try:
         import oqs
@@ -107,10 +116,12 @@ def _liboqs_version() -> str:
 
 
 def collect_environment() -> dict:
+    status = get_crypto_status()
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "git_commit": _git_commit(),
         "protocol_version": PROTOCOL_VERSION,
+        "pqc_mode": status["pqc_mode"],
         "liboqs_version": _liboqs_version(),
         "cpu_model": _cpu_model(),
         "python_version": platform.python_version(),
@@ -281,27 +292,37 @@ class HandshakeBenchmark:
 
     def _run_handshake(self, suite_name: str, client, server) -> HandshakeMetric:
         start_time = time.perf_counter()
-        c_cpu_start = time.process_time()
 
+        c_cpu0 = time.process_time()
         ch_bytes = client.initiate_handshake()
+        c_cpu1 = time.process_time()
 
-        s_cpu_start = time.process_time()
+        s_cpu0 = time.process_time()
         sh_bytes = server.process_client_hello(ch_bytes)
-        s_cpu_end = time.process_time()
+        s_cpu1 = time.process_time()
 
+        c_cpu2 = time.process_time()
         cke_bytes = client.process_server_hello(sh_bytes)
-        c_cpu_end = time.process_time()
+        c_cpu3 = time.process_time()
 
+        s_cpu2 = time.process_time()
         sf_bytes, _ = server.process_client_key_exchange(cke_bytes)
+        s_cpu3 = time.process_time()
+
+        c_cpu4 = time.process_time()
         client.process_server_finished(sf_bytes)
+        c_cpu5 = time.process_time()
 
         end_time = time.perf_counter()
+
+        client_cpu = (c_cpu1 - c_cpu0) + (c_cpu3 - c_cpu2) + (c_cpu5 - c_cpu4)
+        server_cpu = (s_cpu1 - s_cpu0) + (s_cpu3 - s_cpu2)
 
         return HandshakeMetric(
             suite_name=suite_name,
             total_latency_ms=(end_time - start_time) * 1000.0,
-            client_cpu_ms=(c_cpu_end - c_cpu_start) * 1000.0,
-            server_cpu_ms=(s_cpu_end - s_cpu_start) * 1000.0,
+            client_cpu_ms=client_cpu * 1000.0,
+            server_cpu_ms=server_cpu * 1000.0,
             client_hello_bytes=len(ch_bytes),
             server_hello_bytes=len(sh_bytes),
             client_key_exchange_bytes=len(cke_bytes),
@@ -816,6 +837,7 @@ def run_full_suite(iterations: int = 50, profile: str = "lan",
 
 def main() -> None:
     """Parse CLI arguments and run benchmark suite."""
+    require_native_pqc()
     parser = argparse.ArgumentParser(
         description="Hybrid PQC-VPN Benchmark Suite",
     )
