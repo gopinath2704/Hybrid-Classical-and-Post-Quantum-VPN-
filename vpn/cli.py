@@ -23,7 +23,7 @@ from vpn.config import load_client_config, load_server_config, validate_client
 from vpn.identity import (
     AuthorizedClients, EnrollmentRequest, fingerprint, generate_client_identity,
     generate_client_identity_kem, generate_server_identity,
-    load_client_private, load_client_public_key, load_ed25519_public_key,
+    load_client_private, load_client_public_key,
     load_enrollment, validate_server_identity, write_enrollment,
 )
 from vpn.network import connectivity, effective_policy

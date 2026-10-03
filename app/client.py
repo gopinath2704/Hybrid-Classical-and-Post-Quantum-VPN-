@@ -1209,8 +1209,8 @@ class AccountSession:
 # PySide6 remains optional for service-only deployments.  Keeping these imports
 # guarded means the privileged service never needs to initialize a GUI stack.
 try:
-    from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal
-    from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen
+    from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, Signal
+    from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen
     from PySide6.QtWidgets import (
         QApplication,
         QFileDialog,

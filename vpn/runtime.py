@@ -23,12 +23,12 @@ from pathlib import Path
 from crypto.hybrid_crypto import PQCUnavailableError
 from handshake.kemtls import (Channel, DATA_HEADER_FORMAT, DATA_HEADER_SIZE, DATA_MAGIC,
     FrameType, HandshakeError, HandshakeSession, KEMTLSClient, KEMTLSServer, PROTOCOL_VERSION,
-    KEMTLSClientV3, KEMTLSServerV3, PROTOCOL_VERSION_V3, HEADER_SIZE, HEADER_FORMAT, MAGIC,
+    KEMTLSClientV3, KEMTLSServerV3, PROTOCOL_VERSION_V3, HEADER_SIZE, HEADER_FORMAT,
     MessageType, CookieProtector, pack_cookie_challenge, unpack_cookie_challenge,
     pack_cookie_response, unpack_cookie_response)
 from vpn.config import ClientConfig, ServerConfig, validate_server, validate_client
 from vpn.network import NetworkQualityMonitor, TUNInterface, TUNMode
-from vpn.identity import AuthorizedClients, load_client_kem_private, load_client_private, read_private, validate_server_identity
+from vpn.identity import AuthorizedClients, load_client_kem_private, load_client_private, validate_server_identity
 from vpn.network import IPv6Guard, effective_policy, preflight as ipv6_preflight
 
 logger = logging.getLogger("pqvpn.runtime")
