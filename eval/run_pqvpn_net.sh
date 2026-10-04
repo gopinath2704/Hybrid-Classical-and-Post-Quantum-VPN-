@@ -131,6 +131,7 @@ dns_servers = []
 server_identity_private_key = "server.key"
 server_identity_public_key = "server.pub"
 authorized_clients_file = "authorized.json"
+connections_per_source = 100
 EOF
 
 cat >"$RUN_DIR/client/client.toml" <<EOF
