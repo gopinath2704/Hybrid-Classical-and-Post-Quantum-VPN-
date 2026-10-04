@@ -89,7 +89,7 @@ ip -n "$SERVER_NS" addr add 192.0.2.1/24 dev bench-s
 ip -n "$CLIENT_NS" addr add 192.0.2.2/24 dev bench-c
 ip -n "$SERVER_NS" link set bench-s up mtu "$mtu"
 ip -n "$CLIENT_NS" link set bench-c up mtu "$mtu"
-ip -n "$CLIENT_NS" route add default via 192.0.2.1
+#ip -n "$CLIENT_NS" route add default via 192.0.2.1
 
 # --- Apply tc netem ---
 if (( delay_each > 0 )) || (( loss > 0 )); then
@@ -169,6 +169,9 @@ echo "Running $ITERATIONS connect-time measurements..."
 for i in $(seq 0 $(( ITERATIONS - 1 ))); do
   START_NS=$(date +%s%N)
 
+  # Ensure stale TUN device is gone before next iteration
+  ip -n "$CLIENT_NS" link del pqbench0 2>/dev/null || true
+
   ip netns exec "$CLIENT_NS" \
     python -m vpn.cli client connect --config "$RUN_DIR/client/client.toml" \
     >"$RUN_DIR/client.log" 2>&1 &
@@ -181,7 +184,7 @@ for i in $(seq 0 $(( ITERATIONS - 1 ))); do
       CONNECTED=1
       break
     fi
-    sleep 0.5
+    sleep 0.05
   done
 
   END_NS=$(date +%s%N)
@@ -198,7 +201,7 @@ for i in $(seq 0 $(( ITERATIONS - 1 ))); do
   # Disconnect client
   kill "$CLIENT_PID" 2>/dev/null || true
   wait "$CLIENT_PID" 2>/dev/null || true
-  sleep 1
+  sleep 2
 done
 
 echo "=== run_pqvpn_net: completed profile=$PROFILE ==="

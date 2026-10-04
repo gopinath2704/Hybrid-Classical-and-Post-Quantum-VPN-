@@ -104,7 +104,7 @@ WGEOF
             CONNECTED=1
             break
         fi
-        sleep 0.5
+        sleep 0.05
     done
     END=$(date +%s%N)
 
