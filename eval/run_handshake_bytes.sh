@@ -15,13 +15,19 @@ set -euo pipefail
 
 ITERATIONS=10
 OUT=""
+PROTOCOL=v2-ed25519
 while [[ $# -gt 0 ]]; do
   case $1 in
     --iterations) ITERATIONS=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
+    --protocol) PROTOCOL=$2; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
 done
+case "$PROTOCOL" in
+  v2-ed25519|v3-kem) ;;
+  *) echo "unknown protocol: $PROTOCOL (expected v2-ed25519 or v3-kem)" >&2; exit 1 ;;
+esac
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 source "$ROOT_DIR/eval/netem_profiles.sh"
@@ -42,7 +48,7 @@ if [[ "$CSV_FILE" != "/dev/stdout" ]]; then
 fi
 echo "system,profile,metric,run,value,unit" > "$CSV_FILE"
 
-echo "=== run_handshake_bytes: iterations=$ITERATIONS ===" >&2
+echo "=== run_handshake_bytes: iterations=$ITERATIONS protocol=$PROTOCOL ===" >&2
 
 # ---------- PQ-VPN ----------
 echo "--- PQ-VPN handshake bytes ---" >&2
@@ -91,7 +97,9 @@ for i in $(seq 0 $(( ITERATIONS - 1 ))); do
   cd "$ROOT_DIR"
   python -m vpn.cli identity generate \
     --private "$RUN_DIR/server/server.key" --public "$RUN_DIR/server/server.pub" 2>/dev/null
-  python -m vpn.cli client-key generate \
+  KEM_FLAG=""
+  [[ "$PROTOCOL" == "v3-kem" ]] && KEM_FLAG="--kem"
+  python -m vpn.cli client-key generate $KEM_FLAG \
     --private "$RUN_DIR/client/client.key" --public "$RUN_DIR/client/client.pub" 2>/dev/null
   python -m vpn.cli client authorize \
     "$(base64 -w0 "$RUN_DIR/client/client.pub")" \
@@ -128,6 +136,13 @@ dns_mode = "none"
 dns_servers = []
 tun_name = "pqbench0"
 EOF
+
+  # v3-kem: set the negotiated protocol version on both ends and point the
+  # client at its ML-KEM public key so the v3 handshake is captured on the wire.
+  if [[ "$PROTOCOL" == "v3-kem" ]]; then
+    printf 'protocol_version = 3\n' >>"$RUN_DIR/server/server.toml"
+    printf 'protocol_version = 3\nclient_identity_public_key = "client.pub"\n' >>"$RUN_DIR/client/client.toml"
+  fi
 
   ip netns exec "$SERVER_NS" sysctl -q -w net.ipv4.ip_forward=1
   ip netns exec "$SERVER_NS" \

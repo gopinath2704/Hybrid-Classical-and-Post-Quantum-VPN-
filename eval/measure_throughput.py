@@ -50,7 +50,7 @@ PROFILES = {
 PING_COUNT = 50
 
 
-def setup_topology(run_dir: str, profile: str) -> dict:
+def setup_topology(run_dir: str, profile: str, protocol: str = "v2-ed25519") -> dict:
     """Create server + client namespaces with veth + netem."""
     p = PROFILES[profile]
     tag = os.getpid()
@@ -104,10 +104,12 @@ def setup_topology(run_dir: str, profile: str) -> dict:
     fp = subprocess.check_output(
         ["sha256sum", f"{srv_dir}/server.pub"]).decode().split()[0]
 
-    subprocess.run([sys.executable, "-m", "vpn.cli", "client-key", "generate",
-                    "--private", f"{cli_dir}/client.key",
-                    "--public", f"{cli_dir}/client.pub"],
-                   check=True, cwd=str(_ROOT))
+    keygen_cmd = [sys.executable, "-m", "vpn.cli", "client-key", "generate",
+                  "--private", f"{cli_dir}/client.key",
+                  "--public", f"{cli_dir}/client.pub"]
+    if protocol == "v3-kem":
+        keygen_cmd.append("--kem")  # ML-KEM-768 client identity for v3
+    subprocess.run(keygen_cmd, check=True, cwd=str(_ROOT))
     pub_b64 = subprocess.check_output(
         ["base64", "-w0", f"{cli_dir}/client.pub"]).decode().strip()
     subprocess.run([sys.executable, "-m", "vpn.cli", "client", "authorize",
@@ -150,6 +152,16 @@ def setup_topology(run_dir: str, profile: str) -> dict:
             dns_servers = []
             tun_name = "pqm5t0"
         """))
+
+    # v3-kem needs the negotiated protocol version on both ends and the
+    # client's ML-KEM public key; data-plane throughput itself is unchanged
+    # (AES-256-GCM frames either way), so this selects the handshake suite only.
+    if protocol == "v3-kem":
+        with open(f"{srv_dir}/server.toml", "a") as f:
+            f.write("protocol_version = 3\n")
+        with open(f"{cli_dir}/client.toml", "a") as f:
+            f.write("protocol_version = 3\n")
+            f.write('client_identity_public_key = "client.pub"\n')
 
     subprocess.run(["ip", "netns", "exec", srv_ns,
                      "sysctl", "-q", "-w", "net.ipv4.ip_forward=1"],
@@ -304,16 +316,16 @@ def cleanup(topo: dict, procs: list[subprocess.Popen]):
 
 
 def run_profile(profile: str, run_dir: str, duration: int,
-                run_idx: int) -> tuple[list, int]:
+                run_idx: int, protocol: str = "v2-ed25519") -> tuple[list, int]:
     mode_dir = os.path.join(run_dir, profile)
     os.makedirs(mode_dir, exist_ok=True)
     rows = []
 
-    print(f"\n--- Profile: {profile} ---")
+    print(f"\n--- Profile: {profile} ({protocol}) ---")
     p = PROFILES[profile]
     print(f"  netem: rtt={p['rtt_ms']}ms  loss={p['loss_pct']}%  mtu={p['mtu']}")
     print("  Setting up topology...", flush=True)
-    topo = setup_topology(mode_dir, profile)
+    topo = setup_topology(mode_dir, profile, protocol)
     server_proc = start_server(topo, mode_dir)
     client_proc = connect_client(topo)
     procs = [server_proc, client_proc]
@@ -399,6 +411,11 @@ def main():
                         help="iperf3 test duration in seconds (default: 20)")
     parser.add_argument("--out", default="",
                         help="CSV output path")
+    parser.add_argument("--protocol", default="v2-ed25519",
+                        choices=["v2-ed25519", "v3-kem"],
+                        help="handshake suite (default: v2-ed25519). "
+                             "Data-plane throughput is the same either way; "
+                             "v3-kem exercises the v3 data path end-to-end.")
     args = parser.parse_args()
 
     if subprocess.run(["which", "iperf3"], capture_output=True).returncode != 0:
@@ -418,6 +435,7 @@ def main():
 
     print("=== M5 Data-Plane Throughput ===")
     print(f"Profiles: {profiles}")
+    print(f"Protocol: {args.protocol}")
     print(f"iperf3 duration: {args.duration}s")
 
     csv_path = args.out or os.path.join(run_dir, "throughput.csv")
@@ -428,7 +446,8 @@ def main():
 
     run_idx = 0
     for profile in profiles:
-        rows, run_idx = run_profile(profile, run_dir, args.duration, run_idx)
+        rows, run_idx = run_profile(profile, run_dir, args.duration, run_idx,
+                                    args.protocol)
         for row in rows:
             writer.writerow(row)
         csv_f.flush()
