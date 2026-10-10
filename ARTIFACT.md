@@ -300,6 +300,25 @@ sudo python eval/run_all.py --iterations 30 --systems pqvpn,wireguard
 
 ---
 
+## Recorded evaluation run
+
+| Field | Value |
+|---|---|
+| Date | 2026-10-10 |
+| CPU | Intel i7-11800H @ 2.30 GHz |
+| Governor | `performance` |
+| Kernel | 7.2.3-arch1-3 (Arch Linux) |
+| liboqs | 0.16.0 (native) |
+| Python | 3.14 |
+| Commit | `6d9cac1` |
+| Metrics | M1 (n=30), M2 (n=50), M3, M5, M6 (n=30+12), M7, M8 |
+| Baselines | WireGuard (M1 only) |
+
+Summary CSV: `eval/results-summary/summary.csv`
+Full write-up: `eval/results-summary/EVALUATION.md`
+
+---
+
 ## Release tag
 
 This artifact is tagged as `v3-paper-artifact` in the repository.
