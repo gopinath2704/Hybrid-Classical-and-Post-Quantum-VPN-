@@ -4,6 +4,9 @@ server_control_port = 51820
 server_identity_public_key = "server_identity_public.key"
 server_identity_fingerprint = "caa34de32b573b511bde3f5a85b738ecc7cf7aa44b22fdc37e128d00016cf439"
 client_identity_private_key = "client_identity_private.key"
+client_identity_public_key = "client_identity_public.key"
+# v3 (KEM-auth) recommended: 22% smaller wire bytes, faster than v2 (Ed25519)
+protocol_version = 3
 full_tunnel = true
 # Remove this explicit setting when switching to split tunnel to leave unrelated IPv6 alone.
 ipv6_policy = "block"
