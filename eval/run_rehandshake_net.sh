@@ -182,8 +182,14 @@ wait "$TCPDUMP_PID" 2>/dev/null || true
 
 # Parse ping results
 PING_TOTAL=$(grep -c 'bytes from' "$PING_LOG" 2>/dev/null || echo 0)
-PING_LOSS=$(tail -1 "$PING_LOG" | grep -oP '\d+(?=% packet loss)' || echo "unknown")
-echo "  Rekey phase: $PING_TOTAL pings received, $PING_LOSS% loss" >&2
+PING_TX=$(grep 'packets transmitted' "$PING_LOG" | grep -oE '^[0-9]+' || echo 0)
+PING_RX=$(grep 'packets transmitted' "$PING_LOG" | grep -oE ', [0-9]+ received' | grep -oE '[0-9]+' || echo 0)
+if (( PING_TX > 0 )); then
+  PING_LOSS=$(( (PING_TX - PING_RX) * 100 / PING_TX ))
+else
+  PING_LOSS="unknown"
+fi
+echo "  Rekey phase: tx=$PING_TX rx=$PING_RX loss=$PING_LOSS%" >&2
 
 # Parse epoch count from logs
 REKEY_COUNT=$(grep -c 'rekey complete epoch=' "$RUN_DIR/server.log" 2>/dev/null || echo 0)
@@ -265,7 +271,7 @@ vpn_subnet = "10.8.0.0/24"
 server_vpn_ip = "10.8.0.1"
 max_clients = 4
 handshake_timeout = 30
-rekey_interval = 99999
+rekey_interval = 86400
 rehandshake_interval = $REHANDSHAKE_INTERVAL
 outbound_interface = "bench-s"
 dns_servers = []
@@ -356,8 +362,14 @@ wait "$TCPDUMP_PID" 2>/dev/null || true
 
 # Parse ping results
 PING_TOTAL=$(grep -c 'bytes from' "$PING_LOG" 2>/dev/null || echo 0)
-PING_LOSS=$(tail -1 "$PING_LOG" | grep -oP '\d+(?=% packet loss)' || echo "unknown")
-echo "  Re-handshake phase: $PING_TOTAL pings received, $PING_LOSS% loss" >&2
+PING_TX=$(grep 'packets transmitted' "$PING_LOG" | grep -oE '^[0-9]+' || echo 0)
+PING_RX=$(grep 'packets transmitted' "$PING_LOG" | grep -oE ', [0-9]+ received' | grep -oE '[0-9]+' || echo 0)
+if (( PING_TX > 0 )); then
+  PING_LOSS=$(( (PING_TX - PING_RX) * 100 / PING_TX ))
+else
+  PING_LOSS="unknown"
+fi
+echo "  Re-handshake phase: tx=$PING_TX rx=$PING_RX loss=$PING_LOSS%" >&2
 
 # Parse epoch count from logs
 RH_COUNT=$(grep -c 'rehandshake complete epoch=' "$RUN_DIR/server.log" 2>/dev/null || echo 0)
