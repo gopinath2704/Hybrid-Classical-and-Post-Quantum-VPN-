@@ -120,6 +120,7 @@ def setup_topology(run_dir: str, n_clients: int) -> dict:
                 dns_mode = "none"
                 dns_servers = []
                 tun_name = "pqm8t{i}"
+                expected_vpn_subnet = "10.8.0.0/16"
             """))
 
         clients.append({"ns": cli_ns, "dir": cli_dir,
@@ -180,7 +181,7 @@ def connect_client(topo: dict, idx: int) -> subprocess.Popen:
         ["ip", "netns", "exec", c["ns"],
          sys.executable, "-m", "vpn.cli", "client", "connect",
          "--config", c["config"]],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=open(f"{c['dir']}/client.log", "w"), stderr=subprocess.STDOUT,
         cwd=str(_ROOT))
 
 
@@ -245,7 +246,8 @@ def run_measurement(n_clients: int, run_dir: str) -> dict:
             if wait_for_tunnel(topo, i, timeout=60):
                 connected += 1
             else:
-                print(f"\n  WARNING: client {i} failed to connect", flush=True)
+                print(f"\n  WARNING: client {i} failed to connect "
+                      f"(see {topo['clients'][i]['dir']}/client.log)", flush=True)
 
         time.sleep(2)
         loaded_rss = read_vmrss_kb(server_proc.pid)
