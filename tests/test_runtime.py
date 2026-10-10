@@ -716,3 +716,31 @@ def test_resumption_ticket_file_permissions(tmp_path):
     assert path.exists()
     mode = path.stat().st_mode & 0o777
     assert mode == 0o600, f"ticket file mode is {oct(mode)}, expected 0o600"
+
+
+@pytest.mark.parametrize("version,routed", [
+    (0x20, True),   # v2
+    (0x30, True),   # v3-kem
+    (0x31, True),   # v3-mldsa
+    (0x99, False),  # unknown wire version is rejected
+])
+def test_from_frame_routes_all_protocol_versions(version, routed):
+    """Server must route data frames for every protocol version it negotiates.
+
+    Regression: from_frame once hard-coded the v2 version, so v3 sessions
+    completed the handshake but their data frames were dropped — the tunnel
+    passed no traffic once v3 became the default suite.
+    """
+    import struct
+    from vpn.runtime import SessionManager
+    from handshake.kemtls import DATA_MAGIC, DATA_HEADER_FORMAT, Channel
+
+    sm = SessionManager()
+    sid = b"SESSION!"  # 8 bytes
+    sentinel = object()
+    sm._snap_id = {sid: sentinel}
+
+    frame = struct.pack(DATA_HEADER_FORMAT, DATA_MAGIC, version,
+                        int(Channel.DATA), 0, 0, sid, 0, 0)
+    result = sm.from_frame(frame)
+    assert (result is sentinel) == routed

@@ -23,7 +23,7 @@ from pathlib import Path
 from crypto.hybrid_crypto import PQCUnavailableError
 from handshake.kemtls import (Channel, DATA_HEADER_FORMAT, DATA_HEADER_SIZE, DATA_MAGIC,
     FrameType, HandshakeError, HandshakeSession, KEMTLSClient, KEMTLSServer, PROTOCOL_VERSION,
-    KEMTLSClientV3, KEMTLSServerV3, PROTOCOL_VERSION_V3, HEADER_SIZE, HEADER_FORMAT,
+    KEMTLSClientV3, KEMTLSServerV3, PROTOCOL_VERSION_V3, PROTOCOL_VERSION_V3_MLDSA, HEADER_SIZE, HEADER_FORMAT,
     MessageType, CookieProtector, pack_cookie_challenge, unpack_cookie_challenge,
     pack_cookie_response, unpack_cookie_response,
     ResumptionTicketKey, ResumptionClientHandshake, ResumptionServerHandshake)
@@ -230,6 +230,12 @@ class ServerSession:
         self.last_seen = time.monotonic()
 
 
+# Data-plane wire versions the server will route; the per-session
+# HandshakeSession re-validates the exact version in decrypt_frame.
+_DATA_PROTOCOL_VERSIONS = frozenset(
+    {PROTOCOL_VERSION, PROTOCOL_VERSION_V3, PROTOCOL_VERSION_V3_MLDSA})
+
+
 class SessionManager:
     """Session index with lock-free reads on the hot data path.
 
@@ -272,9 +278,11 @@ class SessionManager:
             magic, version, channel, _, _, session_id, _, _ = struct.unpack(DATA_HEADER_FORMAT, data[:DATA_HEADER_SIZE])
         except struct.error:
             return None
-        if magic != DATA_MAGIC or version != PROTOCOL_VERSION or channel != Channel.DATA:
+        if magic != DATA_MAGIC or version not in _DATA_PROTOCOL_VERSIONS or channel != Channel.DATA:
             return None
-        # Lock-free read — _snap_id is an immutable snapshot
+        # Lock-free read — _snap_id is an immutable snapshot.
+        # The per-session HandshakeSession re-checks version against its own
+        # protocol in decrypt_frame; here we only gate the wire magic/version.
         return self._snap_id.get(session_id)
 
     def destination(self, packet: bytes) -> ServerSession | None:
