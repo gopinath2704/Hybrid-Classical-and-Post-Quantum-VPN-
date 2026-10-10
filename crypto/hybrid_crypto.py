@@ -108,6 +108,16 @@ def _require_installed_liboqs():
     raise ImportError("native liboqs is not preinstalled; automatic download/build is disabled")
 
 
+def _selftest_skippable() -> bool:
+    """Skip the keygen+encap+decap self-test on repeat imports in the same process tree.
+
+    The env var is set after the first successful test so child processes
+    (daemon workers, eval harness forks) skip ~100 ms of startup cost.
+    CI / first-run always runs the test.
+    """
+    return os.environ.get("_PQVPN_SELFTEST_PASSED") == "1"
+
+
 try:
     _native_library = _require_installed_liboqs()
     import oqs as _oqs_module  # type: ignore[import-untyped]
@@ -122,15 +132,19 @@ try:
             "liboqs does not expose required ML-KEM-768; enabled mechanisms: "
             + ", ".join(enabled)
         )
-    with _oqs_module.KeyEncapsulation("ML-KEM-768") as _test_kem:
-        _pk = _test_kem.generate_keypair()
-        _sk = _test_kem.export_secret_key()
-    with _oqs_module.KeyEncapsulation("ML-KEM-768") as _enc:
-        _ct, _ss1 = _enc.encap_secret(_pk)
-    with _oqs_module.KeyEncapsulation("ML-KEM-768", _sk) as _dec:
-        _ss2 = _dec.decap_secret(_ct)
-    if not hmac.compare_digest(_ss1, _ss2):
-        raise ImportError("ML-KEM-768 startup self-test failed")
+    if _selftest_skippable():
+        _logger.debug("liboqs self-test skipped (cached pass from parent process).")
+    else:
+        with _oqs_module.KeyEncapsulation("ML-KEM-768") as _test_kem:
+            _pk = _test_kem.generate_keypair()
+            _sk = _test_kem.export_secret_key()
+        with _oqs_module.KeyEncapsulation("ML-KEM-768") as _enc:
+            _ct, _ss1 = _enc.encap_secret(_pk)
+        with _oqs_module.KeyEncapsulation("ML-KEM-768", _sk) as _dec:
+            _ss2 = _dec.decap_secret(_ct)
+        if not hmac.compare_digest(_ss1, _ss2):
+            raise ImportError("ML-KEM-768 startup self-test failed")
+        os.environ["_PQVPN_SELFTEST_PASSED"] = "1"
     _OQS_AVAILABLE = True
     _logger.debug("liboqs loaded successfully — native ML-KEM active.")
 except (ImportError, ModuleNotFoundError) as _e:

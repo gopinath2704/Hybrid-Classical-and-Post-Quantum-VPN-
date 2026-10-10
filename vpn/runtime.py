@@ -25,7 +25,8 @@ from handshake.kemtls import (Channel, DATA_HEADER_FORMAT, DATA_HEADER_SIZE, DAT
     FrameType, HandshakeError, HandshakeSession, KEMTLSClient, KEMTLSServer, PROTOCOL_VERSION,
     KEMTLSClientV3, KEMTLSServerV3, PROTOCOL_VERSION_V3, HEADER_SIZE, HEADER_FORMAT,
     MessageType, CookieProtector, pack_cookie_challenge, unpack_cookie_challenge,
-    pack_cookie_response, unpack_cookie_response)
+    pack_cookie_response, unpack_cookie_response,
+    ResumptionTicketKey, ResumptionClientHandshake, ResumptionServerHandshake)
 from vpn.config import ClientConfig, ServerConfig, validate_server, validate_client
 from vpn.network import NetworkQualityMonitor, TUNInterface, TUNMode
 from vpn.identity import AuthorizedClients, load_client_kem_private, load_client_private, validate_server_identity
@@ -230,9 +231,25 @@ class ServerSession:
 
 
 class SessionManager:
+    """Session index with lock-free reads on the hot data path.
+
+    Mutations (add/remove) publish new snapshot dicts atomically via Python's
+    GIL-protected reference assignment.  The data loop reads _snap_id / _snap_ip
+    without locking — no contention on every datagram.
+    """
     def __init__(self) -> None:
-        self.by_id, self.by_ip = {}, {}
+        self.by_id: dict[bytes, ServerSession] = {}
+        self.by_ip: dict[str, ServerSession] = {}
+        # ponytail: atomic snapshots for lock-free reads; upgrade to sharded
+        # dicts if session count exceeds ~10k
+        self._snap_id: dict[bytes, ServerSession] = {}
+        self._snap_ip: dict[str, ServerSession] = {}
         self.lock = threading.RLock()
+
+    def _publish(self) -> None:
+        """Publish immutable snapshots after a mutation (called under lock)."""
+        self._snap_id = dict(self.by_id)
+        self._snap_ip = dict(self.by_ip)
 
     def add(self, item: ServerSession) -> None:
         with self.lock:
@@ -240,11 +257,13 @@ class SessionManager:
             if key in self.by_id or item.vpn_ip in self.by_ip:
                 raise RuntimeError("duplicate session or VPN IP")
             self.by_id[key], self.by_ip[item.vpn_ip] = item, item
+            self._publish()
 
     def remove(self, item: ServerSession) -> None:
         with self.lock:
             self.by_id.pop(item.crypto.session_id[:8], None)
             self.by_ip.pop(item.vpn_ip, None)
+            self._publish()
 
     def from_frame(self, data: bytes) -> ServerSession | None:
         if len(data) < DATA_HEADER_SIZE:
@@ -255,8 +274,8 @@ class SessionManager:
             return None
         if magic != DATA_MAGIC or version != PROTOCOL_VERSION or channel != Channel.DATA:
             return None
-        with self.lock:
-            return self.by_id.get(session_id)
+        # Lock-free read — _snap_id is an immutable snapshot
+        return self._snap_id.get(session_id)
 
     def destination(self, packet: bytes) -> ServerSession | None:
         if not packet:
@@ -268,8 +287,8 @@ class SessionManager:
             destination = str(ipaddress.ip_address(packet[24:40]))
         else:
             return None
-        with self.lock:
-            return self.by_ip.get(destination)
+        # Lock-free read
+        return self._snap_ip.get(destination)
 
 
 class SourceRateLimiter:
@@ -316,6 +335,7 @@ class VPNServer:
         self._data_thread = None
         self._client_threads: list[threading.Thread] = []
         self._cookie = CookieProtector() if config.cookie_mode != "off" else None
+        self._ticket_key = ResumptionTicketKey() if config.resumption_ticket_lifetime > 0 else None
         self._pending_handshakes = 0
         self._pending_lock = threading.Lock()
 
@@ -372,23 +392,42 @@ class VPNServer:
         try:
             connection.settimeout(self.cfg.handshake_timeout)
             first_msg = recv_message(connection)
-            client_hello_wire = self._cookie_gate(connection, address, first_msg)
-            if self.cfg.protocol_version == 3:
-                handshake = KEMTLSServerV3(self.identity_secret, self.identity_public, self.auth.find_by_fingerprint)
+            # Detect 1-RTT resumption attempt
+            assigned_ip_hint = None
+            if (self._ticket_key and len(first_msg) >= HEADER_SIZE
+                    and struct.unpack(HEADER_FORMAT, first_msg[:HEADER_SIZE])[2] == MessageType.RESUMPTION_HELLO):
+                resume = ResumptionServerHandshake(
+                    self._ticket_key, self.cfg.protocol_version if self.cfg.protocol_version == 3 else PROTOCOL_VERSION_V3)
+                accept_wire, session = resume.process_hello(first_msg)
+                send_message(connection, accept_wire)
+                assigned_ip_hint = resume.assigned_ip or None
             else:
-                handshake = KEMTLSServer(self.identity_secret, self.identity_public, self.auth.find)
-            send_message(connection, handshake.process_client_hello(client_hello_wire))
-            finished, session = handshake.process_client_key_exchange(recv_message(connection))
-            send_message(connection, finished)
-            vpn_ip = self.pool.allocate(session.client_id, handshake.authz.get("assigned_ip"))
+                client_hello_wire = self._cookie_gate(connection, address, first_msg)
+                if self.cfg.protocol_version == 3:
+                    handshake = KEMTLSServerV3(self.identity_secret, self.identity_public, self.auth.find_by_fingerprint)
+                else:
+                    handshake = KEMTLSServer(self.identity_secret, self.identity_public, self.auth.find)
+                send_message(connection, handshake.process_client_hello(client_hello_wire))
+                finished, session = handshake.process_client_key_exchange(recv_message(connection))
+                send_message(connection, finished)
+                assigned_ip_hint = handshake.authz.get("assigned_ip")
+            vpn_ip = self.pool.allocate(session.client_id, assigned_ip_hint)
             item = ServerSession(session, vpn_ip, connection, session.client_id)
             self.sessions.add(item)
+            resumption_enabled = self._ticket_key is not None
             config = json.dumps({"session_id": session.session_id.hex(), "client_vpn_ip": vpn_ip,
                 "server_vpn_ip": self.cfg.server_vpn_ip, "prefix": ipaddress.ip_network(self.cfg.vpn_subnet).prefixlen,
                 "udp_port": self.cfg.udp_port, "mtu": self.cfg.mtu, "routes": ["0.0.0.0/1", "128.0.0.0/1"],
                 "dns": self.cfg.dns_servers, "epoch": session.epoch, "rekey_interval": self.cfg.rekey_interval,
-                "rehandshake_interval": self.cfg.rehandshake_interval}).encode()
+                "rehandshake_interval": self.cfg.rehandshake_interval,
+                "resumption": resumption_enabled}).encode()
             send_message(connection, session.encrypt_control(config, FrameType.CONFIG))
+            # Issue resumption ticket for next connect
+            if resumption_enabled:
+                ticket = self._ticket_key.issue(
+                    bytes(session.secrets.rekey_secret), session.client_id,
+                    session.protocol_version, self.cfg.resumption_ticket_lifetime, vpn_ip)
+                send_message(connection, session.encrypt_control(ticket, FrameType.RESUMPTION_TICKET))
             connection.settimeout(self.cfg.handshake_timeout)
             while not self.stop_event.is_set():
                 with self.sessions.lock:
@@ -501,7 +540,12 @@ class VPNServer:
         item.crypto.activate_epoch(epoch, next_keys)
         logger.info("rehandshake complete epoch=%d client_id=%s", epoch, item.client_id)
 
+    # ponytail: batch size for draining sockets per wakeup; tune up if
+    # profiling shows select() round-trips are still the bottleneck
+    _BATCH_SIZE = 64
+
     def _data_loop(self) -> None:
+        batch = self._BATCH_SIZE
         while not self.stop_event.is_set():
             descriptors = [self.udp]
             if self.tun:
@@ -511,42 +555,48 @@ class VPNServer:
             except (OSError, ValueError):
                 break
             if self.udp in readable:
-                try:
-                    data, address = self.udp.recvfrom(65535)
-                except OSError:
-                    continue
-                self._handle_datagram(data, address)
+                for _ in range(batch):
+                    try:
+                        data, address = self.udp.recvfrom(65535)
+                    except (BlockingIOError, OSError):
+                        break
+                    self._handle_datagram(data, address)
             if self.tun and self.tun.fileno() in readable:
-                packet = self.tun.read()
-                item = self.sessions.destination(packet)
-                if item and item.endpoint and len(packet) <= self.tun.mtu:
-                    try: self.udp.sendto(item.crypto.encrypt_frame(packet), item.endpoint)
-                    except HandshakeError: continue
+                mtu = self.tun.mtu
+                for _ in range(batch):
+                    try:
+                        packet = self.tun.read()
+                    except (BlockingIOError, OSError):
+                        break
+                    item = self.sessions.destination(packet)
+                    if item and item.endpoint and len(packet) <= mtu:
+                        try: self.udp.sendto(item.crypto.encrypt_frame(packet), item.endpoint)
+                        except HandshakeError: continue
 
     def _handle_datagram(self, data: bytes, address: tuple[str, int]) -> None:
-        # Serialize authorization/activity with expiry and epoch activation. No
-        # removed session or record from a superseded epoch may refresh liveness.
-        with self.sessions.lock:
-            item = self.sessions.from_frame(data)
-            if item is None or (item.endpoint is not None and item.endpoint != address):
-                return
-            try:
-                frame_type, payload = item.crypto.decrypt_frame(data)
-                if frame_type == FrameType.UDP_BIND and payload == b"bind":
+        # Lock-free session lookup (snapshot dict), then decrypt.
+        # Lock only for mutations (bind, touch) — the hot DATA path avoids it.
+        item = self.sessions.from_frame(data)
+        if item is None or (item.endpoint is not None and item.endpoint != address):
+            return
+        try:
+            frame_type, payload = item.crypto.decrypt_frame(data)
+            if frame_type == FrameType.UDP_BIND and payload == b"bind":
+                with self.sessions.lock:
                     item.endpoint = address
                     item.touch()
-                    self.udp.sendto(item.crypto.encrypt_frame(b"ok", FrameType.UDP_BIND_ACK), address)
-                elif item.endpoint == address and frame_type == FrameType.DATA:
-                    if len(payload) <= self.tun.mtu and validate_client_packet(payload, item.vpn_ip):
-                        item.touch()
-                        self.tun.write(payload)
-                    else:
-                        logger.warning("rejected spoofed/malformed inner packet client_id=%s", item.client_id)
-                elif item.endpoint == address and frame_type == FrameType.PING and len(payload) == 8:
+                self.udp.sendto(item.crypto.encrypt_frame(b"ok", FrameType.UDP_BIND_ACK), address)
+            elif item.endpoint == address and frame_type == FrameType.DATA:
+                if len(payload) <= self.tun.mtu and validate_client_packet(payload, item.vpn_ip):
                     item.touch()
-                    self.udp.sendto(item.crypto.encrypt_frame(payload, FrameType.PONG), address)
-            except (HandshakeError, OSError):
-                return
+                    self.tun.write(payload)
+                else:
+                    logger.warning("rejected spoofed/malformed inner packet client_id=%s", item.client_id)
+            elif item.endpoint == address and frame_type == FrameType.PING and len(payload) == 8:
+                item.touch()
+                self.udp.sendto(item.crypto.encrypt_frame(payload, FrameType.PONG), address)
+        except (HandshakeError, OSError):
+            return
 
     def _close_listeners(self) -> None:
         for name in ("tcp", "udp"):
@@ -605,6 +655,31 @@ class VPNClient:
         self._responses = queue.Queue(maxsize=1)
         self._epoch_ready = threading.Event()
         self._epoch_ready.set()
+        self._resumption_ticket: bytes | None = None
+        self._resumption_secret: bytes | None = None
+
+    def _ticket_path(self) -> Path:
+        """Ticket stored next to client config for persistence across restarts."""
+        return Path(self.cfg.client_identity_private_key).parent / ".pqvpn_ticket.json"
+
+    def _save_ticket(self, ticket: bytes, secret: bytes, fingerprint: str) -> None:
+        import base64
+        data = {"fp": fingerprint, "t": base64.b64encode(ticket).decode(),
+                "s": base64.b64encode(secret).decode(), "v": self.cfg.protocol_version}
+        try:
+            self._ticket_path().write_text(json.dumps(data), encoding="utf-8")
+        except OSError:
+            logger.debug("could not persist resumption ticket")
+
+    def _load_ticket(self, fingerprint: str) -> tuple[bytes, bytes] | None:
+        import base64
+        try:
+            data = json.loads(self._ticket_path().read_text(encoding="utf-8"))
+            if data.get("fp") != fingerprint or data.get("v") != self.cfg.protocol_version:
+                return None
+            return base64.b64decode(data["t"]), base64.b64decode(data["s"])
+        except (OSError, KeyError, ValueError):
+            return None
 
     def connect(self) -> dict:
         if self.state in {"CONNECTING", "CONNECTED"}:
@@ -624,28 +699,56 @@ class VPNClient:
             identity = Path(self.cfg.server_identity_public_key).read_bytes()
             self.server_ip = socket.gethostbyname(self.cfg.server_host)
             self.control = socket.create_connection((self.server_ip, self.cfg.server_control_port), timeout=10)
-            if self.cfg.protocol_version == 3:
-                client_secret = load_client_kem_private(Path(self.cfg.client_identity_private_key))
-                client_public = Path(self.cfg.client_identity_public_key).read_bytes()
-                handshake = KEMTLSClientV3(identity, self.cfg.server_identity_fingerprint,
-                                           client_secret, client_public)
-            else:
-                private = load_client_private(Path(self.cfg.client_identity_private_key))
-                handshake = KEMTLSClient(identity, self.cfg.server_identity_fingerprint, private)
-            client_hello_wire = handshake.initiate_handshake()
-            send_message(self.control, client_hello_wire)
-            server_reply = recv_message(self.control)
-            if len(server_reply) >= HEADER_SIZE:
-                _, _, reply_type, _ = struct.unpack(HEADER_FORMAT, server_reply[:HEADER_SIZE])
-                if reply_type == MessageType.COOKIE_CHALLENGE:
-                    cookie = unpack_cookie_challenge(server_reply)
-                    version = PROTOCOL_VERSION_V3 if self.cfg.protocol_version == 3 else PROTOCOL_VERSION
-                    send_message(self.control, pack_cookie_response(cookie, client_hello_wire, version))
-                    server_reply = recv_message(self.control)
-            send_message(self.control, handshake.process_server_hello(server_reply))
-            self.session = handshake.process_server_finished(recv_message(self.control))
+            # Try 1-RTT resumption first, fall back to full handshake
+            resumed = False
+            saved = self._load_ticket(self.cfg.server_identity_fingerprint)
+            if saved is not None:
+                ticket, resume_secret = saved
+                try:
+                    resume = ResumptionClientHandshake(resume_secret,
+                        PROTOCOL_VERSION_V3 if self.cfg.protocol_version == 3 else PROTOCOL_VERSION)
+                    send_message(self.control, resume.initiate(ticket))
+                    self.session = resume.process_accept(recv_message(self.control))
+                    resumed = True
+                    logger.info("session resumed via 1-RTT ticket")
+                except (HandshakeError, OSError) as exc:
+                    logger.info("resumption failed (%s), falling back to full handshake", exc)
+                    self.control.close()
+                    self.control = socket.create_connection(
+                        (self.server_ip, self.cfg.server_control_port), timeout=10)
+            if not resumed:
+                if self.cfg.protocol_version == 3:
+                    client_secret = load_client_kem_private(Path(self.cfg.client_identity_private_key))
+                    client_public = Path(self.cfg.client_identity_public_key).read_bytes()
+                    handshake = KEMTLSClientV3(identity, self.cfg.server_identity_fingerprint,
+                                               client_secret, client_public)
+                else:
+                    private = load_client_private(Path(self.cfg.client_identity_private_key))
+                    handshake = KEMTLSClient(identity, self.cfg.server_identity_fingerprint, private)
+                client_hello_wire = handshake.initiate_handshake()
+                send_message(self.control, client_hello_wire)
+                server_reply = recv_message(self.control)
+                if len(server_reply) >= HEADER_SIZE:
+                    _, _, reply_type, _ = struct.unpack(HEADER_FORMAT, server_reply[:HEADER_SIZE])
+                    if reply_type == MessageType.COOKIE_CHALLENGE:
+                        cookie = unpack_cookie_challenge(server_reply)
+                        version = PROTOCOL_VERSION_V3 if self.cfg.protocol_version == 3 else PROTOCOL_VERSION
+                        send_message(self.control, pack_cookie_response(cookie, client_hello_wire, version))
+                        server_reply = recv_message(self.control)
+                send_message(self.control, handshake.process_server_hello(server_reply))
+                self.session = handshake.process_server_finished(recv_message(self.control))
             _, payload = self.session.decrypt_control(recv_message(self.control), FrameType.CONFIG)
             self.tunnel = json.loads(payload)
+            # Store resumption ticket if server issued one
+            if self.tunnel.get("resumption"):
+                try:
+                    frame = recv_message(self.control)
+                    kind, ticket_data = self.session.decrypt_control(frame)
+                    if kind == FrameType.RESUMPTION_TICKET:
+                        self._save_ticket(ticket_data, bytes(self.session.secrets.rekey_secret),
+                                          self.cfg.server_identity_fingerprint)
+                except (HandshakeError, OSError):
+                    logger.debug("resumption ticket receive failed; will use full handshake next time")
             advertised = ipaddress.IPv4Network(f"{self.tunnel['server_vpn_ip']}/{self.tunnel['prefix']}", strict=False)
             if advertised != ipaddress.IPv4Network(self.cfg.expected_vpn_subnet):
                 raise HandshakeError("server VPN subnet differs from expected_vpn_subnet")
