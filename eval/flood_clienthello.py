@@ -59,33 +59,54 @@ def tcp_frame(msg: bytes) -> bytes:
     return struct.pack("!I", len(msg)) + msg
 
 
-def flood_worker(target_ip: str, target_port: int, rate: int,
+_FLOOD_SCRIPT = r"""
+import os,socket,struct,sys,time
+target_ip,target_port,rate,duration = sys.argv[1],int(sys.argv[2]),int(sys.argv[3]),float(sys.argv[4])
+MAGIC=0x4856; VER=0x20; CH=1; PLEN=1312
+hdr=struct.pack("!HBBH",MAGIC,VER,CH,PLEN)
+payload=os.urandom(PLEN)
+frame=struct.pack("!I",len(hdr)+len(payload))+hdr+payload
+interval=1.0/rate if rate>0 else 0
+sent=errors=0
+deadline=time.monotonic()+duration
+while time.monotonic()<deadline:
+    try:
+        s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect((target_ip,target_port))
+        s.sendall(frame)
+        sent+=1
+        s.close()
+    except OSError:
+        errors+=1
+    if interval>0:
+        nxt=time.monotonic()+interval
+        while time.monotonic()<nxt:time.sleep(0.0001)
+print(f"{sent} {errors}")
+"""
+
+
+def flood_worker(flood_ns: str, target_ip: str, target_port: int, rate: int,
                  duration: float, stop_event: threading.Event,
                  stats: dict) -> None:
-    """Send ClientHellos at *rate* per second for *duration* seconds."""
-    ch_frame = tcp_frame(craft_clienthello())
-    sent = 0
-    errors = 0
-    interval = 1.0 / rate if rate > 0 else 0
-    deadline = time.monotonic() + duration
-
-    while time.monotonic() < deadline and not stop_event.is_set():
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(2)
-            s.connect((target_ip, target_port))
-            s.sendall(ch_frame)
-            sent += 1
-            s.close()
-        except OSError:
-            errors += 1
-        if interval > 0:
-            next_send = time.monotonic() + interval
-            while time.monotonic() < next_send and not stop_event.is_set():
-                time.sleep(0.0001)
-
-    stats["flood_sent"] = sent
-    stats["flood_errors"] = errors
+    """Launch a flood process inside *flood_ns* for the full duration."""
+    try:
+        proc = subprocess.run(
+            ["ip", "netns", "exec", flood_ns,
+             sys.executable, "-c", _FLOOD_SCRIPT,
+             target_ip, str(target_port), str(rate), str(duration)],
+            capture_output=True, text=True,
+            timeout=duration + 30)
+        parts = proc.stdout.strip().split()
+        if len(parts) == 2:
+            stats["flood_sent"] = int(parts[0])
+            stats["flood_errors"] = int(parts[1])
+        else:
+            stats["flood_sent"] = 0
+            stats["flood_errors"] = 0
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        stats["flood_sent"] = 0
+        stats["flood_errors"] = 0
 
 
 def legit_connect(run_dir: str, client_ns: str, config_path: str,
@@ -275,7 +296,8 @@ def run_flood_trial(topo: dict, run_dir: str, rate: int, duration: float,
     if rate > 0:
         flood_thread = threading.Thread(
             target=flood_worker,
-            args=("192.0.3.1", 51820, rate, duration, stop_flood, flood_stats),
+            args=(topo["fld_ns"], "192.0.3.1", 51820, rate, duration,
+                  stop_flood, flood_stats),
             daemon=True)
         flood_thread.start()
         time.sleep(1)
@@ -350,8 +372,10 @@ def main():
 
     for cookie_mode in ["off", "always"]:
         print(f"\n--- cookie_mode={cookie_mode} ---")
-        topo = setup_topology(run_dir, cookie_mode)
-        server_proc = start_server(topo, run_dir)
+        mode_dir = os.path.join(run_dir, cookie_mode)
+        os.makedirs(mode_dir, exist_ok=True)
+        topo = setup_topology(mode_dir, cookie_mode)
+        server_proc = start_server(topo, mode_dir)
 
         try:
             for rate in rates:
@@ -359,7 +383,7 @@ def main():
                 print(f"  rate={rate}/s ... ", end="", flush=True)
 
                 trial = run_flood_trial(
-                    topo, run_dir, rate, args.duration,
+                    topo, mode_dir, rate, args.duration,
                     args.connects, server_proc)
 
                 for i, r in enumerate(trial["results"]):
