@@ -392,7 +392,11 @@ class VPNServer:
         try:
             connection.settimeout(self.cfg.handshake_timeout)
             first_msg = recv_message(connection)
-            # Detect 1-RTT resumption attempt
+            # Detect 1-RTT resumption attempt.
+            # Resumption skips cookie_gate: invalid tickets fail fast (GCM reject),
+            # and the per-source rate limiter + global slot bound still apply.
+            # ponytail: single-use ticket set or resumption cookie gate if replay
+            # of captured valid tickets becomes a DoS vector under M7 testing
             assigned_ip_hint = None
             if (self._ticket_key and len(first_msg) >= HEADER_SIZE
                     and struct.unpack(HEADER_FORMAT, first_msg[:HEADER_SIZE])[2] == MessageType.RESUMPTION_HELLO):
@@ -667,7 +671,10 @@ class VPNClient:
         data = {"fp": fingerprint, "t": base64.b64encode(ticket).decode(),
                 "s": base64.b64encode(secret).decode(), "v": self.cfg.protocol_version}
         try:
-            self._ticket_path().write_text(json.dumps(data), encoding="utf-8")
+            path = str(self._ticket_path())
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
         except OSError:
             logger.debug("could not persist resumption ticket")
 
@@ -811,8 +818,11 @@ class VPNClient:
                 if self.stop_event.is_set(): return
                 raise
             if self.tun.fileno() in readable:
-                packet = self.tun.read()
-                if len(packet) <= self.tunnel["mtu"]:
+                try:
+                    packet = self.tun.read()
+                except BlockingIOError:
+                    packet = b""
+                if packet and len(packet) <= self.tunnel["mtu"]:
                     self.udp.sendto(self.session.encrypt_frame(packet), self.server_udp)
             if self.udp in readable:
                 data, address = self.udp.recvfrom(65535)

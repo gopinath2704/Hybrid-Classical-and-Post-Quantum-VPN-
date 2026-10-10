@@ -70,7 +70,7 @@ class TUNInterface:
         if self.mode==TUNMode.NATIVE:
             if sys.platform!="linux":raise OSError("native TUN is Linux-only")
             import fcntl
-            fd=os.open("/dev/net/tun",os.O_RDWR)
+            fd=os.open("/dev/net/tun",os.O_RDWR|os.O_NONBLOCK)
             try:fcntl.ioctl(fd,_TUNSETIFF,struct.pack("16sH",self.name.encode(),_IFF_TUN|_IFF_NO_PI))
             except Exception:os.close(fd);raise
             self._fd=fd

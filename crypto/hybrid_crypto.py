@@ -111,8 +111,10 @@ def _require_installed_liboqs():
 def _selftest_skippable() -> bool:
     """Skip the keygen+encap+decap self-test on repeat imports in the same process tree.
 
-    The env var is set after the first successful test so child processes
-    (daemon workers, eval harness forks) skip ~100 ms of startup cost.
+    The self-test itself is sub-millisecond; the real fixed cost (~100 ms) is
+    interpreter start + liboqs CDLL load, which this cannot skip.  The env var
+    saves the round-trip only — the real startup win requires a persistent
+    daemon that keeps the interpreter + liboqs warm across connects.
     CI / first-run always runs the test.
     """
     return os.environ.get("_PQVPN_SELFTEST_PASSED") == "1"
