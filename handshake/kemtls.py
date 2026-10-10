@@ -45,6 +45,8 @@ class MessageType(enum.IntEnum):
     SERVER_FINISHED = 4
     COOKIE_CHALLENGE = 5
     COOKIE_RESPONSE = 6
+    RESUMPTION_HELLO = 7
+    RESUMPTION_ACCEPT = 8
     HANDSHAKE_ERROR = 0xFF
 
 
@@ -61,6 +63,7 @@ class FrameType(enum.IntEnum):
     ERROR = 10
     REHANDSHAKE_REQUEST = 11
     REHANDSHAKE_RESPONSE = 12
+    RESUMPTION_TICKET = 13
 
 
 class Direction(enum.IntEnum):
@@ -488,17 +491,19 @@ class HandshakeSession:
                 self._control_send_sequence += 1
             return result
 
+    _CONTROL_TYPES = frozenset({
+        FrameType.CONFIG, FrameType.REKEY_REQUEST, FrameType.REKEY_RESPONSE,
+        FrameType.REHANDSHAKE_REQUEST, FrameType.REHANDSHAKE_RESPONSE,
+        FrameType.CLOSE, FrameType.ERROR, FrameType.RESUMPTION_TICKET,
+    })
+
     def encrypt_frame(self, plaintext: bytes, frame_type: FrameType = FrameType.DATA) -> bytes:
-        if frame_type in {FrameType.CONFIG, FrameType.REKEY_REQUEST, FrameType.REKEY_RESPONSE,
-                         FrameType.REHANDSHAKE_REQUEST, FrameType.REHANDSHAKE_RESPONSE,
-                         FrameType.CLOSE, FrameType.ERROR}:
+        if frame_type in self._CONTROL_TYPES:
             raise HandshakeError("control frame type requires encrypt_control")
         return self._encrypt(plaintext, frame_type, Channel.DATA)
 
     def encrypt_control(self, plaintext: bytes, frame_type: FrameType) -> bytes:
-        if frame_type not in {FrameType.CONFIG, FrameType.REKEY_REQUEST, FrameType.REKEY_RESPONSE,
-                              FrameType.REHANDSHAKE_REQUEST, FrameType.REHANDSHAKE_RESPONSE,
-                              FrameType.CLOSE, FrameType.ERROR}:
+        if frame_type not in self._CONTROL_TYPES:
             raise HandshakeError("data frame type requires encrypt_frame")
         return self._encrypt(plaintext, frame_type, Channel.CONTROL)
 
@@ -1257,3 +1262,214 @@ class KEMTLSServerMLDSA:
                                    self.server_random, "server", self.authz.get("client_id", ""),
                                    protocol_version=PROTOCOL_VERSION_V3_MLDSA)
         return finished, session
+
+
+# ---------------------------------------------------------------------------
+# Session Resumption — 1-RTT reconnect with PQ forward secrecy
+# ---------------------------------------------------------------------------
+
+RESUMPTION_PROTOCOL = b"PQVPN-RESUME"
+
+
+class ResumptionTicketKey:
+    """Server-side AES-256-GCM ticket encryption.  Key lives in memory only —
+    server restart invalidates all tickets, which is the safe default."""
+
+    def __init__(self) -> None:
+        self._cipher = AESGCM(os.urandom(32))
+
+    def issue(self, resumption_secret: bytes, client_id: str,
+              protocol_version: int, lifetime: int = 86400,
+              assigned_ip: str = "") -> bytes:
+        now = int(time.time())
+        cid = client_id.encode("utf-8")
+        aip = assigned_ip.encode("utf-8")
+        plaintext = (resumption_secret
+                     + struct.pack("!BqHH", protocol_version, now + lifetime,
+                                   len(cid), len(aip))
+                     + cid + aip)
+        nonce = os.urandom(12)
+        return nonce + self._cipher.encrypt(nonce, plaintext, RESUMPTION_PROTOCOL)
+
+    def validate(self, ticket: bytes) -> tuple[bytes, str, int, str] | None:
+        """→ (resumption_secret, client_id, protocol_version, assigned_ip) or None."""
+        if len(ticket) < 12 + 16 + 32 + 13:  # nonce + tag + secret + header
+            return None
+        try:
+            plaintext = self._cipher.decrypt(ticket[:12], ticket[12:],
+                                             RESUMPTION_PROTOCOL)
+        except Exception:
+            return None
+        if len(plaintext) < 45:
+            return None
+        secret = plaintext[:32]
+        version, expiry, cid_len, aip_len = struct.unpack("!BqHH", plaintext[32:45])
+        if len(plaintext) != 45 + cid_len + aip_len:
+            return None
+        if int(time.time()) > expiry:
+            return None
+        cid = plaintext[45:45 + cid_len].decode("utf-8")
+        aip = plaintext[45 + cid_len:].decode("utf-8")
+        return secret, cid, version, aip
+
+
+def derive_schedule_resume(resumption_secret: bytes, ecc_ss: bytes, kem_ss: bytes,
+                           client_random: bytes, server_random: bytes,
+                           session_id: bytes, transcript_hash: bytes) -> TrafficSecrets:
+    """Key schedule for resumed sessions — mixes old secret + fresh ephemeral material."""
+    context = (RESUMPTION_PROTOCOL + bytes([PROTOCOL_VERSION_V3])
+               + b"|X25519|ML-KEM-768|AES-256-GCM|"
+               + session_id + client_random + server_random + transcript_hash)
+    ikm = resumption_secret + ecc_ss + kem_ss
+    salt = hashlib.sha256(b"pqvpn resume" + client_random + server_random + session_id).digest()
+    master = KeyManager().derive_key(ikm, salt=salt, info=b"pqvpn resume master secret")
+    return _derive_secrets(master, context)
+
+
+@dataclass(frozen=True)
+class ResumptionHello:
+    """Client → Server: ticket + fresh ephemeral keys."""
+    client_random: bytes   # 32
+    ticket: bytes           # variable
+    ecc_public_key: bytes  # 32
+    pqc_public_key: bytes  # 1184
+
+    def pack(self, version: int = PROTOCOL_VERSION_V3) -> bytes:
+        payload = (self.client_random
+                   + struct.pack("!H", len(self.ticket)) + self.ticket
+                   + self.ecc_public_key + self.pqc_public_key)
+        return _pack_header(MessageType.RESUMPTION_HELLO, len(payload), version) + payload
+
+    @classmethod
+    def unpack(cls, data: bytes, version: int = PROTOCOL_VERSION_V3) -> "ResumptionHello":
+        _, _, msg_type, payload_len = _unpack_header(data, version)
+        if msg_type != MessageType.RESUMPTION_HELLO:
+            raise HandshakeError("expected RESUMPTION_HELLO")
+        payload = data[HEADER_SIZE:HEADER_SIZE + payload_len]
+        if len(payload) < 34 + 32 + 1184:
+            raise HandshakeError("RESUMPTION_HELLO too short")
+        cr = payload[:32]
+        tlen = struct.unpack("!H", payload[32:34])[0]
+        if len(payload) != 34 + tlen + 32 + 1184:
+            raise HandshakeError("RESUMPTION_HELLO size mismatch")
+        return cls(cr, payload[34:34 + tlen],
+                   payload[34 + tlen:34 + tlen + 32],
+                   payload[34 + tlen + 32:])
+
+
+@dataclass(frozen=True)
+class ResumptionAccept:
+    """Server → Client: new session keys with forward secrecy."""
+    server_random: bytes     # 32
+    session_id: bytes        # 32
+    ecc_public_key: bytes    # 32
+    pqc_ciphertext: bytes    # 1088
+    finished_mac: bytes      # 32
+    SIZE = 1216
+
+    def pack(self, version: int = PROTOCOL_VERSION_V3) -> bytes:
+        payload = (self.server_random + self.session_id + self.ecc_public_key
+                   + self.pqc_ciphertext + self.finished_mac)
+        return _pack_header(MessageType.RESUMPTION_ACCEPT, len(payload), version) + payload
+
+    @classmethod
+    def unpack(cls, data: bytes, version: int = PROTOCOL_VERSION_V3) -> "ResumptionAccept":
+        payload = _fixed(data, MessageType.RESUMPTION_ACCEPT, cls.SIZE, version)
+        return cls(payload[:32], payload[32:64], payload[64:96],
+                   payload[96:1184], payload[1184:])
+
+
+_RESUME_FINISHED_LABEL = b"pqvpn resume finished"
+
+
+class ResumptionClientHandshake:
+    """Client-side 1-RTT resumption handshake."""
+
+    def __init__(self, resumption_secret: bytes, protocol_version: int = PROTOCOL_VERSION_V3,
+                 allow_mock_pqc: bool = False) -> None:
+        self._secret = resumption_secret
+        self._version = protocol_version
+        self._hybrid = HybridKEM("ML-KEM-768", allow_mock_pqc)
+        self._transcript = TranscriptHasher()
+
+    def initiate(self, ticket: bytes) -> bytes:
+        self.keys = self._hybrid.generate_keypairs()
+        self.client_random = os.urandom(32)
+        wire = ResumptionHello(self.client_random, ticket,
+                               self.keys.ecc_public, self.keys.pqc_public).pack(self._version)
+        self._transcript.update(wire)
+        return wire
+
+    def process_accept(self, wire: bytes) -> HandshakeSession:
+        accept = ResumptionAccept.unpack(wire, self._version)
+        self._transcript.update(wire[:HEADER_SIZE + ResumptionAccept.SIZE - 32])  # sans mac
+
+        ecc_ss = self._hybrid.ecc.derive_shared_secret(self.keys.ecc_private, accept.ecc_public_key)
+        kem_ss = self._hybrid.pqc.decapsulate(self.keys.pqc_secret, accept.pqc_ciphertext)
+
+        schedule = derive_schedule_resume(
+            self._secret, ecc_ss, kem_ss,
+            self.client_random, accept.server_random,
+            accept.session_id, self._transcript.digest())
+
+        expected = _compute_finished_mac(self._transcript.digest(),
+                                         bytes(schedule.server_finished_key),
+                                         _RESUME_FINISHED_LABEL)
+        if not hmac.compare_digest(accept.finished_mac, expected):
+            raise HandshakeError("resumption finished MAC failed")
+
+        return HandshakeSession(accept.session_id, schedule, self.client_random,
+                                accept.server_random, "client",
+                                protocol_version=self._version)
+
+
+class ResumptionServerHandshake:
+    """Server-side 1-RTT resumption handshake."""
+
+    def __init__(self, ticket_key: ResumptionTicketKey,
+                 protocol_version: int = PROTOCOL_VERSION_V3,
+                 allow_mock_pqc: bool = False) -> None:
+        self._ticket_key = ticket_key
+        self._version = protocol_version
+        self._hybrid = HybridKEM("ML-KEM-768", allow_mock_pqc)
+        self._transcript = TranscriptHasher()
+        self.client_id = ""
+        self.assigned_ip: str = ""
+
+    def process_hello(self, wire: bytes) -> tuple[bytes, HandshakeSession]:
+        hello = ResumptionHello.unpack(wire, self._version)
+        result = self._ticket_key.validate(hello.ticket)
+        if result is None:
+            raise HandshakeError("invalid or expired resumption ticket")
+        resumption_secret, self.client_id, ticket_version, self.assigned_ip = result
+        if ticket_version != self._version:
+            raise HandshakeError("resumption ticket protocol version mismatch")
+
+        self._transcript.update(wire)
+        server_random = os.urandom(32)
+        session_id = os.urandom(32)
+        server_ecc_private, server_ecc_public = self._hybrid.ecc.generate_keypair()
+        ecc_ss = self._hybrid.ecc.derive_shared_secret(server_ecc_private, hello.ecc_public_key)
+        pqc_ct, kem_ss = self._hybrid.pqc.encapsulate(hello.pqc_public_key)
+
+        # Build accept sans finished_mac for transcript
+        accept_body = server_random + session_id + server_ecc_public + pqc_ct
+        self._transcript.update(_pack_header(MessageType.RESUMPTION_ACCEPT,
+                                             ResumptionAccept.SIZE, self._version) + accept_body)
+
+        schedule = derive_schedule_resume(
+            resumption_secret, ecc_ss, kem_ss,
+            hello.client_random, server_random,
+            session_id, self._transcript.digest())
+
+        finished = _compute_finished_mac(self._transcript.digest(),
+                                         bytes(schedule.server_finished_key),
+                                         _RESUME_FINISHED_LABEL)
+
+        accept = ResumptionAccept(server_random, session_id, server_ecc_public,
+                                  pqc_ct, finished).pack(self._version)
+
+        session = HandshakeSession(session_id, schedule, hello.client_random,
+                                   server_random, "server", self.client_id,
+                                   protocol_version=self._version)
+        return accept, session

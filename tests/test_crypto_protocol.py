@@ -1190,3 +1190,75 @@ def test_native_authenticated_session_records(identities):
     assert server.decrypt_frame(ping, FrameType.PING)[1] == b'12345678'
     assert client.decrypt_frame(server.encrypt_frame(b'12345678', FrameType.PONG), FrameType.PONG)[1] == b'12345678'
     client.secure_wipe(); server.secure_wipe()
+
+
+# --- Session Resumption Tests ---
+from handshake.kemtls import (
+    ResumptionTicketKey, ResumptionClientHandshake, ResumptionServerHandshake,
+    derive_schedule_resume,
+)
+
+
+@pytest.mark.mock_pqc
+def test_resumption_1rtt_roundtrip(v3_identities):
+    """Full handshake → ticket → 1-RTT resumption produces working sessions."""
+    # First: full v3 handshake to get a session with rekey_secret
+    client_session, server_session = exchange_v3(v3_identities)
+
+    # Server issues a ticket
+    ticket_key = ResumptionTicketKey()
+    resumption_secret = bytes(server_session.secrets.rekey_secret)
+    ticket = ticket_key.issue(resumption_secret, "alice", PROTOCOL_VERSION_V3, 3600, "10.8.0.2")
+
+    # Client resumes with the ticket
+    resume_client = ResumptionClientHandshake(
+        bytes(client_session.secrets.rekey_secret), PROTOCOL_VERSION_V3, allow_mock_pqc=True)
+    hello_wire = resume_client.initiate(ticket)
+
+    # Server processes resumption
+    resume_server = ResumptionServerHandshake(ticket_key, PROTOCOL_VERSION_V3, allow_mock_pqc=True)
+    accept_wire, new_server_session = resume_server.process_hello(hello_wire)
+    assert resume_server.client_id == "alice"
+    assert resume_server.assigned_ip == "10.8.0.2"
+
+    # Client processes accept
+    new_client_session = resume_client.process_accept(accept_wire)
+
+    # Verify the resumed sessions can communicate
+    ciphertext = new_client_session.encrypt_frame(b"resumed-data")
+    frame_type, plaintext = new_server_session.decrypt_frame(ciphertext)
+    assert plaintext == b"resumed-data"
+    assert frame_type == FrameType.DATA
+
+    # And in the reverse direction
+    response = new_server_session.encrypt_frame(b"ack")
+    _, ack = new_client_session.decrypt_frame(response)
+    assert ack == b"ack"
+
+    # New session has different keys from original
+    assert new_client_session.session_id != client_session.session_id
+    new_client_session.secure_wipe()
+    new_server_session.secure_wipe()
+
+
+@pytest.mark.mock_pqc
+def test_resumption_expired_ticket_rejected():
+    ticket_key = ResumptionTicketKey()
+    ticket = ticket_key.issue(os.urandom(32), "alice", PROTOCOL_VERSION_V3, lifetime=-1)
+    assert ticket_key.validate(ticket) is None
+
+
+@pytest.mark.mock_pqc
+def test_resumption_tampered_ticket_rejected():
+    ticket_key = ResumptionTicketKey()
+    ticket = ticket_key.issue(os.urandom(32), "alice", PROTOCOL_VERSION_V3)
+    tampered = bytearray(ticket)
+    tampered[-5] ^= 0xFF
+    assert ticket_key.validate(bytes(tampered)) is None
+
+
+@pytest.mark.mock_pqc
+def test_resumption_wrong_key_rejected():
+    key1, key2 = ResumptionTicketKey(), ResumptionTicketKey()
+    ticket = key1.issue(os.urandom(32), "alice", PROTOCOL_VERSION_V3)
+    assert key2.validate(ticket) is None

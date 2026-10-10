@@ -465,3 +465,13 @@ def test_quality_rolling_window():
     monitor=NetworkQualityMonitor(3)
     for i in range(5):monitor.record_rtt(float(i))
     assert monitor.rtt_samples==[2.,3.,4.]
+
+def test_native_tun_opens_nonblocking():
+    """The native TUN fd must be O_NONBLOCK so batched drain doesn't stall."""
+    import fcntl
+    tun = TUNInterface(name="pqtest0", mode=TUNMode.NATIVE)
+    # We can't actually open /dev/net/tun without CAP_NET_ADMIN,
+    # so verify the flag is in the open() call by inspecting the source.
+    import inspect
+    src = inspect.getsource(tun.open)
+    assert "O_NONBLOCK" in src, "native TUN must open with O_NONBLOCK for batched drain"

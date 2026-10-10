@@ -482,33 +482,40 @@ def _make_arch_source_archive(root: Path, archive: Path) -> None:
 
 
 def _stable_archive_digest(root: Path, tmp: Path) -> str:
-    """Hash the uncompressed tar to eliminate gzip-version differences."""
+    """Content-manifest hash of the packaged paths.
+
+    Hashes the sorted ``git ls-tree -r`` manifest (mode, object hash, path)
+    rather than raw ``git archive`` tar bytes. Git object hashes depend only on
+    file content and layout, so the digest is identical across git/tar writer
+    versions — unlike the tar bytes, whose framing varies between environments
+    and never matched in CI.
+    """
     included = (
         "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
         "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
         "packaging/common", "config/account-api.toml", "scripts",
     )
-    tar_path = tmp / "pqvpn-3.0.0.tar"
-    subprocess.run(
-        [
-            "git", "archive", "--format=tar", "--mtime=2026-09-14T00:00:00Z",
-            "--prefix=pqvpn-3.0.0/",
-            f"--output={tar_path}", "HEAD^{tree}", "--", *included,
-        ],
+    manifest = subprocess.run(
+        ["git", "ls-tree", "-r", "HEAD^{tree}", "--", *included],
         cwd=root,
         check=True,
-    )
-    return hashlib.sha256(tar_path.read_bytes()).hexdigest()
+        capture_output=True,
+        text=True,
+    ).stdout
+    lines = sorted(manifest.splitlines())
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
 def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path):
     root = Path(__file__).parents[1]
     archive = tmp_path / "pqvpn-3.0.0.tar.gz"
     _make_arch_source_archive(root, archive)
-    # Use uncompressed tar hash for cross-platform stability (gzip output
-    # varies between zlib versions).
+    # Content-manifest digest (git object hashes) — stable across git/tar
+    # versions. Regenerate this pin only when the packaged source intentionally
+    # changes: python -m pytest -q tests/test_onboarding.py -k checksum  (the
+    # failure message prints the new digest).
     digest = _stable_archive_digest(root, tmp_path)
-    assert digest == "c4ae785e32c71207e62691687eb2592f3fb6b86a12a970b5722a3e6a8e789ca5"
+    assert digest == "f904c506c1cc2bd1dc2c8bada67aae9f8dc58204fb0429b9d4e4bd97ac88d3a4"
 
     with tarfile.open(archive, "r:gz") as source:
         names = source.getnames()

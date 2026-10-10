@@ -23,3 +23,5 @@ allowed_forward_networks = []
 allow_server_ping = true
 manage_ip_forward = true
 service_user = "pqvpn"
+# v3 (KEM-auth) recommended: 22% smaller wire bytes, faster than v2 (Ed25519)
+protocol_version = 3

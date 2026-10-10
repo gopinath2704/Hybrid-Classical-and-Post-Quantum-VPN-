@@ -700,3 +700,19 @@ def test_rehandshake_after_rekey(connected):
     srv_item = next(iter(server.sessions.by_id.values()))
     until(lambda: srv_item.crypto.epoch == 2)
     assert client.state == 'CONNECTED'
+
+
+def test_resumption_ticket_file_permissions(tmp_path):
+    """Resumption ticket must be written 0600 — it contains key material."""
+    from vpn.runtime import VPNClient
+    cfg = ClientConfig(
+        server_identity_fingerprint="aa" * 32,
+        client_identity_private_key=str(tmp_path / "client.key"),
+        client_identity_public_key=str(tmp_path / "client.pub"),
+    )
+    client = VPNClient(cfg)
+    client._save_ticket(b"ticket", b"secret" * 6, "aa" * 32)
+    path = client._ticket_path()
+    assert path.exists()
+    mode = path.stat().st_mode & 0o777
+    assert mode == 0o600, f"ticket file mode is {oct(mode)}, expected 0o600"

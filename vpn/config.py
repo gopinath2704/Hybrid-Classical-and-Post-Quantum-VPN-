@@ -21,6 +21,7 @@ class ServerConfig:
     protocol_version:int=2
     cookie_mode:str="off"
     cookie_threshold:int=10
+    resumption_ticket_lifetime:int=86400
     dev_emulated_tun:bool=False
     allowed_forward_networks:list[str]=field(default_factory=list)
     allow_server_ping:bool=True
@@ -109,6 +110,7 @@ def validate_server(cfg: ServerConfig, *, test_ports=False) -> None:
     if cfg.protocol_version not in (2, 3): raise ValueError('protocol_version must be 2 or 3')
     if cfg.cookie_mode not in ('off', 'under_load', 'always'): raise ValueError('cookie_mode must be off, under_load, or always')
     number(cfg.cookie_threshold, 'cookie_threshold', 1, integer=True)
+    number(cfg.resumption_ticket_lifetime, 'resumption_ticket_lifetime', 0, 604800, True)
     if cfg.experimental_suite and cfg.experimental_suite not in _VALID_SUITES:
         raise ValueError(f'experimental_suite must be one of {sorted(_VALID_SUITES)} or empty')
 
