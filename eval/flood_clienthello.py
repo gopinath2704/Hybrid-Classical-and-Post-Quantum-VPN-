@@ -27,7 +27,6 @@ import struct
 import subprocess
 import sys
 import textwrap
-import threading
 import time
 from pathlib import Path
 
@@ -60,16 +59,20 @@ def tcp_frame(msg: bytes) -> bytes:
 
 
 _FLOOD_SCRIPT = r"""
-import os,socket,struct,sys,time
-target_ip,target_port,rate,duration = sys.argv[1],int(sys.argv[2]),int(sys.argv[3]),float(sys.argv[4])
+import os,signal,socket,struct,sys,time
+target_ip,target_port,rate = sys.argv[1],int(sys.argv[2]),int(sys.argv[3])
 MAGIC=0x4856; VER=0x20; CH=1; PLEN=1312
 hdr=struct.pack("!HBBH",MAGIC,VER,CH,PLEN)
 payload=os.urandom(PLEN)
 frame=struct.pack("!I",len(hdr)+len(payload))+hdr+payload
 interval=1.0/rate if rate>0 else 0
 sent=errors=0
-deadline=time.monotonic()+duration
-while time.monotonic()<deadline:
+stop=False
+def _stop(sig,frm):
+    global stop; stop=True
+signal.signal(signal.SIGTERM,_stop)
+signal.signal(signal.SIGINT,_stop)
+while not stop:
     try:
         s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
         s.settimeout(2)
@@ -81,32 +84,34 @@ while time.monotonic()<deadline:
         errors+=1
     if interval>0:
         nxt=time.monotonic()+interval
-        while time.monotonic()<nxt:time.sleep(0.0001)
-print(f"{sent} {errors}")
+        while time.monotonic()<nxt and not stop:time.sleep(0.0001)
+print(f"{sent} {errors}",flush=True)
 """
 
 
-def flood_worker(flood_ns: str, target_ip: str, target_port: int, rate: int,
-                 duration: float, stop_event: threading.Event,
-                 stats: dict) -> None:
-    """Launch a flood process inside *flood_ns* for the full duration."""
+def start_flood(flood_ns: str, target_ip: str, target_port: int,
+                rate: int) -> subprocess.Popen:
+    """Start a flood process inside *flood_ns*.  Runs until SIGTERM."""
+    return subprocess.Popen(
+        ["ip", "netns", "exec", flood_ns,
+         sys.executable, "-u", "-c", _FLOOD_SCRIPT,
+         target_ip, str(target_port), str(rate)],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
+
+def stop_flood_proc(proc: subprocess.Popen) -> tuple[int, int]:
+    """Send SIGTERM, read stats line, return (sent, errors)."""
+    proc.terminate()
     try:
-        proc = subprocess.run(
-            ["ip", "netns", "exec", flood_ns,
-             sys.executable, "-c", _FLOOD_SCRIPT,
-             target_ip, str(target_port), str(rate), str(duration)],
-            capture_output=True, text=True,
-            timeout=duration + 30)
-        parts = proc.stdout.strip().split()
-        if len(parts) == 2:
-            stats["flood_sent"] = int(parts[0])
-            stats["flood_errors"] = int(parts[1])
-        else:
-            stats["flood_sent"] = 0
-            stats["flood_errors"] = 0
-    except (subprocess.TimeoutExpired, OSError, ValueError):
-        stats["flood_sent"] = 0
-        stats["flood_errors"] = 0
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    out = proc.stdout.read().strip()
+    parts = out.split()
+    if len(parts) == 2:
+        return int(parts[0]), int(parts[1])
+    return 0, 0
 
 
 def legit_connect(run_dir: str, client_ns: str, config_path: str,
@@ -290,16 +295,12 @@ def cleanup_topology(topo: dict):
 def run_flood_trial(topo: dict, run_dir: str, rate: int, duration: float,
                     connects: int, server_proc: subprocess.Popen) -> dict:
     """Run one trial: flood at *rate* while measuring *connects* legit connects."""
-    stop_flood = threading.Event()
-    flood_stats: dict = {"flood_sent": 0, "flood_errors": 0}
+    flood_proc = None
+    flood_sent = flood_errors = 0
 
     if rate > 0:
-        flood_thread = threading.Thread(
-            target=flood_worker,
-            args=(topo["fld_ns"], "192.0.3.1", 51820, rate, duration,
-                  stop_flood, flood_stats),
-            daemon=True)
-        flood_thread.start()
+        flood_proc = start_flood(
+            topo["fld_ns"], "192.0.3.1", 51820, rate)
         time.sleep(1)
 
     cpu_before = read_server_cpu(server_proc.pid)
@@ -315,9 +316,8 @@ def run_flood_trial(topo: dict, run_dir: str, rate: int, duration: float,
     wall_elapsed = time.monotonic() - wall_start
     cpu_after = read_server_cpu(server_proc.pid)
 
-    stop_flood.set()
-    if rate > 0:
-        flood_thread.join(timeout=5)
+    if flood_proc is not None:
+        flood_sent, flood_errors = stop_flood_proc(flood_proc)
 
     cpu_pct = None
     if cpu_before is not None and cpu_after is not None and wall_elapsed > 0:
@@ -335,8 +335,8 @@ def run_flood_trial(topo: dict, run_dir: str, rate: int, duration: float,
         "avg_latency_ms": avg_latency,
         "median_latency_ms": median_latency,
         "cpu_pct": cpu_pct,
-        "flood_sent": flood_stats["flood_sent"],
-        "flood_errors": flood_stats["flood_errors"],
+        "flood_sent": flood_sent,
+        "flood_errors": flood_errors,
         "results": results,
     }
 
