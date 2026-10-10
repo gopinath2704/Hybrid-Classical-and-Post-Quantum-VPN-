@@ -33,8 +33,8 @@ from crypto.hybrid_crypto import (
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from handshake.kemtls import (
     KEMTLSClient, KEMTLSServer, HandshakeSession, FrameType,
-    send_message, recv_message,
 )
+from vpn.runtime import send_message, recv_message
 from vpn.identity import fingerprint
 
 CSV_COLUMNS = ["system", "profile", "metric", "run", "value", "unit"]
