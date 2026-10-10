@@ -173,23 +173,24 @@ WAIT_TIME=$(( REKEY_INTERVAL * (ITERATIONS + 2) ))
 echo "  Waiting ${WAIT_TIME}s for rekeys to accumulate..." >&2
 sleep "$WAIT_TIME"
 
-# Stop ping and capture
-kill "$PING_PID" 2>/dev/null || true
+# Stop ping (SIGINT so ping prints its summary) and capture
+kill -INT "$PING_PID" 2>/dev/null || true
 wait "$PING_PID" 2>/dev/null || true
 sleep 0.5
 kill "$TCPDUMP_PID" 2>/dev/null || true
 wait "$TCPDUMP_PID" 2>/dev/null || true
 
-# Parse ping results
-PING_TOTAL=$(grep -c 'bytes from' "$PING_LOG" 2>/dev/null || echo 0)
-PING_TX=$(grep 'packets transmitted' "$PING_LOG" | grep -oE '^[0-9]+' || echo 0)
-PING_RX=$(grep 'packets transmitted' "$PING_LOG" | grep -oE ', [0-9]+ received' | grep -oE '[0-9]+' || echo 0)
-if (( PING_TX > 0 )); then
-  PING_LOSS=$(( (PING_TX - PING_RX) * 100 / PING_TX ))
+# Parse ping results — count response lines directly as fallback
+PING_RX=$(grep -c 'bytes from' "$PING_LOG" 2>/dev/null || echo 0)
+PING_SUMMARY=$(grep 'packets transmitted' "$PING_LOG" || true)
+if [[ -n "$PING_SUMMARY" ]]; then
+  PING_TX=$(echo "$PING_SUMMARY" | grep -oE '^[0-9]+')
+  PING_LOSS_PCT=$(echo "$PING_SUMMARY" | grep -oE '[0-9.]+% packet loss' | grep -oE '^[0-9.]+')
 else
-  PING_LOSS="unknown"
+  PING_TX=$PING_RX
+  PING_LOSS_PCT=0
 fi
-echo "  Rekey phase: tx=$PING_TX rx=$PING_RX loss=$PING_LOSS%" >&2
+echo "  Rekey phase: tx=$PING_TX rx=$PING_RX loss=${PING_LOSS_PCT}%" >&2
 
 # Parse epoch count from logs
 REKEY_COUNT=$(grep -c 'rekey complete epoch=' "$RUN_DIR/server.log" 2>/dev/null || echo 0)
@@ -197,8 +198,8 @@ CLIENT_REKEY_COUNT=$(grep -c 'rekey complete epoch=' "$RUN_DIR/client.log" 2>/de
 echo "  Server rekeys: $REKEY_COUNT, Client rekeys: $CLIENT_REKEY_COUNT" >&2
 
 # Record results
-echo "pqvpn-rekey,lan,rekey_ping_loss_pct,0,$PING_LOSS,percent" >> "$CSV_FILE"
-echo "pqvpn-rekey,lan,rekey_ping_total,0,$PING_TOTAL,packets" >> "$CSV_FILE"
+echo "pqvpn-rekey,lan,rekey_ping_loss_pct,0,$PING_LOSS_PCT,percent" >> "$CSV_FILE"
+echo "pqvpn-rekey,lan,rekey_ping_total,0,$PING_RX,packets" >> "$CSV_FILE"
 echo "pqvpn-rekey,lan,rekey_epoch_transitions,0,$REKEY_COUNT,count" >> "$CSV_FILE"
 
 # Count control packets from tcpdump
@@ -353,23 +354,24 @@ WAIT_TIME=$(( REHANDSHAKE_INTERVAL * (ITERATIONS + 2) ))
 echo "  Waiting ${WAIT_TIME}s for re-handshakes to accumulate..." >&2
 sleep "$WAIT_TIME"
 
-# Stop ping and capture
-kill "$PING_PID" 2>/dev/null || true
+# Stop ping (SIGINT so ping prints its summary) and capture
+kill -INT "$PING_PID" 2>/dev/null || true
 wait "$PING_PID" 2>/dev/null || true
 sleep 0.5
 kill "$TCPDUMP_PID" 2>/dev/null || true
 wait "$TCPDUMP_PID" 2>/dev/null || true
 
-# Parse ping results
-PING_TOTAL=$(grep -c 'bytes from' "$PING_LOG" 2>/dev/null || echo 0)
-PING_TX=$(grep 'packets transmitted' "$PING_LOG" | grep -oE '^[0-9]+' || echo 0)
-PING_RX=$(grep 'packets transmitted' "$PING_LOG" | grep -oE ', [0-9]+ received' | grep -oE '[0-9]+' || echo 0)
-if (( PING_TX > 0 )); then
-  PING_LOSS=$(( (PING_TX - PING_RX) * 100 / PING_TX ))
+# Parse ping results — count response lines directly as fallback
+PING_RX=$(grep -c 'bytes from' "$PING_LOG" 2>/dev/null || echo 0)
+PING_SUMMARY=$(grep 'packets transmitted' "$PING_LOG" || true)
+if [[ -n "$PING_SUMMARY" ]]; then
+  PING_TX=$(echo "$PING_SUMMARY" | grep -oE '^[0-9]+')
+  PING_LOSS_PCT=$(echo "$PING_SUMMARY" | grep -oE '[0-9.]+% packet loss' | grep -oE '^[0-9.]+')
 else
-  PING_LOSS="unknown"
+  PING_TX=$PING_RX
+  PING_LOSS_PCT=0
 fi
-echo "  Re-handshake phase: tx=$PING_TX rx=$PING_RX loss=$PING_LOSS%" >&2
+echo "  Re-handshake phase: tx=$PING_TX rx=$PING_RX loss=${PING_LOSS_PCT}%" >&2
 
 # Parse epoch count from logs
 RH_COUNT=$(grep -c 'rehandshake complete epoch=' "$RUN_DIR/server.log" 2>/dev/null || echo 0)
@@ -377,8 +379,8 @@ CLIENT_RH_COUNT=$(grep -c 'rehandshake complete epoch=' "$RUN_DIR/client.log" 2>
 echo "  Server re-handshakes: $RH_COUNT, Client re-handshakes: $CLIENT_RH_COUNT" >&2
 
 # Record results
-echo "pqvpn-rehandshake,lan,rehandshake_ping_loss_pct,0,$PING_LOSS,percent" >> "$CSV_FILE"
-echo "pqvpn-rehandshake,lan,rehandshake_ping_total,0,$PING_TOTAL,packets" >> "$CSV_FILE"
+echo "pqvpn-rehandshake,lan,rehandshake_ping_loss_pct,0,$PING_LOSS_PCT,percent" >> "$CSV_FILE"
+echo "pqvpn-rehandshake,lan,rehandshake_ping_total,0,$PING_RX,packets" >> "$CSV_FILE"
 echo "pqvpn-rehandshake,lan,rehandshake_epoch_transitions,0,$RH_COUNT,count" >> "$CSV_FILE"
 
 # Count control packets
