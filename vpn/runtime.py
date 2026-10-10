@@ -477,6 +477,7 @@ class VPNServer:
                                 b"rekey response" + payload, hashlib.sha256).digest()
         send_message(item.control, item.crypto.encrypt_control(payload[:4] + confirmation, FrameType.REKEY_RESPONSE))
         item.crypto.activate_epoch(epoch, next_keys)
+        logger.info("rekey complete epoch=%d client_id=%s", epoch, item.client_id)
 
     def _rehandshake_server(self, item: ServerSession, payload: bytes) -> None:
         from crypto.hybrid_crypto import HybridKEM
@@ -498,6 +499,7 @@ class VPNServer:
         response = response_body + confirmation
         send_message(item.control, item.crypto.encrypt_control(response, FrameType.REHANDSHAKE_RESPONSE))
         item.crypto.activate_epoch(epoch, next_keys)
+        logger.info("rehandshake complete epoch=%d client_id=%s", epoch, item.client_id)
 
     def _data_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -824,6 +826,7 @@ class VPNClient:
                 raise HandshakeError("invalid rekey confirmation")
             self.rekey_state = RekeyState.ACTIVATING
             self.session.activate_epoch(epoch, pending)
+            logger.info("rekey complete epoch=%d", epoch)
             pending = None
         except Exception:
             failed = True
@@ -884,6 +887,7 @@ class VPNClient:
                 raise HandshakeError("rehandshake key confirmation failed")
             self.rekey_state = RekeyState.ACTIVATING
             self.session.activate_epoch(epoch, pending)
+            logger.info("rehandshake complete epoch=%d", epoch)
             pending = None
         except Exception:
             failed = True

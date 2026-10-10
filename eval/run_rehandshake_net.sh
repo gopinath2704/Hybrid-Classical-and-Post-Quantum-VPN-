@@ -182,9 +182,9 @@ PING_LOSS=$(tail -1 "$PING_LOG" | grep -oP '\d+(?=% packet loss)' || echo "unkno
 echo "  Rekey phase: $PING_TOTAL pings received, $PING_LOSS% loss" >&2
 
 # Parse epoch count from logs
-REKEY_COUNT=$(grep -c 'rekey.*epoch\|epoch.*activated\|activate_epoch\|new epoch' "$RUN_DIR/server.log" 2>/dev/null || echo 0)
-CLIENT_REKEY_COUNT=$(grep -c 'rekey.*epoch\|epoch.*activated\|activate_epoch\|new epoch' "$RUN_DIR/client.log" 2>/dev/null || echo 0)
-echo "  Server log epoch transitions: $REKEY_COUNT, Client: $CLIENT_REKEY_COUNT" >&2
+REKEY_COUNT=$(grep -c 'rekey complete epoch=' "$RUN_DIR/server.log" 2>/dev/null || echo 0)
+CLIENT_REKEY_COUNT=$(grep -c 'rekey complete epoch=' "$RUN_DIR/client.log" 2>/dev/null || echo 0)
+echo "  Server rekeys: $REKEY_COUNT, Client rekeys: $CLIENT_REKEY_COUNT" >&2
 
 # Record results
 echo "pqvpn-rekey,lan,rekey_ping_loss_pct,0,$PING_LOSS,percent" >> "$CSV_FILE"
@@ -352,9 +352,9 @@ PING_LOSS=$(tail -1 "$PING_LOG" | grep -oP '\d+(?=% packet loss)' || echo "unkno
 echo "  Re-handshake phase: $PING_TOTAL pings received, $PING_LOSS% loss" >&2
 
 # Parse epoch count from logs
-RH_COUNT=$(grep -c 'rehandshake.*epoch\|epoch.*activated\|rehandshake\|re-handshake' "$RUN_DIR/server.log" 2>/dev/null || echo 0)
-CLIENT_RH_COUNT=$(grep -c 'rehandshake.*epoch\|epoch.*activated\|rehandshake\|re-handshake' "$RUN_DIR/client.log" 2>/dev/null || echo 0)
-echo "  Server log epoch transitions: $RH_COUNT, Client: $CLIENT_RH_COUNT" >&2
+RH_COUNT=$(grep -c 'rehandshake complete epoch=' "$RUN_DIR/server.log" 2>/dev/null || echo 0)
+CLIENT_RH_COUNT=$(grep -c 'rehandshake complete epoch=' "$RUN_DIR/client.log" 2>/dev/null || echo 0)
+echo "  Server re-handshakes: $RH_COUNT, Client re-handshakes: $CLIENT_RH_COUNT" >&2
 
 # Record results
 echo "pqvpn-rehandshake,lan,rehandshake_ping_loss_pct,0,$PING_LOSS,percent" >> "$CSV_FILE"
