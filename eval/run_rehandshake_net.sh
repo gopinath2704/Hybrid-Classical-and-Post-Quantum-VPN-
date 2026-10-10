@@ -67,13 +67,17 @@ ip netns exec "$CLIENT_NS" ping -c 1 -W 3 192.0.2.1 >/dev/null
 mkdir -p "$RUN_DIR/server" "$RUN_DIR/client"
 cd "$ROOT_DIR"
 
+echo "  Generating identities..." >&2
 python -m vpn.cli identity generate \
-  --private "$RUN_DIR/server/server.key" --public "$RUN_DIR/server/server.pub" 2>/dev/null
+  --private "$RUN_DIR/server/server.key" --public "$RUN_DIR/server/server.pub" || {
+    echo "ERROR: server identity generation failed" >&2; exit 1; }
 python -m vpn.cli client-key generate \
-  --private "$RUN_DIR/client/client.key" --public "$RUN_DIR/client/client.pub" 2>/dev/null
+  --private "$RUN_DIR/client/client.key" --public "$RUN_DIR/client/client.pub" || {
+    echo "ERROR: client key generation failed" >&2; exit 1; }
 python -m vpn.cli client authorize \
   "$(base64 -w0 "$RUN_DIR/client/client.pub")" \
-  --database "$RUN_DIR/server/authorized.json" --client-id bench-client 2>/dev/null
+  --database "$RUN_DIR/server/authorized.json" --client-id bench-client || {
+    echo "ERROR: client authorization failed" >&2; exit 1; }
 FINGERPRINT=$(sha256sum "$RUN_DIR/server/server.pub" | awk '{print $1}')
 
 # Short rekey_interval to trigger frequent rekeys; rehandshake disabled
@@ -237,13 +241,17 @@ ip netns exec "$CLIENT_NS" ping -c 1 -W 3 192.0.2.1 >/dev/null
 mkdir -p "$RUN_DIR/server" "$RUN_DIR/client"
 cd "$ROOT_DIR"
 
+echo "  Generating identities..." >&2
 python -m vpn.cli identity generate \
-  --private "$RUN_DIR/server/server.key" --public "$RUN_DIR/server/server.pub" 2>/dev/null
+  --private "$RUN_DIR/server/server.key" --public "$RUN_DIR/server/server.pub" || {
+    echo "ERROR: server identity generation failed" >&2; exit 1; }
 python -m vpn.cli client-key generate \
-  --private "$RUN_DIR/client/client.key" --public "$RUN_DIR/client/client.pub" 2>/dev/null
+  --private "$RUN_DIR/client/client.key" --public "$RUN_DIR/client/client.pub" || {
+    echo "ERROR: client key generation failed" >&2; exit 1; }
 python -m vpn.cli client authorize \
   "$(base64 -w0 "$RUN_DIR/client/client.pub")" \
-  --database "$RUN_DIR/server/authorized.json" --client-id bench-client 2>/dev/null
+  --database "$RUN_DIR/server/authorized.json" --client-id bench-client || {
+    echo "ERROR: client authorization failed" >&2; exit 1; }
 FINGERPRINT=$(sha256sum "$RUN_DIR/server/server.pub" | awk '{print $1}')
 
 # Short rehandshake_interval; rekey disabled (high interval)
