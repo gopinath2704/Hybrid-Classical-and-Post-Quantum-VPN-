@@ -409,7 +409,8 @@ class VPNServer:
             if (self._ticket_key and len(first_msg) >= HEADER_SIZE
                     and struct.unpack(HEADER_FORMAT, first_msg[:HEADER_SIZE])[2] == MessageType.RESUMPTION_HELLO):
                 resume = ResumptionServerHandshake(
-                    self._ticket_key, self.cfg.protocol_version if self.cfg.protocol_version == 3 else PROTOCOL_VERSION_V3)
+                    self._ticket_key,
+                    PROTOCOL_VERSION_V3 if self.cfg.protocol_version == 3 else PROTOCOL_VERSION)
                 accept_wire, session = resume.process_hello(first_msg)
                 send_message(connection, accept_wire)
                 assigned_ip_hint = resume.assigned_ip or None
