@@ -718,6 +718,81 @@ def test_resumption_ticket_file_permissions(tmp_path):
     assert mode == 0o600, f"ticket file mode is {oct(mode)}, expected 0o600"
 
 
+def test_v3_resumption_resumes_end_to_end_not_fallback(tmp_path, monkeypatch):
+    """A v3 client with a saved ticket performs 1-RTT resumption over the real
+    server, not a silent full-handshake fallback.
+
+    Regression: the server built ResumptionServerHandshake with the raw config
+    integer (3) instead of the negotiated wire version (PROTOCOL_VERSION_V3 =
+    0x30), so every ResumptionHello was rejected with "Unsupported version" and
+    the client quietly fell back to a full handshake. That made "resume" ~2 RTT
+    slower than a cold connect instead of faster. The crypto-layer round-trip
+    test missed it because it drives the handshake objects with matching
+    versions, never exercising the runtime's version mapping.
+    """
+    from vpn.identity import (generate_server_identity, generate_client_identity_kem,
+                              AuthorizedClients)
+    fp = generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
+    generate_client_identity_kem(tmp_path/'client.key', tmp_path/'client.pub')
+    AuthorizedClients(tmp_path/'clients.json').authorize(
+        (tmp_path/'client.pub').read_bytes(), 'resume-test')
+
+    server = runtime.VPNServer(ServerConfig(listen_host='127.0.0.1', control_port=0, udp_port=0,
+        server_identity_private_key=str(tmp_path/'server.key'),
+        server_identity_public_key=str(tmp_path/'server.pub'),
+        authorized_clients_file=str(tmp_path/'clients.json'), dev_emulated_tun=True,
+        cookie_mode='off', protocol_version=3, resumption_ticket_lifetime=86400,
+        idle_timeout=5, rekey_interval=0))
+
+    # Count server-side resumptions that actually succeed (process_hello returns
+    # without raising). With the bug it raises before this records anything.
+    resumed = []
+    real_process_hello = runtime.ResumptionServerHandshake.process_hello
+    def spy(self, wire):
+        out = real_process_hello(self, wire)
+        resumed.append(True)
+        return out
+    monkeypatch.setattr(runtime.ResumptionServerHandshake, 'process_hello', spy)
+
+    worker = threading.Thread(target=server.start)
+    worker.start()
+    try:
+        until(lambda: server._data_thread is not None and server._data_thread.is_alive())
+        server.cfg.udp_port = server.udp.getsockname()[1]
+
+        def make_client(tun_name):
+            c = runtime.VPNClient(ClientConfig(server_host='127.0.0.1',
+                server_control_port=server.tcp.getsockname()[1],
+                server_identity_public_key=str(tmp_path/'server.pub'),
+                server_identity_fingerprint=fp,
+                client_identity_private_key=str(tmp_path/'client.key'),
+                client_identity_public_key=str(tmp_path/'client.pub'),
+                protocol_version=3, dev_emulated_tun=True, tun_name=tun_name,
+                full_tunnel=False))
+            c.PING_INITIAL_DELAY = .1
+            c.PING_INTERVAL = .5
+            return c
+
+        # Cold connect: full handshake, persists a resumption ticket.
+        c1 = make_client('pqres0')
+        c1.connect()
+        assert c1.state == 'CONNECTED'
+        assert c1._ticket_path().exists()
+        c1.disconnect()
+        assert resumed == [], "first connect must be a full handshake, not a resumption"
+
+        # Second connect reuses the ticket: must resume (1-RTT), not fall back.
+        c2 = make_client('pqres1')
+        c2.connect()
+        assert c2.state == 'CONNECTED'
+        c2.disconnect()
+        assert resumed == [True], "second connect must resume via the ticket, not fall back to a full handshake"
+    finally:
+        server.stop()
+        worker.join(4)
+        assert not worker.is_alive()
+
+
 @pytest.mark.parametrize("version,routed", [
     (0x20, True),   # v2
     (0x30, True),   # v3-kem
