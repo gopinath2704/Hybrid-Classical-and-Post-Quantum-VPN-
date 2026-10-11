@@ -60,13 +60,12 @@ never exported to a tracked location.**
    the three baselines are now first-class networked systems in the orchestrator,
    swept across all six profiles.
 
-2. **No networked data-plane throughput (M2) benchmark exists.** `run_pqvpn.py`
-   measures `encrypt_pps`/`encrypt_mbps` **in-process** (one process calling
-   `encrypt_frame` in a loop). That is a crypto-core ceiling, **not** throughput
-   through a TUN tunnel over the link, and it has no baseline counterpart. It
-   must not be reported as data-plane throughput. A networked throughput runner
-   (iperf3 through the tunnel) is **not implemented** — listed as outstanding in
-   `RERUN_COMMANDS.md` / `REMAINING_STEPS.md`.
+2. **Networked data-plane throughput (M2) runner now exists.**
+   `eval/measure_throughput.py` runs iperf3 through the tunnel on namespace-isolated
+   topology. `eval/measure_memory.py` profiles RSS during handshake and data transfer.
+   Both need a capable-host run to produce committed results. `run_pqvpn.py`'s
+   in-process `encrypt_pps`/`encrypt_mbps` remain a crypto-core ceiling and must
+   not be reported as data-plane throughput.
 
 3. **In-process labelling is honest.** `run_pqvpn.py` correctly stamps its rows
    `profile=in-process`, so they cannot be silently mistaken for a netem profile.
@@ -104,7 +103,8 @@ Legend: ✅ trustworthy & committed · 🟡 reproducible-but-not-committed ·
 ### Data-plane throughput / latency (M2)
 | Cell | Status |
 |---|---|
-| Networked throughput through tunnel, any system | ❌ **no benchmark implemented** (only in-process crypto throughput exists) |
+| Networked throughput through tunnel (PQ-VPN) | ❌ absent (runner exists: `eval/measure_throughput.py`; needs capable-host run) |
+| Memory profiling | ❌ absent (runner exists: `eval/measure_memory.py`; needs capable-host run) |
 
 ---
 

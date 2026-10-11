@@ -17,6 +17,7 @@ PQ-VPN is a deployable research prototype implementing a KEMTLS-inspired custom 
 - **Hybrid handshake** — ephemeral X25519 + ML-KEM-768 session establishment
 - **Post-quantum server identity** — static ML-KEM-768 key pinned by SHA-256 fingerprint
 - **Three protocol variants** — v2 (Ed25519 client auth), v3 (fully PQ mutual auth via ML-KEM), v3-mldsa (ML-DSA-44 comparison)
+- **1-RTT session resumption** — ticket-based reconnect with fresh ephemeral X25519 + ML-KEM material, skipping static-key exchange
 - **Post-compromise recovery** — v3 hybrid re-handshake mixes fresh DH + KEM material (passive adversary after full state compromise; active adversary after control-key-only compromise)
 - **DoS resistance** — stateless cookie challenge before resource allocation
 - **Formal model** — Tamarin Prover verifies 13 security lemmas across two theories (secrecy, forward secrecy, mutual auth, KCI resistance, PCS)
@@ -198,7 +199,7 @@ Install  →  Launch PQ-VPN  →  Device identity auto-created
 ## Testing
 
 ```bash
-python -m pytest -q                                    # full suite (555 tests)
+python -m pytest -q                                    # full suite (594 tests)
 ALLOW_MOCK_PQC=0 python -m pytest -q -m native_pqc    # native ML-KEM only
 ```
 
@@ -229,17 +230,14 @@ app/
 crypto/
   hybrid_crypto.py       ML-KEM-768, X25519, AES-256-GCM, HKDF
 handshake/
-  kemtls.py              KEMTLS-inspired v2/v3 protocol state machine
+  kemtls.py              KEMTLS-inspired v2/v3 protocol state machine + session resumption
 vpn/
   account_api.py         Account login/session and device-binding API
   accounts.py            Server-side account/device/session SQLite store
   cli.py                 Provisioning and runtime CLI
   config.py              TOML configuration with validation
-  doctor.py              Read-only deployment diagnostics
-  enrollment.py          Strict public .pqenroll artifacts
   identity.py            Server/client identity management
   network.py             TUN, nftables, MTU, IPv6 guard
-  profiles.py            Strict .pqvpn profiles and atomic profile store
   runtime.py             VPNClient and VPNServer runtimes
 eval/                    Evaluation campaign scripts and table generators
 formal/                  Tamarin Prover models (pqvpn_v3.spthy, pqvpn_v3_pcs.spthy)
@@ -269,8 +267,9 @@ constraints-tested.txt   Tested version pins and native validation record
 **Completed through Milestone 4.7:**
 
 - Hybrid KEMTLS-inspired handshake (v2 + v3)
+- 1-RTT session resumption with ticket-based reconnect
 - Formal Tamarin model with 13 verified security lemmas
-- Evaluation campaign with wire-size and latency benchmarks
+- Evaluation campaign with wire-size, latency, throughput, memory and DoS benchmarks
 - Desktop GUI with managed identity and offline enrollment
 - Account authentication API with device binding and admin approval
 - Post-compromise recovery via hybrid re-handshake (scoped: passive after full state compromise)

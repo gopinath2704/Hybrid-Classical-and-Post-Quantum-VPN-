@@ -110,15 +110,27 @@ target Rosenpass's `rp` wrapper (≥ 0.2) and strongSwan ≥ 5.9 (vici/swanctl).
 
 ---
 
-## 5. Still outstanding: networked data-plane throughput (M2)
+## 5. Networked data-plane throughput (M2)
 
-There is **no** networked throughput/latency-under-load runner yet (the existing
-`encrypt_pps`/`encrypt_mbps` are in-process crypto-core numbers, not through the
-tunnel, and have no baseline). To report the data-plane trade-off honestly it
-must be added, e.g. an `iperf3`-through-the-tunnel runner on the same
-netns+veth+netem topology, emitting `*,<profile>,throughput_mbps,<run>,<v>,Mbps`
-and a steady-state `rtt_ms`. Until then, the throughput/latency trade-off is
-stated qualitatively only (see `EVALUATION.md` §1.3).
+The throughput runner now exists as `eval/measure_throughput.py`. It uses
+iperf3-through-the-tunnel on namespace-isolated topology:
+
+```bash
+# Throughput measurement (requires root, iperf3, netns)
+sudo python eval/measure_throughput.py --duration 10
+
+# Memory profiling
+sudo python eval/measure_memory.py
+
+# DoS resistance / cookie effectiveness
+sudo python eval/flood_clienthello.py
+
+# Re-handshake latency (PCS epoch rotation)
+sudo python eval/run_rehandshake.py --iterations 30
+
+# Resumption handshake timing
+sudo eval/run_resumption_net.sh lan 30
+```
 
 ---
 

@@ -838,8 +838,10 @@ sudo editor /etc/pqvpn/server.toml
 ```
 
 Choose the WAN, free VPN subnet, DNS servers, ports and rekey interval explicitly.
-For a short rekey test, configure `rekey_interval=10` on the disposable test VPS;
-record that test configuration separately from the source tag.
+`resumption_ticket_lifetime` (default 86400 seconds) controls 1-RTT session
+resumption; set to 0 to disable. For a short rekey test, configure
+`rekey_interval=10` on the disposable test VPS; record that test configuration
+separately from the source tag.
 
 On each client, install the same native revision, then follow the existing client CLI:
 

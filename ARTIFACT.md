@@ -13,7 +13,7 @@ This document describes how to reproduce the evaluation results for the
 | RAM | 4 GB | 8 GB |
 | Disk | 2 GB free | 5 GB free |
 | OS | Ubuntu 22.04+ / Arch Linux | Ubuntu 24.04 LTS |
-| Python | 3.11+ | 3.12+ |
+| Python | 3.11+ | 3.14+ |
 
 Optional for constrained-device evaluation: Raspberry Pi 4/5 (aarch64).
 
@@ -43,7 +43,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -c constraints-tested.txt '.[dev]'
 
-# 3. Run the test suite (555 tests expected)
+# 3. Run the test suite (594 tests expected)
 python -m pytest tests/ -q
 
 # 4. Run the evaluation campaign
@@ -59,7 +59,7 @@ python eval/run_all.py --iterations 50
 | Step | Time (4-core laptop) |
 |---|---|
 | Docker build (first time) | ~5 min |
-| Test suite (555 tests) | ~20 s |
+| Test suite (594 tests) | ~20 s |
 | Evaluation (50 iterations) | ~30 s |
 | Table/chart generation | ~2 s |
 | **Total** | **~6 min** |
@@ -71,7 +71,7 @@ python eval/run_all.py --iterations 50
 ### Test suite
 
 ```
-555 passed, 2 skipped
+594 passed, 2 skipped
 ```
 
 The 2 skips are namespace tests requiring root (`CAP_NET_ADMIN`).
@@ -261,14 +261,23 @@ python eval/generate_tables.py \
 
 ---
 
+## Additional evaluation scripts
+
+Beyond the core campaign, dedicated scripts measure:
+
+- **Throughput** (`eval/measure_throughput.py`) — iperf3-through-tunnel with namespace isolation
+- **Memory** (`eval/measure_memory.py`) — RSS tracking during handshake and data transfer
+- **DoS resistance** (`eval/flood_clienthello.py`) — ClientHello flood with cookie-mode measurement
+- **Re-handshake** (`eval/run_rehandshake.py`) — PCS epoch rotation latency
+- **Session resumption** (`eval/run_resumption_net.sh`) — 1-RTT resumption handshake timing
+
 ## Baseline VPN comparison (optional)
 
 The evaluation framework includes a harness for comparing against
 **WireGuard** (classical) — requires `wg` and root.
 
-OpenVPN, Rosenpass, and strongSwan baselines are not implemented; the
-scaffold stubs that previously existed have been removed. Implementing
-these comparisons requires the respective tools and manual configuration.
+Rosenpass and strongSwan baseline runners exist (`eval/run_rosenpass.sh`,
+`eval/run_strongswan.sh`) but require their respective tools installed.
 
 ```bash
 sudo python eval/run_all.py --iterations 30 --systems pqvpn,wireguard

@@ -14,11 +14,10 @@ Fill Tables A/B/D of `EVALUATION.md` from real harness output.
 - **Gate:** every PQ-VPN cell `pqc_mode == native_liboqs`; every cell `n ≥ 30`
   with a 95 % CI; connect time scales with profile (not flat).
 
-### 2. Implement + run the data-plane throughput/latency benchmark (M2) — **blocking for the trade-off claim**
-No networked throughput runner exists (see `RERUN_COMMANDS.md` §5). Add an
-`iperf3`-through-the-tunnel runner on the shared topology, run it for PQ-VPN and
-the baselines, and report the trade-off honestly. Until this exists, the paper
-can only state the throughput trade-off qualitatively.
+### 2. Run the data-plane throughput/latency benchmark (M2) on a capable host — **blocking for the trade-off claim**
+The networked throughput runner now exists (`eval/measure_throughput.py`). Run it
+for PQ-VPN and the baselines on a netem-capable host and commit the results.
+Memory profiling is also available (`eval/measure_memory.py`).
 
 ### 3. Create the `v3-paper-artifact` tag — **not yet done**
 `ARTIFACT.md` claims *"This artifact is tagged as `v3-paper-artifact`"*, but the

@@ -20,7 +20,7 @@ the paper-facing summary and figures live here instead.
   wire sizes (3 768 / 4 792 / 6 124 B).
 - ⏳ **PENDING a capable-host run (never estimated):** connect time (M1) per
   system × profile; handshake CPU vs baselines; baseline wire bytes.
-- 🚧 **Not yet implemented:** networked data-plane throughput/latency (M2) runner.
+- 🔧 **Implemented, awaiting capable-host run:** networked data-plane throughput/latency (M2) via `eval/measure_throughput.py`; memory profiling via `eval/measure_memory.py`.
 
 ## Why cells are PENDING
 

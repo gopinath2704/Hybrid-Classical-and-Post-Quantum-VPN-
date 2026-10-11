@@ -249,6 +249,46 @@ this version or later. Mismatched peers fail closed with "invalid rehandshake
 response length". Re-handshake is off by default, so the impact is limited to
 deployments that have explicitly enabled it.
 
+### 1-RTT session resumption
+
+A client that previously completed a full handshake may reconnect with a single
+round-trip using a ticket issued by the server.
+
+**Ticket issuance:** After a successful full handshake, the server issues an
+encrypted ticket containing the `resumption_secret` (derived during the full
+handshake), the client ID, protocol version, and assigned VPN IP. The ticket is
+encrypted with a server-held `ResumptionTicketKey` using AES-256-GCM and includes
+a creation timestamp and configurable lifetime (`resumption_ticket_lifetime`,
+default 86400 seconds / 24 hours, max 604800 / 7 days, 0 = disabled).
+
+**Resumption handshake:**
+
+```
+Client                                              Server
+ResumptionHello: ticket || X25519_eph_pub(32) || ML-KEM_eph_pub(1184)
+                                ───────────────►
+ResumptionAccept: X25519_eph_pub(32) || ML-KEM_ct(1088) || Finished(32)
+                                ◄───────────────
+```
+
+The server decrypts and validates the ticket, recovering the `resumption_secret`,
+client ID and assigned IP. Both sides compute fresh ephemeral X25519 and ML-KEM
+shared secrets. The new session keys are derived via HKDF mixing the original
+`resumption_secret` with both fresh ephemeral secrets and the session transcript.
+
+**Security properties:**
+- Fresh ephemeral material in every resumption prevents replay of old sessions
+- The `resumption_secret` binds the resumed session to the original full handshake
+- An expired or tampered ticket fails decryption and the server falls through to
+  a full handshake
+- The client persists the ticket and secret to a JSON file beside the config;
+  fingerprint mismatch between the stored ticket and current server rejects reuse
+
+**Configuration:** `resumption_ticket_lifetime` in `[server]` TOML (seconds,
+0 disables). The server advertises resumption support in the encrypted CONFIG
+message. The client attempts resumption automatically when a valid ticket exists
+and falls back to a full handshake on failure.
+
 ### Stateless cookie (DoS resistance)
 
 ML-KEM decapsulation on unauthenticated input lets an attacker burn server CPU.
@@ -366,32 +406,6 @@ Frequent epoch rekey derives successors from the prior `rekey_secret` plus a pub
 The data plane is a Python userspace packet loop (TUN ↔ UDP AES-256-GCM). Profiling shows ~10 µs per packet (~100k pps), with Python overhead (nonce XOR, struct, locks) accounting for 2–3× the raw AES-GCM cost (~0.9 µs). This is comparable to OpenVPN (C userspace, ~5–15 µs) but far slower than WireGuard (kernel, ~0.3 µs). The research contribution is the handshake and control plane; throughput is reported as a functional check with the limitation stated openly. Decision: [D6](#d6-data-plane-implementation-scope).
 
 Python cannot guarantee erasure of all secret copies. Mutable long-lived buffers are overwritten on rekey/disconnect as best-effort in-process zeroization; interpreter, library, allocator, swap, and core-dump copies may remain.
-
-### Authentication boundary
-
-PQVPN KEMTLS-inspired v2 is a custom protocol, not standardized KEMTLS.
-Static ML-KEM-768 authenticates the server; X25519 + ML-KEM-768 establish
-hybrid session keys. Ed25519 authenticates clients and is classical, not
-post-quantum. This is not fully post-quantum mutual authentication.
-Status: deployable research/prototype PQ-VPN. Existing root and VM/client evidence
-does not revise the custom-protocol or assurance limitations.
-
-## Session liveness
-
-Authenticated keepalive traffic refreshes session liveness. Invalid, unauthenticated,
-replayed, or wrong-endpoint traffic does not. UDP PING and PONG retain the existing
-DATA-domain directional AES-256-GCM protection and replay/epoch checks; PING has
-an eight-byte timestamp payload. Only accepted inner IPv4 DATA (including assigned
-source-IP validation), valid endpoint binding, and authorized CONTROL activity
-count. A bound endpoint cannot be replaced by traffic from another endpoint;
-reconnect to establish a new binding. Rekey activity counts only after validation.
-
-A quiet session with healthy PING/PONG survives `idle_timeout`; a genuinely inactive
-session still expires. Expiry removes session/IP mappings and the endpoint, releases
-the lease, wipes session keys best-effort, closes control, and logs the reason with
-client ID and VPN IP, without key material. Client control-loss detection enters
-FAILED and runs network cleanup. The absolute `session_timeout` remains independent
-of keepalive. Python cannot guarantee complete key zeroization.
 
 ## Deployment boundaries
 
