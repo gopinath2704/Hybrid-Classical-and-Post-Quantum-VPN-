@@ -33,6 +33,12 @@ packaging/arch/*/pkg/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Claude Code
+.claude/
+
+# Graphify knowledge graph output
+graphify-out/
 config/*.key
 config/authorized_clients.json
 *.env
