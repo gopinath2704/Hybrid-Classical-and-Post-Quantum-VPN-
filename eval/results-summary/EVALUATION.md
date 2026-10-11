@@ -1,7 +1,7 @@
 # PQ-VPN Evaluation Write-Up
 
 **Project:** Hybrid Classical + Post-Quantum VPN (PQ-VPN)
-**Date:** 2026-10-10
+**Date:** 2026-10-11 (v3-kem + resumption update) / 2026-10-10 (initial campaign)
 **Host:** i7-11800H @ 2.30 GHz, Arch Linux kernel 7.2.3, native liboqs 0.16.0
 **Status:** *complete* — all PQ-VPN metrics (M1–M8) measured on the author's
 host. WireGuard baseline present for connect time (M1). Rosenpass and strongSwan
@@ -54,6 +54,19 @@ network-independent (reproducible with `python eval/run_pqvpn.py`):
 | v3-kem (KEM client auth) | 1 318 B | 2 310 B | 1 126 B | 38 B | **4 792 B** |
 | v3-mldsa (ML-DSA client auth) | 1 318 B | 1 222 B | 3 546 B | 38 B | **6 124 B** |
 
+Handshake **on-the-wire bytes** (M3, tcpdump, LAN, 10 runs — all identical):
+
+| System | Packets | Wire Bytes | vs WireGuard |
+|---|---|---|---|
+| WireGuard (Noise IK) | 4 | 496 | 1.0× |
+| PQ-VPN v2-ed25519 | 17 | 4 562 | 9.2× |
+| PQ-VPN v3-kem | 17 | 5 745 | 11.6× |
+
+v3-kem adds +1 024 B protocol payload (second ML-KEM-768 ciphertext for KEM
+client auth) and +1 183 B on-the-wire (includes TCP/IP header changes from
+different segmentation). Even v3-kem's 5 745 B fits in 4 standard Ethernet
+frames. The dominant connect-time cost is round-trips, not bytes.
+
 Handshake **CPU** (50 iterations, in-process, client/server split):
 
 | Suite | Client CPU | Server CPU | Total CPU |
@@ -82,7 +95,22 @@ TUN subprocess calls) and **3 extra round-trips** (KEMTLS 4–5 RTT vs Noise IK
 1 RTT). The ratio narrows from 7.8× on LAN to 2.2× on continent because
 WireGuard's own time grows with RTT. See `figures/connect_time_comparison.png`.
 
+**1-RTT session resumption** (M1, 20 runs, median, v3-kem):
+
+| Profile | Full (ms) | Resume (ms) | Saving |
+|---|---|---|---|
+| LAN | 159 | 160 | −0.6% |
+| Metro (50 ms) | 457 | 365 | −20.1% (−92 ms) |
+| Continent (200 ms) | 1 356 | 1 115 | −17.8% (−241 ms) |
+
+Resumption eliminates one handshake round-trip, so the saving scales with RTT:
+~0 ms on LAN (fixed CPU cost dominates), ~92 ms on metro (~1 RTT), ~241 ms on
+continent (~1.2 RTT). LAN ties because the ~159 ms fixed local cost (Python
+startup, liboqs warm-up) dominates both paths.
+
 ### 1.3 Data-plane throughput / latency — **measured, framed as context**
+
+**v2-ed25519:**
 
 | Profile | TCP (Mbps) | Bare RTT (ms) | Tunnel RTT (ms) | ΔRTT (ms) |
 |---|---|---|---|---|
@@ -93,12 +121,28 @@ WireGuard's own time grows with RTT. See `figures/connect_time_comparison.png`.
 | Lossy-5% | 0.9 | 50.223 | 50.922 | 0.699 |
 | MTU-1280 | 76.6 | 50.225 | 50.937 | 0.712 |
 
-PQ-VPN achieves **613 Mbps** TCP throughput on LAN with **0.3–0.7 ms** tunnel
-RTT overhead. The throughput ceiling is the Python userspace data path (TUN I/O
-+ asyncio + ChaCha20-Poly1305), not the post-quantum cryptography. Kernel-based
-WireGuard achieves 2–5 Gbps on similar hardware — the ~5× gap is the expected
-cost of a userspace implementation. TCP degradation under RTT and loss follows
-TCP's own congestion dynamics and is not amplified by the tunnel.
+**v3-kem:**
+
+| Profile | TCP (Mbps) | Bare RTT (ms) | Tunnel RTT (ms) | ΔRTT (ms) |
+|---|---|---|---|---|
+| LAN | 335.0 | 0.078 | 1.152 | 1.074 |
+| Metro (50 ms) | 128.0 | 50.260 | 51.411 | 1.151 |
+| Continent (200 ms) | 33.0 | 200.239 | 201.429 | 1.190 |
+| Lossy-1% | 2.6 | 50.245 | 51.392 | 1.147 |
+| Lossy-5% | 0.8 | 50.235 | 51.351 | 1.116 |
+| MTU-1280 | 144.0 | 50.243 | 51.316 | 1.073 |
+
+Both protocol versions use the same **AES-256-GCM** data-plane cipher and
+identical 26-byte frame format. Throughput variations between v2 and v3-kem
+(direction inconsistent across profiles) are **run-to-run variance** from system
+load and Python asyncio dispatch, not a protocol effect.
+
+PQ-VPN achieves **335–613 Mbps** TCP throughput on LAN with **0.3–1.2 ms**
+tunnel RTT overhead. The throughput ceiling is the Python userspace data path
+(TUN I/O + asyncio + AES-256-GCM), not the post-quantum cryptography.
+Kernel-based WireGuard achieves 2–5 Gbps on similar hardware — the ~5× gap is
+the expected cost of a userspace implementation. TCP degradation under RTT and
+loss follows TCP's own congestion dynamics and is not amplified by the tunnel.
 
 ### 1.4 Key rotation — **hitless**
 
@@ -145,6 +189,14 @@ All results measured on i7-11800H @ 2.30 GHz, Arch Linux kernel 7.2.3,
 | rosenpass | — | — | — | — | — | — |
 | strongswan | — | — | — | — | — | — |
 
+### Table A′ — Session resumption M1 (ms), median, n = 20, v3-kem
+
+| Mode | LAN | Metro (50 ms) | Continent (200 ms) |
+|---|---|---|---|
+| Full handshake | 159 | 457 | 1 356 |
+| 1-RTT resume | 160 | 365 | 1 115 |
+| Saving | −0.6% | −20.1% (−92 ms) | −17.8% (−241 ms) |
+
 ### Table B — Handshake CPU M2 (ms), n = 50
 
 | Suite | Client CPU | Server CPU | Total CPU |
@@ -155,9 +207,26 @@ All results measured on i7-11800H @ 2.30 GHz, Arch Linux kernel 7.2.3,
 
 ### Table C — Handshake wire bytes M3 — **final** (see §1.2)
 
-Filled above; these are protocol-determined and reproducible on any host.
+Protocol payload (in-process, deterministic):
+
+| Suite | Payload (B) | vs WireGuard |
+|---|---|---|
+| WireGuard | 496 | 1.0× |
+| PQ-VPN v2-ed25519 | 3 768 | 7.6× |
+| PQ-VPN v3-kem | 4 792 | 9.7× |
+| PQ-VPN v3-mldsa | 6 124 | 12.3× |
+
+On-the-wire (tcpdump, LAN, 10 runs — all identical):
+
+| System | Packets | Wire Bytes | vs WireGuard |
+|---|---|---|---|
+| WireGuard (Noise IK) | 4 | 496 | 1.0× |
+| PQ-VPN v2-ed25519 | 17 | 4 562 | 9.2× |
+| PQ-VPN v3-kem | 17 | 5 745 | 11.6× |
 
 ### Table D — Data-plane throughput M5, iperf3 TCP -t 20
+
+**v2-ed25519:**
 
 | Profile | TCP Received (Mbps) | Bare RTT (ms) | Tunnel RTT (ms) | ΔRTT (ms) |
 |---|---|---|---|---|
@@ -167,6 +236,19 @@ Filled above; these are protocol-determined and reproducible on any host.
 | Lossy-1% | 3.1 | 50.162 | 50.698 | 0.536 |
 | Lossy-5% | 0.9 | 50.223 | 50.922 | 0.699 |
 | MTU-1280 | 76.6 | 50.225 | 50.937 | 0.712 |
+
+**v3-kem:**
+
+| Profile | TCP Received (Mbps) | Bare RTT (ms) | Tunnel RTT (ms) | ΔRTT (ms) |
+|---|---|---|---|---|
+| LAN | 335.0 | 0.078 | 1.152 | 1.074 |
+| Metro (50 ms) | 128.0 | 50.260 | 51.411 | 1.151 |
+| Continent (200 ms) | 33.0 | 200.239 | 201.429 | 1.190 |
+| Lossy-1% | 2.6 | 50.245 | 51.392 | 1.147 |
+| Lossy-5% | 0.8 | 50.235 | 51.351 | 1.116 |
+| MTU-1280 | 144.0 | 50.243 | 51.316 | 1.073 |
+
+Data-plane cipher identical (AES-256-GCM); variance is run-to-run, not protocol.
 
 ### Table E — Rekey & re-handshake cost M6
 

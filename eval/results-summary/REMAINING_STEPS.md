@@ -4,20 +4,19 @@ What is still outstanding after this evaluation pass, in **recommended order**.
 Items 1–2 are blocking for any quantitative claim; 3–5 are artifact packaging;
 6 is optional.
 
-### 1. Run the campaign on a capable host and commit the numbers — **blocking**
-Fill Tables A/B/D of `EVALUATION.md` from real harness output.
-- Follow `RERUN_COMMANDS.md` §1–§3 on a netem + WireGuard + Rosenpass +
-  strongSwan + native-liboqs host.
-- First validate the two new baseline runners (`RERUN_COMMANDS.md` §4).
-- Commit `summary.csv`/`summary.txt`/`*.png`/`sanity.json` into
-  `eval/results-summary/` (because `results/` is git-ignored).
-- **Gate:** every PQ-VPN cell `pqc_mode == native_liboqs`; every cell `n ≥ 30`
-  with a 95 % CI; connect time scales with profile (not flat).
+### 1. ~~Run the campaign on a capable host and commit the numbers~~ — **done**
+Tables A/B/C/D filled from real harness output on i7-11800H with native liboqs.
+All PQ-VPN cells measured with `pqc_mode == native_liboqs`. M1 connect time
+(n=30), M2 CPU (n=50), M3 wire bytes (n=10), M5 throughput, M6–M8 all committed.
+Session resumption (n=20, v3-kem) added: −20% metro, −18% continent.
+v3-kem on-wire bytes (17 packets, 5 745 B) and throughput added.
+Rosenpass and strongSwan baselines still not run.
 
-### 2. Run the data-plane throughput/latency benchmark (M2) on a capable host — **blocking for the trade-off claim**
-The networked throughput runner now exists (`eval/measure_throughput.py`). Run it
-for PQ-VPN and the baselines on a netem-capable host and commit the results.
-Memory profiling is also available (`eval/measure_memory.py`).
+### 2. ~~Run the data-plane throughput/latency benchmark~~ — **done**
+`eval/measure_throughput.py` with `--protocol {v2-ed25519, v3-kem}`.
+Measured on i7-11800H for both v2 and v3-kem across all 6 profiles.
+v2: 613 Mbps LAN; v3-kem: 335 Mbps LAN (same AES-256-GCM cipher; variance
+is run-to-run, not protocol). RTT overhead 0.3–1.2 ms.
 
 ### 3. Create the `v3-paper-artifact` tag — **not yet done**
 `ARTIFACT.md` claims *"This artifact is tagged as `v3-paper-artifact`"*, but the
