@@ -336,6 +336,13 @@ def _parser() -> argparse.ArgumentParser:
     account_revoke.add_argument("device_id", type=int)
     account_revoke.add_argument("--accounts-db", default=str(DEFAULT_ACCOUNT_DATABASE))
     account_revoke.add_argument("--database", default="config/authorized_clients.json")
+    reset_pw = account_actions.add_parser("reset-password", description="Admin password reset for a user")
+    reset_pw.add_argument("username")
+    reset_pw.add_argument("new_password")
+    reset_pw.add_argument("--accounts-db", default=str(DEFAULT_ACCOUNT_DATABASE))
+    unlock = account_actions.add_parser("unlock", description="Unlock a locked-out user account")
+    unlock.add_argument("username")
+    unlock.add_argument("--accounts-db", default=str(DEFAULT_ACCOUNT_DATABASE))
 
     server = commands.add_parser("server")
     server.add_argument("--config", default="config/server.toml")
@@ -363,6 +370,20 @@ def _account_command(args: argparse.Namespace) -> None:
                 f"{owner.username if owner else '?':<20}  {device.client_fingerprint}  "
                 f"{device.device_name}"
             )
+        return
+    if args.action == "reset-password":
+        user = store.get_user_by_username(args.username)
+        if user is None:
+            raise SystemExit("user not found")
+        store.set_password(user.id, args.new_password)
+        print(f"Password reset for {args.username}; user must change password on next login")
+        return
+    if args.action == "unlock":
+        user = store.get_user_by_username(args.username)
+        if user is None:
+            raise SystemExit("user not found")
+        store.unlock_account(user.id)
+        print(f"Account unlocked for {args.username}")
         return
     device = store.get_device_by_id(args.device_id)
     if device is None:

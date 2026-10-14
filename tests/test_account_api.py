@@ -20,7 +20,15 @@ from vpn.account_api import (
     create_app,
     load_account_api_config,
 )
-from vpn.accounts import AccountNotFound, AccountStore, InvalidAccountInput, needs_rehash
+from vpn.accounts import (
+    LOCKOUT_THRESHOLD,
+    AccountNotFound,
+    AccountStore,
+    InvalidAccountInput,
+    compute_totp,
+    generate_totp_secret,
+    needs_rehash,
+)
 from vpn.identity import AuthorizedClients
 
 
@@ -73,6 +81,7 @@ def test_registration_returns_only_normalized_public_user(client, app):
             "email": "alice@example.com",
             "enabled": True,
             "created_at": response.json()["user"]["created_at"],
+            "mfa_enabled": False,
         }
     }
     rendered = response.text.casefold()
@@ -206,7 +215,7 @@ def test_valid_bearer_me_and_logout_revoke_current_session(client):
     headers = {"Authorization": f"Bearer {token}"}
     me = client.get("/auth/me", headers=headers)
     assert me.status_code == 200
-    assert set(me.json()["user"]) == {"id", "username", "email", "enabled", "created_at"}
+    assert set(me.json()["user"]) == {"id", "username", "email", "enabled", "created_at", "mfa_enabled"}
     assert "hash" not in me.text
     assert client.post("/auth/logout", headers=headers).status_code == 204
     assert client.get("/auth/me", headers=headers).status_code == 401
@@ -647,3 +656,103 @@ def test_dependency_and_service_packaging_metadata_are_declared():
     assert not (root / "packaging/common/pqvpn-account.conf").exists()
     assert not (root / "packaging/common/pqvpn-account.sysusers").exists()
     assert not (root / "packaging/deb/debian/pqvpn.sysusers").exists()
+
+
+# --- MFA API ---
+
+def test_mfa_setup_confirm_disable_flow(client):
+    headers = bearer(client)
+    resp = client.post("/mfa/setup", headers=headers)
+    assert resp.status_code == 200
+    secret = resp.json()["secret"]
+    assert "provisioning_uri" in resp.json()
+    code = compute_totp(secret)
+    resp = client.post("/mfa/confirm", json={"secret": secret, "code": code}, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "mfa_enabled"
+    resp = client.post("/mfa/setup", headers=headers)
+    assert resp.status_code == 409
+    code = compute_totp(secret)
+    resp = client.post("/mfa/disable", json={"code": code}, headers=headers)
+    assert resp.status_code == 200
+
+
+def test_mfa_confirm_rejects_wrong_code(client):
+    headers = bearer(client)
+    secret = client.post("/mfa/setup", headers=headers).json()["secret"]
+    resp = client.post("/mfa/confirm", json={"secret": secret, "code": "000000"}, headers=headers)
+    assert resp.status_code == 400
+
+
+def test_login_requires_totp_when_mfa_enabled(client, app):
+    register(client)
+    resp = login(client)
+    token = resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    secret = client.post("/mfa/setup", headers=headers).json()["secret"]
+    code = compute_totp(secret)
+    client.post("/mfa/confirm", json={"secret": secret, "code": code}, headers=headers)
+    resp = client.post("/auth/login", json={"identifier": "alice", "password": PASSWORD})
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "mfa_required"
+    code = compute_totp(secret)
+    resp = client.post("/auth/login", json={"identifier": "alice", "password": PASSWORD, "totp_code": code})
+    assert resp.status_code == 200
+    assert "access_token" in resp.json()
+
+
+def test_login_wrong_totp_rejected(client, app):
+    register(client)
+    resp = login(client)
+    token = resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    secret = client.post("/mfa/setup", headers=headers).json()["secret"]
+    code = compute_totp(secret)
+    client.post("/mfa/confirm", json={"secret": secret, "code": code}, headers=headers)
+    resp = client.post("/auth/login", json={"identifier": "alice", "password": PASSWORD, "totp_code": "000000"})
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "invalid_totp"
+
+
+# --- Account lockout API ---
+
+def test_account_lockout_returns_429(tmp_path):
+    cfg = AccountAPIConfig(
+        database_path=tmp_path / "accounts" / "accounts.db",
+        allow_insecure_loopback=True,
+        login_rate_limit=LOCKOUT_THRESHOLD + 5,
+    )
+    with TestClient(create_app(cfg), client=("192.0.2.10", 50000)) as c:
+        register(c)
+        for _ in range(LOCKOUT_THRESHOLD):
+            c.post("/auth/login", json={"identifier": "alice", "password": "wrong"})
+        resp = c.post("/auth/login", json={"identifier": "alice", "password": PASSWORD})
+        assert resp.status_code == 429
+        assert resp.json()["error"]["code"] == "account_locked"
+
+
+# --- Change password API ---
+
+def test_change_password_endpoint(client):
+    headers = bearer(client)
+    resp = client.post("/auth/change-password", json={
+        "old_password": PASSWORD, "new_password": "new-secure-password-123"
+    }, headers=headers)
+    assert resp.status_code == 200
+    resp = login(client, password="new-secure-password-123")
+    assert resp.status_code == 200
+
+
+def test_change_password_wrong_old_rejected(client):
+    headers = bearer(client)
+    resp = client.post("/auth/change-password", json={
+        "old_password": "wrong-password", "new_password": "new-secure-password-123"
+    }, headers=headers)
+    assert resp.status_code == 400
+
+
+def test_public_user_includes_mfa_enabled(client):
+    register(client)
+    resp = login(client)
+    assert "mfa_enabled" in resp.json()["user"]
+    assert resp.json()["user"]["mfa_enabled"] is False

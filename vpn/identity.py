@@ -297,6 +297,12 @@ class AuthorizedClients:
             if found: _atomic_private(self.path, (json.dumps(db, indent=2) + '\n').encode())
             return found
 
+    def is_client_authorized(self, client_id: str) -> bool:
+        for item in self._load(required=True)['clients']:
+            if item['client_id'] == client_id and item['enabled']:
+                return True
+        return False
+
 
 def verify_client_signature(public_key: bytes, signature: bytes, message: bytes) -> None:
     Ed25519PublicKey.from_public_bytes(public_key).verify(signature, message)

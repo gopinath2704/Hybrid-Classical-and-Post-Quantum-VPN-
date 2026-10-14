@@ -14,7 +14,7 @@ class ServerConfig:
     listen_host:str="0.0.0.0"; control_port:int=51820; udp_port:int=51820
     vpn_subnet:str="10.8.0.0/24"; server_vpn_ip:str="10.8.0.1"; tun_name:str="pqvpn0"; mtu:int=1380
     outbound_interface:str=""; dns_servers:list[str]=field(default_factory=lambda:["1.1.1.1","9.9.9.9"])
-    max_clients:int=64; handshake_timeout:int=10; idle_timeout:int=300; session_timeout:int=86400; rekey_interval:int=3600; rehandshake_interval:int=0
+    max_clients:int=64; handshake_timeout:int=10; idle_timeout:int=300; session_timeout:int=14400; rekey_interval:int=3600; rehandshake_interval:int=0
     connections_per_source:int=10; rate_limit_window:float=60.0
     server_identity_private_key:str="config/server_identity_private.key"; server_identity_public_key:str="config/server_identity_public.key"
     authorized_clients_file:str="config/authorized_clients.json"

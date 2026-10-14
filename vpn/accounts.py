@@ -1,10 +1,16 @@
 """Server-side account, device ownership, and session-schema persistence."""
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac as _hmac
 import os
 import re
+import secrets
 import sqlite3
 import stat
+import struct
+import time
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,7 +24,7 @@ from argon2.exceptions import HashingError, InvalidHashError, VerificationError
 from vpn.identity import fingerprint
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEVICE_STATUSES = ("pending", "approved", "rejected", "revoked")
 DEFAULT_ACCOUNT_DATABASE = Path("/var/lib/pqvpn/accounts/accounts.db")
 MIN_PASSWORD_LENGTH = 12
@@ -26,6 +32,8 @@ MAX_PASSWORD_LENGTH = 1024
 MAX_USERNAME_LENGTH = 64
 MAX_EMAIL_LENGTH = 254
 MAX_DEVICE_NAME_LENGTH = 100
+LOCKOUT_THRESHOLD = 10
+LOCKOUT_DURATION_SECONDS = 900
 
 _USERNAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
@@ -67,6 +75,13 @@ class PasswordHashError(AccountError):
     """Argon2id could not safely process a password hash."""
 
 
+class AccountLocked(AccountError):
+    """The account is temporarily locked after too many failed login attempts."""
+    def __init__(self, locked_until: str):
+        self.locked_until = locked_until
+        super().__init__("account is temporarily locked")
+
+
 @dataclass(frozen=True)
 class UserRecord:
     id: int
@@ -75,6 +90,9 @@ class UserRecord:
     enabled: bool
     created_at: str
     updated_at: str
+    mfa_enabled: bool = False
+    locked_until: str | None = None
+    password_change_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,6 +157,32 @@ def needs_rehash(password_hash: str) -> bool:
         return bool(_PASSWORD_HASHER.check_needs_rehash(password_hash))
     except (InvalidHashError, VerificationError):
         return True
+
+
+def generate_totp_secret() -> str:
+    return base64.b32encode(secrets.token_bytes(20)).decode()
+
+
+def compute_totp(secret_b32: str, now: float | None = None, period: int = 30) -> str:
+    key = base64.b32decode(secret_b32)
+    counter = struct.pack(">Q", int((now or time.time()) // period))
+    mac = _hmac.new(key, counter, hashlib.sha1).digest()
+    offset = mac[-1] & 0x0F
+    code = struct.unpack(">I", mac[offset:offset + 4])[0] & 0x7FFFFFFF
+    return f"{code % 1_000_000:06d}"
+
+
+def verify_totp(secret_b32: str, code: str, *, window: int = 1) -> bool:
+    if not isinstance(code, str) or len(code) != 6 or not code.isdigit():
+        return False
+    now = time.time()
+    return any(_hmac.compare_digest(compute_totp(secret_b32, now + offset * 30), code)
+               for offset in range(-window, window + 1))
+
+
+def totp_provisioning_uri(secret_b32: str, username: str, issuer: str = "PQVPN") -> str:
+    from urllib.parse import quote
+    return f"otpauth://totp/{quote(issuer)}:{quote(username)}?secret={secret_b32}&issuer={quote(issuer)}"
 
 
 def normalize_username(username: object) -> str:
@@ -296,7 +340,12 @@ _SCHEMA_STATEMENTS = (
         password_hash TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        totp_secret TEXT,
+        failed_login_count INTEGER NOT NULL DEFAULT 0,
+        locked_until TEXT,
+        password_change_required INTEGER NOT NULL DEFAULT 0
+            CHECK (password_change_required IN (0, 1))
     )
     """,
     """
@@ -342,9 +391,18 @@ _MIGRATION_V2 = (
     """,
 )
 
+_MIGRATION_V3 = (
+    "ALTER TABLE users ADD COLUMN totp_secret TEXT",
+    "ALTER TABLE users ADD COLUMN failed_login_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN locked_until TEXT",
+    """ALTER TABLE users ADD COLUMN password_change_required INTEGER NOT NULL DEFAULT 0
+        CHECK (password_change_required IN (0, 1))""",
+)
+
 _EXPECTED_COLUMNS = {
     "users": (
-        "id", "username", "email", "password_hash", "enabled", "created_at", "updated_at"
+        "id", "username", "email", "password_hash", "enabled", "created_at", "updated_at",
+        "totp_secret", "failed_login_count", "locked_until", "password_change_required"
     ),
     "devices": (
         "id", "user_id", "device_name", "client_fingerprint", "client_public_key",
@@ -356,6 +414,10 @@ _EXPECTED_COLUMNS = {
     ),
 }
 _EXPECTED_INDEXES = {"idx_devices_user_id", "idx_sessions_user_id", "idx_sessions_expires_at"}
+_USER_COLUMNS = (
+    "id, username, email, enabled, created_at, updated_at, "
+    "totp_secret, locked_until, password_change_required"
+)
 _DEVICE_COLUMNS = (
     "id, user_id, device_name, client_fingerprint, client_public_key, "
     "enabled, created_at, updated_at, status"
@@ -472,6 +534,8 @@ class AccountStore:
         if cls._application_tables(connection) != set(_EXPECTED_COLUMNS):
             raise AccountDatabaseError("account database has an incompatible table layout")
         columns = dict(_EXPECTED_COLUMNS)
+        if version <= 2:
+            columns["users"] = columns["users"][:7]
         if version == 1:
             columns["devices"] = columns["devices"][:-1]
         for table, expected in columns.items():
@@ -507,6 +571,13 @@ class AccountStore:
                     self._validate_schema(connection, version=1)
                     for statement in _MIGRATION_V2:
                         connection.execute(statement)
+                    for statement in _MIGRATION_V3:
+                        connection.execute(statement)
+                    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                elif version == 2:
+                    self._validate_schema(connection, version=2)
+                    for statement in _MIGRATION_V3:
+                        connection.execute(statement)
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 elif version > SCHEMA_VERSION:
                     raise UnsupportedSchemaVersion(
@@ -534,7 +605,10 @@ class AccountStore:
             return None
         return UserRecord(
             id=row["id"], username=row["username"], email=row["email"],
-            enabled=bool(row["enabled"]), created_at=row["created_at"], updated_at=row["updated_at"]
+            enabled=bool(row["enabled"]), created_at=row["created_at"], updated_at=row["updated_at"],
+            mfa_enabled=row["totp_secret"] is not None,
+            locked_until=row["locked_until"],
+            password_change_required=bool(row["password_change_required"]),
         )
 
     @staticmethod
@@ -583,7 +657,7 @@ class AccountStore:
                     (normalized_username, normalized_email, password_hash, int(validated_enabled), now, now),
                 )
                 row = connection.execute(
-                    "SELECT id, username, email, enabled, created_at, updated_at FROM users WHERE id = ?",
+                    f"SELECT {_USER_COLUMNS} FROM users WHERE id = ?",
                     (cursor.lastrowid,),
                 ).fetchone()
                 connection.commit()
@@ -607,7 +681,7 @@ class AccountStore:
         validated = _validate_id(user_id, "user ID")
         with self._connection() as connection:
             return self._user(connection.execute(
-                "SELECT id, username, email, enabled, created_at, updated_at FROM users WHERE id = ?",
+                f"SELECT {_USER_COLUMNS} FROM users WHERE id = ?",
                 (validated,),
             ).fetchone())
 
@@ -615,7 +689,7 @@ class AccountStore:
         normalized = normalize_username(username)
         with self._connection() as connection:
             return self._user(connection.execute(
-                "SELECT id, username, email, enabled, created_at, updated_at FROM users WHERE username = ?",
+                f"SELECT {_USER_COLUMNS} FROM users WHERE username = ?",
                 (normalized,),
             ).fetchone())
 
@@ -623,7 +697,7 @@ class AccountStore:
         normalized = normalize_email(email)
         with self._connection() as connection:
             return self._user(connection.execute(
-                "SELECT id, username, email, enabled, created_at, updated_at FROM users WHERE email = ?",
+                f"SELECT {_USER_COLUMNS} FROM users WHERE email = ?",
                 (normalized,),
             ).fetchone())
 
@@ -638,7 +712,11 @@ class AccountStore:
         return verify_password(row["password_hash"], password)
 
     def authenticate_user(self, identifier: str, password: str) -> UserRecord | None:
-        """Authenticate by normalized username or email with a generic failure path."""
+        """Authenticate by normalized username or email with a generic failure path.
+
+        Raises AccountLocked if the account has exceeded LOCKOUT_THRESHOLD
+        failed attempts and the lockout period has not elapsed.
+        """
         normalized: str | None
         try:
             normalized = normalize_email(identifier) if "@" in identifier else normalize_username(identifier)
@@ -649,26 +727,35 @@ class AccountStore:
                 row = None
             elif "@" in normalized:
                 row = connection.execute(
-                    """
-                    SELECT id, username, email, password_hash, enabled, created_at, updated_at
+                    f"""
+                    SELECT {_USER_COLUMNS}, password_hash, failed_login_count
                     FROM users WHERE email = ?
                     """,
                     (normalized,),
                 ).fetchone()
             else:
                 row = connection.execute(
-                    """
-                    SELECT id, username, email, password_hash, enabled, created_at, updated_at
+                    f"""
+                    SELECT {_USER_COLUMNS}, password_hash, failed_login_count
                     FROM users WHERE username = ?
                     """,
                     (normalized,),
                 ).fetchone()
 
+        if row is not None:
+            locked = row["locked_until"]
+            if locked is not None and _parse_timestamp(locked) > datetime.now(timezone.utc):
+                verify_password(row["password_hash"], password)
+                raise AccountLocked(locked)
+
         candidate_hash = _DUMMY_PASSWORD_HASH if row is None else row["password_hash"]
         password_matches = verify_password(candidate_hash, password)
         if row is None or not password_matches or not bool(row["enabled"]):
+            if row is not None and bool(row["enabled"]):
+                self._record_failed_login(row["id"], row["failed_login_count"])
             return None
 
+        self._reset_login_failures(row["id"])
         user = self._user(row)
         assert user is not None
         if needs_rehash(candidate_hash):
@@ -684,10 +771,7 @@ class AccountStore:
                     (replacement, now, user.id, candidate_hash),
                 )
                 current = connection.execute(
-                    """
-                    SELECT id, username, email, enabled, created_at, updated_at
-                    FROM users WHERE id = ?
-                    """,
+                    f"SELECT {_USER_COLUMNS} FROM users WHERE id = ?",
                     (user.id,),
                 ).fetchone()
                 connection.commit()
@@ -697,6 +781,122 @@ class AccountStore:
             if user is None or not user.enabled:
                 return None
         return user
+
+    def _record_failed_login(self, user_id: int, current_count: int) -> None:
+        now = _utc_now()
+        new_count = current_count + 1
+        locked_until = None
+        if new_count >= LOCKOUT_THRESHOLD:
+            lock_time = datetime.now(timezone.utc) + timedelta(seconds=LOCKOUT_DURATION_SECONDS)
+            locked_until = _utc_timestamp(lock_time, "lockout time")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE users SET failed_login_count = ?, locked_until = ?, updated_at = ? WHERE id = ?",
+                (new_count, locked_until, now, user_id),
+            )
+            connection.commit()
+
+    def _reset_login_failures(self, user_id: int) -> None:
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE users SET failed_login_count = 0, locked_until = NULL, updated_at = ? WHERE id = ?",
+                (now, user_id),
+            )
+            connection.commit()
+
+    def enable_totp(self, user_id: int, secret: str) -> None:
+        validated_id = _validate_id(user_id, "user ID")
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "UPDATE users SET totp_secret = ?, updated_at = ? WHERE id = ? AND enabled = 1",
+                (secret, now, validated_id),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise AccountNotFound("user does not exist or is disabled")
+            connection.commit()
+
+    def disable_totp(self, user_id: int) -> None:
+        validated_id = _validate_id(user_id, "user ID")
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "UPDATE users SET totp_secret = NULL, updated_at = ? WHERE id = ?",
+                (now, validated_id),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise AccountNotFound("user does not exist")
+            connection.commit()
+
+    def get_totp_secret(self, user_id: int) -> str | None:
+        validated_id = _validate_id(user_id, "user ID")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT totp_secret FROM users WHERE id = ? AND enabled = 1", (validated_id,)
+            ).fetchone()
+        if row is None:
+            raise AccountNotFound("user does not exist or is disabled")
+        return row["totp_secret"]
+
+    def set_password(self, user_id: int, password: str, *, require_change: bool = True) -> None:
+        """Admin password reset — sets a new password and optionally requires change on next login."""
+        validated_id = _validate_id(user_id, "user ID")
+        _validate_password(password)
+        hashed = hash_password(password)
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "UPDATE users SET password_hash = ?, password_change_required = ?, updated_at = ? WHERE id = ?",
+                (hashed, int(require_change), now, validated_id),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise AccountNotFound("user does not exist")
+            connection.commit()
+
+    def change_password(self, user_id: int, old_password: str, new_password: str) -> None:
+        """User-initiated password change — verifies old password first."""
+        validated_id = _validate_id(user_id, "user ID")
+        _validate_password(new_password)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT password_hash FROM users WHERE id = ? AND enabled = 1", (validated_id,)
+            ).fetchone()
+        if row is None:
+            raise AccountNotFound("user does not exist or is disabled")
+        if not verify_password(row["password_hash"], old_password):
+            raise InvalidAccountInput("current password is incorrect")
+        hashed = hash_password(new_password)
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE users SET password_hash = ?, password_change_required = 0, updated_at = ? WHERE id = ?",
+                (hashed, now, validated_id),
+            )
+            connection.commit()
+
+    def unlock_account(self, user_id: int) -> None:
+        validated_id = _validate_id(user_id, "user ID")
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "UPDATE users SET failed_login_count = 0, locked_until = NULL, updated_at = ? WHERE id = ?",
+                (now, validated_id),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise AccountNotFound("user does not exist")
+            connection.commit()
 
     def set_user_enabled(self, user_id: int, enabled: bool) -> UserRecord:
         validated_id = _validate_id(user_id, "user ID")
@@ -712,7 +912,7 @@ class AccountStore:
                 connection.rollback()
                 raise AccountNotFound("user does not exist")
             row = connection.execute(
-                "SELECT id, username, email, enabled, created_at, updated_at FROM users WHERE id = ?",
+                f"SELECT {_USER_COLUMNS} FROM users WHERE id = ?",
                 (validated_id,),
             ).fetchone()
             connection.commit()
@@ -971,7 +1171,8 @@ class AccountStore:
                 SELECT s.id, s.user_id, s.token_hash, s.created_at, s.expires_at,
                        s.revoked_at, s.last_used_at,
                        u.username, u.email, u.enabled, u.created_at AS user_created_at,
-                       u.updated_at AS user_updated_at
+                       u.updated_at AS user_updated_at,
+                       u.totp_secret, u.locked_until, u.password_change_required
                 FROM sessions AS s JOIN users AS u ON u.id = s.user_id
                 WHERE s.token_hash = ?
                 """,
@@ -999,7 +1200,8 @@ class AccountStore:
                     SELECT s.id, s.user_id, s.token_hash, s.created_at, s.expires_at,
                            s.revoked_at, s.last_used_at,
                            u.username, u.email, u.enabled, u.created_at AS user_created_at,
-                           u.updated_at AS user_updated_at
+                           u.updated_at AS user_updated_at,
+                           u.totp_secret, u.locked_until, u.password_change_required
                     FROM sessions AS s JOIN users AS u ON u.id = s.user_id
                     WHERE s.id = ?
                     """,
@@ -1011,6 +1213,9 @@ class AccountStore:
             id=row["user_id"], username=row["username"], email=row["email"],
             enabled=bool(row["enabled"]), created_at=row["user_created_at"],
             updated_at=row["user_updated_at"],
+            mfa_enabled=row["totp_secret"] is not None,
+            locked_until=row["locked_until"],
+            password_change_required=bool(row["password_change_required"]),
         )
         session = self._session(row)
         assert session is not None

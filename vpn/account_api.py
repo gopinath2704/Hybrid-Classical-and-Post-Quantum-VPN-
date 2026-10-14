@@ -33,12 +33,16 @@ from vpn.accounts import (
     MAX_USERNAME_LENGTH,
     AccountAlreadyExists,
     AccountDatabaseError,
+    AccountLocked,
     AccountNotFound,
     AccountStore,
     DeviceRecord,
     InvalidAccountInput,
     SessionRecord,
     UserRecord,
+    generate_totp_secret,
+    totp_provisioning_uri,
+    verify_totp,
 )
 
 
@@ -50,8 +54,8 @@ DEFAULT_BODY_LIMIT = 16 * 1024
 SESSION_TOKEN_BYTES = 32
 SESSION_TOUCH_INTERVAL_SECONDS = 60
 MAX_DEVICES_PER_USER = 20
-_LIMITED_PREFIXES = ("/auth/", "/devices")
-_JSON_POST_PATHS = {"/auth/register", "/auth/login", "/devices"}
+_LIMITED_PREFIXES = ("/auth/", "/devices", "/mfa/")
+_JSON_POST_PATHS = {"/auth/register", "/auth/login", "/auth/change-password", "/devices", "/mfa/confirm", "/mfa/disable"}
 
 
 class AccountAPIConfigError(ValueError):
@@ -264,6 +268,24 @@ class LoginRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
     identifier: str = Field(min_length=1, max_length=MAX_EMAIL_LENGTH + 2)
     password: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
+    totp_code: str | None = Field(default=None, min_length=6, max_length=6)
+
+
+class MFAConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    secret: str = Field(min_length=1, max_length=64)
+    code: str = Field(min_length=6, max_length=6)
+
+
+class MFADisableRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    code: str = Field(min_length=6, max_length=6)
+
+
+class ChangePasswordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    old_password: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
+    new_password: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
 
 
 class DeviceBindRequest(BaseModel):
@@ -353,6 +375,7 @@ def _public_user(user: UserRecord) -> dict[str, object]:
         "email": user.email,
         "enabled": user.enabled,
         "created_at": user.created_at,
+        "mfa_enabled": user.mfa_enabled,
     }
 
 
@@ -490,11 +513,22 @@ def create_app(
                 429, "rate_limited", "too many authentication attempts",
                 headers={"Retry-After": str(retry)},
             )
-        user = account_store.authenticate_user(payload.identifier, payload.password)
+        try:
+            user = account_store.authenticate_user(payload.identifier, payload.password)
+        except AccountLocked as exc:
+            logger.info("login rejected category=locked source=%s", _source(request))
+            return _error(429, "account_locked", f"account is temporarily locked until {exc.locked_until}")
         if user is None:
             application.state.login_limiter.record_event(key)
             logger.info("login rejected category=invalid_credentials source=%s", _source(request))
             return _error(401, "invalid_credentials", "invalid credentials")
+        if user.mfa_enabled:
+            if payload.totp_code is None:
+                return _error(403, "mfa_required", "TOTP code is required")
+            secret = account_store.get_totp_secret(user.id)
+            if secret is None or not verify_totp(secret, payload.totp_code):
+                logger.info("login rejected category=invalid_totp user_id=%d source=%s", user.id, _source(request))
+                return _error(401, "invalid_totp", "invalid TOTP code")
         application.state.login_limiter.reset(key)
         expires_at = datetime.now(timezone.utc) + timedelta(
             seconds=config.session_lifetime_seconds
@@ -577,6 +611,60 @@ def create_app(
         account_store.revoke_session(context.token_hash)
         logger.info("logout succeeded user_id=%d source=%s", context.user.id, _source(request))
         return Response(status_code=204)
+
+    @application.post("/auth/change-password")
+    async def change_password(payload: ChangePasswordRequest, request: Request, context=Depends(get_authenticated_user)):
+        if isinstance(context, JSONResponse):
+            return context
+        try:
+            account_store.change_password(context.user.id, payload.old_password, payload.new_password)
+        except InvalidAccountInput as exc:
+            return _error(400, "invalid_password", str(exc))
+        except AccountNotFound:
+            return _error(401, "invalid_session", "session is no longer valid")
+        logger.info("password changed user_id=%d source=%s", context.user.id, _source(request))
+        return {"status": "password_changed"}
+
+    @application.post("/mfa/setup")
+    async def mfa_setup(context=Depends(get_authenticated_user)):
+        if isinstance(context, JSONResponse):
+            return context
+        if context.user.mfa_enabled:
+            return _error(409, "mfa_already_enabled", "MFA is already enabled")
+        secret = generate_totp_secret()
+        uri = totp_provisioning_uri(secret, context.user.username)
+        return {"secret": secret, "provisioning_uri": uri}
+
+    @application.post("/mfa/confirm")
+    async def mfa_confirm(payload: MFAConfirmRequest, request: Request, context=Depends(get_authenticated_user)):
+        if isinstance(context, JSONResponse):
+            return context
+        if context.user.mfa_enabled:
+            return _error(409, "mfa_already_enabled", "MFA is already enabled")
+        if not verify_totp(payload.secret, payload.code):
+            return _error(400, "invalid_totp", "invalid TOTP code for the provided secret")
+        try:
+            account_store.enable_totp(context.user.id, payload.secret)
+        except AccountNotFound:
+            return _error(401, "invalid_session", "session is no longer valid")
+        logger.info("mfa enabled user_id=%d source=%s", context.user.id, _source(request))
+        return {"status": "mfa_enabled"}
+
+    @application.post("/mfa/disable")
+    async def mfa_disable(payload: MFADisableRequest, request: Request, context=Depends(get_authenticated_user)):
+        if isinstance(context, JSONResponse):
+            return context
+        if not context.user.mfa_enabled:
+            return _error(400, "mfa_not_enabled", "MFA is not enabled")
+        secret = account_store.get_totp_secret(context.user.id)
+        if secret is None or not verify_totp(secret, payload.code):
+            return _error(401, "invalid_totp", "invalid TOTP code")
+        try:
+            account_store.disable_totp(context.user.id)
+        except AccountNotFound:
+            return _error(401, "invalid_session", "session is no longer valid")
+        logger.info("mfa disabled user_id=%d source=%s", context.user.id, _source(request))
+        return {"status": "mfa_disabled"}
 
     return application
 

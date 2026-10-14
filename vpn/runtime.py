@@ -346,6 +346,8 @@ class VPNServer:
         self._ticket_key = ResumptionTicketKey() if config.resumption_ticket_lifetime > 0 else None
         self._pending_handshakes = 0
         self._pending_lock = threading.Lock()
+        self._revocation_thread = None
+        self._last_auth_snapshot: set[str] | None = None
 
     def start(self) -> None:
         try:
@@ -362,6 +364,8 @@ class VPNServer:
             listener = self.tcp
             self._data_thread = threading.Thread(target=self._data_loop, daemon=True, name="pqvpn-data")
             self._data_thread.start()
+            self._revocation_thread = threading.Thread(target=self._revocation_loop, daemon=True, name="pqvpn-revoke")
+            self._revocation_thread.start()
             while not self.stop_event.is_set():
                 try:
                     connection, address = listener.accept()
@@ -521,6 +525,8 @@ class VPNServer:
         return client_hello
 
     def _rekey_server(self, item: ServerSession, payload: bytes) -> None:
+        if not self.auth.is_client_authorized(item.client_id):
+            raise HandshakeError("client authorization revoked")
         if len(payload) != 36:
             raise HandshakeError("invalid rekey request")
         epoch, nonce = struct.unpack("!I", payload[:4])[0], payload[4:]
@@ -532,6 +538,8 @@ class VPNServer:
         logger.info("rekey complete epoch=%d client_id=%s", epoch, item.client_id)
 
     def _rehandshake_server(self, item: ServerSession, payload: bytes) -> None:
+        if not self.auth.is_client_authorized(item.client_id):
+            raise HandshakeError("client authorization revoked")
         from crypto.hybrid_crypto import HybridKEM
         expected_len = 4 + 32 + 1184
         if len(payload) != expected_len:
@@ -552,6 +560,35 @@ class VPNServer:
         send_message(item.control, item.crypto.encrypt_control(response, FrameType.REHANDSHAKE_RESPONSE))
         item.crypto.activate_epoch(epoch, next_keys)
         logger.info("rehandshake complete epoch=%d client_id=%s", epoch, item.client_id)
+
+    def _enabled_client_ids(self) -> set[str]:
+        try:
+            db = self.auth._load(required=True)
+            return {item['client_id'] for item in db['clients'] if item['enabled']}
+        except Exception:
+            return self._last_auth_snapshot or set()
+
+    def _check_revocations(self) -> None:
+        enabled = self._enabled_client_ids()
+        old = self._last_auth_snapshot
+        self._last_auth_snapshot = enabled
+        if old is not None and old - enabled and self._ticket_key is not None:
+            self._ticket_key = ResumptionTicketKey()
+            logger.info("resumption ticket key rotated due to client revocation")
+        for item in list(self.sessions._snap_id.values()):
+            if item.client_id not in enabled:
+                logger.info("terminating revoked client session client_id=%s", item.client_id)
+                try:
+                    item.control.close()
+                except Exception:
+                    pass
+
+    def _revocation_loop(self) -> None:
+        while not self.stop_event.wait(30):
+            try:
+                self._check_revocations()
+            except Exception:
+                logger.exception("revocation check failed")
 
     # ponytail: batch size for draining sockets per wakeup; tune up if
     # profiling shows select() round-trips are still the bottleneck
@@ -628,6 +665,8 @@ class VPNServer:
         self._close_listeners()
         if self._data_thread and self._data_thread is not threading.current_thread():
             self._data_thread.join(timeout=3)
+        if self._revocation_thread and self._revocation_thread is not threading.current_thread():
+            self._revocation_thread.join(timeout=3)
         for thread in list(self._client_threads):
             if thread is not threading.current_thread():
                 thread.join(timeout=3)

@@ -12,11 +12,13 @@ from argon2 import PasswordHasher
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from vpn.accounts import (
+    LOCKOUT_THRESHOLD,
     MAX_PASSWORD_LENGTH,
     MIN_PASSWORD_LENGTH,
     SCHEMA_VERSION,
     AccountAlreadyExists,
     AccountDatabaseError,
+    AccountLocked,
     AccountNotFound,
     AccountStore,
     DeviceRecord,
@@ -24,9 +26,12 @@ from vpn.accounts import (
     SessionRecord,
     UnsupportedSchemaVersion,
     UserRecord,
+    compute_totp,
+    generate_totp_secret,
     hash_password,
     needs_rehash,
     verify_password,
+    verify_totp,
 )
 from vpn.identity import AuthorizedClients, fingerprint
 
@@ -62,7 +67,7 @@ def test_fresh_database_initialization_schema_and_permissions(tmp_path):
     assert not path.exists()
     account_store.initialize()
 
-    assert account_store.schema_version() == SCHEMA_VERSION == 2
+    assert account_store.schema_version() == SCHEMA_VERSION == 3
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     with raw_connection(account_store) as connection:
@@ -94,7 +99,7 @@ def test_store_connections_enable_foreign_keys(store):
         connection.close()
 
 
-@pytest.mark.parametrize("version", [3, 99])
+@pytest.mark.parametrize("version", [4, 99])
 def test_newer_schema_version_fails_closed(tmp_path, version):
     path = tmp_path / "accounts.db"
     with sqlite3.connect(path) as connection:
@@ -319,7 +324,7 @@ def test_version_1_database_migrates_with_devices_pending(tmp_path):
         connection.execute("PRAGMA user_version = 1")
     store = AccountStore(path)
     store.initialize()
-    assert store.schema_version() == 2
+    assert store.schema_version() == 3
     device = store.get_device_by_fingerprint(identity_fingerprint)
     assert device.status == "pending" and device.client_public_key == public
     assert store.authenticate_user("alice", "correct horse battery staple") is not None
@@ -539,3 +544,165 @@ def test_admin_unknown_device_and_bad_vpn_ip(review):
         _cli("account", "approve", str(device.id), *db, "--database", str(authorized),
              "--vpn-ip", "not-an-ip")
     assert store.get_device_by_id(device.id).status == "pending"
+
+
+# --- TOTP ---
+
+def test_totp_compute_and_verify():
+    secret = generate_totp_secret()
+    code = compute_totp(secret)
+    assert verify_totp(secret, code)
+    assert not verify_totp(secret, "000000")
+    assert not verify_totp(secret, "short")
+    assert not verify_totp(secret, "abcdef")
+
+
+def test_totp_enable_disable_flow(store, user):
+    assert not user.mfa_enabled
+    secret = generate_totp_secret()
+    store.enable_totp(user.id, secret)
+    fetched = store.get_user_by_id(user.id)
+    assert fetched.mfa_enabled
+    assert store.get_totp_secret(user.id) == secret
+    store.disable_totp(user.id)
+    fetched = store.get_user_by_id(user.id)
+    assert not fetched.mfa_enabled
+    assert store.get_totp_secret(user.id) is None
+
+
+def test_totp_required_when_enabled(store, user):
+    """authenticate_user succeeds but the caller must check mfa_enabled."""
+    secret = generate_totp_secret()
+    store.enable_totp(user.id, secret)
+    result = store.authenticate_user("alice", "correct horse battery staple")
+    assert result is not None
+    assert result.mfa_enabled
+
+
+# --- Account lockout ---
+
+def test_account_lockout_after_failures(store, user):
+    for _ in range(LOCKOUT_THRESHOLD):
+        store.authenticate_user("alice", "wrong-password")
+    with pytest.raises(AccountLocked):
+        store.authenticate_user("alice", "correct horse battery staple")
+
+
+def test_account_unlock(store, user):
+    for _ in range(LOCKOUT_THRESHOLD):
+        store.authenticate_user("alice", "wrong-password")
+    store.unlock_account(user.id)
+    result = store.authenticate_user("alice", "correct horse battery staple")
+    assert result is not None
+
+
+def test_successful_login_resets_failure_count(store, user):
+    for _ in range(LOCKOUT_THRESHOLD - 1):
+        store.authenticate_user("alice", "wrong-password")
+    result = store.authenticate_user("alice", "correct horse battery staple")
+    assert result is not None
+    for _ in range(LOCKOUT_THRESHOLD - 1):
+        store.authenticate_user("alice", "wrong-password")
+    result = store.authenticate_user("alice", "correct horse battery staple")
+    assert result is not None
+
+
+# --- Password management ---
+
+def test_admin_password_reset(store, user):
+    store.set_password(user.id, "new-secure-password-123")
+    result = store.authenticate_user("alice", "new-secure-password-123")
+    assert result is not None
+    assert result.password_change_required
+
+
+def test_user_change_password(store, user):
+    store.change_password(user.id, "correct horse battery staple", "new-secure-password-123")
+    assert store.authenticate_user("alice", "correct horse battery staple") is None
+    result = store.authenticate_user("alice", "new-secure-password-123")
+    assert result is not None
+
+
+def test_change_password_wrong_old(store, user):
+    with pytest.raises(InvalidAccountInput, match="incorrect"):
+        store.change_password(user.id, "wrong-old-password", "new-secure-password-123")
+
+
+# --- Schema migration ---
+
+def test_v2_to_v3_migration(tmp_path):
+    db_path = tmp_path / "accounts" / "accounts.db"
+    db_path.parent.mkdir(mode=0o700)
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("""
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            password_hash TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            token_hash BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            last_used_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE devices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            device_name TEXT NOT NULL,
+            client_fingerprint TEXT NOT NULL UNIQUE,
+            client_public_key BLOB NOT NULL CHECK (length(client_public_key) = 32),
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'approved', 'rejected', 'revoked'))
+        )
+    """)
+    conn.execute("CREATE INDEX idx_devices_user_id ON devices(user_id)")
+    conn.execute("CREATE INDEX idx_sessions_user_id ON sessions(user_id)")
+    conn.execute("CREATE INDEX idx_sessions_expires_at ON sessions(expires_at)")
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+    conn.close()
+    os.chmod(db_path, 0o600)
+    store = AccountStore(db_path)
+    store.initialize()
+    assert store.schema_version() == 3
+    user = store.create_user("bob", "bob@example.com", "secure-password-1234")
+    assert not user.mfa_enabled
+    assert user.locked_until is None
+    assert not user.password_change_required
+
+
+# --- CLI reset-password / unlock ---
+
+def test_cli_reset_password(review):
+    store, _device, _authorized, db = review
+    _cli("account", "reset-password", "alice", "new-password-12345", *db)
+    result = store.authenticate_user("alice", "new-password-12345")
+    assert result is not None
+    assert result.password_change_required
+
+
+def test_cli_unlock(review):
+    store, _device, _authorized, db = review
+    for _ in range(LOCKOUT_THRESHOLD):
+        store.authenticate_user("alice", "wrong")
+    with pytest.raises(AccountLocked):
+        store.authenticate_user("alice", "correct horse battery staple")
+    _cli("account", "unlock", "alice", *db)
+    result = store.authenticate_user("alice", "correct horse battery staple")
+    assert result is not None

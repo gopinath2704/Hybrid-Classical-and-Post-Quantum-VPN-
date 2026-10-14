@@ -819,3 +819,70 @@ def test_from_frame_routes_all_protocol_versions(version, routed):
                         int(Channel.DATA), 0, 0, sid, 0, 0)
     result = sm.from_frame(frame)
     assert (result is sentinel) == routed
+
+
+# --- Device revocation ---
+
+def test_revoked_client_session_terminated(tmp_path):
+    from vpn.identity import AuthorizedClients, fingerprint, generate_server_identity
+    generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
+    auth = AuthorizedClients(tmp_path/'clients.json')
+    auth.authorize(b'\x01' * 32, 'test-client')
+    server = runtime.VPNServer(ServerConfig(
+        listen_host='127.0.0.1', control_port=0, udp_port=0,
+        server_identity_private_key=str(tmp_path/'server.key'),
+        server_identity_public_key=str(tmp_path/'server.pub'),
+        authorized_clients_file=str(tmp_path/'clients.json'),
+        dev_emulated_tun=True, dns_servers=[],
+    ))
+    sock_a, sock_b = socket.socketpair()
+    mock_session = Mock()
+    mock_session.client_id = 'test-client'
+    mock_session.control = sock_a
+    server.sessions._snap_id = {b'12345678': mock_session}
+    server._last_auth_snapshot = {'test-client'}
+    server._ticket_key = Mock()
+    auth.revoke(fingerprint(b'\x01' * 32))
+    server._check_revocations()
+    assert sock_a.fileno() == -1
+    sock_b.close()
+
+
+def test_revocation_rotates_ticket_key(tmp_path):
+    from vpn.identity import AuthorizedClients, fingerprint, generate_server_identity
+    generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
+    auth = AuthorizedClients(tmp_path/'clients.json')
+    auth.authorize(b'\x01' * 32, 'test-client')
+    server = runtime.VPNServer(ServerConfig(
+        listen_host='127.0.0.1', control_port=0, udp_port=0,
+        server_identity_private_key=str(tmp_path/'server.key'),
+        server_identity_public_key=str(tmp_path/'server.pub'),
+        authorized_clients_file=str(tmp_path/'clients.json'),
+        dev_emulated_tun=True, dns_servers=[],
+    ))
+    from handshake.kemtls import ResumptionTicketKey
+    original_key = ResumptionTicketKey()
+    server._ticket_key = original_key
+    server._last_auth_snapshot = {'test-client'}
+    auth.revoke(fingerprint(b'\x01' * 32))
+    server._check_revocations()
+    assert server._ticket_key is not original_key
+
+
+def test_rekey_rejects_revoked_client(tmp_path):
+    from vpn.identity import AuthorizedClients, fingerprint, generate_server_identity
+    generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
+    auth = AuthorizedClients(tmp_path/'clients.json')
+    auth.authorize(b'\x01' * 32, 'test-client')
+    server = runtime.VPNServer(ServerConfig(
+        listen_host='127.0.0.1', control_port=0, udp_port=0,
+        server_identity_private_key=str(tmp_path/'server.key'),
+        server_identity_public_key=str(tmp_path/'server.pub'),
+        authorized_clients_file=str(tmp_path/'clients.json'),
+        dev_emulated_tun=True, dns_servers=[],
+    ))
+    mock_session = Mock()
+    mock_session.client_id = 'test-client'
+    auth.revoke(fingerprint(b'\x01' * 32))
+    with pytest.raises(HandshakeError, match="revoked"):
+        server._rekey_server(mock_session, b'\x00' * 36)
