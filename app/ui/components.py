@@ -4,11 +4,11 @@ from __future__ import annotations
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
-    QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QPushButton,
+    QScrollArea, QVBoxLayout, QWidget,
 )
 
-from app.ui.theme import COLORS, STATE_COLORS, badge_style, label
+from app.ui.theme import COLORS, STATE_COLORS, label
 
 
 # ── Cards ─────────────────────────────────────────────────────────────

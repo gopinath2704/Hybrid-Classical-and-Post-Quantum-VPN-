@@ -11,17 +11,17 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QFileDialog, QHBoxLayout, QInputDialog, QMainWindow, QMessageBox,
-    QPushButton, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
+    QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from app.client import (
-    ACCOUNT_SESSION_CHECK_MS, AccountAPIError, AccountClient, AccountSession,
+    ACCOUNT_SESSION_CHECK_MS, AccountClient, AccountSession,
     ClientStatus, ConnectionState, DEFAULT_CONFIG,
     DEVICE_STATUS_LABELS, IPCClient, SessionState, UserProfile,
     _AccountWorker, _IPCWorker, account_ux_state, format_duration,
     public_device_identity, sanitize_error, truncate_fingerprint,
 )
-from app.ui.theme import COLORS, STATE_COLORS, STYLESHEET, badge_style, label
+from app.ui.theme import COLORS, STATE_COLORS, badge_style, label
 from app.ui.components import NavRail, scroll_page
 from app.ui.pages.home import HomePage
 from app.ui.pages.servers import ServersPage
