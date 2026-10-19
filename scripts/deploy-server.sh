@@ -47,12 +47,34 @@ chown pqvpn:root /etc/pqvpn/server_identity_private.key; chmod 0400 /etc/pqvpn/s
 chown root:pqvpn /etc/pqvpn/server_identity_public.key; chmod 0640 /etc/pqvpn/server_identity_public.key
 [[ -f /etc/pqvpn/server.toml ]] || install -o root -g pqvpn -m 0640 config/server.toml /etc/pqvpn/server.toml
 install -m 0644 packaging/common/pqvpn-server.service /etc/systemd/system/pqvpn-server.service
+
+echo '== account API setup'
+id pqvpn-account >/dev/null 2>&1 || useradd --system --home /nonexistent --shell /usr/sbin/nologin pqvpn-account
+usermod -aG pqvpn pqvpn-account
+if [[ ! -f /etc/pqvpn/tls/account-api.crt ]]; then
+  echo '== account API TLS certificate'
+  install -d -o root -g pqvpn-account -m 0750 /etc/pqvpn/tls
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout /etc/pqvpn/tls/account-api.key -out /etc/pqvpn/tls/account-api.crt \
+    -days 3650 -nodes -subj "/CN=pqvpn-account-api"
+  chown pqvpn-account:pqvpn-account /etc/pqvpn/tls/account-api.key
+  chmod 0400 /etc/pqvpn/tls/account-api.key
+  chown root:pqvpn-account /etc/pqvpn/tls/account-api.crt
+  chmod 0644 /etc/pqvpn/tls/account-api.crt
+fi
+[[ -f /etc/pqvpn/account-api.toml ]] || install -o root -g pqvpn-account -m 0640 config/account-api.toml /etc/pqvpn/account-api.toml
+install -m 0644 packaging/common/pqvpn-account-api.service /etc/systemd/system/pqvpn-account-api.service
+# Account API needs read+write on authorized_clients for auto-approve
+touch /etc/pqvpn/authorized_clients.json
+chown root:pqvpn /etc/pqvpn/authorized_clients.json
+chmod 0660 /etc/pqvpn/authorized_clients.json
 systemctl daemon-reload
+systemctl enable --now pqvpn-account-api
 
 if [[ -n $CLIENT_KEY ]]; then
   echo "== authorize client $CLIENT_ID"
   "$PY" -m vpn.cli client authorize "$CLIENT_KEY" --database /etc/pqvpn/authorized_clients.json --client-id "$CLIENT_ID"
-  chown root:pqvpn /etc/pqvpn/authorized_clients.json; chmod 0640 /etc/pqvpn/authorized_clients.json
+  chown root:pqvpn /etc/pqvpn/authorized_clients.json; chmod 0660 /etc/pqvpn/authorized_clients.json
   echo '== doctor'
   sudo -u pqvpn "$PY" -m vpn.cli doctor server --config /etc/pqvpn/server.toml
   echo '== start'
@@ -62,4 +84,5 @@ fi
 
 echo
 echo "Server identity fingerprint: $(sha256sum /etc/pqvpn/server_identity_public.key | cut -d' ' -f1)"
-echo 'Copy /etc/pqvpn/server_identity_public.key to each client (it is public; the private key never leaves this host).'
+echo "Account API listening on port 8443 (HTTPS) with auto-approve enabled."
+echo 'Clients can register at https://<server-ip>:8443 — no manual key copying needed.'

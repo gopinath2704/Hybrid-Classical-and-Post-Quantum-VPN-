@@ -1052,6 +1052,13 @@ class AccountClient:
         logger.info("device bound to account")
         return device
 
+    def server_info(self) -> dict:
+        """Fetch public server connection info (no auth required)."""
+        body = self._request("GET", "/server/info")
+        if not isinstance(body, dict):
+            raise _invalid_response()
+        return body
+
 
 def account_ux_state(
     session_state: SessionState,
@@ -1733,6 +1740,14 @@ if PYSIDE6_AVAILABLE:
                         from vpn.identity import load_profile
                         content = load_profile(Path(str(payload))).to_json()
                         self.action_finished.emit(command, self.ipc.import_profile(content))
+                    elif command == "import_profile_text":
+                        result = self.ipc.import_profile(str(payload))
+                        if "error" not in (result or {}):
+                            profile = (result or {}).get("profile", {})
+                            pid = profile.get("profile_id")
+                            if pid:
+                                self.ipc.select_profile(pid)
+                        self.action_finished.emit(command, result)
                     elif command == "select_profile":
                         self.action_finished.emit(command, self.ipc.select_profile(str(payload)))
                     elif command == "delete_profile":
@@ -2664,9 +2679,14 @@ if PYSIDE6_AVAILABLE:
         def _account_bind_finished(self, ok, data, message, status_code, retry_after) -> None:
             self.device_bind_btn.setText("Register This Device")
             if ok and isinstance(data, dict):
-                self._add_gui_event(
-                    "info", "Device bound to account; VPN access still requires administrator approval"
-                )
+                status = data.get("status", "pending")
+                if status == "approved":
+                    self._add_gui_event("info", "Device registered and approved for VPN access")
+                    self._fetch_server_info_for_profile()
+                else:
+                    self._add_gui_event(
+                        "info", "Device bound to account; VPN access still requires administrator approval"
+                    )
                 self._account_devices = [
                     d for d in self._account_devices if d.get("fingerprint") != data.get("fingerprint")
                 ] + [data]
@@ -2677,6 +2697,38 @@ if PYSIDE6_AVAILABLE:
                 self.device_error.setText(message or "Device registration failed.")
                 self.device_error.show()
             self._render_account_device()
+
+        def _fetch_server_info_for_profile(self) -> None:
+            """Fetch server info to auto-configure a server profile after device approval."""
+            client = self._account_client
+            if client is None:
+                return
+            self._account_worker.submit("server_info", lambda: client.server_info())
+
+        def _account_server_info_finished(self, ok, data, message, status_code, retry_after) -> None:
+            if not ok or not isinstance(data, dict):
+                logger.warning("server info fetch failed; manual profile setup required")
+                return
+            public_key = data.get("public_key", "")
+            fp = data.get("fingerprint", "")
+            host = data.get("host", "")
+            port = data.get("control_port", 51820)
+            subnet = data.get("expected_vpn_subnet", "10.8.0.0/24")
+            if not public_key or not fp or not host:
+                logger.warning("server info incomplete; manual profile setup required")
+                return
+            import uuid
+            profile = json.dumps({
+                "version": 1,
+                "profile_id": str(uuid.uuid4()),
+                "name": host,
+                "server_host": host,
+                "server_control_port": port,
+                "server_identity_public_key": public_key,
+                "server_identity_fingerprint": fp,
+                "expected_vpn_subnet": subnet,
+            })
+            self._queue_onboarding_action("import_profile_text", profile)
 
         def _current_account_device(self) -> dict | None:
             fingerprint = self._last_status.identity_fingerprint
