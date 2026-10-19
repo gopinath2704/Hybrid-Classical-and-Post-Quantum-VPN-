@@ -57,3 +57,9 @@ config/*.lock
 # Local provisioning artifacts (public but deployment-specific trust material)
 *.pqvpn
 *.pqenroll
+
+# Dev runtime data
+dev/accounts.db
+dev/authorized_clients.json
+dev/*.key
+config/.pqvpn_ticket.json

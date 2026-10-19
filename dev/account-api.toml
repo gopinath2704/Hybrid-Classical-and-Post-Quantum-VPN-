@@ -1,0 +1,19 @@
+[account_api]
+database_path = "accounts.db"
+bind_host = "127.0.0.1"
+bind_port = 8443
+allow_insecure_loopback = true
+session_lifetime_seconds = 43200
+login_rate_limit = 10
+login_rate_window_seconds = 60
+login_cooldown_seconds = 30
+registration_rate_limit = 10
+registration_rate_window_seconds = 60
+registration_cooldown_seconds = 30
+body_limit_bytes = 16384
+auto_approve = true
+authorized_clients_file = "authorized_clients.json"
+server_identity_public_key = "server_identity_public.key"
+server_host = "127.0.0.1"
+server_control_port = 51820
+expected_vpn_subnet = "10.8.0.0/24"
