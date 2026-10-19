@@ -1256,24 +1256,14 @@ class AccountSession:
 # guarded means the privileged service never needs to initialize a GUI stack.
 try:
     from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, Signal
-    from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen
+    from PySide6.QtGui import QColor, QPainter, QPen
     from PySide6.QtWidgets import (
         QApplication,
-        QFileDialog,
         QFrame,
-        QGridLayout,
         QHBoxLayout,
         QLabel,
-        QLineEdit,
-        QInputDialog,
-        QMainWindow,
-        QMessageBox,
-        QPlainTextEdit,
-        QProgressBar,
         QPushButton,
         QScrollArea,
-        QSizePolicy,
-        QStackedWidget,
         QVBoxLayout,
         QWidget,
     )

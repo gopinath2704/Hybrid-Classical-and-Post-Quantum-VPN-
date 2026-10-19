@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QHBoxLayout, QPushButton, QProgressBar, QVBoxLayout, QWidget,
 )
 
-from app.ui.theme import COLORS, STATE_COLORS, badge_style, label
+from app.ui.theme import COLORS, badge_style, label
 from app.ui.components import (
     Card, DataRow, MetricCard, PowerButton, StatusRow, SummaryBlock,
 )
