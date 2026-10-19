@@ -6,6 +6,7 @@ Status: **Deployable research/prototype PQ-VPN**. Unit tests are not a deploymen
 approval. First pass doctor, native ML-KEM tests, and the full root namespace
 suite on a disposable Linux VM. Then validate a real VPS with a separate Linux
 client. Privileged namespace, systemd, and VPS results must be recorded separately.
+For an AWS EC2 server, see [aws.md](aws.md) and `scripts/deploy-server.sh`.
 
 ## Exact tested dependencies
 
