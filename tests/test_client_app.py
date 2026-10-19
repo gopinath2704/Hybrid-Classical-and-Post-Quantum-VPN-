@@ -340,7 +340,7 @@ class TestGUIHeadless:
 
     @pytest.fixture
     def window(self, qapp):
-        from app.client import MainWindow
+        from app.ui.window import MainWindow
         fake = self.FakeIPC()
         result = MainWindow(fake, start_polling=False)
         yield result, fake
@@ -350,7 +350,7 @@ class TestGUIHeadless:
     def test_import_succeeds(self):
         """The client module imports without errors."""
         import app.client
-        assert hasattr(app.client, "MainWindow")
+        assert hasattr(app.client, "_launch_gui")
 
     def test_home_constructs_at_target_size(self, window):
         gui, _ = window
@@ -851,42 +851,123 @@ class TestAccountSession:
         assert not errors
 
 
+# ─── Helper: seed an authenticated MainWindow from the live API ──────────
+
+def _sign_in_direct(gui, qapp, url, identifier="alice"):
+    """Sign in by calling the API directly and seeding MainWindow's session."""
+    client = AccountClient(url)
+    token, _user, expires_at = client.login(identifier, ACCOUNT_PASSWORD)
+    me = client.get_me(token)
+    gui._account_client = client
+    gui._account_session.set_session(token, UserProfile.from_dict(me), expires_at)
+    gui._session_timer.start()
+    gui._refresh_account_view()
+    gui._account_worker.submit("devices", lambda: client.list_devices(token))
+    _wait_for(qapp, lambda: gui._account_session.is_authenticated)
+
+
+def _wait_for(qapp, predicate, timeout=15.0):
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    qapp.processEvents()
+    assert predicate()
+
+
+# ─── LoginWindow tests ──────────────────────────────────────────────────
+
 @pytest.mark.skipif(not _pyside6_available(), reason="PySide6 not installed")
-class TestAccountGUI:
+class TestLoginWindow:
     @pytest.fixture
-    def gui(self, qapp):
-        from app.client import MainWindow
-        window = MainWindow(TestGUIHeadless.FakeIPC(), start_polling=False)
+    def login(self, qapp):
+        from app.ui.login import LoginWindow
+        window = LoginWindow()
         yield window
         window.close()
         qapp.processEvents()
 
-    @staticmethod
-    def wait_for(qapp, predicate, timeout=15.0):
-        deadline = time.monotonic() + timeout
-        while not predicate() and time.monotonic() < deadline:
-            qapp.processEvents()
-            time.sleep(0.01)
-        qapp.processEvents()
-        assert predicate()
+    def test_login_flow_emits_signal(self, login, qapp, live_account_api):
+        url, _store, _app = live_account_api
+        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
+        login.api_url.setText(url)
+        login.login_identifier.setText("alice@example.com")
+        login.login_password.setText(ACCOUNT_PASSWORD)
+        received = []
+        login.login_succeeded.connect(lambda: received.append(True))
+        login._on_login()
+        _wait_for(qapp, lambda: login.login_btn.text() == "Sign In")
+        assert received
+        assert login.session_token and login.session_user["username"] == "alice"
+        assert login.login_password.text() == ""
 
-    def sign_in(self, gui, qapp, url, identifier="alice"):
-        gui.account_api_url.setText(url)
-        gui.login_identifier.setText(identifier)
-        gui.login_password.setText(ACCOUNT_PASSWORD)
-        gui._on_login_clicked()
-        self.wait_for(qapp, lambda: gui.login_btn.text() == "Sign In")
+    def test_login_failure_shows_error(self, login, qapp, live_account_api):
+        url, _store, _app = live_account_api
+        login.api_url.setText(url)
+        login.login_identifier.setText("nobody")
+        login.login_password.setText(ACCOUNT_PASSWORD)
+        login._on_login()
+        _wait_for(qapp, lambda: login.login_btn.text() == "Sign In")
+        assert login.login_error.text() == "Invalid username/email or password."
+        assert login.session_token is None
+
+    def test_cleartext_remote_url_refused(self, login):
+        login.api_url.setText("http://203.0.113.5:8443")
+        login.login_identifier.setText("alice")
+        login.login_password.setText(ACCOUNT_PASSWORD)
+        login._on_login()
+        assert "loopback" in login.login_error.text()
+        assert login.login_btn.isEnabled()
+
+    def test_register_validation(self, login):
+        login._show_register()
+        login.register_username.setText("alice")
+        login.register_email.setText("alice@example.com")
+        login.register_password.setText("short")
+        login.register_confirm.setText("short")
+        login._on_register()
+        assert "12" in login.register_error.text()
+        login.register_password.setText(ACCOUNT_PASSWORD)
+        login.register_confirm.setText(ACCOUNT_PASSWORD + "x")
+        login._on_register()
+        assert "match" in login.register_error.text()
+
+    def test_register_then_login(self, login, qapp, live_account_api):
+        url, _store, _app = live_account_api
+        login.api_url.setText(url)
+        login._show_register()
+        login.register_username.setText("newuser")
+        login.register_email.setText("new@example.com")
+        login.register_password.setText(ACCOUNT_PASSWORD)
+        login.register_confirm.setText(ACCOUNT_PASSWORD)
+        login._on_register()
+        _wait_for(qapp, lambda: login.register_btn.text() == "Create Account")
+        assert "created" in login.register_error.text().lower()
+        # After register, the identifier field should be pre-filled
+        assert login.login_identifier.text() == "newuser"
+
+
+# ─── Account GUI tests (MainWindow, post-login) ─────────────────────────
+
+@pytest.mark.skipif(not _pyside6_available(), reason="PySide6 not installed")
+class TestAccountGUI:
+    @pytest.fixture
+    def gui(self, qapp):
+        from app.ui.window import MainWindow
+        window = MainWindow(TestGUIHeadless.FakeIPC(), start_polling=False)
+        yield window
+        window.close()
+        qapp.processEvents()
 
     def test_login_logout_flow_keeps_token_out_of_ui(self, gui, qapp, live_account_api, caplog):
         from PySide6.QtWidgets import QLabel, QLineEdit
         url, store, _app = live_account_api
         AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
         caplog.set_level("DEBUG")
-        self.sign_in(gui, qapp, url, "alice@example.com")
+        _sign_in_direct(gui, qapp, url, "alice@example.com")
         assert gui._account_session.is_authenticated
-        assert gui.account_stack.currentIndex() == 2
+        assert gui.account_stack.currentIndex() == 1  # profile view
         assert gui.profile_username.text() == "@alice"
-        assert gui.login_password.text() == ""
         token = gui._account_session.get_token()
         widgets_text = " ".join(
             w.text() for w in gui.findChildren(QLabel) + gui.findChildren(QLineEdit)
@@ -896,15 +977,9 @@ class TestAccountGUI:
 
         gui._on_logout_clicked()
         assert gui._account_session.get_token() is None
-        assert gui.account_stack.currentIndex() == 0
+        assert gui.account_stack.currentIndex() == 0  # signed-out view
         token_hash = __import__("hashlib").sha256(token.encode()).digest()
-        self.wait_for(qapp, lambda: store.get_session_by_token_hash(token_hash).revoked_at)
-
-    def test_login_failure_is_sanitized(self, gui, qapp, live_account_api):
-        url, _store, _app = live_account_api
-        self.sign_in(gui, qapp, url, "nobody")
-        assert not gui._account_session.is_authenticated
-        assert gui.login_error.text() == "Invalid username/email or password."
+        _wait_for(qapp, lambda: store.get_session_by_token_hash(token_hash).revoked_at)
 
     def test_logout_clears_locally_when_api_unavailable(self, gui):
         gui._account_session.set_session("tok", TestAccountSession.USER, "")
@@ -913,15 +988,15 @@ class TestAccountGUI:
         assert gui._account_session.get_token() is None
         assert gui._account_session.state == SessionState.LOGGED_OUT
 
-    def test_revoked_session_returns_to_login(self, gui, qapp, live_account_api):
+    def test_revoked_session_shows_signed_out(self, gui, qapp, live_account_api):
         url, _store, _app = live_account_api
         AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
-        self.sign_in(gui, qapp, url)
+        _sign_in_direct(gui, qapp, url)
         AccountClient(url).logout(gui._account_session.get_token())
         gui._validate_account_session()
-        self.wait_for(qapp, lambda: gui._account_session.state == SessionState.SESSION_EXPIRED)
+        _wait_for(qapp, lambda: gui._account_session.state == SessionState.SESSION_EXPIRED)
         assert gui.account_stack.currentIndex() == 0
-        assert "expired" in gui.login_error.text()
+        assert "expired" in gui.signed_out_message.text().lower()
 
     def test_api_unavailable_keeps_session_and_warns(self, gui):
         gui._account_session.set_session("tok", TestAccountSession.USER, "")
@@ -929,32 +1004,33 @@ class TestAccountGUI:
         assert gui._account_session.is_authenticated
         assert "UNAVAILABLE" in gui.profile_session_badge.text()
 
-    def test_cleartext_remote_url_is_refused_inline(self, gui):
-        gui.account_api_url.setText("http://203.0.113.5:8443")
-        gui.login_identifier.setText("alice")
-        gui.login_password.setText(ACCOUNT_PASSWORD)
-        gui._on_login_clicked()
-        assert "loopback" in gui.login_error.text()
-        assert gui.login_btn.isEnabled()
-
-    def test_register_client_validation(self, gui):
-        gui.register_username.setText("alice")
-        gui.register_email.setText("alice@example.com")
-        gui.register_password.setText("short")
-        gui.register_confirm.setText("short")
-        gui._on_register_clicked()
-        assert "12" in gui.register_error.text()
-        gui.register_password.setText(ACCOUNT_PASSWORD)
-        gui.register_confirm.setText(ACCOUNT_PASSWORD + "x")
-        gui._on_register_clicked()
-        assert "match" in gui.register_error.text()
-
     def test_login_never_touches_authorized_clients(self, gui, qapp, live_account_api, tmp_path):
         url, _store, _app = live_account_api
         AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
-        self.sign_in(gui, qapp, url)
+        _sign_in_direct(gui, qapp, url)
         assert gui._account_session.is_authenticated
         assert not list(tmp_path.rglob("authorized_clients.json"))
+
+    def test_session_seeded_at_construction(self, qapp, live_account_api):
+        """MainWindow constructed with session data starts authenticated."""
+        from app.ui.window import MainWindow
+        url, _store, _app = live_account_api
+        client = AccountClient(url)
+        client.register("seeded", "seeded@example.com", ACCOUNT_PASSWORD)
+        token, _user, expires = client.login("seeded", ACCOUNT_PASSWORD)
+        me = client.get_me(token)
+        window = MainWindow(
+            TestGUIHeadless.FakeIPC(), start_polling=False,
+            account_client=client, session_token=token,
+            session_user=me, session_expires_at=expires,
+        )
+        try:
+            assert window._account_session.is_authenticated
+            assert window.profile_username.text() == "@seeded"
+            assert window.account_stack.currentIndex() == 1
+        finally:
+            window.close()
+            qapp.processEvents()
 
 
 # ─── Milestone 4.4: account ↔ managed device binding ──────────────────────
@@ -1009,7 +1085,7 @@ class TestDeviceBindingGUI:
 
     @pytest.fixture
     def gui(self, qapp):
-        from app.client import MainWindow
+        from app.ui.window import MainWindow
         ipc = self.IdentityIPC()
         window = MainWindow(ipc, start_polling=False)
         window._render(ClientStatus(
@@ -1023,12 +1099,12 @@ class TestDeviceBindingGUI:
     def test_bind_current_device_sends_public_identity_only(self, gui, qapp, live_account_api):
         url, store, _app = live_account_api
         AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
-        TestAccountGUI().sign_in(gui, qapp, url)
-        TestAccountGUI.wait_for(qapp, lambda: gui.device_bind_btn.isEnabled())
+        _sign_in_direct(gui, qapp, url)
+        _wait_for(qapp, lambda: gui.device_bind_btn.isEnabled())
         assert gui.device_binding_row.value_label.text() == "Not registered"
         gui.device_name_input.setText("work laptop")
         gui._on_bind_device_clicked()
-        TestAccountGUI.wait_for(qapp, lambda: gui._current_account_device() is not None)
+        _wait_for(qapp, lambda: gui._current_account_device() is not None)
         assert gui.device_binding_row.value_label.text() == (
             "Registered as work laptop · Pending administrator approval"
         )
@@ -1047,7 +1123,7 @@ class TestDeviceBindingGUI:
         gui._account_client = AccountClient("http://127.0.0.1:1")
         gui.ipc.setup_status = lambda: {"error": "Service not running"}
         gui._on_bind_device_clicked()
-        TestAccountGUI.wait_for(qapp, lambda: gui.device_error.isVisible() or not gui.device_error.isHidden())
+        _wait_for(qapp, lambda: gui.device_error.isVisible() or not gui.device_error.isHidden())
         assert "identity" in gui.device_error.text().lower()
 
 
@@ -1091,7 +1167,7 @@ class TestAccountUXState:
 class TestAccountAwareHome:
     @pytest.fixture
     def gui(self, qapp):
-        from app.client import MainWindow
+        from app.ui.window import MainWindow
         window = MainWindow(TestDeviceBindingGUI.IdentityIPC(), start_polling=False)
         window._render(ClientStatus(
             state="DISCONNECTED", managed_mode=True, identity_ready=True,
@@ -1105,12 +1181,12 @@ class TestAccountAwareHome:
         url, store, _app = live_account_api
         assert gui.account_ux_key == "logged_out"
         AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
-        TestAccountGUI().sign_in(gui, qapp, url)
-        TestAccountGUI.wait_for(qapp, lambda: gui.account_ux_key == "no_device")
+        _sign_in_direct(gui, qapp, url)
+        _wait_for(qapp, lambda: gui.account_ux_key == "no_device")
         assert gui.home_account_user.value_label.text() == "alice · alice@example.com"
 
         gui._on_bind_device_clicked()
-        TestAccountGUI.wait_for(qapp, lambda: gui.account_ux_key == "device_pending")
+        _wait_for(qapp, lambda: gui.account_ux_key == "device_pending")
         assert "Pending" in gui.home_account_device.value_label.text()
 
         # Administrator approves on the server; the next session check picks it up.
@@ -1119,11 +1195,11 @@ class TestAccountAwareHome:
         cli(["account", "approve", str(device.id), "--accounts-db", str(store.path),
              "--database", str(tmp_path / "authorized_clients.json")])
         gui._validate_account_session()
-        TestAccountGUI.wait_for(qapp, lambda: gui.account_ux_key == "approved_disconnected")
+        _wait_for(qapp, lambda: gui.account_ux_key == "approved_disconnected")
 
         store.set_device_enabled(device.id, False)
         gui._validate_account_session()
-        TestAccountGUI.wait_for(qapp, lambda: gui.account_ux_key == "device_disabled")
+        _wait_for(qapp, lambda: gui.account_ux_key == "device_disabled")
 
         gui._on_logout_clicked()
         assert gui.account_ux_key == "logged_out"
