@@ -706,9 +706,14 @@ class MainWindow(QMainWindow):
         a = self._account
         a.device_bind_btn.setText("Register This Device")
         if ok and isinstance(data, dict):
-            self._add_gui_event(
-                "info", "Device bound to account; VPN access still requires administrator approval"
-            )
+            status = data.get("status", "pending")
+            if status == "approved":
+                self._add_gui_event("info", "Device registered and approved for VPN access")
+                self._fetch_server_info_for_profile()
+            else:
+                self._add_gui_event(
+                    "info", "Device bound to account; VPN access still requires administrator approval"
+                )
             self._account_devices = [
                 d for d in self._account_devices if d.get("fingerprint") != data.get("fingerprint")
             ] + [data]
@@ -719,6 +724,37 @@ class MainWindow(QMainWindow):
             a.device_error.setText(message or "Device registration failed.")
             a.device_error.show()
         self._render_account_device()
+
+    def _fetch_server_info_for_profile(self) -> None:
+        """Fetch server info to auto-configure a server profile after device approval."""
+        client = self._account_client
+        if client is None:
+            return
+        self._account_worker.submit("server_info", lambda: client.server_info())
+
+    def _account_server_info_finished(self, ok, data, message, status_code, retry_after) -> None:
+        if not ok or not isinstance(data, dict):
+            return
+        import json
+        import uuid
+        public_key = data.get("public_key", "")
+        fp = data.get("fingerprint", "")
+        host = data.get("host", "")
+        port = data.get("control_port", 51820)
+        subnet = data.get("expected_vpn_subnet", "10.8.0.0/24")
+        if not public_key or not fp or not host:
+            return
+        profile = json.dumps({
+            "version": 1,
+            "profile_id": str(uuid.uuid4()),
+            "name": host,
+            "server_host": host,
+            "server_control_port": port,
+            "server_identity_public_key": public_key,
+            "server_identity_fingerprint": fp,
+            "expected_vpn_subnet": subnet,
+        })
+        self._queue_onboarding_action("import_profile_text", profile)
 
     def _account_mfa_setup_finished(self, ok, data, message, status_code, retry_after) -> None:
         a = self._account

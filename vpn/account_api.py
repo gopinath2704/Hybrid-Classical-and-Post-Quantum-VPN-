@@ -25,6 +25,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from vpn.identity import AuthorizedClients
+
 from vpn.accounts import (
     DEFAULT_ACCOUNT_DATABASE,
     MAX_DEVICE_NAME_LENGTH,
@@ -80,6 +82,12 @@ class AccountAPIConfig:
     login_rate_limit_entries: int = 4096
     registration_rate_limit_entries: int = 2048
     body_limit_bytes: int = DEFAULT_BODY_LIMIT
+    auto_approve: bool = False
+    authorized_clients_file: Path = Path("/etc/pqvpn/authorized_clients.json")
+    server_identity_public_key: Path = Path("/etc/pqvpn/server_identity_public.key")
+    server_host: str = ""
+    server_control_port: int = 51820
+    expected_vpn_subnet: str = "10.8.0.0/24"
 
     def validate(self) -> None:
         if not isinstance(self.database_path, Path):
@@ -129,6 +137,23 @@ class AccountAPIConfig:
         for name, (value, minimum, maximum) in numeric_bounds.items():
             if type(value) is not int or not minimum <= value <= maximum:
                 raise AccountAPIConfigError(f"{name} must be in {minimum}..{maximum}")
+        if type(self.auto_approve) is not bool:
+            raise AccountAPIConfigError("auto_approve must be boolean")
+        if not isinstance(self.authorized_clients_file, Path):
+            raise AccountAPIConfigError("authorized_clients_file must be a filesystem path")
+        if not isinstance(self.server_identity_public_key, Path):
+            raise AccountAPIConfigError("server_identity_public_key must be a filesystem path")
+        if not isinstance(self.server_host, str):
+            raise AccountAPIConfigError("server_host must be a string")
+        if type(self.server_control_port) is not int or not 1 <= self.server_control_port <= 65535:
+            raise AccountAPIConfigError("server_control_port must be in 1..65535")
+        if not isinstance(self.expected_vpn_subnet, str):
+            raise AccountAPIConfigError("expected_vpn_subnet must be a string")
+        if self.expected_vpn_subnet:
+            try:
+                ipaddress.IPv4Network(self.expected_vpn_subnet, strict=True)
+            except (TypeError, ValueError):
+                raise AccountAPIConfigError("expected_vpn_subnet must be a valid IPv4 CIDR")
 
 
 def _validate_tls_file(path: Path | None, description: str, *, private: bool) -> None:
@@ -167,7 +192,7 @@ def load_account_api_config(path: Path | str = DEFAULT_CONFIG) -> AccountAPIConf
     if unknown:
         raise AccountAPIConfigError(f"unknown account API setting: {sorted(unknown)[0]}")
     base = config_path.parent
-    for name in ("database_path", "tls_cert", "tls_key"):
+    for name in ("database_path", "tls_cert", "tls_key", "authorized_clients_file", "server_identity_public_key"):
         if name in values and values[name] is not None:
             if not isinstance(values[name], str):
                 raise AccountAPIConfigError(f"{name} must be a path string")
@@ -435,6 +460,31 @@ async def get_authenticated_user(request: Request) -> AuthenticatedContext | JSO
     return AuthenticatedContext(user=user, session=session, token_hash=token_hash)
 
 
+def _auto_approve_device(
+    store: AccountStore,
+    device: DeviceRecord,
+    public_key: bytes,
+    username: str,
+    config: AccountAPIConfig,
+    request: Request,
+) -> DeviceRecord:
+    """Approve a device and authorize it for VPN access; return the updated record on success."""
+    try:
+        store.set_device_status(device.id, "approved", expected=("pending",))
+        client_id = f"{username}-{device.id}"
+        AuthorizedClients(config.authorized_clients_file).authorize(public_key, client_id)
+        updated = store.get_device_by_id(device.id)
+        if updated is not None:
+            device = updated
+        logger.info(
+            "device auto-approved device_id=%d client_id=%s source=%s",
+            device.id, client_id, _source(request),
+        )
+    except Exception:
+        logger.exception("auto-approve failed device_id=%d source=%s", device.id, _source(request))
+    return device
+
+
 def create_app(
     config: AccountAPIConfig,
     *,
@@ -585,6 +635,11 @@ def create_app(
             pass  # rejected with the full validation message below
         if existing is not None:
             if existing.user_id == context.user.id and existing.client_public_key == public_key:
+                if config.auto_approve and existing.status == "pending":
+                    existing = _auto_approve_device(
+                        account_store, existing, public_key,
+                        context.user.username, config, request,
+                    )
                 return JSONResponse(status_code=200, content={"device": _public_device(existing)})
             logger.info("device binding rejected category=duplicate user_id=%d", context.user.id)
             return _error(409, "device_exists", "device identity is already registered")
@@ -602,6 +657,11 @@ def create_app(
             "device bound user_id=%d device_id=%d source=%s",
             context.user.id, device.id, _source(request),
         )
+        if config.auto_approve:
+            device = _auto_approve_device(
+                account_store, device, public_key,
+                context.user.username, config, request,
+            )
         return JSONResponse(status_code=201, content={"device": _public_device(device)})
 
     @application.post("/auth/logout", status_code=204)
@@ -665,6 +725,21 @@ def create_app(
             return _error(401, "invalid_session", "session is no longer valid")
         logger.info("mfa disabled user_id=%d source=%s", context.user.id, _source(request))
         return {"status": "mfa_disabled"}
+
+    @application.get("/server/info")
+    async def server_info():
+        result: dict[str, object] = {"control_port": config.server_control_port}
+        if config.server_host:
+            result["host"] = config.server_host
+        if config.expected_vpn_subnet:
+            result["expected_vpn_subnet"] = config.expected_vpn_subnet
+        try:
+            pub_key = config.server_identity_public_key.read_bytes()
+            result["public_key"] = base64.b64encode(pub_key).decode("ascii")
+            result["fingerprint"] = hashlib.sha256(pub_key).hexdigest()
+        except OSError:
+            pass
+        return result
 
     return application
 

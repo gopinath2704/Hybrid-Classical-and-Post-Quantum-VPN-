@@ -1091,6 +1091,13 @@ class AccountClient:
         logger.info("device bound to account")
         return device
 
+    def server_info(self) -> dict:
+        """Fetch public server connection info (no auth required)."""
+        body = self._request("GET", "/server/info")
+        if not isinstance(body, dict):
+            raise _invalid_response()
+        return body
+
 
 def account_ux_state(
     session_state: SessionState,
@@ -1769,6 +1776,14 @@ if PYSIDE6_AVAILABLE:
                         from vpn.identity import load_profile
                         content = load_profile(Path(str(payload))).to_json()
                         self.action_finished.emit(command, self.ipc.import_profile(content))
+                    elif command == "import_profile_text":
+                        result = self.ipc.import_profile(str(payload))
+                        if "error" not in (result or {}):
+                            profile = (result or {}).get("profile", {})
+                            pid = profile.get("profile_id")
+                            if pid:
+                                self.ipc.select_profile(pid)
+                        self.action_finished.emit(command, result)
                     elif command == "select_profile":
                         self.action_finished.emit(command, self.ipc.select_profile(str(payload)))
                     elif command == "delete_profile":
