@@ -25,7 +25,7 @@ MemoryDenyWriteExecute=true
 CapabilityBoundingSet=
 StateDirectory=pqvpn/accounts
 StateDirectoryMode=0700
-ReadWritePaths=/var/lib/pqvpn/accounts /etc/pqvpn/authorized_clients.json
+ReadWritePaths=/var/lib/pqvpn/accounts /var/lib/pqvpn/authorized
 InaccessiblePaths=-/etc/pqvpn/server_identity_private.key -/var/lib/pqvpn/client_identity_private.key
 UMask=0077
 

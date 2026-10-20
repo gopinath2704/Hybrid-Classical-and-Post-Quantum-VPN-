@@ -181,7 +181,7 @@ def test_concurrent_database_updates_are_not_lost(db):
     with ThreadPoolExecutor(max_workers=6) as pool:
         list(pool.map(lambda pair: AuthorizedClients(db.path).authorize(pair[1],f'client{pair[0]}'),enumerate(keys)))
     assert len(db._load()['clients'])==13
-    assert db.path.stat().st_mode & 0o777 == 0o600
+    assert db.path.stat().st_mode & 0o777 == 0o640  # group pqvpn reads, never world
     assert db.revoke(db._load()['clients'][0]['fingerprint'])
 
 
@@ -324,7 +324,8 @@ def test_deployment_documents_preserve_systemd_boundary():
         assert '--chown=pqvpn:pqvpn' not in text
         assert 'sudo -u pqvpn python3.14 -m venv /opt/pqvpn' not in text
         assert 'sudo -u pqvpn .venv/bin/python -m vpn.cli client authorize' not in text
-        assert 'sudo chmod 0640 /etc/pqvpn/authorized_clients.json' in text
+        assert 'sudo install -d -o root -g pqvpn -m 2770 /var/lib/pqvpn/authorized' in text
+        assert '/etc/pqvpn/authorized_clients.json' not in text
         assert 'sudo chmod 0400 /etc/pqvpn/server_identity_private.key' in text
         assert 'sudo chown -R root:root /opt/pqvpn' in text
     for name in ('deployment.md', 'deployment.md', 'security_audit.md'):

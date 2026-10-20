@@ -27,11 +27,14 @@ def fingerprint(public_key: bytes) -> str:
     return hashlib.sha256(public_key).hexdigest()
 
 
-def _atomic_private(path: Path, data: bytes) -> None:
+def _atomic_private(path: Path, data: bytes, mode: int = 0o600) -> None:
+    if mode & 0o007: raise ValueError('refusing a world-accessible file mode')
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        os.fchmod(fd, 0o600)
+        # Group bits go to the directory's group (e.g. pqvpn), whoever writes.
+        if mode & 0o070: os.fchown(fd, -1, path.parent.stat().st_gid)
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
@@ -271,8 +274,10 @@ class AuthorizedClients:
     @contextmanager
     def _lock(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(self.path) + '.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, 'w') as handle:
+        # Read-only open is enough for flock and lets root and pqvpn-account share one lock.
+        fd = os.open(str(self.path) + '.lock', os.O_CREAT | os.O_RDONLY | os.O_NOFOLLOW, 0o640)
+        if os.fstat(fd).st_uid == os.geteuid(): os.fchmod(fd, 0o640)
+        with os.fdopen(fd, 'r') as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
             yield
 
@@ -285,7 +290,7 @@ class AuthorizedClients:
                 'fingerprint': fp, 'enabled': True, 'created_at': datetime.now(timezone.utc).isoformat(), 'assigned_ip': assigned_ip}
             db['clients'] = [x for x in db['clients'] if x['fingerprint'] != fp] + [record]
             self.validate(db)
-            _atomic_private(self.path, (json.dumps(db, indent=2) + '\n').encode())
+            _atomic_private(self.path, (json.dumps(db, indent=2) + '\n').encode(), 0o640)
         return fp
 
     def revoke(self, fp: str) -> bool:
@@ -294,7 +299,7 @@ class AuthorizedClients:
             found = False
             for item in db['clients']:
                 if item['fingerprint'] == fp: item['enabled'] = False; found = True
-            if found: _atomic_private(self.path, (json.dumps(db, indent=2) + '\n').encode())
+            if found: _atomic_private(self.path, (json.dumps(db, indent=2) + '\n').encode(), 0o640)
             return found
 
     def is_client_authorized(self, client_id: str) -> bool:

@@ -166,33 +166,44 @@ sudo .venv/bin/python -m app.client --service --config config/client.toml
 
 ### Client enrollment
 
+Self-service (default): sign in from the GUI and the device is enrolled for you.
+
+```
+Install  →  Launch PQ-VPN  →  Device identity auto-created
+   →  Register / Sign in (account API over TLS)  →  Device bound + auto-approved
+   →  Server profile fetched automatically  →  Connect
+```
+
+- The GUI reads `PQVPN_ACCOUNT_API_URL` (default `http://127.0.0.1:8443`, cleartext loopback only) and optional `PQVPN_ACCOUNT_CA_CERT` (extra trusted certificate, added to the system store). TLS verification stays strict, so the server certificate must carry a SAN for the host you connect to:
+
+  ```bash
+  # server: cert SAN covers the public host (re-run regenerates the cert if it doesn't match)
+  sudo env PQVPN_PUBLIC_HOST=<server-ip-or-dns> bash scripts/deploy-server.sh
+  # client: fetch /etc/pqvpn/tls/account-api.crt over SSH (not the API port), then
+  PQVPN_ACCOUNT_API_URL=https://<server-ip-or-dns>:8443 \
+  PQVPN_ACCOUNT_CA_CERT=~/.config/pqvpn/server-account-api.crt  python -m app.client
+  ```
+- With `auto_approve = true` in `account-api.toml` (the default), binding a device adds its public key to `/var/lib/pqvpn/authorized/authorized_clients.json`; no admin step
+- The client then calls `GET /server/info` and imports the server profile (endpoint, pinned ML-KEM-768 key, VPN subnet) itself, so there is no `.pqvpn` import and no hand-edited `client.toml`
+- Account API: `POST /auth/register`, `/auth/login`, `/devices`; `GET /devices`, `/server/info`; optional MFA and password change. See [docs/accounts.md](docs/accounts.md)
+- Server side: `scripts/deploy-server.sh` provisions the `pqvpn-account` user, TLS certificate and `pqvpn-account-api.service`
+
+**The account API must be reachable by clients (TCP 8443) for self-service.** Restrict the source in your firewall or security group where you can. With `auto_approve = true`, anyone who can register can obtain tunnel access; set it to `false` to require administrator approval.
+
+Manual / offline fallback (no account API, `auto_approve = false`):
+
 ```bash
-# Export an enrollment request
 python -m vpn.cli client enrollment-request \
   --output my-device.pqenroll \
   --client-id my-device \
   --public-key /path/to/client_identity_public.key
 
-# Administrator authorizes it
 sudo python -m vpn.cli client authorize-request my-device.pqenroll \
-  --database /etc/pqvpn/authorized_clients.json \
+  --database /var/lib/pqvpn/authorized/authorized_clients.json \
   --vpn-ip 10.8.0.9
 ```
 
----
-
-## Onboarding flow
-
-```
-Install  →  Launch PQ-VPN  →  Device identity auto-created
-   →  Import server.pqvpn  →  Export device.pqenroll
-   →  Admin authorizes offline  →  Connect
-```
-
-- `.pqvpn` profiles contain the server endpoint, pinned ML-KEM-768 public key, and VPN subnet
-- `.pqenroll` requests contain the client's public Ed25519 key and fingerprint
-- Neither format permits private keys, passwords, tokens, or commands
-- No TOFU, no server discovery, no Internet-facing enrollment API
+Import a `server.pqvpn` profile by hand in that mode. Profiles hold only public data: endpoint, pinned ML-KEM-768 key, subnet. No private keys, passwords, tokens or commands; no TOFU.
 
 ---
 

@@ -197,9 +197,7 @@ sudo /opt/pqvpn/.venv/bin/python -m vpn.cli account devices --status pending \
   --accounts-db /var/lib/pqvpn/accounts/accounts.db
 sudo /opt/pqvpn/.venv/bin/python -m vpn.cli account approve DEVICE_ID \
   --accounts-db /var/lib/pqvpn/accounts/accounts.db \
-  --database /etc/pqvpn/authorized_clients.json [--vpn-ip 10.8.0.N]
-sudo chown root:pqvpn /etc/pqvpn/authorized_clients.json
-sudo chmod 0640 /etc/pqvpn/authorized_clients.json
+  --database /var/lib/pqvpn/authorized/authorized_clients.json [--vpn-ip 10.8.0.N]
 ```
 
 | Command | Allowed from | Account DB | `AuthorizedClients` |

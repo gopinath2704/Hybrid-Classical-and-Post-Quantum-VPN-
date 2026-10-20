@@ -126,9 +126,7 @@ client ID/fingerprint, and authorize it through the existing database abstractio
 ```bash
 sudo /opt/pqvpn/.venv/bin/python -m vpn.cli client authorize-request \
   /tmp/shadow-laptop.pqenroll \
-  --database /etc/pqvpn/authorized_clients.json
-sudo chown root:pqvpn /etc/pqvpn/authorized_clients.json
-sudo chmod 0640 /etc/pqvpn/authorized_clients.json
+  --database /var/lib/pqvpn/authorized/authorized_clients.json
 ```
 
 The parser rejects malformed/oversized JSON, duplicate properties, non-Ed25519 key
@@ -231,6 +229,7 @@ redistribution of these packages must remain blocked until the owner adds one.
 sudo useradd --system --home /opt/pqvpn --shell /usr/sbin/nologin pqvpn
 sudo install -d -o root -g root -m 0755 /opt/pqvpn
 sudo install -d -o root -g pqvpn -m 0750 /etc/pqvpn
+sudo install -d -o root -g pqvpn -m 2770 /var/lib/pqvpn/authorized
 sudo rsync -a --chown=root:root --exclude=.git --exclude=.venv --exclude=venv --exclude=env --exclude=ENV --exclude=__pycache__ --exclude=.pytest_cache ./ /opt/pqvpn/
 sudo python3 -m venv /opt/pqvpn/.venv
 sudo /opt/pqvpn/.venv/bin/python -m pip install -c /opt/pqvpn/constraints-tested.txt /opt/pqvpn
@@ -245,9 +244,7 @@ sudo chmod 0640 /etc/pqvpn/server_identity_public.key
 sudo install -o root -g pqvpn -m 0640 config/server.toml /etc/pqvpn/server.toml
 sudo editor /etc/pqvpn/server.toml
 # Obtain only the client's public key through authenticated provisioning.
-sudo .venv/bin/python -m vpn.cli client authorize /tmp/alice_public.key --database /etc/pqvpn/authorized_clients.json --client-id alice
-sudo chown root:pqvpn /etc/pqvpn/authorized_clients.json
-sudo chmod 0640 /etc/pqvpn/authorized_clients.json
+sudo .venv/bin/python -m vpn.cli client authorize /tmp/alice_public.key --database /var/lib/pqvpn/authorized/authorized_clients.json --client-id alice
 ```
 
 Private identity files must be regular, non-symlink files with mode 0600 or 0400.
@@ -403,9 +400,7 @@ this prototype baseline.
 ## Revocation semantics
 
 ```bash
-sudo /opt/pqvpn/.venv/bin/python -m vpn.cli client revoke FINGERPRINT --database /etc/pqvpn/authorized_clients.json
-sudo chown root:pqvpn /etc/pqvpn/authorized_clients.json
-sudo chmod 0640 /etc/pqvpn/authorized_clients.json
+sudo /opt/pqvpn/.venv/bin/python -m vpn.cli client revoke FINGERPRINT --database /var/lib/pqvpn/authorized/authorized_clients.json
 ```
 
 Revocation disables future authentication: a new ClientHello reads the updated
@@ -461,11 +456,12 @@ the daemon cannot replace it through the directory. As its file owner, it could
 chmod its private key, so 0400 is not immutability against a compromised daemon.
 No private key or policy file is imported/executed by the privileged helpers.
 
-Run authorize/revoke as root. Each successful atomic update creates a root-owned
-0600 database; immediately restore `root:pqvpn 0640` with the documented chown/chmod
-commands, including after future updates. Between replacement and chmod daemon
-reads fail closed. The root-only lock and temporary files stay in `/etc/pqvpn`;
-locking, fsync and atomic replacement are unchanged. Never grant the service
+Run authorize/revoke as root. The database lives in `/var/lib/pqvpn/authorized`
+(`root:pqvpn 2770`, setgid) with its lock and temporary files, so the account API
+(group `pqvpn`) can update it without write access to `/etc/pqvpn`. Each atomic
+update writes mode `0640` with the directory's group, so no chown/chmod follows;
+never chown/chmod paths inside that group-writable directory as root. Locking,
+fsync and atomic replacement are unchanged. Never grant any service account
 configuration-directory write access to support administration.
 
 Server doctor checks the complete `/opt/pqvpn` tree, symlink targets and ancestors
@@ -656,7 +652,7 @@ Transfer the public request to the VM and authorize it there:
 ```bash
 scp "$HOME/Downloads/shadow-laptop.pqenroll" shadowuser@192.168.8.43:/tmp/
 ssh -t shadowuser@192.168.8.43 \
-  'sudo /opt/pqvpn/.venv/bin/python -m vpn.cli client authorize-request /tmp/shadow-laptop.pqenroll --database /etc/pqvpn/authorized_clients.json && sudo chown root:pqvpn /etc/pqvpn/authorized_clients.json && sudo chmod 0640 /etc/pqvpn/authorized_clients.json'
+  'sudo /opt/pqvpn/.venv/bin/python -m vpn.cli client authorize-request /tmp/shadow-laptop.pqenroll --database /var/lib/pqvpn/authorized/authorized_clients.json'
 ```
 
 Before clicking Connect, capture the client baseline:
@@ -823,6 +819,7 @@ systemd. On a fresh machine, from the clean source checkout:
 sudo useradd --system --home /opt/pqvpn --shell /usr/sbin/nologin pqvpn
 sudo install -d -o root -g root -m 0755 /opt/pqvpn
 sudo install -d -o root -g pqvpn -m 0750 /etc/pqvpn
+sudo install -d -o root -g pqvpn -m 2770 /var/lib/pqvpn/authorized
 sudo rsync -a --chown=root:root --exclude=.git --exclude=.venv --exclude=venv --exclude=env --exclude=ENV --exclude=__pycache__ --exclude=.pytest_cache ./ /opt/pqvpn/
 sudo python3 -m venv /opt/pqvpn/.venv
 sudo /opt/pqvpn/.venv/bin/python -m pip install -c /opt/pqvpn/constraints-tested.txt /opt/pqvpn
@@ -859,12 +856,8 @@ channel. Set the real server host/control port, matching `expected_vpn_subnet`,
 public key to the administrator. On the VPS, using the received public files:
 
 ```bash
-sudo .venv/bin/python -m vpn.cli client authorize /tmp/alice_public.key --database /etc/pqvpn/authorized_clients.json --client-id alice
-sudo chown root:pqvpn /etc/pqvpn/authorized_clients.json
-sudo chmod 0640 /etc/pqvpn/authorized_clients.json
-sudo .venv/bin/python -m vpn.cli client authorize /tmp/bob_public.key --database /etc/pqvpn/authorized_clients.json --client-id bob
-sudo chown root:pqvpn /etc/pqvpn/authorized_clients.json
-sudo chmod 0640 /etc/pqvpn/authorized_clients.json
+sudo .venv/bin/python -m vpn.cli client authorize /tmp/alice_public.key --database /var/lib/pqvpn/authorized/authorized_clients.json --client-id alice
+sudo .venv/bin/python -m vpn.cli client authorize /tmp/bob_public.key --database /var/lib/pqvpn/authorized/authorized_clients.json --client-id bob
 sudo -u pqvpn .venv/bin/python -m vpn.cli doctor server --config /etc/pqvpn/server.toml
 python3 -m venv /tmp/pqvpn-validation
 /tmp/pqvpn-validation/bin/python -m pip install -c constraints-tested.txt '.[dev]'
@@ -964,11 +957,12 @@ the daemon cannot replace it through the directory. As its file owner, it could
 chmod its private key, so 0400 is not immutability against a compromised daemon.
 No private key or policy file is imported/executed by the privileged helpers.
 
-Run authorize/revoke as root. Each successful atomic update creates a root-owned
-0600 database; immediately restore `root:pqvpn 0640` with the documented chown/chmod
-commands, including after future updates. Between replacement and chmod daemon
-reads fail closed. The root-only lock and temporary files stay in `/etc/pqvpn`;
-locking, fsync and atomic replacement are unchanged. Never grant the service
+Run authorize/revoke as root. The database lives in `/var/lib/pqvpn/authorized`
+(`root:pqvpn 2770`, setgid) with its lock and temporary files, so the account API
+(group `pqvpn`) can update it without write access to `/etc/pqvpn`. Each atomic
+update writes mode `0640` with the directory's group, so no chown/chmod follows;
+never chown/chmod paths inside that group-writable directory as root. Locking,
+fsync and atomic replacement are unchanged. Never grant any service account
 configuration-directory write access to support administration.
 
 Server doctor checks the complete `/opt/pqvpn` tree, symlink targets and ancestors

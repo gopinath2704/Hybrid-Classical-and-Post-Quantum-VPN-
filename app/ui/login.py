@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.client import (
-    DEFAULT_ACCOUNT_API_URL, AccountAPIError, AccountClient,
+    AccountAPIError, AccountClient,
     _AccountWorker, _ACCOUNT_ERROR_MESSAGES,
 )
 
@@ -989,7 +989,7 @@ class LoginWindow(QWidget):
 
     def _get_or_create_client(self) -> AccountClient:
         if self.account_client is None:
-            self.account_client = AccountClient(DEFAULT_ACCOUNT_API_URL)
+            self.account_client = AccountClient.from_env()
         return self.account_client
 
     def _submit(self, op: str, call, error_label=None) -> bool:

@@ -83,7 +83,7 @@ class AccountAPIConfig:
     registration_rate_limit_entries: int = 2048
     body_limit_bytes: int = DEFAULT_BODY_LIMIT
     auto_approve: bool = False
-    authorized_clients_file: Path = Path("/etc/pqvpn/authorized_clients.json")
+    authorized_clients_file: Path = Path("/var/lib/pqvpn/authorized/authorized_clients.json")
     server_identity_public_key: Path = Path("/etc/pqvpn/server_identity_public.key")
     server_host: str = ""
     server_control_port: int = 51820
@@ -468,21 +468,24 @@ def _auto_approve_device(
     config: AccountAPIConfig,
     request: Request,
 ) -> DeviceRecord:
-    """Approve a device and authorize it for VPN access; return the updated record on success."""
+    """Authorize first, then mark approved; on failure the device stays pending so a re-bind retries."""
+    client_id = f"{username}-{device.id}"
+    authorized = AuthorizedClients(config.authorized_clients_file)
     try:
-        store.set_device_status(device.id, "approved", expected=("pending",))
-        client_id = f"{username}-{device.id}"
-        AuthorizedClients(config.authorized_clients_file).authorize(public_key, client_id)
-        updated = store.get_device_by_id(device.id)
-        if updated is not None:
-            device = updated
-        logger.info(
-            "device auto-approved device_id=%d client_id=%s source=%s",
-            device.id, client_id, _source(request),
-        )
+        authorized.authorize(public_key, client_id)
+        try:
+            approved = store.set_device_status(device.id, "approved", expected=("pending",))
+        except Exception:
+            authorized.revoke(device.client_fingerprint)
+            raise
     except Exception:
         logger.exception("auto-approve failed device_id=%d source=%s", device.id, _source(request))
-    return device
+        return store.get_device_by_id(device.id) or device
+    logger.info(
+        "device auto-approved device_id=%d client_id=%s source=%s",
+        device.id, client_id, _source(request),
+    )
+    return approved
 
 
 def create_app(
@@ -635,7 +638,7 @@ def create_app(
             pass  # rejected with the full validation message below
         if existing is not None:
             if existing.user_id == context.user.id and existing.client_public_key == public_key:
-                if config.auto_approve and existing.status == "pending":
+                if config.auto_approve and existing.status == "pending" and existing.enabled:
                     existing = _auto_approve_device(
                         account_store, existing, public_key,
                         context.user.username, config, request,

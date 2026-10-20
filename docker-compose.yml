@@ -15,7 +15,7 @@ services:
       - ./config/server.toml:/etc/pqvpn/server.toml:ro
       - ./config/server_identity_private.key:/etc/pqvpn/server_identity_private.key:ro
       - ./config/server_identity_public.key:/etc/pqvpn/server_identity_public.key:ro
-      - ./config/authorized_clients.json:/etc/pqvpn/authorized_clients.json:ro
+      - ./config/authorized_clients.json:/var/lib/pqvpn/authorized/authorized_clients.json:ro
     environment:
       - PYTHONUNBUFFERED=1
     networks:
