@@ -6,7 +6,8 @@
 #   sudo bash scripts/deploy-server.sh                              # install only
 #   sudo bash scripts/deploy-server.sh /tmp/alice_public.key alice  # + authorize, doctor, start
 #
-# Re-running is safe: an existing identity, server.toml and client database are kept.
+# Re-running is safe: an existing identity, server.toml and client database are kept;
+# a legacy /etc/pqvpn/authorized_clients.json is migrated to /var/lib/pqvpn/authorized/.
 set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo 'run as root (sudo)' >&2; exit 1; }
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -48,6 +49,51 @@ chown root:pqvpn /etc/pqvpn/server_identity_public.key; chmod 0640 /etc/pqvpn/se
 [[ -f /etc/pqvpn/server.toml ]] || install -o root -g pqvpn -m 0640 config/server.toml /etc/pqvpn/server.toml
 install -m 0644 packaging/common/pqvpn-server.service /etc/systemd/system/pqvpn-server.service
 
+echo '== authorized clients database'
+# Own directory, root:pqvpn 2770: the lock and atomic-rename temp files need a
+# group-writable directory, while /etc/pqvpn stays read-only for pqvpn-account
+# (it holds the server private key). The VPN server only reads it (ProtectSystem=strict).
+OLD_DB=/etc/pqvpn/authorized_clients.json
+AUTH_DIR=/var/lib/pqvpn/authorized; AUTH_DB=$AUTH_DIR/authorized_clients.json
+STAMP=$(date +%Y%m%d%H%M%S); RESTART=
+[[ -d /var/lib/pqvpn ]] || install -d -o root -g root -m 0755 /var/lib/pqvpn
+install -d -o root -g pqvpn -m 2770 "$AUTH_DIR"
+valid_db() { "$PY" -c 'import sys; from pathlib import Path; from vpn.identity import AuthorizedClients
+AuthorizedClients(Path(sys.argv[1]))._load(required=True)' "$1"; }
+[[ ! -L $OLD_DB ]] || { echo "$OLD_DB is a symlink; migrate it by hand" >&2; exit 1; }
+if [[ -f $OLD_DB ]]; then
+  echo "== migrate $OLD_DB -> $AUTH_DB"
+  systemctl stop pqvpn-account-api 2>/dev/null || true
+  [[ ! -s $OLD_DB ]] || valid_db "$OLD_DB"
+  if [[ -e $AUTH_DB || -L $AUTH_DB ]] && [[ -s $OLD_DB ]] && ! cmp -s "$OLD_DB" "$AUTH_DB"; then
+    echo "$OLD_DB and $AUTH_DB both exist and differ; reconcile by hand" >&2; exit 1
+  fi
+fi
+if [[ ! -e $AUTH_DB && ! -L $AUTH_DB ]]; then
+  # Stage in a root-only directory, then rename in: group members can swap
+  # entries inside AUTH_DIR, so root never chowns/chmods a path there.
+  STAGE=$(mktemp -d /var/lib/pqvpn/.authorized-stage.XXXXXX)
+  if [[ -s $OLD_DB ]]; then cat "$OLD_DB"; else echo '{"clients": []}'; fi > "$STAGE/db"
+  chown root:pqvpn "$STAGE/db"; chmod 0640 "$STAGE/db"
+  mv -T "$STAGE/db" "$AUTH_DB"; rmdir "$STAGE"
+fi
+if [[ -f $OLD_DB ]]; then
+  BAK=$OLD_DB.migrated; [[ ! -e $BAK ]] || BAK+=.$STAMP
+  chown root:root "$OLD_DB"; chmod 0600 "$OLD_DB"; mv -T "$OLD_DB" "$BAK"
+  rm -f "$OLD_DB.lock"; RESTART=1
+  echo "old database kept as $BAK (root-only)"
+fi
+valid_db "$AUTH_DB"
+# Repoint configs that still name the old database (relative or absolute); keep a backup.
+retarget() {
+  local re='^([[:space:]]*authorized_clients_file[[:space:]]*=[[:space:]]*)"(/etc/pqvpn/)?authorized_clients\.json"'
+  [[ -f $1 ]] && grep -Eq "$re" "$1" || return 0
+  cp -p "$1" "$1.bak.$STAMP"
+  sed -E -i "s#$re#\1\"$AUTH_DB\"#" "$1"
+  RESTART=1; echo "repointed $1 (backup $1.bak.$STAMP)"
+}
+retarget /etc/pqvpn/server.toml
+
 echo '== account API setup'
 id pqvpn-account >/dev/null 2>&1 || useradd --system --home /nonexistent --shell /usr/sbin/nologin pqvpn-account
 usermod -aG pqvpn pqvpn-account
@@ -76,19 +122,27 @@ if [[ ! -f $CRT ]] || { ((${#CHECK[@]})) && [[ $(openssl x509 -in "$CRT" -noout 
   chmod 0644 /etc/pqvpn/tls/account-api.crt
 fi
 [[ -f /etc/pqvpn/account-api.toml ]] || install -o root -g pqvpn-account -m 0640 config/account-api.toml /etc/pqvpn/account-api.toml
+retarget /etc/pqvpn/account-api.toml
+# Fail closed if either service would still read another database (e.g. an omitted
+# server.toml field resolves beside the TOML, i.e. the old path).
+"$PY" -c 'import sys
+from vpn.config import load_server_config
+from vpn.account_api import load_account_api_config
+want = sys.argv[1]
+got = {"server.toml": load_server_config("/etc/pqvpn/server.toml").authorized_clients_file,
+       "account-api.toml": str(load_account_api_config("/etc/pqvpn/account-api.toml").authorized_clients_file)}
+bad = [f"{k} -> {v}" for k, v in got.items() if v != want]
+sys.exit(f"set authorized_clients_file = \"{want}\" in: " + ", ".join(bad) if bad else 0)' "$AUTH_DB"
 install -m 0644 packaging/common/pqvpn-account-api.service /etc/systemd/system/pqvpn-account-api.service
-# Account API needs read+write on authorized_clients for auto-approve
-touch /etc/pqvpn/authorized_clients.json
-chown root:pqvpn /etc/pqvpn/authorized_clients.json
-chmod 0660 /etc/pqvpn/authorized_clients.json
 systemctl daemon-reload
 systemctl enable --now pqvpn-account-api
+[[ -z $RESTART ]] || systemctl try-restart pqvpn-server
 [[ -z $ACCOUNT_TLS_NEW ]] || systemctl restart pqvpn-account-api
 
 if [[ -n $CLIENT_KEY ]]; then
   echo "== authorize client $CLIENT_ID"
-  "$PY" -m vpn.cli client authorize "$CLIENT_KEY" --database /etc/pqvpn/authorized_clients.json --client-id "$CLIENT_ID"
-  chown root:pqvpn /etc/pqvpn/authorized_clients.json; chmod 0660 /etc/pqvpn/authorized_clients.json
+  # Writes root:pqvpn 0640 (directory group) itself; no chown/chmod inside AUTH_DIR.
+  "$PY" -m vpn.cli client authorize "$CLIENT_KEY" --database "$AUTH_DB" --client-id "$CLIENT_ID"
   echo '== doctor'
   sudo -u pqvpn "$PY" -m vpn.cli doctor server --config /etc/pqvpn/server.toml
   echo '== start'

@@ -24,7 +24,13 @@ Security group, inbound only:
 | 51820 | TCP | `0.0.0.0/0` | PQ-VPN control channel (handshake) |
 | 51820 | UDP | `0.0.0.0/0` | PQ-VPN data channel |
 
-Do not open 8000, 8443 or any management/account API port. Outbound: allow all (default).
+Do not open 8000 or any management port. Open 8443 (account API, HTTPS) only for
+self-service onboarding, and only to trusted source IPs (`x.x.x.x/32`): with
+`auto_approve = true` anyone who can register gets tunnel access. Outbound: allow all (default).
+
+Authorized clients live in `/var/lib/pqvpn/authorized/authorized_clients.json`
+(directory `root:pqvpn 2770`); `deploy-server.sh` migrates a legacy
+`/etc/pqvpn/authorized_clients.json` there and repoints both TOML files.
 
 AWS CLI equivalent (replace the region, key name and your IP):
 
@@ -81,8 +87,7 @@ Add more clients later:
 
 ```bash
 cd /opt/pqvpn
-sudo .venv/bin/python -m vpn.cli client authorize /tmp/bob_public.key --database /etc/pqvpn/authorized_clients.json --client-id bob
-sudo chown root:pqvpn /etc/pqvpn/authorized_clients.json && sudo chmod 0640 /etc/pqvpn/authorized_clients.json
+sudo .venv/bin/python -m vpn.cli client authorize /tmp/bob_public.key --database /var/lib/pqvpn/authorized/authorized_clients.json --client-id bob
 sudo systemctl restart pqvpn-server
 ```
 

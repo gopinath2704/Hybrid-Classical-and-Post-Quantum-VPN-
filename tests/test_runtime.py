@@ -216,8 +216,9 @@ def test_compose_profile_and_secret_paths():
     assert './config/client.toml:/etc/pqvpn/client.toml:ro' in compose
     assert '"--server-host", "vpn-server"' in compose
     assert compose.count('dockerfile: Dockerfile') == 2
-    for name in ['server_identity_private.key','server_identity_public.key','authorized_clients.json','client_identity_private.key']:
+    for name in ['server_identity_private.key','server_identity_public.key','client_identity_private.key']:
         assert f'./config/{name}:/etc/pqvpn/{name}:ro' in compose
+    assert './config/authorized_clients.json:/var/lib/pqvpn/authorized/authorized_clients.json:ro' in compose
 
 
 def test_setup_uses_nondefault_toml(tmp_path):

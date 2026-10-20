@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import os
 import sqlite3
+import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -29,7 +31,7 @@ from vpn.accounts import (
     generate_totp_secret,
     needs_rehash,
 )
-from vpn.identity import AuthorizedClients
+from vpn.identity import AuthorizedClients, _atomic_private
 
 
 PASSWORD = "correct horse battery staple"
@@ -626,6 +628,66 @@ def test_device_binding_never_changes_vpn_authorization(tmp_path):
     with TestClient(create_app(cfg)) as local_client:
         assert bind(local_client, bearer(local_client)).status_code == 201
     assert authorized_path.read_bytes() == before
+
+
+def _auto_approve_client(tmp_path):
+    authorized = AuthorizedClients(tmp_path / "authorized" / "authorized_clients.json")
+    cfg = AccountAPIConfig(
+        database_path=tmp_path / "accounts" / "accounts.db", allow_insecure_loopback=True,
+        auto_approve=True, authorized_clients_file=authorized.path,
+    )
+    return authorized, TestClient(create_app(cfg))
+
+
+def test_auto_approve_authorizes_then_approves(tmp_path):
+    authorized, local_client = _auto_approve_client(tmp_path)
+    with local_client:
+        response = bind(local_client, bearer(local_client))
+        assert response.status_code == 201
+        assert response.json()["device"]["status"] == "approved"
+        assert local_client.app.state.account_store.list_devices()[0].status == "approved"
+    public_key, _ = device_identity(1)
+    assert authorized.find(base64.b64decode(public_key)) is not None
+
+
+def test_auto_approve_failure_stays_pending_and_rebind_retries(tmp_path, monkeypatch):
+    authorized, local_client = _auto_approve_client(tmp_path)
+    real_authorize = AuthorizedClients.authorize
+
+    def denied(self, *args, **kwargs):
+        raise PermissionError("authorized_clients.json.lock")
+
+    monkeypatch.setattr(AuthorizedClients, "authorize", denied)
+    with local_client:
+        headers = bearer(local_client)
+        store = local_client.app.state.account_store
+        first = bind(local_client, headers)
+        assert first.status_code == 201
+        assert first.json()["device"]["status"] == "pending"
+        assert store.list_devices()[0].status == "pending"
+        assert not authorized.path.exists()
+
+        monkeypatch.setattr(AuthorizedClients, "authorize", real_authorize)
+        retry = bind(local_client, headers)
+        assert retry.status_code == 200
+        assert retry.json()["device"]["status"] == "approved"
+        assert store.list_devices()[0].status == "approved"
+    public_key, _ = device_identity(1)
+    assert authorized.find(base64.b64decode(public_key)) is not None
+
+
+def test_authorized_clients_file_is_group_readable_never_world(tmp_path):
+    authorized = AuthorizedClients(tmp_path / "authorized_clients.json")
+    public_key, _ = device_identity(1)
+    fp = authorized.authorize(base64.b64decode(public_key), "alice")
+    for path in (authorized.path, Path(str(authorized.path) + ".lock")):
+        info = os.stat(path)
+        assert stat.S_IMODE(info.st_mode) == 0o640
+        assert info.st_gid == tmp_path.stat().st_gid
+    assert authorized.revoke(fp)
+    assert stat.S_IMODE(os.stat(authorized.path).st_mode) == 0o640
+    with pytest.raises(ValueError):
+        _atomic_private(tmp_path / "x", b"", 0o644)
 
 
 def test_dependency_and_service_packaging_metadata_are_declared():
