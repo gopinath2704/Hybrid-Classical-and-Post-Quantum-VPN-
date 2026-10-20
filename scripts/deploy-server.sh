@@ -51,12 +51,25 @@ install -m 0644 packaging/common/pqvpn-server.service /etc/systemd/system/pqvpn-
 echo '== account API setup'
 id pqvpn-account >/dev/null 2>&1 || useradd --system --home /nonexistent --shell /usr/sbin/nologin pqvpn-account
 usermod -aG pqvpn pqvpn-account
-if [[ ! -f /etc/pqvpn/tls/account-api.crt ]]; then
-  echo '== account API TLS certificate'
+# PQVPN_PUBLIC_HOST (IP or DNS name clients connect to) goes into the cert SAN; a cert
+# that does not cover it is regenerated, so clients must re-fetch account-api.crt.
+SAN=DNS:pqvpn-account-api; CHECK=(); ACCOUNT_TLS_NEW=
+if [[ -n ${PQVPN_PUBLIC_HOST:-} ]]; then
+  [[ $PQVPN_PUBLIC_HOST =~ ^[A-Za-z0-9.:-]+$ ]] || { echo 'invalid PQVPN_PUBLIC_HOST' >&2; exit 1; }
+  if [[ $PQVPN_PUBLIC_HOST =~ ^[0-9.]+$|: ]]; then
+    SAN+=",IP:$PQVPN_PUBLIC_HOST"; CHECK=(-checkip "$PQVPN_PUBLIC_HOST")
+  else
+    SAN+=",DNS:$PQVPN_PUBLIC_HOST"; CHECK=(-checkhost "$PQVPN_PUBLIC_HOST")
+  fi
+fi
+CRT=/etc/pqvpn/tls/account-api.crt
+if [[ ! -f $CRT ]] || { ((${#CHECK[@]})) && [[ $(openssl x509 -in "$CRT" -noout "${CHECK[@]}") != *' does match'* ]]; }; then
+  echo "== account API TLS certificate ($SAN)"
   install -d -o root -g pqvpn-account -m 0750 /etc/pqvpn/tls
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-    -keyout /etc/pqvpn/tls/account-api.key -out /etc/pqvpn/tls/account-api.crt \
-    -days 3650 -nodes -subj "/CN=pqvpn-account-api"
+    -keyout /etc/pqvpn/tls/account-api.key -out "$CRT" \
+    -days 3650 -nodes -subj "/CN=pqvpn-account-api" -addext "subjectAltName=$SAN"
+  ACCOUNT_TLS_NEW=1
   chown pqvpn-account:pqvpn-account /etc/pqvpn/tls/account-api.key
   chmod 0400 /etc/pqvpn/tls/account-api.key
   chown root:pqvpn-account /etc/pqvpn/tls/account-api.crt
@@ -70,6 +83,7 @@ chown root:pqvpn /etc/pqvpn/authorized_clients.json
 chmod 0660 /etc/pqvpn/authorized_clients.json
 systemctl daemon-reload
 systemctl enable --now pqvpn-account-api
+[[ -z $ACCOUNT_TLS_NEW ]] || systemctl restart pqvpn-account-api
 
 if [[ -n $CLIENT_KEY ]]; then
   echo "== authorize client $CLIENT_ID"

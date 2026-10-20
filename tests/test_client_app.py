@@ -646,6 +646,107 @@ class TestAccountClientConstruction:
         assert AccountClient("http://127.0.0.1:8443/").base_url == "http://127.0.0.1:8443"
 
 
+def _self_signed_cert(tmp_path: Path, name: str, san: str | None) -> tuple[Path, Path]:
+    """Same openssl invocation as scripts/deploy-server.sh, optionally with a SAN."""
+    import shutil
+    import subprocess
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl not installed")
+    crt, key = tmp_path / f"{name}.crt", tmp_path / f"{name}.key"
+    cmd = ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+           "-keyout", str(key), "-out", str(crt), "-days", "1", "-nodes",
+           "-subj", "/CN=pqvpn-account-api"]
+    subprocess.run(cmd + (["-addext", f"subjectAltName={san}"] if san else []),
+                   check=True, capture_output=True)
+    return crt, key
+
+
+@pytest.fixture
+def tls_info_server(tmp_path):
+    """HTTPS /server/info on 127.0.0.1; yields (url, cert_path) for a cert of the given SAN."""
+    import http.server
+    import ssl
+    servers = []
+
+    def start(san: str | None, name: str = "server") -> tuple[str, Path]:
+        crt, key = _self_signed_cert(tmp_path, name, san)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b'{"ok": true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(crt, key)
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+        return f"https://127.0.0.1:{server.server_address[1]}", crt
+
+    yield start
+    for server in servers:
+        server.shutdown()
+        server.server_close()
+
+
+class TestAccountClientFromEnv:
+    def test_defaults_to_loopback_without_ca(self, monkeypatch):
+        monkeypatch.delenv("PQVPN_ACCOUNT_API_URL", raising=False)
+        monkeypatch.delenv("PQVPN_ACCOUNT_CA_CERT", raising=False)
+        client = AccountClient.from_env()
+        assert client.base_url == "http://127.0.0.1:8443" and client.ca_cert is None
+
+    def test_env_url_and_pinned_ca_verify_self_signed_ip_cert(self, monkeypatch, tls_info_server):
+        url, crt = tls_info_server("DNS:pqvpn-account-api,IP:127.0.0.1")
+        monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", url)
+        monkeypatch.setenv("PQVPN_ACCOUNT_CA_CERT", str(crt))
+        client = AccountClient.from_env()
+        assert client.base_url == url and client.ca_cert == crt
+        assert client.server_info() == {"ok": True}
+
+    def test_untrusted_cert_is_rejected(self, monkeypatch, tls_info_server):
+        url, _crt = tls_info_server("IP:127.0.0.1")
+        other, _ = _self_signed_cert(Path(_crt).parent, "other", "IP:127.0.0.1")
+        monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", url)
+        monkeypatch.setenv("PQVPN_ACCOUNT_CA_CERT", str(other))
+        with pytest.raises(AccountAPIError) as exc_info:
+            AccountClient.from_env().server_info()
+        assert exc_info.value.code == "ssl_error"
+
+    def test_cert_without_ip_san_is_rejected(self, monkeypatch, tls_info_server):
+        url, crt = tls_info_server(None)
+        monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", url)
+        monkeypatch.setenv("PQVPN_ACCOUNT_CA_CERT", str(crt))
+        with pytest.raises(AccountAPIError) as exc_info:
+            AccountClient.from_env().server_info()
+        assert exc_info.value.code == "ssl_error"
+
+    def test_unloadable_ca_fails_closed(self, monkeypatch, tmp_path):
+        bad = tmp_path / "bad.pem"
+        bad.write_text("not a certificate")
+        monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", "https://52.62.237.95:8443")
+        for ca in (tmp_path / "missing.pem", bad):
+            monkeypatch.setenv("PQVPN_ACCOUNT_CA_CERT", str(ca))
+            with pytest.raises(AccountAPIError) as exc_info:
+                AccountClient.from_env()
+            assert exc_info.value.code == "ssl_error"
+
+    def test_env_cleartext_to_remote_host_rejected(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", "http://52.62.237.95:8443")
+        monkeypatch.delenv("PQVPN_ACCOUNT_CA_CERT", raising=False)
+        with pytest.raises(AccountAPIError) as exc_info:
+            AccountClient.from_env()
+        assert exc_info.value.code == "tls_required"
+
+
 class TestAccountErrorMessages:
     def test_known_codes_are_uniform(self):
         assert _sanitized_message("invalid_credentials", 401) == "Invalid username/email or password."
@@ -880,17 +981,18 @@ def _wait_for(qapp, predicate, timeout=15.0):
 @pytest.mark.skipif(not _pyside6_available(), reason="PySide6 not installed")
 class TestLoginWindow:
     @pytest.fixture
-    def login(self, qapp):
+    def login(self, qapp, monkeypatch):
         from app.ui.login import LoginWindow
+        monkeypatch.delenv("PQVPN_ACCOUNT_CA_CERT", raising=False)
         window = LoginWindow()
         yield window
         window.close()
         qapp.processEvents()
 
-    def test_login_flow_emits_signal(self, login, qapp, live_account_api):
+    def test_login_flow_emits_signal(self, login, qapp, live_account_api, monkeypatch):
         url, _store, _app = live_account_api
         AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
-        login.api_url.setText(url)
+        monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", url)
         login.login_identifier.setText("alice@example.com")
         login.login_password.setText(ACCOUNT_PASSWORD)
         received = []
@@ -901,9 +1003,9 @@ class TestLoginWindow:
         assert login.session_token and login.session_user["username"] == "alice"
         assert login.login_password.text() == ""
 
-    def test_login_failure_shows_error(self, login, qapp, live_account_api):
+    def test_login_failure_shows_error(self, login, qapp, live_account_api, monkeypatch):
         url, _store, _app = live_account_api
-        login.api_url.setText(url)
+        monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", url)
         login.login_identifier.setText("nobody")
         login.login_password.setText(ACCOUNT_PASSWORD)
         login._on_login()
@@ -911,8 +1013,8 @@ class TestLoginWindow:
         assert login.login_error.text() == "Invalid username/email or password."
         assert login.session_token is None
 
-    def test_cleartext_remote_url_refused(self, login):
-        login.api_url.setText("http://203.0.113.5:8443")
+    def test_cleartext_remote_url_refused(self, login, monkeypatch):
+        monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", "http://203.0.113.5:8443")
         login.login_identifier.setText("alice")
         login.login_password.setText(ACCOUNT_PASSWORD)
         login._on_login()
@@ -932,9 +1034,9 @@ class TestLoginWindow:
         login._on_register()
         assert "match" in login.register_error.text()
 
-    def test_register_then_login(self, login, qapp, live_account_api):
+    def test_register_then_login(self, login, qapp, live_account_api, monkeypatch):
         url, _store, _app = live_account_api
-        login.api_url.setText(url)
+        monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", url)
         login._show_register()
         login.register_username.setText("newuser")
         login.register_email.setText("new@example.com")

@@ -904,6 +904,12 @@ class AccountClient:
         self.timeout = timeout
         self._ssl_context = self._create_ssl_context()
 
+    @classmethod
+    def from_env(cls) -> AccountClient:
+        ca = os.environ.get("PQVPN_ACCOUNT_CA_CERT")
+        return cls(os.environ.get("PQVPN_ACCOUNT_API_URL", DEFAULT_ACCOUNT_API_URL),
+                   Path(ca) if ca else None)
+
     def _create_ssl_context(self):
         import ipaddress
         import ssl
