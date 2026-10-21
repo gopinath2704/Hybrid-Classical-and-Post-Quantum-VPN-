@@ -304,10 +304,14 @@ def _pyside6_available():
 
 
 @pytest.fixture(scope="session")
-def qapp():
+def qapp(tmp_path_factory):
     if not _pyside6_available():
         pytest.skip("PySide6 not installed")
+    from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
+    settings_dir = str(tmp_path_factory.mktemp("qsettings"))
+    for fmt in (QSettings.NativeFormat, QSettings.IniFormat):
+        QSettings.setPath(fmt, QSettings.UserScope, settings_dir)
     return QApplication.instance() or QApplication([])
 
 
@@ -1328,3 +1332,286 @@ class TestAccountAwareHome:
         gui._render(ClientStatus(state="DISCONNECTED", managed_mode=False))
         assert gui.account_ux_key == "logged_out"
         assert gui.action_btn.isEnabled()
+
+
+# ─── GUI improvements: tray, live stats, stepper, logs, theme, a11y ─────────
+
+from app.ui.components import sparkline_points, step_states  # noqa: E402
+from app.ui.pages.home import explain_failure  # noqa: E402
+from app.ui.pages.logs import format_entries, redact_secrets  # noqa: E402
+from app.ui.pages.servers import (  # noqa: E402
+    format_latency, probe_tcp_latency, sort_profiles,
+)
+from app.ui.theme import (  # noqa: E402
+    DARK, LIGHT, PALETTES, STATE_COLORS, contrast_ratio, recolor, resolve_theme,
+)
+
+
+class TestGUIPureHelpers:
+    @pytest.mark.parametrize("error, page", [
+        ("[Errno 111] Connection refused", 1),
+        ("timed out", 1),
+        ("[Errno -2] Name or service not known", 1),
+        ("server identity fingerprint mismatch", 2),
+        ("server identity substitution detected", 2),
+        ("The selected server closed authentication. This device may not yet be authorized", 3),
+        ("client authorization revoked", 3),
+        ("Import and select a server profile", 1),
+        ("Unsupported version", 6),
+    ])
+    def test_failure_reasons_map_to_pages(self, error, page):
+        reason, target, link = explain_failure(error)
+        assert target == page and link.startswith("Open ") and reason != error
+
+    def test_unknown_failure_falls_back_to_raw(self):
+        assert explain_failure("weird glitch 42") == ("weird glitch 42", None, "")
+
+    def test_redaction_of_secret_looking_values(self):
+        text = redact_secrets(
+            "Authorization: Bearer abcdefghijklmnop api_key=XYZ123 session_key: s3cr3t "
+            "jwt eyJhbGciOiJI.eyJzdWIiOiIx.c2lnbmF0dXJl otpauth://totp/x?secret=ABC")
+        for leaked in ("abcdefghijklmnop", "XYZ123", "s3cr3t", "eyJhbGciOiJI", "secret=ABC"):
+            assert leaked not in text
+        assert "server fingerprint 1a2b" in redact_secrets("server fingerprint 1a2b")
+
+    def test_format_entries_filters_level_and_search(self):
+        entries = [
+            {"timestamp": "t1", "level": "info", "message": "Client service started"},
+            {"timestamp": "t2", "level": "warn", "message": "DNS unmanaged"},
+            {"timestamp": "t3", "level": "error", "message": "Connection failed password=hunter2"},
+        ]
+        assert len(format_entries(entries, None, "")) == 3
+        assert format_entries(entries, "WARNING", "") == ["[t2] WARNING DNS unmanaged"]
+        errors = format_entries(entries, "ERROR", "")
+        assert len(errors) == 1 and "hunter2" not in errors[0]
+        assert len(format_entries(entries, None, "dns")) == 1
+
+    def test_step_states(self):
+        assert step_states([True, False, False]) == ["complete", "current", "pending"]
+        assert step_states([True, True]) == ["complete", "complete"]
+        assert step_states([False, True, False]) == ["current", "complete", "pending"]
+
+    def test_sparkline_points_scale_into_box(self):
+        assert sparkline_points([5.0], 100, 40) == []
+        points = sparkline_points([10.0, 20.0, 15.0], 100, 40, pad=0)
+        assert points[0] == (0, 40) and points[1] == (50, 0) and points[2] == (100, 20)
+        flat = sparkline_points([3.0, 3.0], 10, 10, pad=0)
+        assert all(y == 10 for _, y in flat)
+
+    def test_sort_profiles_favourites_then_latency(self):
+        profiles = [{"profile_id": pid, "name": pid} for pid in ("a", "b", "c", "d")]
+        ordered = sort_profiles(profiles + ["junk"], {"a": 50.0, "b": 10.0, "c": None}, {"d"})
+        assert [p["profile_id"] for p in ordered] == ["d", "b", "a", "c"]
+        assert format_latency("x", {}) == "Latency not measured"
+        assert "timeout" in format_latency("c", {"c": None})
+        assert format_latency("b", {"b": 10.4}) == "TCP connect 10 ms"
+
+    def test_probe_tcp_latency_is_bounded_and_validated(self):
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        try:
+            assert isinstance(probe_tcp_latency("127.0.0.1", port, timeout=1.0), float)
+        finally:
+            server.close()
+        assert probe_tcp_latency("127.0.0.1", port, timeout=1.0) is None
+        assert probe_tcp_latency("127.0.0.1", 0) is None
+        assert probe_tcp_latency("127.0.0.1", True) is None
+        assert probe_tcp_latency("", 51820) is None
+
+    def test_palettes_are_consistent_and_recolor_keeps_alpha(self):
+        assert DARK.keys() == LIGHT.keys()
+        for palette in PALETTES.values():
+            by_hex: dict[str, set[str]] = {}
+            for other in PALETTES.values():
+                for token, value in other.items():
+                    by_hex.setdefault(value.upper(), set()).add(palette[token].upper())
+            assert all(len(targets) == 1 for targets in by_hex.values())
+        sheet = f"color: {DARK['green']}; border: 1px solid #55{DARK['green'][1:]}; x: #123456"
+        assert recolor(sheet, LIGHT) == (
+            f"color: {LIGHT['green']}; border: 1px solid #55{LIGHT['green'][1:]}; x: #123456")
+        assert resolve_theme("system", True) == "light"
+        assert resolve_theme("system", False) == "dark"
+        assert resolve_theme("bogus", True) == "dark"
+
+    @pytest.mark.parametrize("name", ["dark", "light"])
+    def test_text_tokens_meet_wcag_aa(self, name):
+        palette = PALETTES[name]
+        for fg in ("text", "secondary", "muted", "green", "amber", "red", "cyan", "purple"):
+            for bg in ("background", "sidebar", "surface", "card"):
+                assert contrast_ratio(palette[fg], palette[bg]) >= 4.5, (name, fg, bg)
+        assert contrast_ratio(palette["on_accent"], palette["green"]) >= 4.5
+        assert contrast_ratio(palette["red"], palette["danger_bg"]) >= 4.5
+        assert contrast_ratio(palette["amber"], palette["warn_bg"]) >= 4.5
+
+
+@pytest.mark.skipif(not _pyside6_available(), reason="PySide6 not installed")
+class TestGUIImprovements:
+    @pytest.fixture
+    def gui(self, qapp, tmp_path):
+        from PySide6.QtCore import QSettings
+        from app.ui.window import MainWindow
+        settings = QSettings(str(tmp_path / "gui.ini"), QSettings.IniFormat)
+        window = MainWindow(TestGUIHeadless.FakeIPC(), start_polling=False, settings=settings)
+        window._worker.request_action = Mock()
+        yield window
+        window._tray = None
+        window._on_pref_changed("theme", "dark")
+        window.close()
+        qapp.processEvents()
+
+    def test_failed_state_shows_reason_and_link(self, gui):
+        gui._render(ClientStatus(state="FAILED", error="[Errno 111] Connection refused"))
+        assert "could not be reached" in gui.error_label.text()
+        assert "Connection refused" in gui.error_label.text()
+        assert gui.action_btn.text() == "Retry"
+        assert not gui.failure_link_btn.isHidden()
+        gui.failure_link_btn.click()
+        assert gui.pages.currentIndex() == 1
+        gui._render(ClientStatus(state="FAILED", error="weird glitch"))
+        assert gui.failure_link_btn.isHidden()
+        assert gui.error_label.text() == "weird glitch"
+
+    def test_logs_filter_copy_and_export_are_redacted(self, gui, tmp_path, qapp):
+        from PySide6.QtGui import QGuiApplication
+        gui._logs.render([
+            {"timestamp": "t1", "level": "info", "message": "hello"},
+            {"timestamp": "t2", "level": "error", "message": "boom token=abc123"},
+        ], [])
+        assert "abc123" not in gui.logs_view.toPlainText()
+        gui.logs_level_filter.setCurrentText("Errors")
+        assert "hello" not in gui.logs_view.toPlainText()
+        gui.logs_level_filter.setCurrentText("All levels")
+        gui.logs_search.setText("hello")
+        assert gui.logs_view.toPlainText().endswith("hello")
+        gui.logs_search.clear()
+        gui._copy_logs()
+        assert "boom" in QGuiApplication.clipboard().text()
+        out = tmp_path / "events.log"
+        with patch("app.ui.window.QFileDialog.getSaveFileName", return_value=(str(out), "")):
+            gui._export_logs()
+        exported = out.read_text()
+        assert "boom" in exported and "abc123" not in exported
+
+    def test_logs_poll_only_on_logs_page(self, gui):
+        gui._worker.request_logs = Mock()
+        gui._worker.request_status = Mock()
+        gui._poll_status()
+        gui._worker.request_logs.assert_not_called()
+        gui.switch_page(5)
+        gui._worker.request_logs.reset_mock()
+        gui._poll_status()
+        gui._worker.request_logs.assert_called_once()
+
+    def test_security_badge_and_server_fingerprint_copy(self, gui):
+        from PySide6.QtGui import QGuiApplication
+        gui._render(ClientStatus(state="CONNECTED", is_quantum_safe=True,
+                                 pqc_mode="native_liboqs", server_fingerprint="f" * 64))
+        assert gui.sec_quantum_badge.text().startswith("QUANTUM-SAFE · ACTIVE")
+        assert "native_liboqs" in gui.sec_suite.value_label.text()
+        gui.sec_copy_server_fp_btn.click()
+        assert QGuiApplication.clipboard().text() == "f" * 64
+        gui._render(ClientStatus(state="CONNECTED", is_quantum_safe=False, pqc_mode="none"))
+        assert gui.sec_quantum_badge.text().startswith("NOT QUANTUM-SAFE")
+
+    def test_live_stats_sparkline_and_epoch(self, gui):
+        for rtt in (10.0, 12.0, 11.0):
+            gui._on_status(ClientStatus(state="CONNECTED", rtt_ms=rtt, epoch=3,
+                                        rekey_countdown=30))
+        assert list(gui.rtt_sparkline.samples) == [10.0, 12.0, 11.0]
+        assert not gui.rtt_card.isHidden()
+        assert "epoch 3" in gui.detail_rekey.note_label.text()
+        gui._on_status(ClientStatus(state="DISCONNECTED"))
+        assert not gui.rtt_sparkline.samples
+        assert gui.rtt_card.isHidden()
+
+    def test_handshake_stepper_only_while_connecting(self, gui):
+        gui._render(ClientStatus(state="CONNECTING"))
+        assert not gui.handshake_steps.isHidden()
+        assert [m.text() for m in gui.handshake_steps.marks] == ["●"] * 3
+        assert "together" in gui.handshake_note.text()
+        gui._render(ClientStatus(state="CONNECTED"))
+        assert gui.handshake_steps.isHidden()
+
+    def test_onboarding_stepper_tracks_progress(self, gui):
+        status = ClientStatus(state="SETUP_REQUIRED", managed_mode=True, setup_complete=False,
+                              identity_ready=True, profiles=[])
+        gui._render(status)
+        marks = [m.text() for m in gui.onboarding_steps.marks]
+        assert marks == ["✓", "●", "○", "○"]
+        gui._action_finished("copy_enrollment", {"content": "public request"})
+        gui._render(status)
+        assert gui.onboarding_steps.marks[2].text() == "✓"
+
+    def test_preferences_persist_and_kill_switch_is_honest(self, gui):
+        gui.pref_auto_connect.setChecked(True)
+        gui.pref_reduce_motion.setChecked(True)
+        assert gui.settings.value("auto_connect", type=bool) is True
+        assert gui.power_btn.reduce_motion
+        gui._render(ClientStatus(state="CONNECTED", kill_switch_active=True))
+        assert "NOT ENFORCED" in gui.kill_switch_chip.text()
+        assert "not enforced" in gui.settings_kill_switch.status_label.text()
+        gui._render(ClientStatus(state="CONNECTED", kill_switch_active=False))
+        assert gui.kill_switch_chip.text() == "KILL SWITCH · NOT ARMED"
+
+    def test_auto_connect_runs_once_at_startup(self, gui):
+        gui.prefs["auto_connect"] = True
+        gui._auto_connect_pending = True
+        gui._on_status(ClientStatus(state="DISCONNECTED"))
+        gui._busy = False
+        gui._on_status(ClientStatus(state="DISCONNECTED"))
+        gui._worker.request_action.assert_called_once_with("connect")
+
+    def test_server_latency_and_favourites(self, gui, qapp):
+        profiles = [
+            {"profile_id": "slow", "name": "Slow", "server_host": "192.0.2.1",
+             "server_control_port": 51820},
+            {"profile_id": "fast", "name": "Fast", "server_host": "192.0.2.2",
+             "server_control_port": 51820},
+        ]
+        gui._render(ClientStatus(state="DISCONNECTED", managed_mode=True, profiles=profiles))
+        gui._servers.latency_probe._probe = lambda host, port: 5.0 if host.endswith(".2") else 80.0
+        gui.server_latency_btn.click()
+        _wait_for(qapp, lambda: not gui._servers.latency_probe.running
+                  and gui.server_latency_btn.text() == "Measure latency")
+        assert gui._servers.latencies == {"slow": 80.0, "fast": 5.0}
+        order = [p["profile_id"] for p in sort_profiles(profiles, gui._servers.latencies,
+                                                        gui._servers.favourites)]
+        assert order == ["fast", "slow"]
+        gui._servers.toggle_favourite("slow")
+        assert json.loads(gui.settings.value("favourites")) == ["slow"]
+
+    def test_close_hides_to_tray_until_quit(self, gui):
+        gui._tray = Mock()
+        gui._tray_toggle_action = Mock()
+        gui._tray_show_action = Mock()
+        gui.show()
+        assert gui.hides_to_tray()
+        gui.close()
+        assert not gui.isVisible() and gui._worker._thread.is_alive()
+        gui.prefs["close_to_tray"] = False
+        assert not gui.hides_to_tray()
+        gui.prefs["close_to_tray"] = True
+        gui._quitting = True
+        assert not gui.hides_to_tray()
+
+    def test_ctrl_k_toggles_connection(self, gui):
+        gui._render(ClientStatus(state="DISCONNECTED"))
+        assert gui._toggle_shortcut.key().toString() == "Ctrl+K"
+        gui._toggle_shortcut.activated.emit()
+        gui._worker.request_action.assert_called_once_with("connect")
+
+    def test_motion_is_disabled_offscreen(self, gui):
+        assert gui.power_btn.reduce_motion
+        gui._render(ClientStatus(state="CONNECTING"))
+        assert not gui.power_btn._animation.isActive()
+        assert gui.connection_progress.isHidden()
+
+    def test_light_theme_recolors_live_widgets(self, gui):
+        gui._on_pref_changed("theme", "light")
+        assert STATE_COLORS["CONNECTED"] == LIGHT["green"]
+        assert LIGHT["text"] in gui.page_title.styleSheet()
+        assert DARK["text"] not in gui.page_title.styleSheet()
+        gui._on_pref_changed("theme", "dark")
+        assert DARK["text"] in gui.page_title.styleSheet()

@@ -1,8 +1,10 @@
 """Reusable PQ-VPN widgets — cards, data rows, power button, navigation."""
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
+from collections import deque
+
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QVBoxLayout, QWidget,
@@ -106,6 +108,105 @@ class MetricCard(Card):
         )
 
 
+# ── Stepper ───────────────────────────────────────────────────────────
+STEP_MARKS = {"complete": "✓", "current": "●", "pending": "○"}
+
+
+def step_states(done: list[bool]) -> list[str]:
+    """First unfinished step is current; later unfinished steps are pending."""
+    states: list[str] = []
+    for finished in done:
+        if finished:
+            states.append("complete")
+        elif "current" not in states:
+            states.append("current")
+        else:
+            states.append("pending")
+    return states
+
+
+class Stepper(QWidget):
+    """Numbered steps, each a StatusRow with a state mark and an optional action row."""
+
+    def __init__(self, titles: tuple[str, ...]) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self.marks: list[QLabel] = []
+        self.rows: list[StatusRow] = []
+        self.actions: list[QHBoxLayout] = []
+        for number, title in enumerate(titles, 1):
+            line = QHBoxLayout()
+            mark = QLabel(STEP_MARKS["pending"])
+            mark.setFixedWidth(22)
+            mark.setAlignment(Qt.AlignCenter)
+            row = StatusRow(f"{number}. {title}")
+            line.addWidget(mark)
+            line.addWidget(row, 1)
+            actions = QHBoxLayout()
+            actions.setContentsMargins(30, 0, 0, 4)
+            layout.addLayout(line)
+            layout.addLayout(actions)
+            self.marks.append(mark)
+            self.rows.append(row)
+            self.actions.append(actions)
+
+    def set_states(self, states: list[str]) -> None:
+        colors = {"complete": COLORS["green"], "current": COLORS["cyan"],
+                  "pending": COLORS["muted"]}
+        for number, (mark, state) in enumerate(zip(self.marks, states), 1):
+            mark.setText(STEP_MARKS[state])
+            mark.setAccessibleName(f"Step {number}: {state}")
+            mark.setStyleSheet(f"font-size: 14px; color: {colors[state]}; font-weight: 700;")
+
+
+# ── Sparkline ─────────────────────────────────────────────────────────
+def sparkline_points(values: list[float], width: float, height: float,
+                     pad: float = 3.0) -> list[tuple[float, float]]:
+    if len(values) < 2:
+        return []
+    low, high = min(values), max(values)
+    span = (high - low) or 1.0
+    step = (width - 2 * pad) / (len(values) - 1)
+    return [(pad + i * step, height - pad - (v - low) / span * (height - 2 * pad))
+            for i, v in enumerate(values)]
+
+
+class Sparkline(QWidget):
+    """Painted line of the most recent real samples (ring buffer)."""
+
+    def __init__(self, capacity: int = 60, accessible_name: str = "Recent samples") -> None:
+        super().__init__()
+        self.samples: deque[float] = deque(maxlen=capacity)
+        self.setMinimumHeight(46)
+        self.setAccessibleName(accessible_name)
+
+    def add(self, value: float) -> None:
+        self.samples.append(float(value))
+        low, high = min(self.samples), max(self.samples)
+        self.setToolTip(f"{len(self.samples)} samples · min {low:.1f} · max {high:.1f}")
+        self.update()
+
+    def clear(self) -> None:
+        self.samples.clear()
+        self.setToolTip("")
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        points = sparkline_points(list(self.samples), self.width(), self.height())
+        if not points:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor(COLORS["cyan"]), 2))
+        painter.drawPolyline(QPolygonF([QPointF(x, y) for x, y in points]))
+
+
+def motion_allowed(reduce_motion: bool) -> bool:
+    return not reduce_motion and QGuiApplication.platformName() != "offscreen"
+
+
 # ── Power button ──────────────────────────────────────────────────────
 class PowerButton(QPushButton):
     """Painted circular control with animated busy state."""
@@ -120,16 +221,27 @@ class PowerButton(QPushButton):
         self._state = "DISCONNECTED"
         self._hovered = False
         self._phase = 0
+        self._pulse = 0.0
+        self.reduce_motion = not motion_allowed(False)
         self._animation = QTimer(self)
         self._animation.setInterval(40)
         self._animation.timeout.connect(self._advance)
+        self._pulse_animation = QVariantAnimation(self)
+        self._pulse_animation.setDuration(650)
+        self._pulse_animation.setStartValue(1.0)
+        self._pulse_animation.setEndValue(0.0)
+        self._pulse_animation.valueChanged.connect(self._set_pulse)
 
     def set_state(self, state: str) -> None:
+        changed = state != self._state
         self._state = state
-        if state in {"CONNECTING", "DISCONNECTING"}:
+        if state in {"CONNECTING", "DISCONNECTING"} and not self.reduce_motion:
             self._animation.start()
         else:
             self._animation.stop()
+        if changed and not self.reduce_motion:
+            self._pulse_animation.stop()
+            self._pulse_animation.start()
         connected = state == "CONNECTED"
         self.setAccessibleName("Disconnect VPN" if connected else "Connect to VPN")
         self.setToolTip("Disconnect" if connected else "Connect")
@@ -137,6 +249,10 @@ class PowerButton(QPushButton):
 
     def _advance(self) -> None:
         self._phase = (self._phase + 8) % 360
+        self.update()
+
+    def _set_pulse(self, value: float) -> None:
+        self._pulse = float(value)
         self.update()
 
     def enterEvent(self, event) -> None:
@@ -164,13 +280,20 @@ class PowerButton(QPushButton):
                 painter.setPen(QPen(glow, width))
                 painter.drawEllipse(bounds.adjusted(width / 2, width / 2, -width / 2, -width / 2))
 
+        if self._pulse > 0:
+            ring = QColor(state_color)
+            ring.setAlpha(int(110 * self._pulse))
+            spread = 6 * (1 - self._pulse)
+            painter.setPen(QPen(ring, 3))
+            painter.drawEllipse(bounds.adjusted(-spread, -spread, spread, spread))
+
         fill = QColor(COLORS["surface"])
         if self._state == "CONNECTED":
             fill = QColor(COLORS["green_dim"])
         elif self._state in {"CONNECTING", "DISCONNECTING"}:
-            fill = QColor("#2B2112")
+            fill = QColor(COLORS["warn_bg"])
         elif self._state == "FAILED":
-            fill = QColor("#2B171B")
+            fill = QColor(COLORS["danger_bg"])
         painter.setBrush(fill)
         painter.setPen(QPen(state_color, 4))
         painter.drawEllipse(bounds)
@@ -186,6 +309,10 @@ class PowerButton(QPushButton):
         icon = bounds.adjusted(48, 45, -48, -45)
         painter.drawArc(icon, 45 * 16, 270 * 16)
         painter.drawLine(QPointF(85, 55), QPointF(85, 88))
+
+        if self.hasFocus():
+            painter.setPen(QPen(QColor(COLORS["cyan"]), 2, Qt.DashLine))
+            painter.drawEllipse(QRectF(2, 2, 166, 166))
 
 
 # ── Sidebar navigation ───────────────────────────────────────────────
@@ -226,13 +353,14 @@ class NavButton(QPushButton):
                 color: {COLORS['text']};
             }}
             QPushButton:checked {{
-                background: #0E2A20;
+                background: {COLORS['nav_active']};
                 border-left-color: {COLORS['green']};
                 color: {COLORS['green']};
                 font-weight: 650;
             }}
             QPushButton:focus {{
-                border-color: {COLORS['cyan']};
+                border: 1px solid {COLORS['cyan']};
+                border-left: 3px solid {COLORS['cyan']};
             }}
         """)
 
@@ -257,9 +385,9 @@ class NavRail(QFrame):
         mark.setAlignment(Qt.AlignCenter)
         mark.setFixedSize(38, 38)
         mark.setStyleSheet(f"""
-            background: #0E3423;
+            background: {COLORS['nav_active']};
             color: {COLORS['green']};
-            border: 1px solid #1B5B3D;
+            border: 1px solid {COLORS['brand_border']};
             border-radius: 10px;
             font-size: 12px;
             font-weight: 750;

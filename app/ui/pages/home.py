@@ -1,21 +1,60 @@
 """Home page — connection hero, protection strip, account summary, metrics."""
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QGridLayout, QHBoxLayout, QPushButton, QProgressBar, QVBoxLayout, QWidget,
 )
 
-from app.ui.theme import COLORS, badge_style, label
+from app.ui.theme import COLORS, LINK_BTN, badge_style, label
 from app.ui.components import (
-    Card, DataRow, MetricCard, PowerButton, StatusRow, SummaryBlock,
+    Card, DataRow, MetricCard, PowerButton, Sparkline, Stepper, SummaryBlock,
 )
+
+PAGE_SERVERS, PAGE_SECURITY, PAGE_ACCOUNT, PAGE_SETTINGS, PAGE_ABOUT = 1, 2, 3, 4, 6
+
+_FAILURE_HINTS: tuple[tuple[tuple[str, ...], str, int, str], ...] = (
+    (("not yet be authorized", "authorization revoked", "not authorized",
+      "unauthorized", "not registered", "device not bound", "identity proof failed"),
+     "This device is not authorized on the server yet.", PAGE_ACCOUNT, "Open Account"),
+    (("server identity", "fingerprint mismatch", "substitution detected",
+      "signature verification failed", "certificate"),
+     "The server's identity did not match the pinned fingerprint.", PAGE_SECURITY,
+     "Open Security"),
+    (("connection refused", "timed out", "timeout", "unreachable", "no route to host",
+      "name or service not known", "temporary failure in name resolution",
+      "nodename nor servname"),
+     "The server could not be reached. Check the address, your network, and that the "
+     "server is running.", PAGE_SERVERS, "Open Servers"),
+    (("server profile", "no profile"),
+     "No usable server profile is selected.", PAGE_SERVERS, "Open Servers"),
+    (("unsupported version", "protocol version mismatch"),
+     "The server speaks a different protocol version than this client.", PAGE_ABOUT,
+     "Open About"),
+    (("resolvectl", "native tun", "ipv6"),
+     "A local network prerequisite is missing on this machine.", PAGE_SETTINGS,
+     "Open Settings"),
+)
+
+
+def explain_failure(error: str) -> tuple[str, int | None, str]:
+    """Return (plain-language reason, page to open, link text); unknown errors pass through."""
+    lowered = error.lower()
+    for needles, reason, page, link in _FAILURE_HINTS:
+        if any(needle in lowered for needle in needles):
+            return reason, page, link
+    return error, None, ""
 
 
 class HomePage:
     def __init__(self, *, on_toggle, on_ensure_identity, on_choose_profile,
-                 on_copy_enrollment, on_export_enrollment, on_open_account) -> None:
+                 on_copy_enrollment, on_export_enrollment, on_open_account,
+                 on_open_page: Callable[[int], None]) -> None:
         self._on_toggle = on_toggle
+        self._on_open_page = on_open_page
+        self._failure_page: int | None = None
         self._on_open_account = on_open_account
         self._on_ensure_identity = on_ensure_identity
         self._on_choose_profile = on_choose_profile
@@ -33,13 +72,13 @@ class HomePage:
             "Finish device setup",
             "The privileged service owns identity and profiles; only public enrollment data leaves it.",
         )
-        self.onboarding_identity = StatusRow("1. Device identity")
-        self.onboarding_profile = StatusRow("2. Server profile")
-        self.onboarding_authorization = StatusRow("3. Administrator authorization")
-        for row in (self.onboarding_identity, self.onboarding_profile,
-                    self.onboarding_authorization):
-            self.onboarding_card.body.addWidget(row)
-        onboarding_actions = QHBoxLayout()
+        self.onboarding_steps = Stepper((
+            "Device identity", "Server profile", "Enrollment request",
+            "Administrator authorization",
+        ))
+        (self.onboarding_identity, self.onboarding_profile,
+         self.onboarding_enrollment, self.onboarding_authorization) = self.onboarding_steps.rows
+        self.onboarding_card.body.addWidget(self.onboarding_steps)
         self.onboarding_identity_btn = QPushButton("Ensure identity")
         self.onboarding_identity_btn.clicked.connect(self._on_ensure_identity)
         self.onboarding_import_btn = QPushButton("Import .pqvpn")
@@ -48,11 +87,12 @@ class HomePage:
         self.onboarding_copy_btn.clicked.connect(self._on_copy_enrollment)
         self.onboarding_export_btn = QPushButton("Export .pqenroll")
         self.onboarding_export_btn.clicked.connect(self._on_export_enrollment)
-        for btn in (self.onboarding_identity_btn, self.onboarding_import_btn,
-                    self.onboarding_copy_btn, self.onboarding_export_btn):
-            onboarding_actions.addWidget(btn)
-        onboarding_actions.addStretch(1)
-        self.onboarding_card.body.addLayout(onboarding_actions)
+        for step, buttons in enumerate(((self.onboarding_identity_btn,),
+                                        (self.onboarding_import_btn,),
+                                        (self.onboarding_copy_btn, self.onboarding_export_btn))):
+            for btn in buttons:
+                self.onboarding_steps.actions[step].addWidget(btn)
+            self.onboarding_steps.actions[step].addStretch(1)
         self.onboarding_note = label(
             "Exporting a request does not mean the server has authorized this device.",
             10, COLORS["amber"], 550,
@@ -69,6 +109,9 @@ class HomePage:
         state_row = QHBoxLayout()
         self.connection_badge = label("OFFLINE", 9, COLORS["muted"], 700)
         self.connection_badge.setStyleSheet(badge_style(COLORS["muted"]))
+        self.kill_switch_chip = label("KILL SWITCH · OFF", 9, COLORS["muted"], 700)
+        self.kill_switch_chip.setStyleSheet(badge_style(COLORS["muted"]))
+        state_row.addWidget(self.kill_switch_chip)
         state_row.addStretch(1)
         state_row.addWidget(self.connection_badge)
         hero.body.addLayout(state_row)
@@ -89,6 +132,27 @@ class HomePage:
         hero.body.addWidget(self.state_label)
         hero.body.addWidget(self.subtitle_label)
         hero.body.addWidget(self.error_label)
+        self.failure_link_btn = QPushButton("")
+        self.failure_link_btn.setStyleSheet(LINK_BTN)
+        self.failure_link_btn.setCursor(Qt.PointingHandCursor)
+        self.failure_link_btn.clicked.connect(self._open_failure_page)
+        self.failure_link_btn.hide()
+        hero.body.addWidget(self.failure_link_btn, alignment=Qt.AlignHCenter)
+
+        self.handshake_steps = Stepper((
+            "Classical key exchange (X25519)",
+            "Post-quantum KEM (ML-KEM-768)",
+            "Session established",
+        ))
+        self.handshake_note = label(
+            "The service reports only the overall handshake state, so these steps "
+            "complete together.", 9, COLORS["muted"],
+        )
+        self.handshake_note.setWordWrap(True)
+        hero.body.addWidget(self.handshake_steps)
+        hero.body.addWidget(self.handshake_note)
+        self.handshake_steps.hide()
+        self.handshake_note.hide()
 
         self.connection_progress = QProgressBar()
         self.connection_progress.setRange(0, 0)
@@ -167,6 +231,12 @@ class HomePage:
             metrics.setColumnStretch(column, 1)
         layout.addLayout(metrics)
 
+        self.rtt_card = Card("Live latency", "Authenticated RTT, last 60 samples")
+        self.rtt_sparkline = Sparkline(60, "Recent authenticated RTT samples")
+        self.rtt_card.body.addWidget(self.rtt_sparkline)
+        self.rtt_card.hide()
+        layout.addWidget(self.rtt_card)
+
         # ── Security at a glance ──
         security = Card("Security at a glance")
         security_grid = QGridLayout()
@@ -190,3 +260,18 @@ class HomePage:
         layout.addWidget(security)
         layout.addStretch(1)
         return page
+
+    def render_failure(self, error: str, failed: bool) -> None:
+        """Plain-language reason plus a link to the page that can fix it; raw text kept."""
+        reason, page, link = explain_failure(error) if failed else (error, None, "")
+        text = f"{reason}\n{error}" if page is not None else error
+        self.error_label.setText(text)
+        self.error_label.setVisible(bool(error))
+        self._failure_page = page
+        self.failure_link_btn.setText(link)
+        self.failure_link_btn.setAccessibleName(link)
+        self.failure_link_btn.setVisible(page is not None)
+
+    def _open_failure_page(self) -> None:
+        if self._failure_page is not None:
+            self._on_open_page(self._failure_page)
