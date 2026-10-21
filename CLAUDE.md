@@ -24,3 +24,16 @@ This is a post-quantum cryptographic VPN — security is critical:
 2. Activate agent-skills:security-and-hardening
 3. Activate ponytail:ponytail (full mode) — minimal code = smaller attack surface
 4. Run tests + verify no security properties are weakened
+
+Implementation of the above is delegated to an **Opus** agent; the main (Sonnet) session reviews the diff, re-runs `python -m pytest tests/ -q`, and commits.
+
+## Deploy and packaging gotchas
+
+Full detail in the vault: `[[pq-vpn-deploy-gotchas]]`, `[[pq-vpn-aws-server]]`.
+
+- The `pqvpn-client` systemd service runs the **pacman-installed package**, not this repo. After code changes: `cd packaging/arch && makepkg -f --nodeps`, then the user runs `sudo pacman -U ...pkg.tar.zst` and `sudo systemctl restart pqvpn-client`.
+- The package is built from the **committed** tree (`git archive HEAD`). After committing, refresh `packaging/arch/pqvpn-3.0.0.tar.gz`, the `sha256sums` in `PKGBUILD`, and the digest pin in `tests/test_onboarding.py`.
+- Managed desktop clients speak `protocol_version = 2`; a v3 server rejects them ("Unsupported version").
+- The GUI defaults to the built-in account API `https://52.62.237.95:8443` with the bundled cert `app/server-account-api.crt` (exclusive pin); `PQVPN_ACCOUNT_API_URL` / `PQVPN_ACCOUNT_CA_CERT` only override. If the server cert is regenerated (`PQVPN_PUBLIC_HOST` must be in its SAN), replace the bundled cert. Registration is invite-only (`vpn.cli account invite-create`); sign-out suspends the device on the server.
+- Authorized clients DB lives in `/var/lib/pqvpn/authorized/`; never make `/etc/pqvpn` group-writable.
+- Update the AWS server with `scripts/deploy-server.sh` (idempotent); disconnect the client first, a restart drops tunnels.
