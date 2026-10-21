@@ -72,42 +72,57 @@ PQ-VPN is a deployable research prototype implementing a KEMTLS-inspired custom 
 
 ---
 
+## Requirements
+
+| | Client (desktop) | Server |
+|---|---|---|
+| OS | Linux (Arch or Debian/Ubuntu for the installer); Windows and macOS are not supported | Linux (Ubuntu for `deploy-server.sh`) |
+| Python | 3.11+ (tested on 3.14) | 3.11+ (tested on 3.14) |
+| Native | liboqs 0.16.0, built by `scripts/install-liboqs.sh` | same |
+| Build tools | git, CMake, Ninja, gcc/g++, OpenSSL headers, rsync | same |
+| Network tools | iproute2, nftables | iproute2, nftables |
+| Kernel | TUN device (`/dev/net/tun`) | TUN device |
+| Python deps | pinned in `constraints-tested.txt`; GUI extra: PySide6 | same, minus the GUI |
+| Privileges | `sudo` once, for install; the service then runs with `CAP_NET_ADMIN` only | root for install |
+| Network | outbound TCP 8443 (account API) and UDP/TCP 51820 (tunnel) to the server | inbound 8443 and 51820 |
+| Account | an **invite code** from the server admin (registration is invite-only) | n/a |
+
+A graphical session is needed for the GUI (Wayland or X11).
+
+---
+
 ## Quick start
 
-### Prerequisites
-
-- Python 3.14+, git, CMake, Ninja, C compiler (gcc/g++)
-- iproute2, nftables, OpenSSL development headers
-- Linux with TUN support
-
-### 1. Install native liboqs
+### Install the desktop client (one command)
 
 ```bash
-sudo bash scripts/install-liboqs.sh /usr/local
+git clone git@github.com:gopinath2704/Hybrid-Classical-and-Post-Quantum-VPN-.git
+cd Hybrid-Classical-and-Post-Quantum-VPN-
+sudo bash scripts/install-client.sh
 ```
 
-### 2. Set up the Python environment
+The script installs the system packages, builds liboqs, copies the app to `/opt/pqvpn`
+with its own venv, and starts the privileged `pqvpn-client` service. It is safe to
+re-run to upgrade; the device identity and state in `/var/lib/pqvpn` are kept.
+
+Then launch **PQ-VPN** from the app menu (or run `pqvpn-gui`), register with your
+invite code, and press Connect. Check the service with `systemctl status pqvpn-client`.
+
+### Manual / development setup
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -c constraints-tested.txt '.[dev]'
-```
+sudo bash scripts/install-liboqs.sh /usr/local        # native liboqs
+python3 -m venv .venv && source .venv/bin/activate
+pip install -c constraints-tested.txt '.[dev]'        # '.[desktop]' for the GUI only
 
-### 3. Generate identities
-
-```bash
 python -m vpn.cli identity generate
 python -m vpn.cli client-key generate
 python -m vpn.cli client authorize config/client_identity_public.key --client-id local
 ```
 
-### 4. Configure and run
-
 Edit `config/client.toml` to set the server fingerprint and hostname, then see
-[Running the server](#running-the-server) below.
-
-For full deployment instructions, see [docs/deployment.md](docs/deployment.md).
+[Running the server](#running-the-server). For full deployment instructions, see
+[docs/deployment.md](docs/deployment.md).
 
 ---
 
@@ -143,9 +158,12 @@ ss -tulpn | grep 51820
 
 The GUI runs as a normal user; a privileged service manages the VPN connection.
 
+After `scripts/install-client.sh` the service is already running and you only launch
+the GUI. To run from a source checkout instead:
+
 ```bash
 # Install GUI dependencies
-pip install 'pqvpn[desktop]'
+pip install -c constraints-tested.txt '.[desktop]'
 
 # Terminal 1: start the privileged service
 sudo .venv/bin/python -m app.client --service
@@ -218,7 +236,7 @@ Import a `server.pqvpn` profile by hand in that mode. Profiles hold only public 
 ## Testing
 
 ```bash
-python -m pytest -q                                    # full suite (594 tests)
+python -m pytest -q                                    # full suite
 ALLOW_MOCK_PQC=0 python -m pytest -q -m native_pqc    # native ML-KEM only
 ```
 
@@ -262,7 +280,7 @@ eval/                    Evaluation campaign scripts and table generators
 formal/                  Tamarin Prover models (pqvpn_v3.spthy, pqvpn_v3_pcs.spthy)
 config/                  Default client/server TOML examples
 packaging/               Arch, Debian, desktop entry, icon, systemd units
-scripts/                 Native liboqs installer and server network helpers
+scripts/                 Client and server installers, native liboqs installer, network helpers
 tests/                   Pytest suite with shared fixtures
 constraints-tested.txt   Tested version pins and native validation record
 ```
@@ -309,7 +327,6 @@ constraints-tested.txt   Tested version pins and native validation record
 - No kill switch
 - No dynamic PMTU discovery
 - v2 client authentication is classical Ed25519 (not post-quantum)
-- No server enrollment API or invite codes
 - Re-handshake does not recover from an active adversary who holds the full epoch state (including rekey secret); recovery is against passive adversaries after full state compromise and active adversaries after control-key-only compromise
 - Custom protocol without independent formal review
 - Up to five imported profiles; no public server discovery
