@@ -108,6 +108,13 @@ re-run to upgrade; the device identity and state in `/var/lib/pqvpn` are kept.
 Then launch **PQ-VPN** from the app menu (or run `pqvpn-gui`), register with your
 invite code, and press Connect. Check the service with `systemctl status pqvpn-client`.
 
+Launch the GUI from a terminal:
+
+```bash
+sudo systemctl start pqvpn-client   # only if the service isn't active
+pqvpn-gui
+```
+
 ### Manual / development setup
 
 ```bash
