@@ -226,7 +226,7 @@ def staged_privileged_tree(tmp_path, monkeypatch):
         values[4] = 0
         values[5] = 0
         # Model production ancestors, not the shared writable /tmp fixture path.
-        if path in root.parents:
+        if path == root or path in root.parents:
             values[0] = stat.S_IFDIR | 0o755
         for index, value in overrides.get(path, {}).items():
             values[index] = value
