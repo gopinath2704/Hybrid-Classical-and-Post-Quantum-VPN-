@@ -1,6 +1,12 @@
 """Servers page — imported profiles, selected server detail, selection policy."""
 from __future__ import annotations
 
+import socket
+import threading
+import time
+from collections.abc import Callable
+
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QPushButton, QVBoxLayout, QWidget,
 )
@@ -10,10 +16,88 @@ from app.ui.theme import COLORS, label
 from app.ui.components import Card, DataRow
 
 
+PROBE_TIMEOUT = 2.0
+
+
+def probe_tcp_latency(host: object, port: object, timeout: float = PROBE_TIMEOUT) -> float | None:
+    """Milliseconds to open (then close) one TCP connection to the control endpoint."""
+    if not isinstance(host, str) or not host or len(host) > 253:
+        return None
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        return None
+    try:
+        family, kind, proto, _, address = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM)[0]
+        with socket.socket(family, kind, proto) as sock:
+            sock.settimeout(timeout)
+            started = time.perf_counter()
+            sock.connect(address)
+            return (time.perf_counter() - started) * 1000
+    except OSError:
+        return None
+
+
+def sort_profiles(profiles: list[dict], latencies: dict[str, float | None],
+                  favourites: set[str]) -> list[dict]:
+    """Favourites first, then measured latency ascending (unmeasured last), then name."""
+    def key(item: dict) -> tuple[bool, bool, float, str]:
+        pid = str(item.get("profile_id", ""))
+        latency = latencies.get(pid)
+        return (pid not in favourites, latency is None, latency or 0.0,
+                str(item.get("name", "")).lower())
+    return sorted((item for item in profiles if isinstance(item, dict)), key=key)
+
+
+def format_latency(profile_id: str, latencies: dict[str, float | None]) -> str:
+    if profile_id not in latencies:
+        return "Latency not measured"
+    value = latencies[profile_id]
+    return f"TCP connect {value:.0f} ms" if value is not None else "Unreachable (2 s timeout)"
+
+
+class LatencyProbe(QObject):
+    """Measures profiles one at a time on a daemon thread; never blocks the UI."""
+
+    measured = Signal(str, object)
+    finished = Signal()
+
+    def __init__(self, probe: Callable[[object, object], float | None] = probe_tcp_latency) -> None:
+        super().__init__()
+        self._probe = probe
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, targets: list[tuple[str, object, object]]) -> bool:
+        if self.running:
+            return False
+        self._thread = threading.Thread(
+            target=self._run, args=(targets,), daemon=True, name="pqvpn-gui-latency")
+        self._thread.start()
+        return True
+
+    def _run(self, targets: list[tuple[str, object, object]]) -> None:
+        for profile_id, host, port in targets:
+            self.measured.emit(profile_id, self._probe(host, port))
+        self.finished.emit()
+
+
 class ServersPage:
     def __init__(self, *, on_choose_profile, on_poll_status,
                  on_select_profile, on_remove_profile, on_copy_profile_info,
-                 on_copy_fingerprint) -> None:
+                 on_copy_fingerprint,
+                 on_favourites_changed: Callable[[set[str]], None],
+                 favourites: set[str]) -> None:
+        self._on_favourites_changed = on_favourites_changed
+        self.favourites = set(favourites)
+        self.latencies: dict[str, float | None] = {}
+        self._profiles: list[dict] = []
+        self._state = ""
+        self.latency_probe = LatencyProbe()
+        self.latency_probe.measured.connect(self._latency_measured)
+        self.latency_probe.finished.connect(self._latency_finished)
         self._on_choose_profile = on_choose_profile
         self._on_poll_status = on_poll_status
         self._on_select_profile = on_select_profile
@@ -33,8 +117,13 @@ class ServersPage:
         self.server_import_btn.clicked.connect(self._on_choose_profile)
         self.server_refresh_btn = QPushButton("Refresh profiles")
         self.server_refresh_btn.clicked.connect(self._on_poll_status)
+        self.server_latency_btn = QPushButton("Measure latency")
+        self.server_latency_btn.setToolTip(
+            "Opens one TCP connection to each profile's control endpoint (2 s timeout)")
+        self.server_latency_btn.clicked.connect(self.measure_latency)
         actions.addWidget(self.server_import_btn)
         actions.addWidget(self.server_refresh_btn)
+        actions.addWidget(self.server_latency_btn)
         actions.addStretch(1)
         layout.addLayout(actions)
 
@@ -73,7 +162,8 @@ class ServersPage:
         note = Card("Selection policy")
         note.body.addWidget(label(
             "Profiles cannot be imported, selected, or removed while connected. "
-            "No discovery, geolocation, load, or fabricated latency data is used.",
+            "Latency is measured only on request, as one TCP connect to each imported "
+            "control endpoint. No discovery, geolocation, or load data is used.",
             11, COLORS["secondary"]
         ))
         layout.addWidget(note)
@@ -103,7 +193,10 @@ class ServersPage:
         )
         if signature != self._profile_signature:
             self._profile_signature = signature
+            self._profiles, self._state = list(status.profiles), status.state
             self._rebuild_profile_list(status.profiles, status.state)
+        self.server_latency_btn.setEnabled(
+            bool(self._profiles) and not self.latency_probe.running)
 
         mutable = status.managed_mode and status.state not in {
             ConnectionState.CONNECTED.value,
@@ -117,13 +210,34 @@ class ServersPage:
         )
         self.servers_setup_label.setVisible(setup)
 
+    def measure_latency(self) -> None:
+        targets = [(str(item.get("profile_id", "")), item.get("server_host"),
+                    item.get("server_control_port"))
+                   for item in self._profiles if isinstance(item, dict)]
+        if targets and self.latency_probe.start(targets):
+            self.server_latency_btn.setEnabled(False)
+            self.server_latency_btn.setText("Measuring…")
+
+    def _latency_measured(self, profile_id: str, value: object) -> None:
+        self.latencies[profile_id] = value if isinstance(value, float) else None
+
+    def _latency_finished(self) -> None:
+        self.server_latency_btn.setText("Measure latency")
+        self.server_latency_btn.setEnabled(bool(self._profiles))
+        self._rebuild_profile_list(self._profiles, self._state)
+
+    def toggle_favourite(self, profile_id: str) -> None:
+        self.favourites ^= {profile_id}
+        self._on_favourites_changed(set(self.favourites))
+        self._rebuild_profile_list(self._profiles, self._state)
+
     def _rebuild_profile_list(self, profiles: list[dict], state: str) -> None:
         for widget in self.server_profile_widgets:
             self.server_profiles_card.body.removeWidget(widget)
             widget.setParent(None)
             widget.deleteLater()
         self.server_profile_widgets.clear()
-        valid = [item for item in profiles if isinstance(item, dict)]
+        valid = sort_profiles(profiles, self.latencies, self.favourites)
         self.server_profiles_empty.setVisible(not valid)
         mutable = state not in {
             ConnectionState.CONNECTED.value,
@@ -143,10 +257,22 @@ class ServersPage:
             body = QVBoxLayout(block)
             body.setContentsMargins(14, 12, 14, 12)
             title = QHBoxLayout()
+            favourite = profile_id in self.favourites
+            star = QPushButton("★" if favourite else "☆")
+            star.setFixedWidth(40)
+            star.setAccessibleName(
+                f"{'Remove' if favourite else 'Add'} {name} {'from' if favourite else 'to'} favourites")
+            star.setToolTip("Favourite (sorted first)")
+            star.clicked.connect(lambda checked=False, v=profile_id: self.toggle_favourite(v))
+            title.addWidget(star)
             title.addWidget(label(name, 13, weight=650))
             if active:
                 title.addWidget(label("SELECTED", 9, COLORS["green"], 700))
             title.addStretch(1)
+            latency = self.latencies.get(profile_id)
+            title.addWidget(label(
+                format_latency(profile_id, self.latencies), 10,
+                COLORS["green"] if latency is not None else COLORS["muted"], 600))
             body.addLayout(title)
             body.addWidget(label(f"{host}:{port}  ·  {subnet}", 10, COLORS["secondary"]))
             body.addWidget(label(

@@ -833,7 +833,9 @@ class IPCClient:
 
 
 
-DEFAULT_ACCOUNT_API_URL = "http://127.0.0.1:8443"
+DEFAULT_ACCOUNT_API_URL = "https://52.62.237.95:8443"
+# Public self-signed certificate of the default server, used as its trust anchor.
+BUNDLED_ACCOUNT_CA_CERT = Path(__file__).with_name("server-account-api.crt")
 ACCOUNT_API_TIMEOUT = 10.0
 MAX_ACCOUNT_RESPONSE = 64 * 1024
 ACCOUNT_SESSION_CHECK_MS = 60_000
@@ -861,6 +863,7 @@ _ACCOUNT_ERROR_MESSAGES = {
     "invalid_password": "Password change failed. Check your current password and try again.",
     "mfa_already_enabled": "Multi-factor authentication is already enabled.",
     "mfa_not_enabled": "Multi-factor authentication is not enabled.",
+    "invalid_invite": "The invite code is invalid, expired, or already used.",
 }
 
 
@@ -906,9 +909,15 @@ class AccountClient:
 
     @classmethod
     def from_env(cls) -> AccountClient:
+        """Built-in server and pinned cert by default; env vars override both."""
+        url = os.environ.get("PQVPN_ACCOUNT_API_URL")
         ca = os.environ.get("PQVPN_ACCOUNT_CA_CERT")
-        return cls(os.environ.get("PQVPN_ACCOUNT_API_URL", DEFAULT_ACCOUNT_API_URL),
-                   Path(ca) if ca else None)
+        if ca:
+            return cls(url or DEFAULT_ACCOUNT_API_URL, Path(ca))
+        # The bundled cert only vouches for the built-in server; other URLs use the system store.
+        if not url or url.strip().rstrip("/") == DEFAULT_ACCOUNT_API_URL:
+            return cls(DEFAULT_ACCOUNT_API_URL, BUNDLED_ACCOUNT_CA_CERT)
+        return cls(url)
 
     def _create_ssl_context(self):
         import ipaddress
@@ -936,15 +945,15 @@ class AccountClient:
                     "tls_required", "Cleartext HTTP is only permitted on loopback addresses."
                 )
             return None
-        context = ssl.create_default_context()
-        if self.ca_cert is not None:
-            try:
-                context.load_verify_locations(str(self.ca_cert))
-            except (OSError, ssl.SSLError):
-                raise AccountAPIError(
-                    "ssl_error", "The configured CA certificate could not be loaded."
-                ) from None
-        return context
+        if self.ca_cert is None:
+            return ssl.create_default_context()
+        try:
+            # cafile replaces the system store: a configured cert is an exclusive pin.
+            return ssl.create_default_context(cafile=str(self.ca_cert))
+        except (OSError, ssl.SSLError):
+            raise AccountAPIError(
+                "ssl_error", "The configured CA certificate could not be loaded."
+            ) from None
 
     def _request(self, method: str, path: str, body: dict | None = None,
                  token: str | None = None) -> dict | None:
@@ -1016,12 +1025,12 @@ class AccountClient:
             raise _invalid_response()
         return user
 
-    def register(self, username: str, email: str, password: str) -> dict:
+    def register(self, username: str, email: str, password: str, invite_code: str = "") -> dict:
         """Register a new account and return its public user fields."""
-        user = self._user(self._request(
-            "POST", "/auth/register",
-            body={"username": username, "email": email, "password": password},
-        ))
+        body = {"username": username, "email": email, "password": password}
+        if invite_code:
+            body["invite_code"] = invite_code
+        user = self._user(self._request("POST", "/auth/register", body=body))
         logger.info("account registration succeeded")
         return user
 
@@ -1043,9 +1052,10 @@ class AccountClient:
         """Validate the session and return the current public user fields."""
         return self._user(self._request("GET", "/auth/me", token=token))
 
-    def logout(self, token: str) -> None:
-        """Revoke the presented session on the server."""
-        self._request("POST", "/auth/logout", token=token)
+    def logout(self, token: str, fingerprint: str | None = None) -> None:
+        """Revoke the session and, given this device's fingerprint, suspend its VPN access."""
+        body = {"fingerprint": fingerprint} if fingerprint else None
+        self._request("POST", "/auth/logout", body=body, token=token)
         logger.info("account logout completed")
 
     def list_devices(self, token: str) -> list[dict]:
@@ -1087,7 +1097,7 @@ class AccountClient:
         return body
 
     def bind_device(self, token: str, device_name: str, public_key: str, fingerprint: str) -> dict:
-        """Bind a public device identity to the account.  Never grants VPN access."""
+        """Bind a public device identity; for a bound approved device this restores signed-out access."""
         body = self._request("POST", "/devices", token=token, body={
             "device_name": device_name, "public_key": public_key, "fingerprint": fingerprint,
         })
@@ -1170,6 +1180,24 @@ def public_device_identity(setup: object) -> tuple[str, str]:
     if len(raw) != 32 or hashlib.sha256(raw).hexdigest() != fingerprint:
         raise AccountAPIError("identity_unavailable", "Device identity failed its consistency check.")
     return public_key, fingerprint
+
+
+def restore_device_access(client: AccountClient, token: str, setup: object) -> list[dict]:
+    """After sign-in, re-bind this already-approved device so the server restores its VPN access.
+
+    Only a device the account already lists is re-bound; signing in never binds a new one.
+    """
+    devices = client.list_devices(token)
+    try:
+        public_key, fingerprint = public_device_identity(setup)
+    except AccountAPIError:
+        return devices  # no managed identity (e.g. explicit --config service): nothing to restore
+    current = next((d for d in devices if d.get("fingerprint") == fingerprint), None)
+    if current is None or current.get("status") != "approved" or current.get("enabled") is False:
+        return devices
+    name = str(current.get("device_name") or "device")
+    restored = client.bind_device(token, name, public_key, fingerprint)
+    return [restored if d is current else d for d in devices]
 
 
 @dataclass(frozen=True)
@@ -1889,9 +1917,18 @@ if PYSIDE6_AVAILABLE:
                 session_user=login.session_user,
                 session_expires_at=login.session_expires_at,
             )
+            login.session_token = login.session_user = None  # MainWindow owns the session now
+            window.signed_out.connect(_on_signed_out)
             app.pqvpn_main_window = window  # prevent GC
             window.show()
-            login.close()
+            login.hide()
+
+        def _on_signed_out(message: str) -> None:
+            window = app.pqvpn_main_window
+            app.pqvpn_main_window = None
+            window.shutdown()
+            window.deleteLater()
+            login.show_signed_out(message)
 
         login.login_succeeded.connect(_on_authenticated)
         login.show()

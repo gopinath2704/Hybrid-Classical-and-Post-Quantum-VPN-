@@ -174,7 +174,7 @@ Install  →  Launch PQ-VPN  →  Device identity auto-created
    →  Server profile fetched automatically  →  Connect
 ```
 
-- The GUI reads `PQVPN_ACCOUNT_API_URL` (default `http://127.0.0.1:8443`, cleartext loopback only) and optional `PQVPN_ACCOUNT_CA_CERT` (extra trusted certificate, added to the system store). TLS verification stays strict, so the server certificate must carry a SAN for the host you connect to:
+- The GUI talks to the built-in account API `https://52.62.237.95:8443` and trusts only the server certificate bundled with the package (`app/server-account-api.crt`, an exclusive pin), so users set nothing. For another deployment, override with `PQVPN_ACCOUNT_API_URL` and `PQVPN_ACCOUNT_CA_CERT` (a CA file replaces the system store for that connection; a URL without one uses the system store; plain `http://` is allowed only for loopback dev). TLS verification stays strict, so the server certificate must carry a SAN for the host you connect to:
 
   ```bash
   # server: cert SAN covers the public host (re-run regenerates the cert if it doesn't match)
@@ -183,12 +183,20 @@ Install  →  Launch PQ-VPN  →  Device identity auto-created
   PQVPN_ACCOUNT_API_URL=https://<server-ip-or-dns>:8443 \
   PQVPN_ACCOUNT_CA_CERT=~/.config/pqvpn/server-account-api.crt  python -m app.client
   ```
+  If the built-in server's certificate is regenerated, replace `app/server-account-api.crt` and rebuild the package.
+- Registration is invite-only (`require_invite = true`, the default). The admin creates a code on the server and hands it over out of band; the user enters it in the register form:
+
+  ```bash
+  sudo /opt/pqvpn/.venv/bin/python -m vpn.cli account invite-create [--uses N] [--expires-hours H] \
+    --accounts-db /var/lib/pqvpn/accounts/accounts.db
+  ```
+  `account invites` lists id, uses left and expiry (never the code); `account invite-revoke ID` deletes one. Set `require_invite = false` only for local development.
 - With `auto_approve = true` in `account-api.toml` (the default), binding a device adds its public key to `/var/lib/pqvpn/authorized/authorized_clients.json`; no admin step
 - The client then calls `GET /server/info` and imports the server profile (endpoint, pinned ML-KEM-768 key, VPN subnet) itself, so there is no `.pqvpn` import and no hand-edited `client.toml`
 - Account API: `POST /auth/register`, `/auth/login`, `/devices`; `GET /devices`, `/server/info`; optional MFA and password change. See [docs/accounts.md](docs/accounts.md)
 - Server side: `scripts/deploy-server.sh` provisions the `pqvpn-account` user, TLS certificate and `pqvpn-account-api.service`
 
-**The account API must be reachable by clients (TCP 8443) for self-service.** Restrict the source in your firewall or security group where you can. With `auto_approve = true`, anyone who can register can obtain tunnel access; set it to `false` to require administrator approval.
+**The account API must be reachable by clients (TCP 8443) for self-service.** Restrict the source in your firewall or security group where you can. With `auto_approve = true`, anyone who can register (i.e. holds an invite) can obtain tunnel access; set it to `false` to require administrator approval.
 
 Manual / offline fallback (no account API, `auto_approve = false`):
 

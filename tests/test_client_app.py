@@ -304,10 +304,14 @@ def _pyside6_available():
 
 
 @pytest.fixture(scope="session")
-def qapp():
+def qapp(tmp_path_factory):
     if not _pyside6_available():
         pytest.skip("PySide6 not installed")
+    from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
+    settings_dir = str(tmp_path_factory.mktemp("qsettings"))
+    for fmt in (QSettings.NativeFormat, QSettings.IniFormat):
+        QSettings.setPath(fmt, QSettings.UserScope, settings_dir)
     return QApplication.instance() or QApplication([])
 
 
@@ -572,6 +576,8 @@ class TestGUIHeadless:
 # ─── Milestone 4.3: account API client, memory-only session, desktop auth ──
 
 from app.client import (  # noqa: E402 - grouped with the M4 account tests
+    BUNDLED_ACCOUNT_CA_CERT,
+    DEFAULT_ACCOUNT_API_URL,
     AccountAPIError,
     AccountClient,
     AccountSession,
@@ -583,6 +589,11 @@ from app.client import (  # noqa: E402 - grouped with the M4 account tests
 ACCOUNT_PASSWORD = "correct horse battery staple"
 
 
+def _invite(store) -> str:
+    """A fresh single-use invite: the live API runs invite-only like production."""
+    return store.create_invite()[1]
+
+
 @pytest.fixture
 def live_account_api(tmp_path):
     """Run the real pqvpn-account-api app on loopback for client integration tests."""
@@ -592,7 +603,9 @@ def live_account_api(tmp_path):
 
     store = AccountStore(tmp_path / "accounts" / "accounts.db")
     app = create_app(
-        AccountAPIConfig(database_path=store.path, allow_insecure_loopback=True), store=store
+        AccountAPIConfig(database_path=store.path, allow_insecure_loopback=True,
+                         authorized_clients_file=tmp_path / "authorized" / "authorized_clients.json"),
+        store=store,
     )
     probe = socket.socket()
     probe.bind(("127.0.0.1", 0))
@@ -698,11 +711,53 @@ def tls_info_server(tmp_path):
 
 
 class TestAccountClientFromEnv:
-    def test_defaults_to_loopback_without_ca(self, monkeypatch):
+    def test_defaults_to_built_in_server_pinned_to_bundled_cert(self, monkeypatch):
+        import ssl
         monkeypatch.delenv("PQVPN_ACCOUNT_API_URL", raising=False)
         monkeypatch.delenv("PQVPN_ACCOUNT_CA_CERT", raising=False)
         client = AccountClient.from_env()
-        assert client.base_url == "http://127.0.0.1:8443" and client.ca_cert is None
+        assert client.base_url == DEFAULT_ACCOUNT_API_URL == "https://52.62.237.95:8443"
+        assert client.ca_cert == BUNDLED_ACCOUNT_CA_CERT
+        context = client._ssl_context
+        assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+        # Exclusive pin: only the bundled certificate is trusted, not the system store.
+        assert [ca["subject"] for ca in context.get_ca_certs()] == [
+            ((("commonName", "pqvpn-account-api"),),)
+        ]
+
+    def test_bundled_cert_is_public_x509_with_server_ip_san(self):
+        import ipaddress
+        from cryptography import x509
+        pem = BUNDLED_ACCOUNT_CA_CERT.read_bytes()
+        assert b"PRIVATE" not in pem
+        cert = x509.load_pem_x509_certificate(pem)
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        assert ipaddress.ip_address("52.62.237.95") in san.get_values_for_type(x509.IPAddress)
+
+    def test_bundled_cert_is_declared_package_data(self):
+        import tomllib
+        pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+        assert BUNDLED_ACCOUNT_CA_CERT.name in pyproject["tool"]["setuptools"]["package-data"]["app"]
+        assert BUNDLED_ACCOUNT_CA_CERT.parent.name == "app"
+
+    def test_env_url_override_does_not_trust_bundled_cert(self, monkeypatch):
+        monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", "https://vpn.example.com:8443")
+        monkeypatch.delenv("PQVPN_ACCOUNT_CA_CERT", raising=False)
+        client = AccountClient.from_env()
+        assert client.base_url == "https://vpn.example.com:8443" and client.ca_cert is None
+
+    def test_env_ca_overrides_bundled_cert_for_default_url(self, monkeypatch, tmp_path):
+        crt, _key = _self_signed_cert(tmp_path, "other", "IP:52.62.237.95")
+        monkeypatch.delenv("PQVPN_ACCOUNT_API_URL", raising=False)
+        monkeypatch.setenv("PQVPN_ACCOUNT_CA_CERT", str(crt))
+        client = AccountClient.from_env()
+        assert client.base_url == DEFAULT_ACCOUNT_API_URL and client.ca_cert == crt
+
+    def test_env_loopback_cleartext_still_allowed_for_dev(self, monkeypatch):
+        monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", "http://127.0.0.1:8443")
+        monkeypatch.delenv("PQVPN_ACCOUNT_CA_CERT", raising=False)
+        client = AccountClient.from_env()
+        assert client.base_url == "http://127.0.0.1:8443" and client._ssl_context is None
 
     def test_env_url_and_pinned_ca_verify_self_signed_ip_cert(self, monkeypatch, tls_info_server):
         url, crt = tls_info_server("DNS:pqvpn-account-api,IP:127.0.0.1")
@@ -760,9 +815,9 @@ class TestAccountErrorMessages:
 
 class TestAccountClientLiveAPI:
     def test_full_lifecycle_against_real_api(self, live_account_api):
-        url, _store, _app = live_account_api
+        url, store, _app = live_account_api
         client = AccountClient(url)
-        user = client.register("Alice", "Alice@Example.com", ACCOUNT_PASSWORD)
+        user = client.register("Alice", "Alice@Example.com", ACCOUNT_PASSWORD, _invite(store))
         assert user["username"] == "alice"
         token, login_user, expires_at = client.login("alice", ACCOUNT_PASSWORD)
         assert login_user["email"] == "alice@example.com" and expires_at
@@ -774,16 +829,16 @@ class TestAccountClientLiveAPI:
         assert exc_info.value.code == "invalid_session"
 
     def test_email_login(self, live_account_api):
-        url, _store, _app = live_account_api
+        url, store, _app = live_account_api
         client = AccountClient(url)
-        client.register("bob", "bob@example.com", ACCOUNT_PASSWORD)
+        client.register("bob", "bob@example.com", ACCOUNT_PASSWORD, _invite(store))
         token, user, _ = client.login("BOB@example.com", ACCOUNT_PASSWORD)
         assert user["username"] == "bob" and token
 
     def test_failures_are_indistinguishable(self, live_account_api):
         url, store, _app = live_account_api
         client = AccountClient(url)
-        created = client.register("carol", "carol@example.com", ACCOUNT_PASSWORD)
+        created = client.register("carol", "carol@example.com", ACCOUNT_PASSWORD, _invite(store))
         store.set_user_enabled(created["id"], False)
         messages = set()
         for identifier, password in (
@@ -800,7 +855,7 @@ class TestAccountClientLiveAPI:
     def test_disabled_account_session_is_rejected(self, live_account_api):
         url, store, _app = live_account_api
         client = AccountClient(url)
-        created = client.register("dave", "dave@example.com", ACCOUNT_PASSWORD)
+        created = client.register("dave", "dave@example.com", ACCOUNT_PASSWORD, _invite(store))
         token, _, _ = client.login("dave", ACCOUNT_PASSWORD)
         store.set_user_enabled(created["id"], False)
         with pytest.raises(AccountAPIError) as exc_info:
@@ -808,7 +863,7 @@ class TestAccountClientLiveAPI:
         assert exc_info.value.status_code == 401
 
     def test_login_rate_limit_reports_retry_after(self, live_account_api):
-        url, _store, _app = live_account_api
+        url, store, _app = live_account_api
         client = AccountClient(url)
         for _ in range(5):
             with pytest.raises(AccountAPIError):
@@ -820,12 +875,12 @@ class TestAccountClientLiveAPI:
         assert str(exc_info.value.retry_after) in exc_info.value.message
 
     def test_registration_rate_limit(self, live_account_api):
-        url, _store, _app = live_account_api
+        url, store, _app = live_account_api
         client = AccountClient(url)
         for index in range(3):
-            client.register(f"user{index}", f"user{index}@example.com", ACCOUNT_PASSWORD)
+            client.register(f"user{index}", f"user{index}@example.com", ACCOUNT_PASSWORD, _invite(store))
         with pytest.raises(AccountAPIError) as exc_info:
-            client.register("user9", "user9@example.com", ACCOUNT_PASSWORD)
+            client.register("user9", "user9@example.com", ACCOUNT_PASSWORD, _invite(store))
         assert exc_info.value.code == "rate_limited"
 
     @pytest.mark.parametrize("username,email,password,code", [
@@ -835,19 +890,19 @@ class TestAccountClientLiveAPI:
         ("frank", "not-an-email", ACCOUNT_PASSWORD, "invalid_registration"),
     ], ids=["short-password", "long-password", "invalid-username", "invalid-email"])
     def test_invalid_registration(self, live_account_api, username, email, password, code):
-        url, _store, _app = live_account_api
+        url, store, _app = live_account_api
         with pytest.raises(AccountAPIError) as exc_info:
-            AccountClient(url).register(username, email, password)
+            AccountClient(url).register(username, email, password, _invite(store))
         assert exc_info.value.code == code
         assert password not in exc_info.value.message
 
     def test_duplicate_username_and_email(self, live_account_api):
-        url, _store, _app = live_account_api
+        url, store, _app = live_account_api
         client = AccountClient(url)
-        client.register("gina", "gina@example.com", ACCOUNT_PASSWORD)
+        client.register("gina", "gina@example.com", ACCOUNT_PASSWORD, _invite(store))
         for username, email in (("gina", "other@example.com"), ("other", "gina@example.com")):
             with pytest.raises(AccountAPIError) as exc_info:
-                client.register(username, email, ACCOUNT_PASSWORD)
+                client.register(username, email, ACCOUNT_PASSWORD, _invite(store))
             assert exc_info.value.code == "account_exists"
 
     def test_api_unavailable(self):
@@ -990,8 +1045,8 @@ class TestLoginWindow:
         qapp.processEvents()
 
     def test_login_flow_emits_signal(self, login, qapp, live_account_api, monkeypatch):
-        url, _store, _app = live_account_api
-        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
+        url, store, _app = live_account_api
+        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD, _invite(store))
         monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", url)
         login.login_identifier.setText("alice@example.com")
         login.login_password.setText(ACCOUNT_PASSWORD)
@@ -1004,7 +1059,7 @@ class TestLoginWindow:
         assert login.login_password.text() == ""
 
     def test_login_failure_shows_error(self, login, qapp, live_account_api, monkeypatch):
-        url, _store, _app = live_account_api
+        url, store, _app = live_account_api
         monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", url)
         login.login_identifier.setText("nobody")
         login.login_password.setText(ACCOUNT_PASSWORD)
@@ -1033,20 +1088,44 @@ class TestLoginWindow:
         login.register_confirm.setText(ACCOUNT_PASSWORD + "x")
         login._on_register()
         assert "match" in login.register_error.text()
+        login.register_confirm.setText(ACCOUNT_PASSWORD)
+        login._on_register()
+        assert "invite code is required" in login.register_error.text()
+        assert login.register_btn.text() == "Create Account"
 
     def test_register_then_login(self, login, qapp, live_account_api, monkeypatch):
-        url, _store, _app = live_account_api
+        url, store, _app = live_account_api
         monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", url)
         login._show_register()
         login.register_username.setText("newuser")
         login.register_email.setText("new@example.com")
         login.register_password.setText(ACCOUNT_PASSWORD)
         login.register_confirm.setText(ACCOUNT_PASSWORD)
+        login.register_invite.setText(_invite(store))
         login._on_register()
         _wait_for(qapp, lambda: login.register_btn.text() == "Create Account")
         assert "created" in login.register_error.text().lower()
         # After register, the identifier field should be pre-filled
         assert login.login_identifier.text() == "newuser"
+        assert login.register_invite.text() == ""
+
+    def test_register_rejected_invite_shows_clear_error(self, login, qapp, live_account_api,
+                                                       monkeypatch, caplog):
+        url, store, _app = live_account_api
+        monkeypatch.setenv("PQVPN_ACCOUNT_API_URL", url)
+        bad_code = "not-a-real-invite-code-0123456789abcdefghij"
+        caplog.set_level("DEBUG")
+        login._show_register()
+        login.register_username.setText("newuser")
+        login.register_email.setText("new@example.com")
+        login.register_password.setText(ACCOUNT_PASSWORD)
+        login.register_confirm.setText(ACCOUNT_PASSWORD)
+        login.register_invite.setText(bad_code)
+        login._on_register()
+        _wait_for(qapp, lambda: login.register_btn.text() == "Create Account")
+        assert login.register_error.text() == "The invite code is invalid, expired, or already used."
+        assert bad_code not in caplog.text
+        assert store.get_user_by_username("newuser") is None
 
 
 # ─── Account GUI tests (MainWindow, post-login) ─────────────────────────
@@ -1064,7 +1143,7 @@ class TestAccountGUI:
     def test_login_logout_flow_keeps_token_out_of_ui(self, gui, qapp, live_account_api, caplog):
         from PySide6.QtWidgets import QLabel, QLineEdit
         url, store, _app = live_account_api
-        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
+        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD, _invite(store))
         caplog.set_level("DEBUG")
         _sign_in_direct(gui, qapp, url, "alice@example.com")
         assert gui._account_session.is_authenticated
@@ -1091,8 +1170,8 @@ class TestAccountGUI:
         assert gui._account_session.state == SessionState.LOGGED_OUT
 
     def test_revoked_session_shows_signed_out(self, gui, qapp, live_account_api):
-        url, _store, _app = live_account_api
-        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
+        url, store, _app = live_account_api
+        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD, _invite(store))
         _sign_in_direct(gui, qapp, url)
         AccountClient(url).logout(gui._account_session.get_token())
         gui._validate_account_session()
@@ -1107,8 +1186,8 @@ class TestAccountGUI:
         assert "UNAVAILABLE" in gui.profile_session_badge.text()
 
     def test_login_never_touches_authorized_clients(self, gui, qapp, live_account_api, tmp_path):
-        url, _store, _app = live_account_api
-        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
+        url, store, _app = live_account_api
+        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD, _invite(store))
         _sign_in_direct(gui, qapp, url)
         assert gui._account_session.is_authenticated
         assert not list(tmp_path.rglob("authorized_clients.json"))
@@ -1116,9 +1195,9 @@ class TestAccountGUI:
     def test_session_seeded_at_construction(self, qapp, live_account_api):
         """MainWindow constructed with session data starts authenticated."""
         from app.ui.window import MainWindow
-        url, _store, _app = live_account_api
+        url, store, _app = live_account_api
         client = AccountClient(url)
-        client.register("seeded", "seeded@example.com", ACCOUNT_PASSWORD)
+        client.register("seeded", "seeded@example.com", ACCOUNT_PASSWORD, _invite(store))
         token, _user, expires = client.login("seeded", ACCOUNT_PASSWORD)
         me = client.get_me(token)
         window = MainWindow(
@@ -1200,7 +1279,7 @@ class TestDeviceBindingGUI:
 
     def test_bind_current_device_sends_public_identity_only(self, gui, qapp, live_account_api):
         url, store, _app = live_account_api
-        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
+        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD, _invite(store))
         _sign_in_direct(gui, qapp, url)
         _wait_for(qapp, lambda: gui.device_bind_btn.isEnabled())
         assert gui.device_binding_row.value_label.text() == "Not registered"
@@ -1282,7 +1361,7 @@ class TestAccountAwareHome:
     def test_home_tracks_full_account_device_lifecycle(self, gui, qapp, live_account_api, tmp_path):
         url, store, _app = live_account_api
         assert gui.account_ux_key == "logged_out"
-        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD)
+        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD, _invite(store))
         _sign_in_direct(gui, qapp, url)
         _wait_for(qapp, lambda: gui.account_ux_key == "no_device")
         assert gui.home_account_user.value_label.text() == "alice · alice@example.com"
@@ -1328,3 +1407,467 @@ class TestAccountAwareHome:
         gui._render(ClientStatus(state="DISCONNECTED", managed_mode=False))
         assert gui.account_ux_key == "logged_out"
         assert gui.action_btn.isEnabled()
+
+
+# ─── GUI improvements: tray, live stats, stepper, logs, theme, a11y ─────────
+
+from app.ui.components import sparkline_points, step_states  # noqa: E402
+from app.ui.pages.home import explain_failure  # noqa: E402
+from app.ui.pages.logs import format_entries, redact_secrets  # noqa: E402
+from app.ui.pages.servers import (  # noqa: E402
+    format_latency, probe_tcp_latency, sort_profiles,
+)
+from app.ui.theme import (  # noqa: E402
+    DARK, LIGHT, PALETTES, STATE_COLORS, contrast_ratio, recolor, resolve_theme,
+)
+
+
+class TestGUIPureHelpers:
+    @pytest.mark.parametrize("error, page", [
+        ("[Errno 111] Connection refused", 1),
+        ("timed out", 1),
+        ("[Errno -2] Name or service not known", 1),
+        ("server identity fingerprint mismatch", 2),
+        ("server identity substitution detected", 2),
+        ("The selected server closed authentication. This device may not yet be authorized", 3),
+        ("client authorization revoked", 3),
+        ("Import and select a server profile", 1),
+        ("Unsupported version", 6),
+    ])
+    def test_failure_reasons_map_to_pages(self, error, page):
+        reason, target, link = explain_failure(error)
+        assert target == page and link.startswith("Open ") and reason != error
+
+    def test_unknown_failure_falls_back_to_raw(self):
+        assert explain_failure("weird glitch 42") == ("weird glitch 42", None, "")
+
+    def test_redaction_of_secret_looking_values(self):
+        text = redact_secrets(
+            "Authorization: Bearer abcdefghijklmnop api_key=XYZ123 session_key: s3cr3t "
+            "jwt eyJhbGciOiJI.eyJzdWIiOiIx.c2lnbmF0dXJl otpauth://totp/x?secret=ABC")
+        for leaked in ("abcdefghijklmnop", "XYZ123", "s3cr3t", "eyJhbGciOiJI", "secret=ABC"):
+            assert leaked not in text
+        assert "server fingerprint 1a2b" in redact_secrets("server fingerprint 1a2b")
+
+    def test_format_entries_filters_level_and_search(self):
+        entries = [
+            {"timestamp": "t1", "level": "info", "message": "Client service started"},
+            {"timestamp": "t2", "level": "warn", "message": "DNS unmanaged"},
+            {"timestamp": "t3", "level": "error", "message": "Connection failed password=hunter2"},
+        ]
+        assert len(format_entries(entries, None, "")) == 3
+        assert format_entries(entries, "WARNING", "") == ["[t2] WARNING DNS unmanaged"]
+        errors = format_entries(entries, "ERROR", "")
+        assert len(errors) == 1 and "hunter2" not in errors[0]
+        assert len(format_entries(entries, None, "dns")) == 1
+
+    def test_step_states(self):
+        assert step_states([True, False, False]) == ["complete", "current", "pending"]
+        assert step_states([True, True]) == ["complete", "complete"]
+        assert step_states([False, True, False]) == ["current", "complete", "pending"]
+
+    def test_sparkline_points_scale_into_box(self):
+        assert sparkline_points([5.0], 100, 40) == []
+        points = sparkline_points([10.0, 20.0, 15.0], 100, 40, pad=0)
+        assert points[0] == (0, 40) and points[1] == (50, 0) and points[2] == (100, 20)
+        flat = sparkline_points([3.0, 3.0], 10, 10, pad=0)
+        assert all(y == 10 for _, y in flat)
+
+    def test_sort_profiles_favourites_then_latency(self):
+        profiles = [{"profile_id": pid, "name": pid} for pid in ("a", "b", "c", "d")]
+        ordered = sort_profiles(profiles + ["junk"], {"a": 50.0, "b": 10.0, "c": None}, {"d"})
+        assert [p["profile_id"] for p in ordered] == ["d", "b", "a", "c"]
+        assert format_latency("x", {}) == "Latency not measured"
+        assert "timeout" in format_latency("c", {"c": None})
+        assert format_latency("b", {"b": 10.4}) == "TCP connect 10 ms"
+
+    def test_probe_tcp_latency_is_bounded_and_validated(self):
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        try:
+            assert isinstance(probe_tcp_latency("127.0.0.1", port, timeout=1.0), float)
+        finally:
+            server.close()
+        assert probe_tcp_latency("127.0.0.1", port, timeout=1.0) is None
+        assert probe_tcp_latency("127.0.0.1", 0) is None
+        assert probe_tcp_latency("127.0.0.1", True) is None
+        assert probe_tcp_latency("", 51820) is None
+
+    def test_palettes_are_consistent_and_recolor_keeps_alpha(self):
+        assert DARK.keys() == LIGHT.keys()
+        for palette in PALETTES.values():
+            by_hex: dict[str, set[str]] = {}
+            for other in PALETTES.values():
+                for token, value in other.items():
+                    by_hex.setdefault(value.upper(), set()).add(palette[token].upper())
+            assert all(len(targets) == 1 for targets in by_hex.values())
+        sheet = f"color: {DARK['green']}; border: 1px solid #55{DARK['green'][1:]}; x: #123456"
+        assert recolor(sheet, LIGHT) == (
+            f"color: {LIGHT['green']}; border: 1px solid #55{LIGHT['green'][1:]}; x: #123456")
+        assert resolve_theme("system", True) == "light"
+        assert resolve_theme("system", False) == "dark"
+        assert resolve_theme("bogus", True) == "dark"
+
+    @pytest.mark.parametrize("name", ["dark", "light"])
+    def test_text_tokens_meet_wcag_aa(self, name):
+        palette = PALETTES[name]
+        for fg in ("text", "secondary", "muted", "green", "amber", "red", "cyan", "purple"):
+            for bg in ("background", "sidebar", "surface", "card"):
+                assert contrast_ratio(palette[fg], palette[bg]) >= 4.5, (name, fg, bg)
+        assert contrast_ratio(palette["on_accent"], palette["green"]) >= 4.5
+        assert contrast_ratio(palette["red"], palette["danger_bg"]) >= 4.5
+        assert contrast_ratio(palette["amber"], palette["warn_bg"]) >= 4.5
+
+
+@pytest.mark.skipif(not _pyside6_available(), reason="PySide6 not installed")
+class TestGUIImprovements:
+    @pytest.fixture
+    def gui(self, qapp, tmp_path):
+        from PySide6.QtCore import QSettings
+        from app.ui.window import MainWindow
+        settings = QSettings(str(tmp_path / "gui.ini"), QSettings.IniFormat)
+        window = MainWindow(TestGUIHeadless.FakeIPC(), start_polling=False, settings=settings)
+        window._worker.request_action = Mock()
+        yield window
+        window._tray = None
+        window._on_pref_changed("theme", "dark")
+        window.close()
+        qapp.processEvents()
+
+    def test_failed_state_shows_reason_and_link(self, gui):
+        gui._render(ClientStatus(state="FAILED", error="[Errno 111] Connection refused"))
+        assert "could not be reached" in gui.error_label.text()
+        assert "Connection refused" in gui.error_label.text()
+        assert gui.action_btn.text() == "Retry"
+        assert not gui.failure_link_btn.isHidden()
+        gui.failure_link_btn.click()
+        assert gui.pages.currentIndex() == 1
+        gui._render(ClientStatus(state="FAILED", error="weird glitch"))
+        assert gui.failure_link_btn.isHidden()
+        assert gui.error_label.text() == "weird glitch"
+
+    def test_logs_filter_copy_and_export_are_redacted(self, gui, tmp_path, qapp):
+        from PySide6.QtGui import QGuiApplication
+        gui._logs.render([
+            {"timestamp": "t1", "level": "info", "message": "hello"},
+            {"timestamp": "t2", "level": "error", "message": "boom token=abc123"},
+        ], [])
+        assert "abc123" not in gui.logs_view.toPlainText()
+        gui.logs_level_filter.setCurrentText("Errors")
+        assert "hello" not in gui.logs_view.toPlainText()
+        gui.logs_level_filter.setCurrentText("All levels")
+        gui.logs_search.setText("hello")
+        assert gui.logs_view.toPlainText().endswith("hello")
+        gui.logs_search.clear()
+        gui._copy_logs()
+        assert "boom" in QGuiApplication.clipboard().text()
+        out = tmp_path / "events.log"
+        with patch("app.ui.window.QFileDialog.getSaveFileName", return_value=(str(out), "")):
+            gui._export_logs()
+        exported = out.read_text()
+        assert "boom" in exported and "abc123" not in exported
+
+    def test_logs_poll_only_on_logs_page(self, gui):
+        gui._worker.request_logs = Mock()
+        gui._worker.request_status = Mock()
+        gui._poll_status()
+        gui._worker.request_logs.assert_not_called()
+        gui.switch_page(5)
+        gui._worker.request_logs.reset_mock()
+        gui._poll_status()
+        gui._worker.request_logs.assert_called_once()
+
+    def test_security_badge_and_server_fingerprint_copy(self, gui):
+        from PySide6.QtGui import QGuiApplication
+        gui._render(ClientStatus(state="CONNECTED", is_quantum_safe=True,
+                                 pqc_mode="native_liboqs", server_fingerprint="f" * 64))
+        assert gui.sec_quantum_badge.text().startswith("QUANTUM-SAFE · ACTIVE")
+        assert "native_liboqs" in gui.sec_suite.value_label.text()
+        gui.sec_copy_server_fp_btn.click()
+        assert QGuiApplication.clipboard().text() == "f" * 64
+        gui._render(ClientStatus(state="CONNECTED", is_quantum_safe=False, pqc_mode="none"))
+        assert gui.sec_quantum_badge.text().startswith("NOT QUANTUM-SAFE")
+
+    def test_live_stats_sparkline_and_epoch(self, gui):
+        for rtt in (10.0, 12.0, 11.0):
+            gui._on_status(ClientStatus(state="CONNECTED", rtt_ms=rtt, epoch=3,
+                                        rekey_countdown=30))
+        assert list(gui.rtt_sparkline.samples) == [10.0, 12.0, 11.0]
+        assert not gui.rtt_card.isHidden()
+        assert "epoch 3" in gui.detail_rekey.note_label.text()
+        gui._on_status(ClientStatus(state="DISCONNECTED"))
+        assert not gui.rtt_sparkline.samples
+        assert gui.rtt_card.isHidden()
+
+    def test_handshake_stepper_only_while_connecting(self, gui):
+        gui._render(ClientStatus(state="CONNECTING"))
+        assert not gui.handshake_steps.isHidden()
+        assert [m.text() for m in gui.handshake_steps.marks] == ["●"] * 3
+        assert "together" in gui.handshake_note.text()
+        gui._render(ClientStatus(state="CONNECTED"))
+        assert gui.handshake_steps.isHidden()
+
+    def test_onboarding_stepper_tracks_progress(self, gui):
+        status = ClientStatus(state="SETUP_REQUIRED", managed_mode=True, setup_complete=False,
+                              identity_ready=True, profiles=[])
+        gui._render(status)
+        marks = [m.text() for m in gui.onboarding_steps.marks]
+        assert marks == ["✓", "●", "○", "○"]
+        gui._action_finished("copy_enrollment", {"content": "public request"})
+        gui._render(status)
+        assert gui.onboarding_steps.marks[2].text() == "✓"
+
+    def test_preferences_persist_and_kill_switch_is_honest(self, gui):
+        gui.pref_auto_connect.setChecked(True)
+        gui.pref_reduce_motion.setChecked(True)
+        assert gui.settings.value("auto_connect", type=bool) is True
+        assert gui.power_btn.reduce_motion
+        gui._render(ClientStatus(state="CONNECTED", kill_switch_active=True))
+        assert "NOT ENFORCED" in gui.kill_switch_chip.text()
+        assert "not enforced" in gui.settings_kill_switch.status_label.text()
+        gui._render(ClientStatus(state="CONNECTED", kill_switch_active=False))
+        assert gui.kill_switch_chip.text() == "KILL SWITCH · NOT ARMED"
+
+    def test_auto_connect_runs_once_at_startup(self, gui):
+        gui.prefs["auto_connect"] = True
+        gui._auto_connect_pending = True
+        gui._on_status(ClientStatus(state="DISCONNECTED"))
+        gui._busy = False
+        gui._on_status(ClientStatus(state="DISCONNECTED"))
+        gui._worker.request_action.assert_called_once_with("connect")
+
+    def test_server_latency_and_favourites(self, gui, qapp):
+        profiles = [
+            {"profile_id": "slow", "name": "Slow", "server_host": "192.0.2.1",
+             "server_control_port": 51820},
+            {"profile_id": "fast", "name": "Fast", "server_host": "192.0.2.2",
+             "server_control_port": 51820},
+        ]
+        gui._render(ClientStatus(state="DISCONNECTED", managed_mode=True, profiles=profiles))
+        gui._servers.latency_probe._probe = lambda host, port: 5.0 if host.endswith(".2") else 80.0
+        gui.server_latency_btn.click()
+        _wait_for(qapp, lambda: not gui._servers.latency_probe.running
+                  and gui.server_latency_btn.text() == "Measure latency")
+        assert gui._servers.latencies == {"slow": 80.0, "fast": 5.0}
+        order = [p["profile_id"] for p in sort_profiles(profiles, gui._servers.latencies,
+                                                        gui._servers.favourites)]
+        assert order == ["fast", "slow"]
+        gui._servers.toggle_favourite("slow")
+        assert json.loads(gui.settings.value("favourites")) == ["slow"]
+
+    def test_close_hides_to_tray_until_quit(self, gui):
+        gui._tray = Mock()
+        gui._tray_toggle_action = Mock()
+        gui._tray_show_action = Mock()
+        gui.show()
+        assert gui.hides_to_tray()
+        gui.close()
+        assert not gui.isVisible() and gui._worker._thread.is_alive()
+        gui.prefs["close_to_tray"] = False
+        assert not gui.hides_to_tray()
+        gui.prefs["close_to_tray"] = True
+        gui._quitting = True
+        assert not gui.hides_to_tray()
+
+    def test_ctrl_k_toggles_connection(self, gui):
+        gui._render(ClientStatus(state="DISCONNECTED"))
+        assert gui._toggle_shortcut.key().toString() == "Ctrl+K"
+        gui._toggle_shortcut.activated.emit()
+        gui._worker.request_action.assert_called_once_with("connect")
+
+    def test_motion_is_disabled_offscreen(self, gui):
+        assert gui.power_btn.reduce_motion
+        gui._render(ClientStatus(state="CONNECTING"))
+        assert not gui.power_btn._animation.isActive()
+        assert gui.connection_progress.isHidden()
+
+    def test_light_theme_recolors_live_widgets(self, gui):
+        gui._on_pref_changed("theme", "light")
+        assert STATE_COLORS["CONNECTED"] == LIGHT["green"]
+        assert LIGHT["text"] in gui.page_title.styleSheet()
+        assert DARK["text"] not in gui.page_title.styleSheet()
+        gui._on_pref_changed("theme", "dark")
+        assert DARK["text"] in gui.page_title.styleSheet()
+
+
+# ─── Sign-out means no VPN ────────────────────────────────────────────────
+
+@pytest.mark.skipif(not _pyside6_available(), reason="PySide6 not installed")
+class TestSignOutGatesVPN:
+    """Rule: when the GUI holds an account client, VPN connect needs a live account session."""
+
+    FP = _device_setup()["setup"]["identity_fingerprint"]
+
+    @pytest.fixture
+    def gui(self, qapp, tmp_path):
+        from PySide6.QtCore import QSettings
+        from app.ui.window import MainWindow
+        settings = QSettings(str(tmp_path / "gui.ini"), QSettings.IniFormat)
+        window = MainWindow(TestDeviceBindingGUI.IdentityIPC(), start_polling=False,
+                            settings=settings)
+        window._account_client = AccountClient("http://127.0.0.1:1")
+        window._worker.request_action = Mock()
+        window._render(ClientStatus(state="DISCONNECTED", identity_fingerprint=self.FP))
+        yield window
+        window.close()
+        qapp.processEvents()
+
+    def _entry_points(self, gui, monkeypatch):
+        """Button, tray, Ctrl+K and auto-connect: every way a connect can start."""
+        from PySide6.QtWidgets import QSystemTrayIcon
+        monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+        gui._tray = gui._create_tray()
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance().setQuitOnLastWindowClosed(True)
+        gui.prefs["auto_connect"] = True
+
+        def auto_connect():
+            gui._auto_connect_pending = True
+            gui._on_status(ClientStatus(state="DISCONNECTED", identity_fingerprint=self.FP))
+
+        try:
+            return [gui._on_toggle, gui._tray_toggle_action.trigger,
+                    gui._toggle_shortcut.activated.emit, auto_connect]
+        finally:
+            gui._tray.hide()
+
+    def _ready(self, gui):
+        """Fresh DISCONNECTED state; the tray action is forced on so only the gate can refuse."""
+        gui._busy = False
+        gui._render(ClientStatus(state="DISCONNECTED", identity_fingerprint=self.FP))
+        gui._tray_toggle_action.setEnabled(True)
+
+    def test_every_connect_entry_point_refused_when_signed_out(self, gui, monkeypatch):
+        for start in self._entry_points(gui, monkeypatch):
+            self._ready(gui)
+            start()
+        gui._worker.request_action.assert_not_called()
+        assert not gui.action_btn.isEnabled() and gui.action_btn.text() == "Sign in to connect"
+        assert "Signed out" in gui.subtitle_label.text()
+        assert any("Connect refused" in e["message"] for e in gui._gui_events)
+
+    def test_every_connect_entry_point_allowed_when_signed_in(self, gui, monkeypatch):
+        gui._account_session.set_session("tok", TestAccountSession.USER, "")
+        gui._render(ClientStatus(state="DISCONNECTED", identity_fingerprint=self.FP))
+        assert gui.action_btn.isEnabled() and gui.action_btn.text() == "Connect"
+        starts = self._entry_points(gui, monkeypatch)
+        for start in starts:
+            self._ready(gui)
+            start()
+        assert gui._worker.request_action.call_count == len(starts)
+        assert {c.args for c in gui._worker.request_action.call_args_list} == {("connect",)}
+
+    def test_gui_without_account_client_is_not_gated(self, gui):
+        gui._account_client = None  # legacy: no account API session got the user in
+        gui._on_toggle()
+        gui._worker.request_action.assert_called_once_with("connect")
+
+    def test_disconnect_is_never_gated(self, gui):
+        gui._render(ClientStatus(state="CONNECTED", identity_fingerprint=self.FP))
+        gui._on_toggle()
+        gui._worker.request_action.assert_called_once_with("disconnect")
+
+    def test_sign_out_disconnects_first_then_suspends_device(
+            self, gui, qapp, live_account_api, tmp_path):
+        import base64
+        from vpn.cli import main as cli
+        from vpn.identity import AuthorizedClients
+        url, store, _app = live_account_api
+        authorized = AuthorizedClients(tmp_path / "authorized" / "authorized_clients.json")
+        setup = _device_setup()["setup"]
+        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD, _invite(store))
+        _sign_in_direct(gui, qapp, url)
+        gui._account_client.bind_device(gui._account_session.get_token(), "laptop",
+                                        setup["identity_public_key"], self.FP)
+        cli(["account", "approve", str(store.get_device_by_fingerprint(self.FP).id),
+             "--accounts-db", str(store.path), "--database", str(authorized.path)])
+        public = base64.b64decode(setup["identity_public_key"])
+        assert authorized.find(public) is not None
+        emitted: list[str] = []
+        gui.signed_out.connect(emitted.append)
+        gui._render(ClientStatus(state="CONNECTED", identity_fingerprint=self.FP))
+
+        gui._on_logout_clicked()
+        gui._worker.request_action.assert_called_once_with("disconnect")
+        assert authorized.find(public) is not None  # nothing revoked before the tunnel is down
+        gui._on_toggle()  # a connect attempt mid sign-out is refused
+        gui._worker.request_action.assert_called_once_with("disconnect")
+
+        gui._render(ClientStatus(state="DISCONNECTED", identity_fingerprint=self.FP))
+        gui._action_finished("disconnect", {"status": "disconnected"})
+        assert gui._account_session.state == SessionState.LOGGED_OUT
+        _wait_for(qapp, lambda: emitted == [""])
+        assert authorized.find(public) is None
+        assert store.get_device_by_fingerprint(self.FP).status == "approved"
+
+    def test_forced_expiry_disconnects_first(self, gui):
+        emitted: list[str] = []
+        gui.signed_out.connect(emitted.append)
+        gui._account_session.set_session("tok", TestAccountSession.USER, "")
+        gui._render(ClientStatus(state="CONNECTED", identity_fingerprint=self.FP))
+        gui._account_validate_finished(False, "invalid_session", "x", 401, 0)
+        gui._worker.request_action.assert_called_once_with("disconnect")
+        assert gui._account_session.is_authenticated and emitted == []
+        gui._action_finished("disconnect", {"error": "service unreachable"})
+        assert gui._account_session.state == SessionState.SESSION_EXPIRED
+        assert emitted and "expired" in emitted[0]
+
+    def test_unconfirmed_server_sign_out_is_reported(self, gui, qapp):
+        emitted: list[str] = []
+        gui.signed_out.connect(emitted.append)
+        gui._account_session.set_session("tok", TestAccountSession.USER, "")
+        gui._on_logout_clicked()
+        assert gui._account_session.get_token() is None
+        _wait_for(qapp, lambda: emitted)
+        assert "may still have VPN access" in emitted[0]
+
+    def test_shutdown_stops_background_work_and_hides(self, gui):
+        gui.show()
+        gui.shutdown()
+        assert not gui.isVisible() and not gui._timer.isActive()
+        gui._worker._thread.join(2)
+        assert not gui._worker._thread.is_alive()
+
+    def test_sign_in_restores_signed_out_device(self, qapp, live_account_api, tmp_path):
+        import base64
+        from app.ui.window import MainWindow
+        from vpn.cli import main as cli
+        from vpn.identity import AuthorizedClients
+        url, store, _app = live_account_api
+        authorized = AuthorizedClients(tmp_path / "authorized" / "authorized_clients.json")
+        setup = _device_setup()["setup"]
+        public = base64.b64decode(setup["identity_public_key"])
+        client = AccountClient(url)
+        client.register("alice", "alice@example.com", ACCOUNT_PASSWORD, _invite(store))
+        token, _user, _ = client.login("alice", ACCOUNT_PASSWORD)
+        client.bind_device(token, "laptop", setup["identity_public_key"], self.FP)
+        cli(["account", "approve", str(store.get_device_by_fingerprint(self.FP).id),
+             "--accounts-db", str(store.path), "--database", str(authorized.path)])
+        client.logout(token, self.FP)
+        assert authorized.find(public) is None
+
+        token, _user, expires = client.login("alice", ACCOUNT_PASSWORD)
+        window = MainWindow(TestDeviceBindingGUI.IdentityIPC(), start_polling=False,
+                            account_client=client, session_token=token,
+                            session_user=client.get_me(token), session_expires_at=expires)
+        try:
+            _wait_for(qapp, lambda: authorized.find(public) is not None)
+            _wait_for(qapp, lambda: window._account_devices)
+        finally:
+            window.close()
+            qapp.processEvents()
+
+
+@pytest.mark.skipif(not _pyside6_available(), reason="PySide6 not installed")
+def test_login_window_shows_sign_out_message(qapp):
+    from app.ui.login import LoginWindow
+    login = LoginWindow()
+    try:
+        login.show_signed_out("server did not confirm")
+        assert login.isVisible() and login.login_error.text() == "server did not confirm"
+        assert login.stack.currentIndex() == 0
+    finally:
+        login.close()
+        qapp.processEvents()

@@ -24,7 +24,7 @@ from argon2.exceptions import HashingError, InvalidHashError, VerificationError
 from vpn.identity import fingerprint
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEVICE_STATUSES = ("pending", "approved", "rejected", "revoked")
 DEFAULT_ACCOUNT_DATABASE = Path("/var/lib/pqvpn/accounts/accounts.db")
 MIN_PASSWORD_LENGTH = 12
@@ -34,6 +34,8 @@ MAX_EMAIL_LENGTH = 254
 MAX_DEVICE_NAME_LENGTH = 100
 LOCKOUT_THRESHOLD = 10
 LOCKOUT_DURATION_SECONDS = 900
+INVITE_CODE_BYTES = 32
+MAX_INVITE_USES = 1000
 
 _USERNAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
@@ -75,6 +77,10 @@ class PasswordHashError(AccountError):
     """Argon2id could not safely process a password hash."""
 
 
+class InvalidInvite(AccountError):
+    """The invite code is missing, unknown, revoked, expired, or exhausted (deliberately one error)."""
+
+
 class AccountLocked(AccountError):
     """The account is temporarily locked after too many failed login attempts."""
     def __init__(self, locked_until: str):
@@ -106,6 +112,20 @@ class DeviceRecord:
     created_at: str
     updated_at: str
     status: str = "pending"
+
+
+@dataclass(frozen=True)
+class InviteRecord:
+    """Admin-visible invite metadata; the code and its hash are never exposed."""
+    id: int
+    uses_left: int
+    expires_at: str | None
+    created_at: str
+
+
+def invite_code_hash(code: str) -> bytes:
+    """Unsalted SHA-256 suffices: codes carry 256 random bits, like session tokens."""
+    return hashlib.sha256(code.encode("utf-8", errors="replace")).digest()
 
 
 @dataclass(frozen=True)
@@ -382,6 +402,19 @@ _SCHEMA_STATEMENTS = (
     "CREATE INDEX idx_sessions_expires_at ON sessions(expires_at)",
 )
 
+# Version 4 adds hash-only registration invites.
+_MIGRATION_V4 = (
+    """
+    CREATE TABLE invites (
+        id INTEGER PRIMARY KEY,
+        code_hash BLOB NOT NULL UNIQUE CHECK (length(code_hash) = 32),
+        uses_left INTEGER NOT NULL CHECK (uses_left >= 0),
+        expires_at TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+)
+
 # Version 1 → 2 adds the administrator review state. Existing bindings start as
 # pending: no version 1 device was ever approved through the account workflow.
 _MIGRATION_V2 = (
@@ -412,6 +445,7 @@ _EXPECTED_COLUMNS = {
         "id", "user_id", "token_hash", "created_at", "expires_at", "revoked_at",
         "last_used_at"
     ),
+    "invites": ("id", "code_hash", "uses_left", "expires_at", "created_at"),
 }
 _EXPECTED_INDEXES = {"idx_devices_user_id", "idx_sessions_user_id", "idx_sessions_expires_at"}
 _USER_COLUMNS = (
@@ -531,9 +565,11 @@ class AccountStore:
         integrity = connection.execute("PRAGMA quick_check").fetchall()
         if len(integrity) != 1 or integrity[0][0] != "ok":
             raise AccountDatabaseError("account database integrity check failed")
-        if cls._application_tables(connection) != set(_EXPECTED_COLUMNS):
-            raise AccountDatabaseError("account database has an incompatible table layout")
         columns = dict(_EXPECTED_COLUMNS)
+        if version <= 3:
+            del columns["invites"]
+        if cls._application_tables(connection) != set(columns):
+            raise AccountDatabaseError("account database has an incompatible table layout")
         if version <= 2:
             columns["users"] = columns["users"][:7]
         if version == 1:
@@ -564,19 +600,24 @@ class AccountStore:
                 version = self._version(connection)
                 tables = self._application_tables(connection)
                 if version == 0 and not tables:
-                    for statement in _SCHEMA_STATEMENTS:
+                    for statement in (*_SCHEMA_STATEMENTS, *_MIGRATION_V4):
                         connection.execute(statement)
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 elif version == 1:
                     self._validate_schema(connection, version=1)
                     for statement in _MIGRATION_V2:
                         connection.execute(statement)
-                    for statement in _MIGRATION_V3:
+                    for statement in (*_MIGRATION_V3, *_MIGRATION_V4):
                         connection.execute(statement)
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 elif version == 2:
                     self._validate_schema(connection, version=2)
-                    for statement in _MIGRATION_V3:
+                    for statement in (*_MIGRATION_V3, *_MIGRATION_V4):
+                        connection.execute(statement)
+                    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                elif version == 3:
+                    self._validate_schema(connection, version=3)
+                    for statement in _MIGRATION_V4:
                         connection.execute(statement)
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 elif version > SCHEMA_VERSION:
@@ -632,7 +673,15 @@ class AccountStore:
             revoked_at=row["revoked_at"], last_used_at=row["last_used_at"],
         )
 
-    def create_user(self, username: str, email: str, password: str, *, enabled: bool = True) -> UserRecord:
+    def create_user(
+        self, username: str, email: str, password: str, *, enabled: bool = True,
+        invite_code: str | None = None,
+    ) -> UserRecord:
+        """Create a user; with invite_code, consume one use in the same transaction.
+
+        The invite is checked before duplicate detection, so callers without a valid
+        invite learn nothing about existing accounts; any failure rolls the use back.
+        """
         normalized_username = normalize_username(username)
         normalized_email = normalize_email(email)
         validated_enabled = _validate_enabled(enabled)
@@ -641,6 +690,14 @@ class AccountStore:
         with self._connection() as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                if invite_code is not None and connection.execute(
+                    """
+                    UPDATE invites SET uses_left = uses_left - 1
+                    WHERE code_hash = ? AND uses_left > 0 AND (expires_at IS NULL OR expires_at > ?)
+                    """,
+                    (invite_code_hash(invite_code), now),
+                ).rowcount != 1:
+                    raise InvalidInvite("a valid invite code is required")
                 if connection.execute(
                     "SELECT 1 FROM users WHERE username = ?", (normalized_username,)
                 ).fetchone():
@@ -676,6 +733,43 @@ class AccountStore:
         result = self._user(row)
         assert result is not None
         return result
+
+    def create_invite(
+        self, max_uses: int = 1, expires_at: datetime | None = None
+    ) -> tuple[int, str]:
+        """Store only the hash of a new 256-bit code; return (id, code) for one-time display."""
+        if type(max_uses) is not int or not 1 <= max_uses <= MAX_INVITE_USES:
+            raise InvalidAccountInput(f"invite uses must be in 1..{MAX_INVITE_USES}")
+        expiry = None if expires_at is None else _utc_timestamp(expires_at, "invite expiry")
+        now = _utc_now()
+        if expiry is not None and expiry <= now:
+            raise InvalidAccountInput("invite expiry must be in the future")
+        code = secrets.token_urlsafe(INVITE_CODE_BYTES)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "INSERT INTO invites (code_hash, uses_left, expires_at, created_at) VALUES (?, ?, ?, ?)",
+                (invite_code_hash(code), max_uses, expiry, now),
+            )
+            connection.commit()
+        return int(cursor.lastrowid), code
+
+    def list_invites(self) -> list[InviteRecord]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT id, uses_left, expires_at, created_at FROM invites ORDER BY id"
+            ).fetchall()
+        return [InviteRecord(row["id"], row["uses_left"], row["expires_at"], row["created_at"])
+                for row in rows]
+
+    def revoke_invite(self, invite_id: int) -> None:
+        validated = _validate_id(invite_id, "invite ID")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("DELETE FROM invites WHERE id = ?", (validated,)).rowcount != 1:
+                connection.rollback()
+                raise AccountNotFound("invite does not exist")
+            connection.commit()
 
     def get_user_by_id(self, user_id: int) -> UserRecord | None:
         validated = _validate_id(user_id, "user ID")

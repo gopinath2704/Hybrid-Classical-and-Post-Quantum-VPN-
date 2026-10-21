@@ -824,6 +824,50 @@ def test_from_frame_routes_all_protocol_versions(version, routed):
 
 # --- Device revocation ---
 
+def test_signed_out_client_cannot_resume_before_revocation_sweep(tmp_path):
+    """A resumption ticket must not outlive the client's authorization (sign-out/revoke)."""
+    from vpn.identity import (generate_server_identity, generate_client_identity_kem,
+                              AuthorizedClients, fingerprint)
+    fp = generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
+    generate_client_identity_kem(tmp_path/'client.key', tmp_path/'client.pub')
+    auth = AuthorizedClients(tmp_path/'clients.json')
+    auth.authorize((tmp_path/'client.pub').read_bytes(), 'alice-1')
+    server = runtime.VPNServer(ServerConfig(listen_host='127.0.0.1', control_port=0, udp_port=0,
+        server_identity_private_key=str(tmp_path/'server.key'),
+        server_identity_public_key=str(tmp_path/'server.pub'),
+        authorized_clients_file=str(tmp_path/'clients.json'), dev_emulated_tun=True,
+        cookie_mode='off', protocol_version=3, resumption_ticket_lifetime=86400,
+        idle_timeout=5, rekey_interval=0))
+    worker = threading.Thread(target=server.start)
+    worker.start()
+    try:
+        until(lambda: server._data_thread is not None and server._data_thread.is_alive())
+        server.cfg.udp_port = server.udp.getsockname()[1]
+
+        def make_client(tun_name):
+            return runtime.VPNClient(ClientConfig(server_host='127.0.0.1',
+                server_control_port=server.tcp.getsockname()[1],
+                server_identity_public_key=str(tmp_path/'server.pub'),
+                server_identity_fingerprint=fp,
+                client_identity_private_key=str(tmp_path/'client.key'),
+                client_identity_public_key=str(tmp_path/'client.pub'),
+                protocol_version=3, dev_emulated_tun=True, tun_name=tun_name,
+                full_tunnel=False))
+
+        c1 = make_client('pqso0')
+        c1.connect()
+        assert c1._ticket_path().exists()
+        c1.disconnect()
+        assert auth.suspend(fingerprint((tmp_path/'client.pub').read_bytes()))
+        c2 = make_client('pqso1')
+        with pytest.raises(Exception):
+            c2.connect()
+        assert c2.state != 'CONNECTED'
+    finally:
+        server.stop()
+        worker.join(4)
+        assert not worker.is_alive()
+
 def test_revoked_client_session_terminated(tmp_path):
     from vpn.identity import AuthorizedClients, fingerprint, generate_server_identity
     generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)

@@ -721,6 +721,7 @@ class LoginWindow(QWidget):
             ("register_email", "EMAIL", "Your email address", False),
             ("register_password", "PASSWORD", "Minimum 12 characters", True),
             ("register_confirm", "CONFIRM PASSWORD", "Re-enter password", True),
+            ("register_invite", "INVITE CODE", "Code from your administrator", False),
         ):
             lo.addWidget(self._lbl(label_text))
             lo.addSpacing(6)
@@ -738,6 +739,7 @@ class LoginWindow(QWidget):
         self.register_password.textChanged.connect(self._update_register_validation)
         self.register_confirm.textChanged.connect(self._update_register_validation)
         self.register_confirm.returnPressed.connect(self._on_register)
+        self.register_invite.returnPressed.connect(self._on_register)
 
         self.register_validation = QLabel("")
         self.register_validation.setStyleSheet(f"color:{C_MUTED};font-size:11px;")
@@ -941,6 +943,17 @@ class LoginWindow(QWidget):
         self.login_totp.hide()
         self.login_totp.clear()
 
+    def show_signed_out(self, message: str) -> None:
+        """Return here after sign-out; message reports any server-side failure."""
+        self.show_login_view()
+        self.login_password.clear()
+        if message:
+            self.login_error.setText(message)
+            self.login_error.show()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
     def show_register_view(self) -> None:
         self.stack.setCurrentIndex(1)
         self.login_error.hide()
@@ -981,7 +994,7 @@ class LoginWindow(QWidget):
         for w in (self.login_identifier, self.login_password, self.login_totp,
                   self.login_btn, self.login_register_link,
                   self.register_username, self.register_email,
-                  self.register_password, self.register_confirm,
+                  self.register_password, self.register_confirm, self.register_invite,
                   self.register_btn, self.register_back_link):
             w.setEnabled(enabled)
 
@@ -1045,6 +1058,7 @@ class LoginWindow(QWidget):
         email = self.register_email.text().strip()
         password = self.register_password.text()
         confirm = self.register_confirm.text()
+        invite = self.register_invite.text().strip()
         msg = ""
         if not username or not email or not password:
             msg = "All fields are required."
@@ -1054,11 +1068,13 @@ class LoginWindow(QWidget):
             msg = "Password must be at most 1024 characters."
         elif password != confirm:
             msg = "Passwords do not match."
+        elif not invite:
+            msg = "An invite code is required. Ask your administrator for one."
         self._set_register_message(msg)
         if msg:
             return
         if self._submit(
-            "register", lambda client: client.register(username, email, password),
+            "register", lambda client: client.register(username, email, password, invite),
             self.register_error,
         ):
             self.set_inputs_enabled(False)
@@ -1114,7 +1130,7 @@ class LoginWindow(QWidget):
         self.register_btn.setText("Create Account")
         if ok:
             username = data.get("username", "") if isinstance(data, dict) else ""
-            for w in (self.register_password, self.register_confirm):
+            for w in (self.register_password, self.register_confirm, self.register_invite):
                 w.clear()
             if username:
                 self.login_identifier.setText(username)

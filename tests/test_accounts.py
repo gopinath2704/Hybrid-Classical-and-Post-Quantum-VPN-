@@ -23,12 +23,14 @@ from vpn.accounts import (
     AccountStore,
     DeviceRecord,
     InvalidAccountInput,
+    InvalidInvite,
     SessionRecord,
     UnsupportedSchemaVersion,
     UserRecord,
     compute_totp,
     generate_totp_secret,
     hash_password,
+    invite_code_hash,
     needs_rehash,
     verify_password,
     verify_totp,
@@ -67,7 +69,7 @@ def test_fresh_database_initialization_schema_and_permissions(tmp_path):
     assert not path.exists()
     account_store.initialize()
 
-    assert account_store.schema_version() == SCHEMA_VERSION == 3
+    assert account_store.schema_version() == SCHEMA_VERSION == 4
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     with raw_connection(account_store) as connection:
@@ -81,7 +83,7 @@ def test_fresh_database_initialization_schema_and_permissions(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'"
             )
         }
-    assert tables == {"users", "devices", "sessions"}
+    assert tables == {"users", "devices", "sessions", "invites"}
     assert {"idx_devices_user_id", "idx_sessions_user_id", "idx_sessions_expires_at"} <= indexes
 
 
@@ -99,7 +101,7 @@ def test_store_connections_enable_foreign_keys(store):
         connection.close()
 
 
-@pytest.mark.parametrize("version", [4, 99])
+@pytest.mark.parametrize("version", [5, 99])
 def test_newer_schema_version_fails_closed(tmp_path, version):
     path = tmp_path / "accounts.db"
     with sqlite3.connect(path) as connection:
@@ -324,7 +326,7 @@ def test_version_1_database_migrates_with_devices_pending(tmp_path):
         connection.execute("PRAGMA user_version = 1")
     store = AccountStore(path)
     store.initialize()
-    assert store.schema_version() == 3
+    assert store.schema_version() == 4
     device = store.get_device_by_fingerprint(identity_fingerprint)
     assert device.status == "pending" and device.client_public_key == public
     assert store.authenticate_user("alice", "correct horse battery staple") is not None
@@ -680,7 +682,7 @@ def test_v2_to_v3_migration(tmp_path):
     os.chmod(db_path, 0o600)
     store = AccountStore(db_path)
     store.initialize()
-    assert store.schema_version() == 3
+    assert store.schema_version() == 4
     user = store.create_user("bob", "bob@example.com", "secure-password-1234")
     assert not user.mfa_enabled
     assert user.locked_until is None
@@ -706,3 +708,139 @@ def test_cli_unlock(review):
     _cli("account", "unlock", "alice", *db)
     result = store.authenticate_user("alice", "correct horse battery staple")
     assert result is not None
+
+
+# --- Registration invites ---
+
+PW = "correct horse battery staple"
+
+
+def test_invite_code_has_256_bits_and_only_its_hash_is_stored(store):
+    invite_id, code = store.create_invite()
+    assert len(code) == 43  # token_urlsafe(32): 256 random bits
+    with raw_connection(store) as connection:
+        row = connection.execute("SELECT * FROM invites WHERE id = ?", (invite_id,)).fetchone()
+    assert code.encode() not in b"".join(
+        value if isinstance(value, bytes) else str(value).encode() for value in row
+    )
+    assert invite_code_hash(code) in row
+    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+
+
+def test_single_use_invite_is_consumed_once(store):
+    _id, code = store.create_invite()
+    assert store.create_user("alice", "alice@example.com", PW, invite_code=code)
+    with pytest.raises(InvalidInvite):
+        store.create_user("bob", "bob@example.com", PW, invite_code=code)
+    assert store.list_invites()[0].uses_left == 0
+
+
+def test_duplicate_account_does_not_burn_invite(store, user):
+    _id, code = store.create_invite()
+    with pytest.raises(AccountAlreadyExists):
+        store.create_user("alice", "other@example.com", PW, invite_code=code)
+    assert store.list_invites()[0].uses_left == 1
+    assert store.create_user("bob", "bob@example.com", PW, invite_code=code)
+
+
+def test_invalid_invite_is_checked_before_duplicates(store, user):
+    """Without a valid invite, callers cannot probe which accounts exist."""
+    with pytest.raises(InvalidInvite):
+        store.create_user("alice", "alice@example.com", PW, invite_code="guess")
+
+
+@pytest.mark.parametrize("state", ["unknown", "empty", "expired", "exhausted", "revoked"])
+def test_every_invalid_invite_state_raises_the_same_error(store, state):
+    invite_id, code = store.create_invite()
+    if state == "unknown":
+        code = code[:-1] + ("A" if code[-1] != "A" else "B")
+    elif state == "empty":
+        code = ""
+    elif state == "expired":
+        with raw_connection(store) as connection:
+            connection.execute("UPDATE invites SET expires_at = '2000-01-01T00:00:00.000000Z'")
+    elif state == "exhausted":
+        store.create_user("first", "first@example.com", PW, invite_code=code)
+    else:
+        store.revoke_invite(invite_id)
+    with pytest.raises(InvalidInvite) as exc_info:
+        store.create_user("bob", "bob@example.com", PW, invite_code=code)
+    assert str(exc_info.value) == "a valid invite code is required"
+    assert store.get_user_by_username("bob") is None
+
+
+def test_multi_use_invite_and_future_expiry(store):
+    _id, code = store.create_invite(2, datetime.now(timezone.utc) + timedelta(hours=1))
+    store.create_user("a1", "a1@example.com", PW, invite_code=code)
+    store.create_user("a2", "a2@example.com", PW, invite_code=code)
+    with pytest.raises(InvalidInvite):
+        store.create_user("a3", "a3@example.com", PW, invite_code=code)
+
+
+@pytest.mark.parametrize("uses", [0, -1, 1001, True])
+def test_invite_use_bounds(store, uses):
+    with pytest.raises(InvalidAccountInput):
+        store.create_invite(uses)
+
+
+def test_invite_expiry_must_be_future(store):
+    with pytest.raises(InvalidAccountInput):
+        store.create_invite(1, datetime.now(timezone.utc) - timedelta(seconds=1))
+
+
+def test_concurrent_registrations_cannot_share_single_use_invite(store):
+    import threading
+    _id, code = store.create_invite()
+    results: list[str] = []
+    barrier = threading.Barrier(6)
+
+    def attempt(index: int) -> None:
+        barrier.wait()
+        try:
+            AccountStore(store.path).create_user(
+                f"user{index}", f"user{index}@example.com", PW, invite_code=code
+            )
+            results.append("ok")
+        except InvalidInvite:
+            results.append("invite")
+
+    threads = [threading.Thread(target=attempt, args=(index,)) for index in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert sorted(results) == ["invite"] * 5 + ["ok"]
+
+
+def test_version_3_database_migrates_to_invites(tmp_path):
+    store = AccountStore(tmp_path / "accounts" / "accounts.db")
+    store.initialize()
+    created = store.create_user("alice", "alice@example.com", PW)
+    with raw_connection(store) as connection:
+        connection.execute("DROP TABLE invites")
+        connection.execute("PRAGMA user_version = 3")
+    store.initialize()
+    assert store.schema_version() == 4
+    assert store.get_user_by_id(created.id) == created
+    assert store.list_invites() == []
+
+
+def test_cli_invite_lifecycle_never_shows_hash(store, capsys):
+    db = ("--accounts-db", str(store.path))
+    _cli("account", "invite-create", "--uses", "2", "--expires-hours", "24", *db)
+    created = capsys.readouterr().out
+    code = created.rsplit(": ", 1)[1].strip()
+    assert len(code) == 43
+    _cli("account", "invites", *db)
+    listing = capsys.readouterr().out
+    assert "uses_left=2" in listing and code not in listing
+    assert invite_code_hash(code).hex() not in listing
+    store.create_user("bob", "bob@example.com", PW, invite_code=code)
+    _cli("account", "invite-revoke", "1", *db)
+    assert store.list_invites() == []
+    with pytest.raises(InvalidInvite):
+        store.create_user("carol", "carol@example.com", PW, invite_code=code)
+    with pytest.raises(SystemExit):
+        _cli("account", "invite-revoke", "1", *db)
+    with pytest.raises(SystemExit):
+        _cli("account", "invite-create", "--expires-hours", "0", *db)

@@ -1,20 +1,66 @@
 """Settings page — read-only service-owned configuration."""
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QVBoxLayout, QWidget
+from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QVBoxLayout, QWidget
 
 from app.client import DEFAULT_CONFIG, truncate_fingerprint
 from app.ui.theme import COLORS, badge_style, label
-from app.ui.components import Card, DataRow
+from app.ui.components import Card, DataRow, StatusRow
+
+DEFAULT_PREFS: dict[str, object] = {
+    "theme": "dark",
+    "reduce_motion": False,
+    "close_to_tray": True,
+    "auto_connect": False,
+}
+
+KILL_SWITCH_NOTE = (
+    "The kill switch is a service configuration flag. The current runtime records it but "
+    "does not install blocking firewall rules, so traffic is not blocked if the tunnel drops."
+)
 
 
 class SettingsPage:
+    def __init__(self, *, on_pref_changed: Callable[[str, object], None]) -> None:
+        self._on_pref_changed = on_pref_changed
+
     def build(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 2, 0, 10)
         layout.setSpacing(14)
+
+        prefs = Card("Desktop preferences", "Stored for this user only; never sent to the service.")
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(label("Theme", 11, COLORS["secondary"]))
+        theme_row.addStretch(1)
+        self.pref_theme = QComboBox()
+        self.pref_theme.addItems(["Dark", "Light", "System"])
+        self.pref_theme.setAccessibleName("Theme")
+        self.pref_theme.currentTextChanged.connect(
+            lambda text: self._on_pref_changed("theme", text.lower()))
+        theme_row.addWidget(self.pref_theme)
+        prefs.body.addLayout(theme_row)
+        self.pref_reduce_motion = QCheckBox("Reduce motion (no pulse or spinning ring)")
+        self.pref_close_to_tray = QCheckBox("Closing the window keeps PQ-VPN in the system tray")
+        self.pref_auto_connect = QCheckBox(
+            "Connect automatically when the desktop app starts and setup is complete")
+        for key, box in (("reduce_motion", self.pref_reduce_motion),
+                         ("close_to_tray", self.pref_close_to_tray),
+                         ("auto_connect", self.pref_auto_connect)):
+            box.setAccessibleName(box.text())
+            box.toggled.connect(lambda checked, k=key: self._on_pref_changed(k, checked))
+            prefs.body.addWidget(box)
+        self.settings_kill_switch = StatusRow("Kill switch (service config)")
+        self.settings_kill_switch.setToolTip(KILL_SWITCH_NOTE)
+        prefs.body.addWidget(self.settings_kill_switch)
+        ks_note = label(KILL_SWITCH_NOTE, 10, COLORS["amber"])
+        ks_note.setWordWrap(True)
+        prefs.body.addWidget(ks_note)
+        layout.addWidget(prefs)
 
         read_only = label("READ-ONLY", 9, COLORS["cyan"], 700)
         read_only.setStyleSheet(badge_style(COLORS["cyan"]))
@@ -45,7 +91,24 @@ class SettingsPage:
         layout.addStretch(1)
         return page
 
+    def load_prefs(self, prefs: dict[str, object]) -> None:
+        widgets = (self.pref_theme, self.pref_reduce_motion,
+                   self.pref_close_to_tray, self.pref_auto_connect)
+        for widget in widgets:
+            widget.blockSignals(True)
+        self.pref_theme.setCurrentText(str(prefs["theme"]).title())
+        self.pref_reduce_motion.setChecked(bool(prefs["reduce_motion"]))
+        self.pref_close_to_tray.setChecked(bool(prefs["close_to_tray"]))
+        self.pref_auto_connect.setChecked(bool(prefs["auto_connect"]))
+        for widget in widgets:
+            widget.blockSignals(False)
+
     def render(self, status, connected: bool) -> None:
+        self.settings_kill_switch.set_status(
+            ("Flag on · not enforced" if status.kill_switch_active else "Off")
+            if connected else "Reported only while connected",
+            warning=connected and status.kill_switch_active,
+        )
         if status.full_tunnel is True:
             tunnel = "Full tunnel"
         elif status.full_tunnel is False:

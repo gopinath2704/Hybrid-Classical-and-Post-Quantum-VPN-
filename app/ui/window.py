@@ -1,17 +1,19 @@
 """MainWindow coordinator — wires pages, workers, navigation, and status polling."""
 from __future__ import annotations
 
+import json
 import re
 import socket
 import time
 from collections import deque
 from dataclasses import asdict
+from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QSettings, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QFileDialog, QHBoxLayout, QInputDialog, QMainWindow, QMessageBox,
-    QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
+    QApplication, QFileDialog, QHBoxLayout, QInputDialog, QMainWindow, QMenu, QMessageBox,
+    QSizePolicy, QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 from app.client import (
@@ -19,26 +21,61 @@ from app.client import (
     ClientStatus, ConnectionState, DEFAULT_CONFIG,
     DEVICE_STATUS_LABELS, IPCClient, SessionState, UserProfile,
     _AccountWorker, _IPCWorker, account_ux_state, format_duration,
-    public_device_identity, sanitize_error, truncate_fingerprint,
+    public_device_identity, restore_device_access, sanitize_error, truncate_fingerprint,
 )
-from app.ui.theme import COLORS, STATE_COLORS, badge_style, label
-from app.ui.components import NavRail, scroll_page
+from app.ui.theme import (
+    COLORS, STATE_COLORS, THEME_CHOICES, apply_palette, badge_style, label, resolve_theme,
+)
+from app.ui.components import NavRail, motion_allowed, scroll_page, step_states
 from app.ui.pages.home import HomePage
 from app.ui.pages.servers import ServersPage
 from app.ui.pages.security import SecurityPage
 from app.ui.pages.account import AccountPage
-from app.ui.pages.settings import SettingsPage
+from app.ui.pages.settings import DEFAULT_PREFS, KILL_SWITCH_NOTE, SettingsPage
 from app.ui.pages.logs import LogsPage
 from app.ui.pages.about import AboutPage
 
+LOGS_PAGE = 5
+
+
+def state_icon(color: str) -> QIcon:
+    pixmap = QPixmap(32, 32)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor(color))
+    painter.drawEllipse(4, 4, 24, 24)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def load_prefs(settings: QSettings) -> dict[str, object]:
+    prefs = {key: settings.value(key, default, type=type(default))
+             for key, default in DEFAULT_PREFS.items()}
+    if prefs["theme"] not in THEME_CHOICES:
+        prefs["theme"] = DEFAULT_PREFS["theme"]
+    return prefs
+
+
+def load_favourites(settings: QSettings) -> set[str]:
+    try:
+        values = json.loads(str(settings.value("favourites", "[]")))
+    except ValueError:
+        return set()
+    return {v for v in values if isinstance(v, str)} if isinstance(values, list) else set()
+
 
 class MainWindow(QMainWindow):
+    # Emitted once sign-out completes; the text reports a server-side failure, if any.
+    signed_out = Signal(str)
+
     PAGE_TITLES = (
         ("Home", "Connection overview and live tunnel health"),
         ("Servers", "Imported public server profiles"),
         ("Security", "Cryptography, network protection, and identity"),
         ("Account", "Authentication and user session management"),
-        ("Settings", "Validated service-owned configuration (read-only)"),
+        ("Settings", "Desktop preferences and service-owned configuration"),
         ("Logs", "Bounded, sanitized client service events"),
         ("About", "Project scope and security boundaries"),
     )
@@ -47,8 +84,16 @@ class MainWindow(QMainWindow):
                  account_client: AccountClient | None = None,
                  session_token: str | None = None,
                  session_user: dict | None = None,
-                 session_expires_at: str = "") -> None:
+                 session_expires_at: str = "",
+                 settings: QSettings | None = None) -> None:
         super().__init__()
+        self.settings = settings or QSettings("PQ-VPN", "desktop")
+        self.prefs = load_prefs(self.settings)
+        self._enrollment_shared = False
+        self._quitting = False
+        self._auto_connect_pending = start_polling
+        self._signing_out = False
+        self._sign_out_expired = False
         self.setObjectName("pqvpnMainWindow")
         self.setWindowTitle("PQ-VPN")
         self.setMinimumSize(980, 650)
@@ -101,6 +146,7 @@ class MainWindow(QMainWindow):
             on_copy_enrollment=self._copy_enrollment_request,
             on_export_enrollment=self._export_enrollment_request,
             on_open_account=lambda: self.switch_page(3),
+            on_open_page=self.switch_page,
         )
         self._servers = ServersPage(
             on_choose_profile=self._choose_profile,
@@ -109,9 +155,12 @@ class MainWindow(QMainWindow):
             on_remove_profile=self._remove_profile,
             on_copy_profile_info=self._copy_profile_info,
             on_copy_fingerprint=self._copy_fingerprint,
+            on_favourites_changed=self._save_favourites,
+            favourites=load_favourites(self.settings),
         )
         self._security = SecurityPage(
             on_copy_client_fp=self._copy_client_fingerprint,
+            on_copy_server_fp=self._copy_fingerprint,
             on_copy_enrollment=self._copy_enrollment_request,
             on_export_enrollment=self._export_enrollment_request,
         )
@@ -123,8 +172,9 @@ class MainWindow(QMainWindow):
             on_mfa_disable=self._on_mfa_disable_clicked,
             on_change_password=self._on_change_password_clicked,
         )
-        self._settings = SettingsPage()
-        self._logs = LogsPage(on_refresh=self._refresh_logs, on_copy=self._copy_logs)
+        self._settings = SettingsPage(on_pref_changed=self._on_pref_changed)
+        self._logs = LogsPage(on_refresh=self._refresh_logs, on_copy=self._copy_logs,
+                              on_export=self._export_logs)
         self._about = AboutPage()
 
         self.pages = QStackedWidget()
@@ -150,7 +200,7 @@ class MainWindow(QMainWindow):
 
         # ── Workers ──
         self._worker = _IPCWorker(self.ipc)
-        self._worker.status_ready.connect(self._render)
+        self._worker.status_ready.connect(self._on_status)
         self._worker.action_finished.connect(self._action_finished)
         self._worker.logs_ready.connect(self._render_logs_signal)
 
@@ -173,8 +223,18 @@ class MainWindow(QMainWindow):
             self._add_gui_event("info", f"Signed in as {user.username}")
             self._refresh_account_view()
             if account_client is not None:
-                self._account_worker.submit(
-                    "devices", lambda: account_client.list_devices(session_token))
+                ipc = self.ipc
+                self._account_worker.submit("restore", lambda: restore_device_access(
+                    account_client, session_token, ipc.setup_status()))
+
+        self._settings.load_prefs(self.prefs)
+        self._apply_theme(rerender=False)
+        self._apply_motion()
+        QGuiApplication.styleHints().colorSchemeChanged.connect(self._on_system_scheme_changed)
+        self._tray = self._create_tray()
+        self._toggle_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
+        self._toggle_shortcut.activated.connect(self._on_toggle)
+        self._home.action_btn.setToolTip("Connect or disconnect (Ctrl+K)")
 
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
@@ -182,6 +242,80 @@ class MainWindow(QMainWindow):
         if start_polling:
             self._timer.start()
             QTimer.singleShot(80, self._poll_status)
+
+    # ── Preferences, theme, tray ──
+    def _on_pref_changed(self, key: str, value: object) -> None:
+        self.prefs[key] = value
+        self.settings.setValue(key, value)
+        if key == "theme":
+            self._apply_theme(rerender=True)
+        elif key == "reduce_motion":
+            self._apply_motion()
+
+    def _save_favourites(self, favourites: set[str]) -> None:
+        self.settings.setValue("favourites", json.dumps(sorted(favourites)))
+
+    def _apply_theme(self, rerender: bool) -> None:
+        system_light = QGuiApplication.styleHints().colorScheme() == Qt.ColorScheme.Light
+        sheet = apply_palette(resolve_theme(str(self.prefs["theme"]), system_light), self)
+        app = QApplication.instance()
+        if app is not None and app.styleSheet() != sheet:
+            app.setStyleSheet(sheet)
+        if rerender:
+            self._render(self._last_status)
+
+    def _on_system_scheme_changed(self, *_: object) -> None:
+        if self.prefs["theme"] == "system":
+            self._apply_theme(rerender=True)
+
+    def _apply_motion(self) -> None:
+        self._home.power_btn.reduce_motion = not motion_allowed(bool(self.prefs["reduce_motion"]))
+
+    def _create_tray(self) -> QSystemTrayIcon | None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return None
+        menu = QMenu(self)
+        self._tray_toggle_action = menu.addAction("Connect", self._on_toggle)
+        self._tray_show_action = menu.addAction("Hide window", self._toggle_window)
+        menu.addSeparator()
+        menu.addAction("Quit PQ-VPN", self.quit_app)
+        tray = QSystemTrayIcon(state_icon(STATE_COLORS["DISCONNECTED"]), self)
+        tray.setToolTip("PQ-VPN · DISCONNECTED")
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._tray_activated)
+        tray.show()
+        QApplication.instance().setQuitOnLastWindowClosed(False)
+        return tray
+
+    def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.Trigger:
+            self._toggle_window()
+
+    def _toggle_window(self) -> None:
+        if self.isVisible():
+            self.hide()
+        else:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+        self._update_tray(self._last_status.state)
+
+    def _update_tray(self, state: str) -> None:
+        if self._tray is None:
+            return
+        self._tray.setIcon(state_icon(STATE_COLORS.get(state, COLORS["muted"])))
+        self._tray.setToolTip(f"PQ-VPN · {state.replace('_', ' ')}")
+        self._tray_toggle_action.setText(
+            "Disconnect" if state == ConnectionState.CONNECTED.value else "Connect")
+        self._tray_toggle_action.setEnabled(self._home.action_btn.isEnabled())
+        self._tray_show_action.setText("Hide window" if self.isVisible() else "Show window")
+
+    def quit_app(self) -> None:
+        self._quitting = True
+        self.close()
+
+    def hides_to_tray(self) -> bool:
+        return self._tray is not None and bool(self.prefs["close_to_tray"]) and not self._quitting
 
     def __getattr__(self, name: str):
         for page in (self._home, self._servers, self._security,
@@ -201,24 +335,51 @@ class MainWindow(QMainWindow):
         title, subtitle = self.PAGE_TITLES[index]
         self.page_title.setText(title)
         self.page_subtitle.setText(subtitle)
-        if index == 5:
+        if index == LOGS_PAGE:
             self._refresh_logs()
 
     # ── Polling ──
     def _poll_status(self) -> None:
         self._worker.request_status()
+        if self.pages.currentIndex() == LOGS_PAGE:
+            self._worker.request_logs()
+
+    def _on_status(self, status: object) -> None:
+        self._render(status)
+        status = self._last_status
+        connected = status.state == ConnectionState.CONNECTED.value
+        if connected and status.rtt_ms is not None:
+            self._home.rtt_sparkline.add(status.rtt_ms)
+        elif not connected:
+            self._home.rtt_sparkline.clear()
+        if self._auto_connect_pending:
+            self._auto_connect_pending = False
+            if self.prefs["auto_connect"] and status.state == ConnectionState.DISCONNECTED.value:
+                self._add_gui_event("info", "Auto-connect requested by desktop preference")
+                self._on_toggle()
 
     def _refresh_logs(self) -> None:
         self._worker.request_logs()
 
     # ── Connection toggle ──
+    def _vpn_locked(self) -> bool:
+        """Account-managed GUI (an account client exists) with no live session: no VPN."""
+        return self._account_client is not None and (
+            self._signing_out or not self._account_session.is_authenticated)
+
     def _on_toggle(self) -> None:
+        """Single connect path for the button, tray, Ctrl+K and auto-connect."""
         state = self._last_status.state
         if self._busy or state in {ConnectionState.CONNECTING.value,
                                    ConnectionState.DISCONNECTING.value,
                                    ConnectionState.SETUP_REQUIRED.value}:
             return
         action = "disconnect" if state == ConnectionState.CONNECTED.value else "connect"
+        if action == "connect" and self._vpn_locked():
+            self._add_gui_event("warning", "Connect refused: signed out. Sign in to use the VPN.")
+            self._home.render_failure("Signed out. Sign in to use the VPN.", False)
+            self._set_visual_state(state)
+            return
         transient = (ConnectionState.DISCONNECTING.value if action == "disconnect"
                      else ConnectionState.CONNECTING.value)
         self._busy = True
@@ -309,7 +470,19 @@ class MainWindow(QMainWindow):
         )
 
     def _copy_logs(self) -> None:
-        QGuiApplication.clipboard().setText(self._logs.logs_view.toPlainText())
+        QGuiApplication.clipboard().setText(self._logs.visible_text())
+
+    def _export_logs(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export client events", "pqvpn-events.log", "Log files (*.log *.txt)")
+        if not path:
+            return
+        try:
+            Path(path).write_text(self._logs.visible_text() + "\n", encoding="utf-8")
+        except OSError as exc:
+            self._add_gui_event("error", f"Event export failed: {exc}")
+        else:
+            self._add_gui_event("info", f"Events exported to {path}")
 
     # ── IPC action result ──
     def _action_finished(self, action: str, result: object) -> None:
@@ -326,6 +499,8 @@ class MainWindow(QMainWindow):
                 self._home.error_label.setText(error)
                 self._home.error_label.show()
         else:
+            if action in {"copy_enrollment", "export_enrollment"}:
+                self._enrollment_shared = True
             if action == "copy_enrollment":
                 QGuiApplication.clipboard().setText(str(result.get("content", "")))
             elif action == "export_enrollment":
@@ -334,8 +509,10 @@ class MainWindow(QMainWindow):
                 )
             self._add_gui_event("info", f"{action.title()} completed")
         self._worker.request_status()
-        if self.pages.currentIndex() == 5:
+        if self.pages.currentIndex() == LOGS_PAGE:
             self._worker.request_logs()
+        if action == "disconnect" and self._signing_out:
+            self._finish_sign_out()  # tunnel is down (or failed to stop); proceed regardless
 
     def _add_gui_event(self, level: str, message: str) -> None:
         self._gui_events.append({
@@ -375,14 +552,15 @@ class MainWindow(QMainWindow):
         dns_exposed = connected and status.dns_mode == "none"
         if dns_exposed:
             subtitle = "Connected, DNS unprotected"
+        elif not connected and self._vpn_locked():
+            subtitle = "Signed out · sign in to use the VPN"
         self._home.subtitle_label.setText(subtitle)
         subtitle_color = COLORS["amber"] if dns_exposed else COLORS["secondary"]
         self._home.subtitle_label.setStyleSheet(f"font-size: 11px; color: {subtitle_color};")
         error = sanitize_error(status.error) if status.error else ""
         if state == ConnectionState.SETUP_REQUIRED.value:
             error = error or f"Configuration required: {status.config_path or DEFAULT_CONFIG}"
-        self._home.error_label.setText(error)
-        self._home.error_label.setVisible(bool(error))
+        self._home.render_failure(error, state == ConnectionState.FAILED.value)
 
         server_display = (status.connected_profile_name if connected else status.active_profile_name)
         server_display = server_display or status.server_host or "—"
@@ -408,6 +586,10 @@ class MainWindow(QMainWindow):
             if connected and status.rekey_countdown is not None else "—",
             connected and status.rekey_countdown is not None,
         )
+        self._home.detail_rekey.note_label.setText(
+            f"Session rotation · epoch {status.epoch}"
+            if connected and status.epoch is not None else "Session rotation")
+        self._home.rtt_card.setVisible(connected)
 
         self._render_pq(status, connected)
         self._render_onboarding(status, connected)
@@ -431,9 +613,16 @@ class MainWindow(QMainWindow):
         h.onboarding_profile.set_status(
             profile_text, active=profile_ready, warning=not profile_ready
         )
+        h.onboarding_enrollment.set_status(
+            "Shared this session · send it to your administrator" if self._enrollment_shared
+            else "Copy or export, then send to your administrator",
+            active=self._enrollment_shared, warning=not self._enrollment_shared,
+        )
         h.onboarding_authorization.set_status(
             "Offline administrator approval required", warning=True,
         )
+        h.onboarding_steps.set_states(step_states(
+            [status.identity_ready, profile_ready, self._enrollment_shared, False]))
         mutations_enabled = status.managed_mode and not connected and not self._busy
         h.onboarding_identity_btn.setEnabled(mutations_enabled and not status.identity_ready)
         h.onboarding_import_btn.setEnabled(mutations_enabled)
@@ -478,8 +667,8 @@ class MainWindow(QMainWindow):
             ipv6_ok = status.ipv6_guard_active
             ipv6_text = "Active" if ipv6_ok else "Inactive"
             ipv6_color = COLORS["green"] if ipv6_ok else COLORS["secondary"]
-            ks_text = "Active" if status.kill_switch_active else "Inactive"
-            ks_color = COLORS["green"] if status.kill_switch_active else COLORS["secondary"]
+            ks_text = "Flag on · not enforced" if status.kill_switch_active else "Not armed"
+            ks_color = COLORS["amber"] if status.kill_switch_active else COLORS["secondary"]
         else:
             dns_text = f"Configured: {status.dns_mode}" if status.dns_mode else "Idle"
             dns_color = COLORS["secondary"]
@@ -487,6 +676,11 @@ class MainWindow(QMainWindow):
             ipv6_color = COLORS["secondary"]
             ks_text = "Idle"
             ks_color = COLORS["secondary"]
+        flagged = connected and status.kill_switch_active
+        h.kill_switch_chip.setText(
+            "KILL SWITCH · FLAG ON, NOT ENFORCED" if flagged else "KILL SWITCH · NOT ARMED")
+        h.kill_switch_chip.setStyleSheet(badge_style(COLORS["amber" if flagged else "muted"]))
+        h.kill_switch_chip.setToolTip(KILL_SWITCH_NOTE)
         for lbl, text, color in (
             (h.home_dns_value, dns_text, dns_color),
             (h.home_ipv6_value, ipv6_text, ipv6_color),
@@ -517,26 +711,33 @@ class MainWindow(QMainWindow):
         self.footer_state.setStyleSheet(f"font-size: 9px; color: {color}; font-weight: 700;")
         busy_state = state in {ConnectionState.CONNECTING.value,
                                ConnectionState.DISCONNECTING.value}
-        h.connection_progress.setVisible(busy_state)
+        h.connection_progress.setVisible(busy_state and not h.power_btn.reduce_motion)
+        handshaking = state == ConnectionState.CONNECTING.value
+        h.handshake_steps.setVisible(handshaking)
+        h.handshake_note.setVisible(handshaking)
+        if handshaking:
+            h.handshake_steps.set_states(["current"] * 3)
+            for row in h.handshake_steps.rows:
+                row.set_status("In progress", warning=True)
 
+        danger = COLORS["danger_bg"], COLORS["red"], COLORS["danger_border"]
+        warn = COLORS["warn_bg"], COLORS["amber"], COLORS["warn_border"]
         if state == ConnectionState.CONNECTED.value:
-            text = "Disconnect"
-            background, foreground, border = "#2A171B", COLORS["red"], "#63303A"
+            text, (background, foreground, border) = "Disconnect", danger
         elif state == ConnectionState.CONNECTING.value:
-            text = "Connecting…"
-            background, foreground, border = "#2B2112", COLORS["amber"], "#61491C"
+            text, (background, foreground, border) = "Connecting…", warn
         elif state == ConnectionState.DISCONNECTING.value:
-            text = "Disconnecting…"
-            background, foreground, border = "#2B2112", COLORS["amber"], "#61491C"
+            text, (background, foreground, border) = "Disconnecting…", warn
         elif state == ConnectionState.FAILED.value:
-            text = "Retry"
-            background, foreground, border = "#32191E", COLORS["red"], "#71313C"
+            text, (background, foreground, border) = "Retry", danger
         elif state == ConnectionState.SETUP_REQUIRED.value:
-            text = "Setup required"
-            background, foreground, border = "#211D16", COLORS["amber"], "#4E4025"
+            text, (background, foreground, border) = "Setup required", warn
         else:
             text = "Connect"
-            background, foreground, border = COLORS["green"], "#06110B", COLORS["green"]
+            background, foreground, border = COLORS["green"], COLORS["on_accent"], COLORS["green"]
+        locked = state != ConnectionState.CONNECTED.value and self._vpn_locked()
+        if locked:
+            text = "Sign in to connect"
         h.action_btn.setText(text)
         h.action_btn.setStyleSheet(f"""
             QPushButton {{
@@ -546,18 +747,20 @@ class MainWindow(QMainWindow):
                 padding: 10px 22px; font-size: 12px; font-weight: 700;
             }}
             QPushButton:hover {{ border-color: {foreground}; }}
+            QPushButton:focus {{ border: 2px solid {COLORS['cyan']}; }}
             QPushButton:disabled {{
-                background: #11161C; color: {COLORS['muted']};
+                background: {COLORS['disabled_bg']}; color: {COLORS['muted']};
                 border-color: {COLORS['border_soft']};
             }}
         """)
-        enabled = not self._busy and state not in {
+        enabled = not self._busy and not locked and state not in {
             ConnectionState.CONNECTING.value,
             ConnectionState.DISCONNECTING.value,
             ConnectionState.SETUP_REQUIRED.value,
         }
         h.action_btn.setEnabled(enabled)
         h.power_btn.setEnabled(enabled)
+        self._update_tray(state)
 
     # ── Logs ──
     def _render_logs_signal(self, entries: object) -> None:
@@ -576,21 +779,44 @@ class MainWindow(QMainWindow):
         return True
 
     def _on_logout_clicked(self) -> None:
-        token = self._account_session.get_token()
         self._end_account_session(expired=False)
-        if token and self._account_client is not None:
-            client = self._account_client
-            self._account_worker.submit("logout", lambda: client.logout(token))
 
     def _end_account_session(self, *, expired: bool) -> None:
+        """Sign-out or forced expiry: take any tunnel down first, then end the session."""
+        if self._signing_out:
+            return
+        self._signing_out = True  # gates connect from here on
+        self._sign_out_expired = expired
         self._session_timer.stop()
+        if self._last_status.state in {ConnectionState.CONNECTED.value,
+                                       ConnectionState.CONNECTING.value}:
+            self._add_gui_event("info", "Disconnecting before sign-out")
+            self._busy = True
+            self._set_visual_state(ConnectionState.DISCONNECTING.value)
+            self._worker.request_action("disconnect")  # resumes in _action_finished
+            return
+        self._finish_sign_out()
+
+    def _finish_sign_out(self) -> None:
+        expired = self._sign_out_expired
+        token = self._account_session.get_token()
+        fingerprint = self._last_status.identity_fingerprint or None
         self._account_session.clear_session(expired=expired)
         self._account_devices = []
+        self._signing_out = False
         self._add_gui_event(
             "warning" if expired else "info",
             "Session expired — signed out automatically" if expired else "Signed out",
         )
         self._refresh_account_view()
+        self._set_visual_state(self._last_status.state)
+        client = self._account_client
+        if token and client is not None and not expired:
+            # The server suspends this device's VPN access, then revokes the session.
+            self._account_worker.submit("logout", lambda: client.logout(token, fingerprint))
+        else:
+            self.signed_out.emit(
+                "Your session expired. Sign in again to use the VPN." if expired else "")
 
     def _validate_account_session(self) -> None:
         token = self._account_session.get_token()
@@ -827,8 +1053,21 @@ class MainWindow(QMainWindow):
             a.acct_pw_error.show()
 
     def _account_logout_finished(self, ok, data, message, status_code, retry_after) -> None:
-        if not ok and status_code != 401:
-            self._add_gui_event("warning", "Remote sign-out failed; local session was cleared")
+        if ok:
+            self.signed_out.emit("")
+            return
+        warning = ("Signed out on this computer, but the account server did not confirm it "
+                   f"({message or 'unknown error'}). This device may still have VPN access.")
+        self._add_gui_event("warning", warning)
+        self._account.show_signed_out(warning)
+        self.signed_out.emit(warning)
+
+    def _account_restore_finished(self, ok, data, message, status_code, retry_after) -> None:
+        if ok or status_code == 401:
+            self._account_devices_finished(ok, data, message, status_code, retry_after)
+            return
+        self._add_gui_event("warning", f"Could not restore this device's VPN access: {message}")
+        self._validate_account_session()
 
     def _account_validate_finished(self, ok, data, message, status_code, retry_after) -> None:
         if not self._account_session.is_authenticated:
@@ -921,9 +1160,28 @@ class MainWindow(QMainWindow):
         h.home_account_device.set_value(device_text)
 
     # ── Cleanup ──
-    def closeEvent(self, event) -> None:  # noqa: N802
+    def _stop_background(self) -> None:
         self._timer.stop()
         self._session_timer.stop()
         self._worker.stop()
         self._account_worker.stop()
+
+    def shutdown(self) -> None:
+        """Tear down after sign-out without quitting the app (the login window takes over)."""
+        self._stop_background()
+        if self._tray is not None:
+            self._tray.hide()
+            QApplication.instance().setQuitOnLastWindowClosed(True)
+        self.hide()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if self.hides_to_tray():
+            event.ignore()
+            self.hide()
+            self._update_tray(self._last_status.state)
+            return
+        self._stop_background()
         super().closeEvent(event)
+        if self._tray is not None:
+            self._tray.hide()
+            QApplication.quit()

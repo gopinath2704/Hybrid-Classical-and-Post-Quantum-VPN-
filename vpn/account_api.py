@@ -40,6 +40,7 @@ from vpn.accounts import (
     AccountStore,
     DeviceRecord,
     InvalidAccountInput,
+    InvalidInvite,
     SessionRecord,
     UserRecord,
     generate_totp_secret,
@@ -83,6 +84,9 @@ class AccountAPIConfig:
     registration_rate_limit_entries: int = 2048
     body_limit_bytes: int = DEFAULT_BODY_LIMIT
     auto_approve: bool = False
+    # Secure by default: registration needs an admin-issued invite. Set
+    # require_invite = false only for local development or open test deployments.
+    require_invite: bool = True
     authorized_clients_file: Path = Path("/var/lib/pqvpn/authorized/authorized_clients.json")
     server_identity_public_key: Path = Path("/etc/pqvpn/server_identity_public.key")
     server_host: str = ""
@@ -139,6 +143,8 @@ class AccountAPIConfig:
                 raise AccountAPIConfigError(f"{name} must be in {minimum}..{maximum}")
         if type(self.auto_approve) is not bool:
             raise AccountAPIConfigError("auto_approve must be boolean")
+        if type(self.require_invite) is not bool:
+            raise AccountAPIConfigError("require_invite must be boolean")
         if not isinstance(self.authorized_clients_file, Path):
             raise AccountAPIConfigError("authorized_clients_file must be a filesystem path")
         if not isinstance(self.server_identity_public_key, Path):
@@ -287,6 +293,7 @@ class RegisterRequest(BaseModel):
     username: str = Field(max_length=MAX_USERNAME_LENGTH + 2)
     email: str = Field(max_length=MAX_EMAIL_LENGTH + 2)
     password: str = Field(max_length=MAX_PASSWORD_LENGTH + 1)
+    invite_code: str | None = Field(default=None, max_length=128)
 
 
 class LoginRequest(BaseModel):
@@ -317,6 +324,12 @@ class DeviceBindRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
     device_name: str = Field(min_length=1, max_length=MAX_DEVICE_NAME_LENGTH + 2)
     public_key: str = Field(min_length=1, max_length=64)
+    fingerprint: str = Field(min_length=64, max_length=64)
+
+
+class LogoutRequest(BaseModel):
+    """Optional body: the device signing out, so its VPN authorization is suspended too."""
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
     fingerprint: str = Field(min_length=64, max_length=64)
 
 
@@ -488,6 +501,15 @@ def _auto_approve_device(
     return approved
 
 
+def _owned_device(store: AccountStore, user_id: int, fingerprint: str) -> DeviceRecord | None:
+    """The caller's own device, or None; another user's device is indistinguishable from none."""
+    try:
+        device = store.get_device_by_fingerprint(fingerprint)
+    except InvalidAccountInput:
+        return None
+    return device if device is not None and device.user_id == user_id else None
+
+
 def create_app(
     config: AccountAPIConfig,
     *,
@@ -544,9 +566,16 @@ def create_app(
                 429, "rate_limited", "too many registration attempts",
                 headers={"Retry-After": str(retry)},
             )
+        # Recorded before the invite check, so wrong codes count against the limit.
         application.state.registration_limiter.record_event(key)
+        invite = (payload.invite_code or "") if config.require_invite else None
         try:
-            user = account_store.create_user(payload.username, payload.email, payload.password)
+            user = account_store.create_user(
+                payload.username, payload.email, payload.password, invite_code=invite
+            )
+        except InvalidInvite:
+            logger.info("registration rejected category=invite source=%s", _source(request))
+            return _error(403, "invalid_invite", "a valid invite code is required")
         except AccountAlreadyExists as exc:
             logger.info("registration rejected category=duplicate source=%s", _source(request))
             return _error(409, "account_exists", str(exc))
@@ -624,7 +653,7 @@ def create_app(
     async def bind_device(
         payload: DeviceBindRequest, request: Request, context=Depends(get_authenticated_user)
     ):
-        """Bind a public Ed25519 identity to the account; never grants VPN access."""
+        """Bind a public Ed25519 identity; grants VPN access only via auto_approve or sign-in restore."""
         if isinstance(context, JSONResponse):
             return context
         try:
@@ -643,6 +672,20 @@ def create_app(
                         account_store, existing, public_key,
                         context.user.username, config, request,
                     )
+                elif existing.status == "approved" and existing.enabled:
+                    # Sign-in path: undo this owner's sign-out suspension (never an admin revocation).
+                    try:
+                        restored = AuthorizedClients(config.authorized_clients_file).restore(
+                            existing.client_fingerprint
+                        )
+                    except Exception:
+                        logger.error("device access restore failed device_id=%d", existing.id)
+                        return _error(503, "authorize_failed", "device VPN access could not be restored")
+                    if restored:
+                        logger.info(
+                            "device access restored user_id=%d device_id=%d source=%s",
+                            context.user.id, existing.id, _source(request),
+                        )
                 return JSONResponse(status_code=200, content={"device": _public_device(existing)})
             logger.info("device binding rejected category=duplicate user_id=%d", context.user.id)
             return _error(409, "device_exists", "device identity is already registered")
@@ -668,9 +711,26 @@ def create_app(
         return JSONResponse(status_code=201, content={"device": _public_device(device)})
 
     @application.post("/auth/logout", status_code=204)
-    async def logout(request: Request, context=Depends(get_authenticated_user)):
+    async def logout(
+        request: Request, payload: LogoutRequest | None = None,
+        context=Depends(get_authenticated_user),
+    ):
         if isinstance(context, JSONResponse):
             return context
+        device = (_owned_device(account_store, context.user.id, payload.fingerprint)
+                  if payload is not None else None)
+        if device is not None:
+            # Fail closed: suspend VPN access before ending the session; on failure the
+            # session stays valid so the client can retry instead of silently "succeeding".
+            try:
+                AuthorizedClients(config.authorized_clients_file).suspend(device.client_fingerprint)
+            except Exception:
+                logger.error("logout device suspension failed device_id=%d", device.id)
+                return _error(
+                    503, "deauthorize_failed",
+                    "this device's VPN access could not be revoked; the session is still active",
+                )
+            logger.info("device access suspended user_id=%d device_id=%d", context.user.id, device.id)
         account_store.revoke_session(context.token_hash)
         logger.info("logout succeeded user_id=%d source=%s", context.user.id, _source(request))
         return Response(status_code=204)
