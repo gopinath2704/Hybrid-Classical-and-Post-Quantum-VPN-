@@ -12,7 +12,7 @@ license=('custom')
 depends=('python>=3.11' 'python-argon2-cffi' 'python-cryptography' 'python-fastapi' 'uvicorn' 'pyside6' 'iproute2' 'nftables')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 source=("${pkgname}-${pkgver}.tar.gz")
-sha256sums=('f2a2975af30c9ce99922f7f41a70407e91c583de11767bf049ba8e9cf72eb5cb')
+sha256sums=('b509fa75d7b3f08a9fb7278789ec79f9babac94e9635fa9a519a7387279153a8')
 
 build() {
   cd "${srcdir}/${pkgname}-${pkgver}"
