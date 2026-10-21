@@ -833,7 +833,9 @@ class IPCClient:
 
 
 
-DEFAULT_ACCOUNT_API_URL = "http://127.0.0.1:8443"
+DEFAULT_ACCOUNT_API_URL = "https://52.62.237.95:8443"
+# Public self-signed certificate of the default server, used as its trust anchor.
+BUNDLED_ACCOUNT_CA_CERT = Path(__file__).with_name("server-account-api.crt")
 ACCOUNT_API_TIMEOUT = 10.0
 MAX_ACCOUNT_RESPONSE = 64 * 1024
 ACCOUNT_SESSION_CHECK_MS = 60_000
@@ -861,6 +863,7 @@ _ACCOUNT_ERROR_MESSAGES = {
     "invalid_password": "Password change failed. Check your current password and try again.",
     "mfa_already_enabled": "Multi-factor authentication is already enabled.",
     "mfa_not_enabled": "Multi-factor authentication is not enabled.",
+    "invalid_invite": "The invite code is invalid, expired, or already used.",
 }
 
 
@@ -906,9 +909,15 @@ class AccountClient:
 
     @classmethod
     def from_env(cls) -> AccountClient:
+        """Built-in server and pinned cert by default; env vars override both."""
+        url = os.environ.get("PQVPN_ACCOUNT_API_URL")
         ca = os.environ.get("PQVPN_ACCOUNT_CA_CERT")
-        return cls(os.environ.get("PQVPN_ACCOUNT_API_URL", DEFAULT_ACCOUNT_API_URL),
-                   Path(ca) if ca else None)
+        if ca:
+            return cls(url or DEFAULT_ACCOUNT_API_URL, Path(ca))
+        # The bundled cert only vouches for the built-in server; other URLs use the system store.
+        if not url or url.strip().rstrip("/") == DEFAULT_ACCOUNT_API_URL:
+            return cls(DEFAULT_ACCOUNT_API_URL, BUNDLED_ACCOUNT_CA_CERT)
+        return cls(url)
 
     def _create_ssl_context(self):
         import ipaddress
@@ -936,15 +945,15 @@ class AccountClient:
                     "tls_required", "Cleartext HTTP is only permitted on loopback addresses."
                 )
             return None
-        context = ssl.create_default_context()
-        if self.ca_cert is not None:
-            try:
-                context.load_verify_locations(str(self.ca_cert))
-            except (OSError, ssl.SSLError):
-                raise AccountAPIError(
-                    "ssl_error", "The configured CA certificate could not be loaded."
-                ) from None
-        return context
+        if self.ca_cert is None:
+            return ssl.create_default_context()
+        try:
+            # cafile replaces the system store: a configured cert is an exclusive pin.
+            return ssl.create_default_context(cafile=str(self.ca_cert))
+        except (OSError, ssl.SSLError):
+            raise AccountAPIError(
+                "ssl_error", "The configured CA certificate could not be loaded."
+            ) from None
 
     def _request(self, method: str, path: str, body: dict | None = None,
                  token: str | None = None) -> dict | None:
@@ -1016,12 +1025,12 @@ class AccountClient:
             raise _invalid_response()
         return user
 
-    def register(self, username: str, email: str, password: str) -> dict:
+    def register(self, username: str, email: str, password: str, invite_code: str = "") -> dict:
         """Register a new account and return its public user fields."""
-        user = self._user(self._request(
-            "POST", "/auth/register",
-            body={"username": username, "email": email, "password": password},
-        ))
+        body = {"username": username, "email": email, "password": password}
+        if invite_code:
+            body["invite_code"] = invite_code
+        user = self._user(self._request("POST", "/auth/register", body=body))
         logger.info("account registration succeeded")
         return user
 

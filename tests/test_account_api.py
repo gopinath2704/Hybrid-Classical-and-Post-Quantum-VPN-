@@ -56,10 +56,17 @@ def client(app):
         yield result
 
 
-def register(client: TestClient, username="alice", email="alice@example.com", password=PASSWORD):
+def invite(client: TestClient, **kwargs) -> str:
+    return client.app.state.account_store.create_invite(**kwargs)[1]
+
+
+def register(client: TestClient, username="alice", email="alice@example.com", password=PASSWORD,
+             invite_code: str | None = None):
+    """Register with a fresh single-use invite unless one is given explicitly."""
     return client.post(
         "/auth/register",
-        json={"username": username, "email": email, "password": password},
+        json={"username": username, "email": email, "password": password,
+              "invite_code": invite(client) if invite_code is None else invite_code},
     )
 
 
@@ -114,7 +121,8 @@ def test_duplicate_username_and_email_are_specific_registration_conflicts(client
     ],
 )
 def test_invalid_registration_input_is_bounded_and_safe(client, field, value):
-    payload = {"username": "alice", "email": "alice@example.com", "password": PASSWORD}
+    payload = {"username": "alice", "email": "alice@example.com", "password": PASSWORD,
+               "invite_code": invite(client)}
     payload[field] = value
     response = client.post("/auth/register", json=payload)
     assert response.status_code == 400
@@ -416,6 +424,7 @@ def test_unexpected_fields_and_sql_injection_shapes_are_data(client):
             "username": "alice",
             "email": "alice@example.com",
             "password": PASSWORD,
+            "invite_code": invite(client),
             "admin": True,
         },
     )
@@ -818,3 +827,87 @@ def test_public_user_includes_mfa_enabled(client):
     resp = login(client)
     assert "mfa_enabled" in resp.json()["user"]
     assert resp.json()["user"]["mfa_enabled"] is False
+
+
+# --- Invite-only registration ---
+
+def _invite_failures(client: TestClient) -> list:
+    expired_id, expired = client.app.state.account_store.create_invite()
+    with raw_connection(client.app.state.account_store) as connection:
+        connection.execute(
+            "UPDATE invites SET expires_at = '2000-01-01T00:00:00.000000Z' WHERE id = ?",
+            (expired_id,),
+        )
+    used = invite(client)
+    assert register(client, "first", "first@example.com", invite_code=used).status_code == 201
+    missing = client.post("/auth/register", json={
+        "username": "bob", "email": "bob@example.com", "password": PASSWORD,
+    })
+    return [missing, register(client, "bob", "bob@example.com", invite_code="x" * 43),
+            register(client, "bob", "bob@example.com", invite_code=expired),
+            register(client, "bob", "bob@example.com", invite_code=used)]
+
+
+def test_invite_is_required_by_default_and_failures_are_indistinguishable(config):
+    assert config.require_invite is True
+    cfg = AccountAPIConfig(**{**config.__dict__, "registration_rate_limit": 10})
+    with TestClient(create_app(cfg)) as local_client:
+        responses = _invite_failures(local_client)
+        assert {(r.status_code, r.text) for r in responses} == {(
+            403, '{"error":{"code":"invalid_invite","message":"a valid invite code is required"}}'
+        )}
+        assert local_client.app.state.account_store.get_user_by_username("bob") is None
+
+
+def test_invalid_invite_does_not_reveal_existing_accounts(client):
+    assert register(client).status_code == 201
+    response = register(client, "alice", "alice@example.com", invite_code="wrong")
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "invalid_invite"
+
+
+def test_wrong_invite_codes_count_against_registration_rate_limit(config):
+    cfg = AccountAPIConfig(**{**config.__dict__, "registration_rate_limit": 3})
+    with TestClient(create_app(cfg)) as local_client:
+        for index in range(3):
+            assert register(
+                local_client, f"u{index}", f"u{index}@example.com", invite_code=f"guess{index}"
+            ).status_code == 403
+        limited = register(local_client, "bob", "bob@example.com")  # valid code, still limited
+        assert limited.status_code == 429 and limited.headers["retry-after"]
+
+
+def test_invite_code_is_never_logged(client, caplog):
+    code = invite(client)
+    with caplog.at_level(logging.DEBUG):
+        assert register(client, invite_code=code).status_code == 201
+        assert register(client, "bob", "bob@example.com", invite_code=code).status_code == 403
+    assert code not in caplog.text
+    assert hashlib.sha256(code.encode()).hexdigest() not in caplog.text
+
+
+def test_require_invite_false_allows_open_registration_for_dev(config):
+    cfg = AccountAPIConfig(**{**config.__dict__, "require_invite": False})
+    with TestClient(create_app(cfg)) as local_client:
+        response = local_client.post("/auth/register", json={
+            "username": "alice", "email": "alice@example.com", "password": PASSWORD,
+        })
+        assert response.status_code == 201
+
+
+def test_require_invite_must_be_boolean_and_loads_from_toml(tmp_path):
+    with pytest.raises(AccountAPIConfigError, match="require_invite"):
+        AccountAPIConfig(
+            database_path=tmp_path / "a.db", allow_insecure_loopback=True, require_invite="no"
+        ).validate()
+    path = tmp_path / "account-api.toml"
+    path.write_text('[account_api]\nallow_insecure_loopback = true\nrequire_invite = false\n')
+    assert load_account_api_config(path).require_invite is False
+    path.write_text('[account_api]\nallow_insecure_loopback = true\n')
+    assert load_account_api_config(path).require_invite is True
+
+
+def test_oversized_invite_code_is_rejected(client):
+    response = register(client, invite_code="x" * 129)
+    assert response.status_code == 400
+    assert "x" * 129 not in response.text

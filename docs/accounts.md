@@ -87,13 +87,25 @@ are limited to 16 KiB by default, including streamed requests.
 Request:
 
 ```json
-{"username":"alice","email":"alice@example.com","password":"a long passphrase"}
+{"username":"alice","email":"alice@example.com","password":"a long passphrase","invite_code":"..."}
 ```
 
 Success is `201` with a `user` object containing only `id`, normalized
 `username`, normalized `email`, `enabled`, and `created_at`. Registration does
 not create a session. Invalid account input is `400`; an already-used username
 or email is `409`. Passwords and password hashes are never returned.
+
+With `require_invite = true` (the default) `invite_code` is required. A
+missing, unknown, revoked, expired or used-up code returns one generic `403`
+`invalid_invite`, checked before the duplicate-account check so non-invitees
+cannot probe which accounts exist. One use is consumed in the same SQLite
+transaction that inserts the user, so a failed registration (duplicate, invalid
+input) does not burn the code and concurrent registrations cannot share a
+single-use code. Every attempt, including a wrong code, counts against the
+per-source registration rate limit. Codes are 256-bit random tokens; only their
+SHA-256 is stored (like session tokens), in the `invites` table of the 0600
+accounts database. `require_invite = false` restores open registration for
+local development only.
 
 ### `POST /auth/login`
 
@@ -198,6 +210,17 @@ sudo /opt/pqvpn/.venv/bin/python -m vpn.cli account devices --status pending \
 sudo /opt/pqvpn/.venv/bin/python -m vpn.cli account approve DEVICE_ID \
   --accounts-db /var/lib/pqvpn/accounts/accounts.db \
   --database /var/lib/pqvpn/authorized/authorized_clients.json [--vpn-ip 10.8.0.N]
+```
+
+Registration invites (the code is printed once by `invite-create`; listing shows
+only id, uses left and expiry):
+
+```bash
+sudo /opt/pqvpn/.venv/bin/python -m vpn.cli account invite-create --uses 1 --expires-hours 72 \
+  --accounts-db /var/lib/pqvpn/accounts/accounts.db
+sudo /opt/pqvpn/.venv/bin/python -m vpn.cli account invites --accounts-db /var/lib/pqvpn/accounts/accounts.db
+sudo /opt/pqvpn/.venv/bin/python -m vpn.cli account invite-revoke INVITE_ID \
+  --accounts-db /var/lib/pqvpn/accounts/accounts.db
 ```
 
 | Command | Allowed from | Account DB | `AuthorizedClients` |

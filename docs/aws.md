@@ -26,7 +26,8 @@ Security group, inbound only:
 
 Do not open 8000 or any management port. Open 8443 (account API, HTTPS) only for
 self-service onboarding, and only to trusted source IPs (`x.x.x.x/32`): with
-`auto_approve = true` anyone who can register gets tunnel access. Outbound: allow all (default).
+`auto_approve = true` anyone who can register (registration needs an admin-issued invite
+by default) gets tunnel access. Outbound: allow all (default).
 
 Authorized clients live in `/var/lib/pqvpn/authorized/authorized_clients.json`
 (directory `root:pqvpn 2770`); `deploy-server.sh` migrates a legacy

@@ -15,6 +15,7 @@ import socket
 import stat
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from crypto.hybrid_crypto import PQCProvider, _OQS_AVAILABLE, _oqs_module, get_crypto_status
@@ -343,6 +344,17 @@ def _parser() -> argparse.ArgumentParser:
     unlock = account_actions.add_parser("unlock", description="Unlock a locked-out user account")
     unlock.add_argument("username")
     unlock.add_argument("--accounts-db", default=str(DEFAULT_ACCOUNT_DATABASE))
+    invite_create = account_actions.add_parser(
+        "invite-create", description="Create a registration invite; the code is shown only once"
+    )
+    invite_create.add_argument("--uses", type=int, default=1)
+    invite_create.add_argument("--expires-hours", type=int, help="default: never expires")
+    invite_create.add_argument("--accounts-db", default=str(DEFAULT_ACCOUNT_DATABASE))
+    invites = account_actions.add_parser("invites", description="List invites (never the codes)")
+    invites.add_argument("--accounts-db", default=str(DEFAULT_ACCOUNT_DATABASE))
+    invite_revoke = account_actions.add_parser("invite-revoke", description="Delete an invite")
+    invite_revoke.add_argument("invite_id", type=int)
+    invite_revoke.add_argument("--accounts-db", default=str(DEFAULT_ACCOUNT_DATABASE))
 
     server = commands.add_parser("server")
     server.add_argument("--config", default="config/server.toml")
@@ -370,6 +382,27 @@ def _account_command(args: argparse.Namespace) -> None:
                 f"{owner.username if owner else '?':<20}  {device.client_fingerprint}  "
                 f"{device.device_name}"
             )
+        return
+    if args.action == "invite-create":
+        if args.expires_hours is not None and not 1 <= args.expires_hours <= 87600:
+            raise SystemExit("--expires-hours must be in 1..87600")
+        expires = (None if args.expires_hours is None
+                   else datetime.now(timezone.utc) + timedelta(hours=args.expires_hours))
+        invite_id, code = store.create_invite(args.uses, expires)
+        print(f"Invite {invite_id} created ({args.uses} use(s), expires {expires or 'never'})")
+        print(f"Invite code (shown once, give it to the user out of band): {code}")
+        return
+    if args.action == "invites":
+        invites = store.list_invites()
+        if not invites:
+            print("No invites")
+        for invite in invites:
+            print(f"{invite.id:>5}  uses_left={invite.uses_left:<4}  "
+                  f"expires={invite.expires_at or 'never'}  created={invite.created_at}")
+        return
+    if args.action == "invite-revoke":
+        store.revoke_invite(args.invite_id)
+        print(f"Invite {args.invite_id} revoked")
         return
     if args.action == "reset-password":
         user = store.get_user_by_username(args.username)

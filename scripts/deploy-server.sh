@@ -98,8 +98,9 @@ echo '== account API setup'
 id pqvpn-account >/dev/null 2>&1 || useradd --system --home /nonexistent --shell /usr/sbin/nologin pqvpn-account
 usermod -aG pqvpn pqvpn-account
 # PQVPN_PUBLIC_HOST (IP or DNS name clients connect to) goes into the cert SAN; a cert
-# that does not cover it is regenerated, so clients must re-fetch account-api.crt.
-SAN=DNS:pqvpn-account-api; CHECK=(); ACCOUNT_TLS_NEW=
+# that does not cover it is regenerated, so clients must re-fetch account-api.crt
+# (and the default server's copy bundled as app/server-account-api.crt must be replaced).
+SAN=DNS:pqvpn-account-api; CHECK=()
 if [[ -n ${PQVPN_PUBLIC_HOST:-} ]]; then
   [[ $PQVPN_PUBLIC_HOST =~ ^[A-Za-z0-9.:-]+$ ]] || { echo 'invalid PQVPN_PUBLIC_HOST' >&2; exit 1; }
   if [[ $PQVPN_PUBLIC_HOST =~ ^[0-9.]+$|: ]]; then
@@ -115,7 +116,6 @@ if [[ ! -f $CRT ]] || { ((${#CHECK[@]})) && [[ $(openssl x509 -in "$CRT" -noout 
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -keyout /etc/pqvpn/tls/account-api.key -out "$CRT" \
     -days 3650 -nodes -subj "/CN=pqvpn-account-api" -addext "subjectAltName=$SAN"
-  ACCOUNT_TLS_NEW=1
   chown pqvpn-account:pqvpn-account /etc/pqvpn/tls/account-api.key
   chmod 0400 /etc/pqvpn/tls/account-api.key
   chown root:pqvpn-account /etc/pqvpn/tls/account-api.crt
@@ -135,9 +135,10 @@ bad = [f"{k} -> {v}" for k, v in got.items() if v != want]
 sys.exit(f"set authorized_clients_file = \"{want}\" in: " + ", ".join(bad) if bad else 0)' "$AUTH_DB"
 install -m 0644 packaging/common/pqvpn-account-api.service /etc/systemd/system/pqvpn-account-api.service
 systemctl daemon-reload
-systemctl enable --now pqvpn-account-api
+systemctl enable pqvpn-account-api
+# Always restart so updated code (and account DB schema migrations) take effect; no tunnels drop.
+systemctl restart pqvpn-account-api
 [[ -z $RESTART ]] || systemctl try-restart pqvpn-server
-[[ -z $ACCOUNT_TLS_NEW ]] || systemctl restart pqvpn-account-api
 
 if [[ -n $CLIENT_KEY ]]; then
   echo "== authorize client $CLIENT_ID"

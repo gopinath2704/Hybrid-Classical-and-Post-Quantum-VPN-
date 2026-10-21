@@ -41,6 +41,9 @@ namespaces = true
 [tool.setuptools]
 py-modules = ["benchmarks"]
 
+[tool.setuptools.package-data]
+app = ["server-account-api.crt"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 markers = [

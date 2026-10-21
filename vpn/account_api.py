@@ -40,6 +40,7 @@ from vpn.accounts import (
     AccountStore,
     DeviceRecord,
     InvalidAccountInput,
+    InvalidInvite,
     SessionRecord,
     UserRecord,
     generate_totp_secret,
@@ -83,6 +84,9 @@ class AccountAPIConfig:
     registration_rate_limit_entries: int = 2048
     body_limit_bytes: int = DEFAULT_BODY_LIMIT
     auto_approve: bool = False
+    # Secure by default: registration needs an admin-issued invite. Set
+    # require_invite = false only for local development or open test deployments.
+    require_invite: bool = True
     authorized_clients_file: Path = Path("/var/lib/pqvpn/authorized/authorized_clients.json")
     server_identity_public_key: Path = Path("/etc/pqvpn/server_identity_public.key")
     server_host: str = ""
@@ -139,6 +143,8 @@ class AccountAPIConfig:
                 raise AccountAPIConfigError(f"{name} must be in {minimum}..{maximum}")
         if type(self.auto_approve) is not bool:
             raise AccountAPIConfigError("auto_approve must be boolean")
+        if type(self.require_invite) is not bool:
+            raise AccountAPIConfigError("require_invite must be boolean")
         if not isinstance(self.authorized_clients_file, Path):
             raise AccountAPIConfigError("authorized_clients_file must be a filesystem path")
         if not isinstance(self.server_identity_public_key, Path):
@@ -287,6 +293,7 @@ class RegisterRequest(BaseModel):
     username: str = Field(max_length=MAX_USERNAME_LENGTH + 2)
     email: str = Field(max_length=MAX_EMAIL_LENGTH + 2)
     password: str = Field(max_length=MAX_PASSWORD_LENGTH + 1)
+    invite_code: str | None = Field(default=None, max_length=128)
 
 
 class LoginRequest(BaseModel):
@@ -544,9 +551,16 @@ def create_app(
                 429, "rate_limited", "too many registration attempts",
                 headers={"Retry-After": str(retry)},
             )
+        # Recorded before the invite check, so wrong codes count against the limit.
         application.state.registration_limiter.record_event(key)
+        invite = (payload.invite_code or "") if config.require_invite else None
         try:
-            user = account_store.create_user(payload.username, payload.email, payload.password)
+            user = account_store.create_user(
+                payload.username, payload.email, payload.password, invite_code=invite
+            )
+        except InvalidInvite:
+            logger.info("registration rejected category=invite source=%s", _source(request))
+            return _error(403, "invalid_invite", "a valid invite code is required")
         except AccountAlreadyExists as exc:
             logger.info("registration rejected category=duplicate source=%s", _source(request))
             return _error(409, "account_exists", str(exc))
