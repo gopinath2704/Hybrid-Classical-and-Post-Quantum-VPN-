@@ -538,6 +538,8 @@ def test_packages_do_not_include_deployment_identity_or_config(tmp_path):
 
     with tarfile.open(archive, "r:gz") as source:
         names = [member.name for member in source.getmembers()]
+        cert_member = source.extractfile("pqvpn-3.0.0/app/server-account-api.crt")
+        public_cert_pem = cert_member.read().decode("ascii") if cert_member else ""
     assert names
     forbidden_names = {
         "authorized_clients.json", "client_identity_private.key",
@@ -552,13 +554,18 @@ def test_packages_do_not_include_deployment_identity_or_config(tmp_path):
         ".key", ".pem", ".p12", ".pfx", ".crt", ".db",
         ".db-wal", ".db-shm", ".sqlite", ".sqlite3",
     )
+    PUBLIC_ACCOUNT_CERT = "pqvpn-3.0.0/app/server-account-api.crt"
     for name in names:
         path = Path(name)
         parts = {part.lower() for part in path.parts}
         filename = path.name.lower()
         assert not parts.intersection(forbidden_directories), name
         assert filename not in forbidden_names, name
-        assert not filename.endswith(forbidden_suffixes), name
+        if name == PUBLIC_ACCOUNT_CERT:
+            assert public_cert_pem.count("BEGIN CERTIFICATE") == 1, name
+            assert "PRIVATE" not in public_cert_pem, name
+        else:
+            assert not filename.endswith(forbidden_suffixes), name
         assert ".pqenroll" not in filename, name
         assert not re.search(r"(^|[._-])(secret|credential|private_key)([._-]|$)", filename), name
         assert "var/lib/pqvpn" not in name.lower(), name
