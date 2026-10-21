@@ -603,7 +603,9 @@ def live_account_api(tmp_path):
 
     store = AccountStore(tmp_path / "accounts" / "accounts.db")
     app = create_app(
-        AccountAPIConfig(database_path=store.path, allow_insecure_loopback=True), store=store
+        AccountAPIConfig(database_path=store.path, allow_insecure_loopback=True,
+                         authorized_clients_file=tmp_path / "authorized" / "authorized_clients.json"),
+        store=store,
     )
     probe = socket.socket()
     probe.bind(("127.0.0.1", 0))
@@ -1688,3 +1690,184 @@ class TestGUIImprovements:
         assert DARK["text"] not in gui.page_title.styleSheet()
         gui._on_pref_changed("theme", "dark")
         assert DARK["text"] in gui.page_title.styleSheet()
+
+
+# ─── Sign-out means no VPN ────────────────────────────────────────────────
+
+@pytest.mark.skipif(not _pyside6_available(), reason="PySide6 not installed")
+class TestSignOutGatesVPN:
+    """Rule: when the GUI holds an account client, VPN connect needs a live account session."""
+
+    FP = _device_setup()["setup"]["identity_fingerprint"]
+
+    @pytest.fixture
+    def gui(self, qapp, tmp_path):
+        from PySide6.QtCore import QSettings
+        from app.ui.window import MainWindow
+        settings = QSettings(str(tmp_path / "gui.ini"), QSettings.IniFormat)
+        window = MainWindow(TestDeviceBindingGUI.IdentityIPC(), start_polling=False,
+                            settings=settings)
+        window._account_client = AccountClient("http://127.0.0.1:1")
+        window._worker.request_action = Mock()
+        window._render(ClientStatus(state="DISCONNECTED", identity_fingerprint=self.FP))
+        yield window
+        window.close()
+        qapp.processEvents()
+
+    def _entry_points(self, gui, monkeypatch):
+        """Button, tray, Ctrl+K and auto-connect: every way a connect can start."""
+        from PySide6.QtWidgets import QSystemTrayIcon
+        monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+        gui._tray = gui._create_tray()
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance().setQuitOnLastWindowClosed(True)
+        gui.prefs["auto_connect"] = True
+
+        def auto_connect():
+            gui._auto_connect_pending = True
+            gui._on_status(ClientStatus(state="DISCONNECTED", identity_fingerprint=self.FP))
+
+        try:
+            return [gui._on_toggle, gui._tray_toggle_action.trigger,
+                    gui._toggle_shortcut.activated.emit, auto_connect]
+        finally:
+            gui._tray.hide()
+
+    def _ready(self, gui):
+        """Fresh DISCONNECTED state; the tray action is forced on so only the gate can refuse."""
+        gui._busy = False
+        gui._render(ClientStatus(state="DISCONNECTED", identity_fingerprint=self.FP))
+        gui._tray_toggle_action.setEnabled(True)
+
+    def test_every_connect_entry_point_refused_when_signed_out(self, gui, monkeypatch):
+        for start in self._entry_points(gui, monkeypatch):
+            self._ready(gui)
+            start()
+        gui._worker.request_action.assert_not_called()
+        assert not gui.action_btn.isEnabled() and gui.action_btn.text() == "Sign in to connect"
+        assert "Signed out" in gui.subtitle_label.text()
+        assert any("Connect refused" in e["message"] for e in gui._gui_events)
+
+    def test_every_connect_entry_point_allowed_when_signed_in(self, gui, monkeypatch):
+        gui._account_session.set_session("tok", TestAccountSession.USER, "")
+        gui._render(ClientStatus(state="DISCONNECTED", identity_fingerprint=self.FP))
+        assert gui.action_btn.isEnabled() and gui.action_btn.text() == "Connect"
+        starts = self._entry_points(gui, monkeypatch)
+        for start in starts:
+            self._ready(gui)
+            start()
+        assert gui._worker.request_action.call_count == len(starts)
+        assert {c.args for c in gui._worker.request_action.call_args_list} == {("connect",)}
+
+    def test_gui_without_account_client_is_not_gated(self, gui):
+        gui._account_client = None  # legacy: no account API session got the user in
+        gui._on_toggle()
+        gui._worker.request_action.assert_called_once_with("connect")
+
+    def test_disconnect_is_never_gated(self, gui):
+        gui._render(ClientStatus(state="CONNECTED", identity_fingerprint=self.FP))
+        gui._on_toggle()
+        gui._worker.request_action.assert_called_once_with("disconnect")
+
+    def test_sign_out_disconnects_first_then_suspends_device(
+            self, gui, qapp, live_account_api, tmp_path):
+        import base64
+        from vpn.cli import main as cli
+        from vpn.identity import AuthorizedClients
+        url, store, _app = live_account_api
+        authorized = AuthorizedClients(tmp_path / "authorized" / "authorized_clients.json")
+        setup = _device_setup()["setup"]
+        AccountClient(url).register("alice", "alice@example.com", ACCOUNT_PASSWORD, _invite(store))
+        _sign_in_direct(gui, qapp, url)
+        gui._account_client.bind_device(gui._account_session.get_token(), "laptop",
+                                        setup["identity_public_key"], self.FP)
+        cli(["account", "approve", str(store.get_device_by_fingerprint(self.FP).id),
+             "--accounts-db", str(store.path), "--database", str(authorized.path)])
+        public = base64.b64decode(setup["identity_public_key"])
+        assert authorized.find(public) is not None
+        emitted: list[str] = []
+        gui.signed_out.connect(emitted.append)
+        gui._render(ClientStatus(state="CONNECTED", identity_fingerprint=self.FP))
+
+        gui._on_logout_clicked()
+        gui._worker.request_action.assert_called_once_with("disconnect")
+        assert authorized.find(public) is not None  # nothing revoked before the tunnel is down
+        gui._on_toggle()  # a connect attempt mid sign-out is refused
+        gui._worker.request_action.assert_called_once_with("disconnect")
+
+        gui._render(ClientStatus(state="DISCONNECTED", identity_fingerprint=self.FP))
+        gui._action_finished("disconnect", {"status": "disconnected"})
+        assert gui._account_session.state == SessionState.LOGGED_OUT
+        _wait_for(qapp, lambda: emitted == [""])
+        assert authorized.find(public) is None
+        assert store.get_device_by_fingerprint(self.FP).status == "approved"
+
+    def test_forced_expiry_disconnects_first(self, gui):
+        emitted: list[str] = []
+        gui.signed_out.connect(emitted.append)
+        gui._account_session.set_session("tok", TestAccountSession.USER, "")
+        gui._render(ClientStatus(state="CONNECTED", identity_fingerprint=self.FP))
+        gui._account_validate_finished(False, "invalid_session", "x", 401, 0)
+        gui._worker.request_action.assert_called_once_with("disconnect")
+        assert gui._account_session.is_authenticated and emitted == []
+        gui._action_finished("disconnect", {"error": "service unreachable"})
+        assert gui._account_session.state == SessionState.SESSION_EXPIRED
+        assert emitted and "expired" in emitted[0]
+
+    def test_unconfirmed_server_sign_out_is_reported(self, gui, qapp):
+        emitted: list[str] = []
+        gui.signed_out.connect(emitted.append)
+        gui._account_session.set_session("tok", TestAccountSession.USER, "")
+        gui._on_logout_clicked()
+        assert gui._account_session.get_token() is None
+        _wait_for(qapp, lambda: emitted)
+        assert "may still have VPN access" in emitted[0]
+
+    def test_shutdown_stops_background_work_and_hides(self, gui):
+        gui.show()
+        gui.shutdown()
+        assert not gui.isVisible() and not gui._timer.isActive()
+        gui._worker._thread.join(2)
+        assert not gui._worker._thread.is_alive()
+
+    def test_sign_in_restores_signed_out_device(self, qapp, live_account_api, tmp_path):
+        import base64
+        from app.ui.window import MainWindow
+        from vpn.cli import main as cli
+        from vpn.identity import AuthorizedClients
+        url, store, _app = live_account_api
+        authorized = AuthorizedClients(tmp_path / "authorized" / "authorized_clients.json")
+        setup = _device_setup()["setup"]
+        public = base64.b64decode(setup["identity_public_key"])
+        client = AccountClient(url)
+        client.register("alice", "alice@example.com", ACCOUNT_PASSWORD, _invite(store))
+        token, _user, _ = client.login("alice", ACCOUNT_PASSWORD)
+        client.bind_device(token, "laptop", setup["identity_public_key"], self.FP)
+        cli(["account", "approve", str(store.get_device_by_fingerprint(self.FP).id),
+             "--accounts-db", str(store.path), "--database", str(authorized.path)])
+        client.logout(token, self.FP)
+        assert authorized.find(public) is None
+
+        token, _user, expires = client.login("alice", ACCOUNT_PASSWORD)
+        window = MainWindow(TestDeviceBindingGUI.IdentityIPC(), start_polling=False,
+                            account_client=client, session_token=token,
+                            session_user=client.get_me(token), session_expires_at=expires)
+        try:
+            _wait_for(qapp, lambda: authorized.find(public) is not None)
+            _wait_for(qapp, lambda: window._account_devices)
+        finally:
+            window.close()
+            qapp.processEvents()
+
+
+@pytest.mark.skipif(not _pyside6_available(), reason="PySide6 not installed")
+def test_login_window_shows_sign_out_message(qapp):
+    from app.ui.login import LoginWindow
+    login = LoginWindow()
+    try:
+        login.show_signed_out("server did not confirm")
+        assert login.isVisible() and login.login_error.text() == "server did not confirm"
+        assert login.stack.currentIndex() == 0
+    finally:
+        login.close()
+        qapp.processEvents()

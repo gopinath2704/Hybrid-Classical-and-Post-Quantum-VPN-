@@ -9,7 +9,7 @@ from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtCore import QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QInputDialog, QMainWindow, QMenu, QMessageBox,
@@ -21,7 +21,7 @@ from app.client import (
     ClientStatus, ConnectionState, DEFAULT_CONFIG,
     DEVICE_STATUS_LABELS, IPCClient, SessionState, UserProfile,
     _AccountWorker, _IPCWorker, account_ux_state, format_duration,
-    public_device_identity, sanitize_error, truncate_fingerprint,
+    public_device_identity, restore_device_access, sanitize_error, truncate_fingerprint,
 )
 from app.ui.theme import (
     COLORS, STATE_COLORS, THEME_CHOICES, apply_palette, badge_style, label, resolve_theme,
@@ -67,6 +67,9 @@ def load_favourites(settings: QSettings) -> set[str]:
 
 
 class MainWindow(QMainWindow):
+    # Emitted once sign-out completes; the text reports a server-side failure, if any.
+    signed_out = Signal(str)
+
     PAGE_TITLES = (
         ("Home", "Connection overview and live tunnel health"),
         ("Servers", "Imported public server profiles"),
@@ -89,6 +92,8 @@ class MainWindow(QMainWindow):
         self._enrollment_shared = False
         self._quitting = False
         self._auto_connect_pending = start_polling
+        self._signing_out = False
+        self._sign_out_expired = False
         self.setObjectName("pqvpnMainWindow")
         self.setWindowTitle("PQ-VPN")
         self.setMinimumSize(980, 650)
@@ -218,8 +223,9 @@ class MainWindow(QMainWindow):
             self._add_gui_event("info", f"Signed in as {user.username}")
             self._refresh_account_view()
             if account_client is not None:
-                self._account_worker.submit(
-                    "devices", lambda: account_client.list_devices(session_token))
+                ipc = self.ipc
+                self._account_worker.submit("restore", lambda: restore_device_access(
+                    account_client, session_token, ipc.setup_status()))
 
         self._settings.load_prefs(self.prefs)
         self._apply_theme(rerender=False)
@@ -356,13 +362,24 @@ class MainWindow(QMainWindow):
         self._worker.request_logs()
 
     # ── Connection toggle ──
+    def _vpn_locked(self) -> bool:
+        """Account-managed GUI (an account client exists) with no live session: no VPN."""
+        return self._account_client is not None and (
+            self._signing_out or not self._account_session.is_authenticated)
+
     def _on_toggle(self) -> None:
+        """Single connect path for the button, tray, Ctrl+K and auto-connect."""
         state = self._last_status.state
         if self._busy or state in {ConnectionState.CONNECTING.value,
                                    ConnectionState.DISCONNECTING.value,
                                    ConnectionState.SETUP_REQUIRED.value}:
             return
         action = "disconnect" if state == ConnectionState.CONNECTED.value else "connect"
+        if action == "connect" and self._vpn_locked():
+            self._add_gui_event("warning", "Connect refused: signed out. Sign in to use the VPN.")
+            self._home.render_failure("Signed out. Sign in to use the VPN.", False)
+            self._set_visual_state(state)
+            return
         transient = (ConnectionState.DISCONNECTING.value if action == "disconnect"
                      else ConnectionState.CONNECTING.value)
         self._busy = True
@@ -494,6 +511,8 @@ class MainWindow(QMainWindow):
         self._worker.request_status()
         if self.pages.currentIndex() == LOGS_PAGE:
             self._worker.request_logs()
+        if action == "disconnect" and self._signing_out:
+            self._finish_sign_out()  # tunnel is down (or failed to stop); proceed regardless
 
     def _add_gui_event(self, level: str, message: str) -> None:
         self._gui_events.append({
@@ -533,6 +552,8 @@ class MainWindow(QMainWindow):
         dns_exposed = connected and status.dns_mode == "none"
         if dns_exposed:
             subtitle = "Connected, DNS unprotected"
+        elif not connected and self._vpn_locked():
+            subtitle = "Signed out · sign in to use the VPN"
         self._home.subtitle_label.setText(subtitle)
         subtitle_color = COLORS["amber"] if dns_exposed else COLORS["secondary"]
         self._home.subtitle_label.setStyleSheet(f"font-size: 11px; color: {subtitle_color};")
@@ -714,6 +735,9 @@ class MainWindow(QMainWindow):
         else:
             text = "Connect"
             background, foreground, border = COLORS["green"], COLORS["on_accent"], COLORS["green"]
+        locked = state != ConnectionState.CONNECTED.value and self._vpn_locked()
+        if locked:
+            text = "Sign in to connect"
         h.action_btn.setText(text)
         h.action_btn.setStyleSheet(f"""
             QPushButton {{
@@ -729,7 +753,7 @@ class MainWindow(QMainWindow):
                 border-color: {COLORS['border_soft']};
             }}
         """)
-        enabled = not self._busy and state not in {
+        enabled = not self._busy and not locked and state not in {
             ConnectionState.CONNECTING.value,
             ConnectionState.DISCONNECTING.value,
             ConnectionState.SETUP_REQUIRED.value,
@@ -755,21 +779,44 @@ class MainWindow(QMainWindow):
         return True
 
     def _on_logout_clicked(self) -> None:
-        token = self._account_session.get_token()
         self._end_account_session(expired=False)
-        if token and self._account_client is not None:
-            client = self._account_client
-            self._account_worker.submit("logout", lambda: client.logout(token))
 
     def _end_account_session(self, *, expired: bool) -> None:
+        """Sign-out or forced expiry: take any tunnel down first, then end the session."""
+        if self._signing_out:
+            return
+        self._signing_out = True  # gates connect from here on
+        self._sign_out_expired = expired
         self._session_timer.stop()
+        if self._last_status.state in {ConnectionState.CONNECTED.value,
+                                       ConnectionState.CONNECTING.value}:
+            self._add_gui_event("info", "Disconnecting before sign-out")
+            self._busy = True
+            self._set_visual_state(ConnectionState.DISCONNECTING.value)
+            self._worker.request_action("disconnect")  # resumes in _action_finished
+            return
+        self._finish_sign_out()
+
+    def _finish_sign_out(self) -> None:
+        expired = self._sign_out_expired
+        token = self._account_session.get_token()
+        fingerprint = self._last_status.identity_fingerprint or None
         self._account_session.clear_session(expired=expired)
         self._account_devices = []
+        self._signing_out = False
         self._add_gui_event(
             "warning" if expired else "info",
             "Session expired — signed out automatically" if expired else "Signed out",
         )
         self._refresh_account_view()
+        self._set_visual_state(self._last_status.state)
+        client = self._account_client
+        if token and client is not None and not expired:
+            # The server suspends this device's VPN access, then revokes the session.
+            self._account_worker.submit("logout", lambda: client.logout(token, fingerprint))
+        else:
+            self.signed_out.emit(
+                "Your session expired. Sign in again to use the VPN." if expired else "")
 
     def _validate_account_session(self) -> None:
         token = self._account_session.get_token()
@@ -1006,8 +1053,21 @@ class MainWindow(QMainWindow):
             a.acct_pw_error.show()
 
     def _account_logout_finished(self, ok, data, message, status_code, retry_after) -> None:
-        if not ok and status_code != 401:
-            self._add_gui_event("warning", "Remote sign-out failed; local session was cleared")
+        if ok:
+            self.signed_out.emit("")
+            return
+        warning = ("Signed out on this computer, but the account server did not confirm it "
+                   f"({message or 'unknown error'}). This device may still have VPN access.")
+        self._add_gui_event("warning", warning)
+        self._account.show_signed_out(warning)
+        self.signed_out.emit(warning)
+
+    def _account_restore_finished(self, ok, data, message, status_code, retry_after) -> None:
+        if ok or status_code == 401:
+            self._account_devices_finished(ok, data, message, status_code, retry_after)
+            return
+        self._add_gui_event("warning", f"Could not restore this device's VPN access: {message}")
+        self._validate_account_session()
 
     def _account_validate_finished(self, ok, data, message, status_code, retry_after) -> None:
         if not self._account_session.is_authenticated:
@@ -1100,16 +1160,27 @@ class MainWindow(QMainWindow):
         h.home_account_device.set_value(device_text)
 
     # ── Cleanup ──
+    def _stop_background(self) -> None:
+        self._timer.stop()
+        self._session_timer.stop()
+        self._worker.stop()
+        self._account_worker.stop()
+
+    def shutdown(self) -> None:
+        """Tear down after sign-out without quitting the app (the login window takes over)."""
+        self._stop_background()
+        if self._tray is not None:
+            self._tray.hide()
+            QApplication.instance().setQuitOnLastWindowClosed(True)
+        self.hide()
+
     def closeEvent(self, event) -> None:  # noqa: N802
         if self.hides_to_tray():
             event.ignore()
             self.hide()
             self._update_tray(self._last_status.state)
             return
-        self._timer.stop()
-        self._session_timer.stop()
-        self._worker.stop()
-        self._account_worker.stop()
+        self._stop_background()
         super().closeEvent(event)
         if self._tray is not None:
             self._tray.hide()

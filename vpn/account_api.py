@@ -327,6 +327,12 @@ class DeviceBindRequest(BaseModel):
     fingerprint: str = Field(min_length=64, max_length=64)
 
 
+class LogoutRequest(BaseModel):
+    """Optional body: the device signing out, so its VPN authorization is suspended too."""
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    fingerprint: str = Field(min_length=64, max_length=64)
+
+
 @dataclass(frozen=True)
 class AuthenticatedContext:
     user: UserRecord
@@ -495,6 +501,15 @@ def _auto_approve_device(
     return approved
 
 
+def _owned_device(store: AccountStore, user_id: int, fingerprint: str) -> DeviceRecord | None:
+    """The caller's own device, or None; another user's device is indistinguishable from none."""
+    try:
+        device = store.get_device_by_fingerprint(fingerprint)
+    except InvalidAccountInput:
+        return None
+    return device if device is not None and device.user_id == user_id else None
+
+
 def create_app(
     config: AccountAPIConfig,
     *,
@@ -638,7 +653,7 @@ def create_app(
     async def bind_device(
         payload: DeviceBindRequest, request: Request, context=Depends(get_authenticated_user)
     ):
-        """Bind a public Ed25519 identity to the account; never grants VPN access."""
+        """Bind a public Ed25519 identity; grants VPN access only via auto_approve or sign-in restore."""
         if isinstance(context, JSONResponse):
             return context
         try:
@@ -657,6 +672,20 @@ def create_app(
                         account_store, existing, public_key,
                         context.user.username, config, request,
                     )
+                elif existing.status == "approved" and existing.enabled:
+                    # Sign-in path: undo this owner's sign-out suspension (never an admin revocation).
+                    try:
+                        restored = AuthorizedClients(config.authorized_clients_file).restore(
+                            existing.client_fingerprint
+                        )
+                    except Exception:
+                        logger.error("device access restore failed device_id=%d", existing.id)
+                        return _error(503, "authorize_failed", "device VPN access could not be restored")
+                    if restored:
+                        logger.info(
+                            "device access restored user_id=%d device_id=%d source=%s",
+                            context.user.id, existing.id, _source(request),
+                        )
                 return JSONResponse(status_code=200, content={"device": _public_device(existing)})
             logger.info("device binding rejected category=duplicate user_id=%d", context.user.id)
             return _error(409, "device_exists", "device identity is already registered")
@@ -682,9 +711,26 @@ def create_app(
         return JSONResponse(status_code=201, content={"device": _public_device(device)})
 
     @application.post("/auth/logout", status_code=204)
-    async def logout(request: Request, context=Depends(get_authenticated_user)):
+    async def logout(
+        request: Request, payload: LogoutRequest | None = None,
+        context=Depends(get_authenticated_user),
+    ):
         if isinstance(context, JSONResponse):
             return context
+        device = (_owned_device(account_store, context.user.id, payload.fingerprint)
+                  if payload is not None else None)
+        if device is not None:
+            # Fail closed: suspend VPN access before ending the session; on failure the
+            # session stays valid so the client can retry instead of silently "succeeding".
+            try:
+                AuthorizedClients(config.authorized_clients_file).suspend(device.client_fingerprint)
+            except Exception:
+                logger.error("logout device suspension failed device_id=%d", device.id)
+                return _error(
+                    503, "deauthorize_failed",
+                    "this device's VPN access could not be revoked; the session is still active",
+                )
+            logger.info("device access suspended user_id=%d device_id=%d", context.user.id, device.id)
         account_store.revoke_session(context.token_hash)
         logger.info("logout succeeded user_id=%d source=%s", context.user.id, _source(request))
         return Response(status_code=204)

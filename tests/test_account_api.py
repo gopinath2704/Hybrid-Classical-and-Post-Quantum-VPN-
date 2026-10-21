@@ -42,6 +42,7 @@ def config(tmp_path) -> AccountAPIConfig:
     return AccountAPIConfig(
         database_path=tmp_path / "accounts" / "accounts.db",
         allow_insecure_loopback=True,
+        authorized_clients_file=tmp_path / "authorized" / "authorized_clients.json",
     )
 
 
@@ -697,6 +698,183 @@ def test_authorized_clients_file_is_group_readable_never_world(tmp_path):
     assert stat.S_IMODE(os.stat(authorized.path).st_mode) == 0o640
     with pytest.raises(ValueError):
         _atomic_private(tmp_path / "x", b"", 0o644)
+
+
+def _public(seed: int = 1) -> bytes:
+    return base64.b64decode(device_identity(seed)[0])
+
+
+def _logout(client: TestClient, headers, seed: int | None = 1):
+    body = None if seed is None else {"fingerprint": device_identity(seed)[1]}
+    return client.post("/auth/logout", headers=headers, json=body)
+
+
+def _relogin(client: TestClient, username="alice") -> dict[str, str]:
+    return {"Authorization": f"Bearer {login(client, username).json()['access_token']}"}
+
+
+def test_logout_suspends_only_this_device_and_sign_in_restores_it(tmp_path):
+    authorized, local_client = _auto_approve_client(tmp_path)
+    with local_client:
+        headers = bearer(local_client)
+        assert bind(local_client, headers, seed=1).status_code == 201
+        assert bind(local_client, headers, seed=2, name="phone").status_code == 201
+        assert _logout(local_client, headers, seed=1).status_code == 204
+        assert local_client.get("/auth/me", headers=headers).status_code == 401
+        assert authorized.find(_public(1)) is None
+        assert authorized.find(_public(2)) is not None  # other devices of the account untouched
+        assert local_client.app.state.account_store.list_devices()[0].status == "approved"
+
+        restored = bind(local_client, _relogin(local_client), seed=1)
+        assert restored.status_code == 200 and restored.json()["device"]["status"] == "approved"
+    assert authorized.find(_public(1)) is not None
+    assert stat.S_IMODE(os.stat(authorized.path).st_mode) == 0o640
+
+
+def test_logout_without_fingerprint_keeps_device_authorization(tmp_path):
+    """Old clients send no body: session-only logout, as before."""
+    authorized, local_client = _auto_approve_client(tmp_path)
+    with local_client:
+        headers = bearer(local_client)
+        bind(local_client, headers)
+        assert _logout(local_client, headers, seed=None).status_code == 204
+    assert authorized.find(_public(1)) is not None
+
+
+def test_logout_and_bind_never_touch_another_users_device(tmp_path):
+    authorized, local_client = _auto_approve_client(tmp_path)
+    with local_client:
+        alice = bearer(local_client)
+        bind(local_client, alice, seed=1)
+        mallory = bearer(local_client, "mallory", "mallory@example.com")
+        assert _logout(local_client, mallory, seed=1).status_code == 204
+        assert authorized.find(_public(1)) is not None  # alice's device still authorized
+        assert local_client.get("/auth/me", headers=mallory).status_code == 401
+
+        assert _logout(local_client, alice, seed=1).status_code == 204
+        mallory = _relogin(local_client, "mallory")
+        stolen = bind(local_client, mallory, seed=1)
+        assert stolen.status_code == 409 and stolen.json()["error"]["code"] == "device_exists"
+    assert authorized.find(_public(1)) is None  # mallory cannot restore alice's device
+
+
+def test_logout_fails_closed_when_suspension_fails(tmp_path, monkeypatch):
+    authorized, local_client = _auto_approve_client(tmp_path)
+
+    def denied(self, fp):
+        raise PermissionError("authorized_clients.json.lock")
+
+    with local_client:
+        headers = bearer(local_client)
+        bind(local_client, headers)
+        monkeypatch.setattr(AuthorizedClients, "suspend", denied)
+        response = _logout(local_client, headers)
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "deauthorize_failed"
+        assert "lock" not in response.text
+        assert local_client.get("/auth/me", headers=headers).status_code == 200  # retry possible
+    assert authorized.find(_public(1)) is not None
+
+
+def test_session_cleanup_failure_after_suspension_leaves_device_blocked(tmp_path, monkeypatch):
+    from vpn.accounts import AccountDatabaseError
+    authorized, local_client = _auto_approve_client(tmp_path)
+
+    def broken(self, token_hash, **kwargs):
+        raise AccountDatabaseError("database is locked")
+
+    with local_client:
+        headers = bearer(local_client)
+        bind(local_client, headers)
+        monkeypatch.setattr(AccountStore, "revoke_session", broken)
+        assert _logout(local_client, headers).status_code == 500
+    assert authorized.find(_public(1)) is None
+
+
+def test_sign_in_never_restores_disabled_or_revoked_access(tmp_path):
+    authorized, local_client = _auto_approve_client(tmp_path)
+    with local_client:
+        store = local_client.app.state.account_store
+        held = bearer(local_client)
+        bind(local_client, held, seed=1)
+        bind(local_client, held, seed=2, name="phone")
+        bind(local_client, held, seed=3, name="tablet")
+        _logout(local_client, _relogin(local_client), seed=1)
+        _logout(local_client, _relogin(local_client), seed=2)
+        _logout(local_client, _relogin(local_client), seed=3)
+
+        user = store.get_user_by_username("alice")
+        store.set_user_enabled(user.id, False)
+        assert login(local_client).status_code == 401
+        assert bind(local_client, held, seed=1).status_code == 401  # pre-existing session dies too
+        store.set_user_enabled(user.id, True)
+
+        devices = {d.client_fingerprint: d for d in store.list_devices()}
+        # Administrator revocation (account revoke) and raw `client revoke` both outrank sign-in.
+        authorized.revoke(device_identity(1)[1])
+        store.set_device_status(devices[device_identity(1)[1]].id, "revoked", expected=("approved",))
+        authorized.revoke(device_identity(2)[1])
+        store.set_device_enabled(devices[device_identity(3)[1]].id, False)
+
+        headers = _relogin(local_client)
+        for seed in (1, 2, 3):
+            assert bind(local_client, headers, seed=seed).status_code == 200
+    for seed in (1, 2, 3):
+        assert authorized.find(_public(seed)) is None
+
+
+def test_restore_failure_is_reported(tmp_path, monkeypatch):
+    authorized, local_client = _auto_approve_client(tmp_path)
+
+    def denied(self, fp):
+        raise PermissionError("authorized_clients.json.lock")
+
+    with local_client:
+        bind(local_client, bearer(local_client))
+        _logout(local_client, _relogin(local_client))
+        monkeypatch.setattr(AuthorizedClients, "restore", denied)
+        response = bind(local_client, _relogin(local_client))
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "authorize_failed"
+    assert authorized.find(_public(1)) is None
+
+
+def test_suspend_and_restore_use_the_lock_and_atomic_write(tmp_path, monkeypatch):
+    import vpn.identity as identity
+    authorized = AuthorizedClients(tmp_path / "authorized_clients.json")
+    authorized.authorize(_public(1), "alice-1", "10.8.0.5")
+    events: list[str] = []
+    real_lock, real_write = AuthorizedClients._lock, identity._atomic_private
+
+    def lock(self):
+        events.append("lock")
+        return real_lock(self)
+
+    def write(path, data, mode=0o600):
+        events.append(f"write {oct(mode)}")
+        return real_write(path, data, mode)
+
+    monkeypatch.setattr(AuthorizedClients, "_lock", lock)
+    monkeypatch.setattr(identity, "_atomic_private", write)
+    fp = device_identity(1)[1]
+    assert authorized.suspend(fp) and not authorized.suspend(fp)
+    assert authorized.restore(fp) and not authorized.restore(fp)
+    assert events == ["lock", "write 0o640", "lock", "lock", "write 0o640", "lock"]
+    record = authorized.find(_public(1))
+    assert record["assigned_ip"] == "10.8.0.5" and "signed_out" not in record  # record preserved
+    assert stat.S_IMODE(os.stat(authorized.path).st_mode) == 0o640
+
+
+def test_signed_out_marker_only_on_disabled_records(tmp_path):
+    import json
+    path = tmp_path / "authorized_clients.json"
+    authorized = AuthorizedClients(path)
+    authorized.authorize(_public(1), "alice-1")
+    db = json.loads(path.read_text())
+    db["clients"][0]["signed_out"] = True  # enabled + marker is inconsistent
+    path.write_text(json.dumps(db))
+    with pytest.raises(ValueError, match="signed_out"):
+        authorized._load(required=True)
 
 
 def test_dependency_and_service_packaging_metadata_are_declared():

@@ -1052,9 +1052,10 @@ class AccountClient:
         """Validate the session and return the current public user fields."""
         return self._user(self._request("GET", "/auth/me", token=token))
 
-    def logout(self, token: str) -> None:
-        """Revoke the presented session on the server."""
-        self._request("POST", "/auth/logout", token=token)
+    def logout(self, token: str, fingerprint: str | None = None) -> None:
+        """Revoke the session and, given this device's fingerprint, suspend its VPN access."""
+        body = {"fingerprint": fingerprint} if fingerprint else None
+        self._request("POST", "/auth/logout", body=body, token=token)
         logger.info("account logout completed")
 
     def list_devices(self, token: str) -> list[dict]:
@@ -1096,7 +1097,7 @@ class AccountClient:
         return body
 
     def bind_device(self, token: str, device_name: str, public_key: str, fingerprint: str) -> dict:
-        """Bind a public device identity to the account.  Never grants VPN access."""
+        """Bind a public device identity; for a bound approved device this restores signed-out access."""
         body = self._request("POST", "/devices", token=token, body={
             "device_name": device_name, "public_key": public_key, "fingerprint": fingerprint,
         })
@@ -1179,6 +1180,24 @@ def public_device_identity(setup: object) -> tuple[str, str]:
     if len(raw) != 32 or hashlib.sha256(raw).hexdigest() != fingerprint:
         raise AccountAPIError("identity_unavailable", "Device identity failed its consistency check.")
     return public_key, fingerprint
+
+
+def restore_device_access(client: AccountClient, token: str, setup: object) -> list[dict]:
+    """After sign-in, re-bind this already-approved device so the server restores its VPN access.
+
+    Only a device the account already lists is re-bound; signing in never binds a new one.
+    """
+    devices = client.list_devices(token)
+    try:
+        public_key, fingerprint = public_device_identity(setup)
+    except AccountAPIError:
+        return devices  # no managed identity (e.g. explicit --config service): nothing to restore
+    current = next((d for d in devices if d.get("fingerprint") == fingerprint), None)
+    if current is None or current.get("status") != "approved" or current.get("enabled") is False:
+        return devices
+    name = str(current.get("device_name") or "device")
+    restored = client.bind_device(token, name, public_key, fingerprint)
+    return [restored if d is current else d for d in devices]
 
 
 @dataclass(frozen=True)
@@ -1898,9 +1917,18 @@ if PYSIDE6_AVAILABLE:
                 session_user=login.session_user,
                 session_expires_at=login.session_expires_at,
             )
+            login.session_token = login.session_user = None  # MainWindow owns the session now
+            window.signed_out.connect(_on_signed_out)
             app.pqvpn_main_window = window  # prevent GC
             window.show()
-            login.close()
+            login.hide()
+
+        def _on_signed_out(message: str) -> None:
+            window = app.pqvpn_main_window
+            app.pqvpn_main_window = None
+            window.shutdown()
+            window.deleteLater()
+            login.show_signed_out(message)
 
         login.login_succeeded.connect(_on_authenticated)
         login.show()

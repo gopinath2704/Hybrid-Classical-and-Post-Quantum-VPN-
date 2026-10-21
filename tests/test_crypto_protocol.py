@@ -428,6 +428,13 @@ def test_mitm_identity_substitution_rejected(identities):
 def test_unauthorized_client_rejected(identities):
     sk,pk,csk,_=identities;c=KEMTLSClient(pk,fingerprint(pk),csk,True);s=KEMTLSServer(sk,pk,lambda _:None,True)
     with pytest.raises(HandshakeError,match="unauthorized"):s.process_client_hello(c.initiate_handshake())
+def test_signed_out_client_fails_handshake_authorization(identities, tmp_path):
+    from vpn.identity import AuthorizedClients
+    sk,pk,csk,cpk=identities;auth=AuthorizedClients(tmp_path/"clients.json");auth.authorize(cpk,"alice-1")
+    def hello(): return KEMTLSServer(sk,pk,auth.find,True).process_client_hello(KEMTLSClient(pk,fingerprint(pk),csk,True).initiate_handshake())
+    hello();assert auth.suspend(fingerprint(cpk))
+    with pytest.raises(HandshakeError,match="unauthorized"):hello()
+    assert auth.restore(fingerprint(cpk));hello()
 def test_transcript_tampering_rejected(identities):
     sk,pk,csk,cpk=identities;c=KEMTLSClient(pk,fingerprint(pk),csk,True);s=KEMTLSServer(sk,pk,lambda _:{"client_id":"a"},True)
     ch=c.initiate_handshake();sh=s.process_client_hello(ch);cke=bytearray(c.process_server_hello(sh));cke[-40]^=1

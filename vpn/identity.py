@@ -15,6 +15,7 @@ import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, PublicFormat, NoEncryption
@@ -235,6 +236,8 @@ class AuthorizedClients:
             if not isinstance(cid, str) or not cid or len(cid) > 128 or any(ord(x) < 32 for x in cid):
                 raise ValueError('invalid client_id')
             if type(item.get('enabled')) is not bool: raise ValueError('client enabled must be boolean')
+            if 'signed_out' in item and (item['signed_out'] is not True or item['enabled']):
+                raise ValueError('signed_out marks only a disabled client')
             if fp in fingerprints or cid in ids: raise ValueError('duplicate client fingerprint or client_id')
             fingerprints.add(fp); ids.add(cid)
             assigned = item.get('assigned_ip')
@@ -293,14 +296,41 @@ class AuthorizedClients:
             _atomic_private(self.path, (json.dumps(db, indent=2) + '\n').encode(), 0o640)
         return fp
 
-    def revoke(self, fp: str) -> bool:
+    def _update(self, fp: str, change: Callable[[dict], bool]) -> bool:
+        """Apply change() to the record with this fingerprint under the lock; persist if it changed."""
         with self._lock():
             db = self._load()
-            found = False
-            for item in db['clients']:
-                if item['fingerprint'] == fp: item['enabled'] = False; found = True
-            if found: _atomic_private(self.path, (json.dumps(db, indent=2) + '\n').encode(), 0o640)
-            return found
+            changed = any([change(item) for item in db['clients'] if item['fingerprint'] == fp])
+            if changed:
+                self.validate(db)
+                _atomic_private(self.path, (json.dumps(db, indent=2) + '\n').encode(), 0o640)
+            return changed
+
+    def revoke(self, fp: str) -> bool:
+        """Administrator revocation: disabled and never restorable by a sign-in."""
+        def change(item: dict) -> bool:
+            item['enabled'] = False
+            item.pop('signed_out', None)
+            return True
+        return self._update(fp, change)
+
+    def suspend(self, fp: str) -> bool:
+        """Account sign-out: disable an enabled client and mark it restorable by the owner's sign-in."""
+        def change(item: dict) -> bool:
+            if not item['enabled']: return False
+            item['enabled'] = False
+            item['signed_out'] = True
+            return True
+        return self._update(fp, change)
+
+    def restore(self, fp: str) -> bool:
+        """Account sign-in: re-enable only a client that suspend() disabled."""
+        def change(item: dict) -> bool:
+            if item.get('signed_out') is not True: return False
+            item['enabled'] = True
+            del item['signed_out']
+            return True
+        return self._update(fp, change)
 
     def is_client_authorized(self, client_id: str) -> bool:
         for item in self._load(required=True)['clients']:

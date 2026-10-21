@@ -943,6 +943,17 @@ class LoginWindow(QWidget):
         self.login_totp.hide()
         self.login_totp.clear()
 
+    def show_signed_out(self, message: str) -> None:
+        """Return here after sign-out; message reports any server-side failure."""
+        self.show_login_view()
+        self.login_password.clear()
+        if message:
+            self.login_error.setText(message)
+            self.login_error.show()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
     def show_register_view(self) -> None:
         self.stack.setCurrentIndex(1)
         self.login_error.hide()

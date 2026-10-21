@@ -416,6 +416,10 @@ class VPNServer:
                     self._ticket_key,
                     PROTOCOL_VERSION_V3 if self.cfg.protocol_version == 3 else PROTOCOL_VERSION)
                 accept_wire, session = resume.process_hello(first_msg)
+                # Tickets outlive authorization; re-check so a revoked or signed-out
+                # client cannot resume before the revocation loop rotates the ticket key.
+                if not self.auth.is_client_authorized(session.client_id):
+                    raise HandshakeError("unauthorized: client authorization revoked")
                 send_message(connection, accept_wire)
                 assigned_ip_hint = resume.assigned_ip or None
             else:
