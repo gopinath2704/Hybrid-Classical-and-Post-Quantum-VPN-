@@ -1,0 +1,13 @@
+post_install() {
+  cat <<'MSG'
+==> pqvpn-client only accepts the GUI from uids in PQVPN_ALLOWED_UIDS. One-time setup
+    (the drop-in lives in /etc and survives upgrades); run as your desktop user:
+      sudo install -d /etc/systemd/system/pqvpn-client.service.d
+      printf '[Service]\nEnvironment=PQVPN_ALLOWED_UIDS=%s\n' "$(id -u)" | sudo tee /etc/systemd/system/pqvpn-client.service.d/allowed-uids.conf
+      sudo systemctl daemon-reload && sudo systemctl restart pqvpn-client
+MSG
+}
+
+post_upgrade() {
+  [ -f /etc/systemd/system/pqvpn-client.service.d/allowed-uids.conf ] || post_install
+}

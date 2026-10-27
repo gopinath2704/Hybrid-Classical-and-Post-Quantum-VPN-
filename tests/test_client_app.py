@@ -163,6 +163,7 @@ class TestClientService:
         config = tmp_path / "client.toml"
         config.write_text("[client]\n")
         service = ClientService(str(config))
+        service.ALLOWED_UIDS = {os.getuid()}
 
         a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -193,6 +194,7 @@ class TestClientService:
         config = tmp_path / "client.toml"
         config.write_text("[client]\nserver_host='vpn.example'\n")
         service = ClientService(str(config))
+        service.ALLOWED_UIDS = {os.getuid()}
 
         for _ in range(2):
             a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -246,6 +248,7 @@ class TestMalformedIPC:
         config = tmp_path / "client.toml"
         config.write_text("[client]\n")
         service = ClientService(str(config))
+        service.ALLOWED_UIDS = {os.getuid()}
 
         a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -262,6 +265,7 @@ class TestMalformedIPC:
         config = tmp_path / "client.toml"
         config.write_text("[client]\n")
         service = ClientService(str(config))
+        service.ALLOWED_UIDS = {os.getuid()}
 
         a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -273,9 +277,119 @@ class TestMalformedIPC:
             a.close()
 
 
+# ─── Peer authorization (pentest #46/#50) ─────────────────────────────────
+
+class TestPeerAuthorization:
+    def _service(self, tmp_path, monkeypatch, allowed: str | None):
+        if allowed is None:
+            monkeypatch.delenv("PQVPN_ALLOWED_UIDS", raising=False)
+        else:
+            monkeypatch.setenv("PQVPN_ALLOWED_UIDS", allowed)
+        config = tmp_path / "client.toml"
+        config.write_text("[client]\n")
+        return ClientService(str(config))
+
+    def _authorized(self, service, monkeypatch, uid: int | None) -> bool:
+        monkeypatch.setattr("app.client.get_peer_uid", lambda _sock: uid)
+        return service._authorize_peer(None)
+
+    def test_no_allowlist_rejects_non_root(self, tmp_path, monkeypatch):
+        service = self._service(tmp_path, monkeypatch, None)
+        assert not self._authorized(service, monkeypatch, 31337)
+        assert not self._authorized(service, monkeypatch, None)
+        assert self._authorized(service, monkeypatch, 0)
+
+    def test_desktop_user_in_allowlist_is_authorized(self, tmp_path, monkeypatch):
+        """GUI regression guard: the configured desktop uid must still reach the service."""
+        service = self._service(tmp_path, monkeypatch, f"{os.getuid()}, 4242")
+        assert self._authorized(service, monkeypatch, os.getuid())
+        assert self._authorized(service, monkeypatch, 4242)
+        assert not self._authorized(service, monkeypatch, 31337)
+
+    def test_desktop_user_runs_commands_over_real_socket(self, tmp_path, monkeypatch):
+        service = self._service(tmp_path, monkeypatch, str(os.getuid()))
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            ipc_send(a, {"command": "STATUS"})
+            service._handle_connection(b)
+            assert "status" in ipc_recv(a, timeout=2.0)
+        finally:
+            a.close()
+
+    @pytest.mark.parametrize("bad", ["abc", "1000,x", "-1", "1000;0", "1e3", "１０００"])
+    def test_malformed_allowlist_fails_closed(self, tmp_path, monkeypatch, bad):
+        service = self._service(tmp_path, monkeypatch, bad)
+        assert service.ALLOWED_UIDS == set()
+        assert not self._authorized(service, monkeypatch, 1000)
+
+
 # ─── IPCClient connection error tests ─────────────────────────────────────
 
 class TestIPCClient:
+    def test_unauthorized_user_gets_actionable_error(self, monkeypatch, tmp_path):
+        """The service answers 'unauthorized' and closes unread; the GUI must not report a broken pipe."""
+        monkeypatch.setattr("app.client._RUNTIME_DIR", tmp_path)
+        monkeypatch.setattr("app.client.get_peer_uid", lambda _sock: 0)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(tmp_path / "client.sock"))
+        listener.listen(1)
+        replied = threading.Event()
+
+        def serve() -> None:
+            conn, _ = listener.accept()
+            ipc_send(conn, {"error": "unauthorized"})
+            conn.close()
+            replied.set()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        real_send = ipc_send
+
+        def late_send(sock, msg):
+            replied.wait(2)
+            real_send(sock, {"pad": "x" * 600_000, **msg})  # overflow the socket buffer -> EPIPE
+
+        monkeypatch.setattr("app.client.ipc_send", late_send)
+        monkeypatch.setattr("app.client.MAX_IPC_MESSAGE", 1_000_000)
+        try:
+            resp = IPCClient().send_command("STATUS")
+        finally:
+            thread.join(timeout=3)
+            listener.close()
+        assert "PQVPN_ALLOWED_UIDS" in resp["error"]
+
+    def test_rejects_non_root_listener(self, monkeypatch, tmp_path):
+        """A squatted fallback socket (not uid 0) is never trusted or sent the request (#46b)."""
+        monkeypatch.setattr("app.client._RUNTIME_DIR", tmp_path / "missing")
+        monkeypatch.setattr("app.client._FALLBACK_DIR", tmp_path)
+        squatter = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        squatter.bind(str(tmp_path / "pqvpn-client.sock"))
+        squatter.listen(1)
+        received: list[bytes] = []
+
+        def serve() -> None:
+            conn, _ = squatter.accept()
+            conn.settimeout(2)
+            try:
+                received.append(conn.recv(4096))
+                ipc_send(conn, {"status": {"state": "CONNECTED"}})
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            status = IPCClient().status()
+        finally:
+            thread.join(timeout=3)
+            squatter.close()
+        assert status.state == ConnectionState.FAILED.value
+        assert "root" in status.error
+        assert received in ([], [b""])
+
+
     def test_service_not_running(self, monkeypatch, tmp_path):
         """IPCClient returns a useful error when no service is listening."""
         monkeypatch.setattr("app.client._RUNTIME_DIR", tmp_path / "nonexistent")

@@ -1041,10 +1041,9 @@ class MainWindow(QMainWindow):
         a.acct_old_password.clear()
         a.acct_new_password.clear()
         if ok:
-            self._add_gui_event("info", "Password changed")
-            a.acct_pw_error.setStyleSheet(f"font-size: 11px; color: {COLORS['green']}; font-weight: 550;")
-            a.acct_pw_error.setText("Password changed successfully.")
-            a.acct_pw_error.show()
+            # The server ended every session and suspended every device; sign in again to restore.
+            self._add_gui_event("info", "Password changed — sign in again with the new password")
+            self._end_account_session(expired=True)
         elif status_code == 401:
             self._end_account_session(expired=True)
         else:

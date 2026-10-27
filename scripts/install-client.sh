@@ -42,6 +42,14 @@ chmod -R u=rwX,go=rX /opt/pqvpn
 echo '== service and launcher'
 cd /opt/pqvpn
 install -m 0644 packaging/common/pqvpn-client-deploy.service /etc/systemd/system/pqvpn-client.service
+# The service only accepts IPC from root and PQVPN_ALLOWED_UIDS, so authorize the invoking desktop user.
+if [[ ${SUDO_UID:-} =~ ^[1-9][0-9]*$ ]]; then
+  install -d -m 0755 /etc/systemd/system/pqvpn-client.service.d
+  printf '[Service]\nEnvironment=PQVPN_ALLOWED_UIDS=%s\n' "$SUDO_UID" \
+    > /etc/systemd/system/pqvpn-client.service.d/allowed-uids.conf
+else
+  echo 'warning: not run via sudo; set PQVPN_ALLOWED_UIDS in a pqvpn-client drop-in or the GUI is refused' >&2
+fi
 install -Dm644 packaging/common/pqvpn.desktop /usr/share/applications/pqvpn.desktop
 install -Dm644 packaging/common/pqvpn.svg /usr/share/icons/hicolor/scalable/apps/pqvpn.svg
 ln -sf /opt/pqvpn/.venv/bin/pqvpn-gui /usr/local/bin/pqvpn-gui

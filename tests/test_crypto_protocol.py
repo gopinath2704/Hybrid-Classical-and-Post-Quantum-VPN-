@@ -1269,3 +1269,16 @@ def test_resumption_wrong_key_rejected():
     key1, key2 = ResumptionTicketKey(), ResumptionTicketKey()
     ticket = key1.issue(os.urandom(32), "alice", PROTOCOL_VERSION_V3)
     assert key2.validate(ticket) is None
+
+
+def test_invalid_x25519_points_raise_handshake_error(identities):
+    """Pentest #7: a low-order peer X25519 key is a clean HandshakeError, not a raw ValueError."""
+    sk,pk,csk,cpk=identities
+    c=KEMTLSClient(pk,fingerprint(pk),csk,True);s=KEMTLSServer(sk,pk,lambda _:{"client_id":"a"},True)
+    ch=ClientHello.unpack(c.initiate_handshake())
+    zero_ch=ClientHello(ch.client_random,ch.session_id,b"\0"*32,ch.pqc_public_key,ch.client_public_key).pack()
+    with pytest.raises(HandshakeError):s.process_client_hello(zero_ch)
+    c=KEMTLSClient(pk,fingerprint(pk),csk,True)
+    sh=ServerHello.unpack(s.process_client_hello(c.initiate_handshake()))
+    zero_sh=ServerHello(sh.server_random,sh.session_id,b"\0"*32,sh.pqc_ciphertext,sh.identity_id).pack()
+    with pytest.raises(HandshakeError):c.process_server_hello(zero_sh)

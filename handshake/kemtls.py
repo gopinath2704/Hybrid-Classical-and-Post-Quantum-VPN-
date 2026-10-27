@@ -9,7 +9,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, TypeVar
 
 from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes
@@ -78,6 +78,17 @@ class Channel(enum.IntEnum):
 
 class HandshakeError(Exception):
     pass
+
+
+_T = TypeVar("_T")
+
+
+def _primitive(operation: Callable[..., _T], *args: object) -> _T:
+    """Run an X25519/ML-KEM primitive; malformed peer key material becomes a HandshakeError."""
+    try:
+        return operation(*args)
+    except (ValueError, RuntimeError) as exc:
+        raise HandshakeError(f"invalid peer key material ({type(exc).__name__})") from exc
 
 
 def _pack_header(msg_type: MessageType, payload_length: int, version: int = PROTOCOL_VERSION) -> bytes:
@@ -647,9 +658,9 @@ class KEMTLSClient:
             raise HandshakeError("server identity substitution detected")
         self._transcript.update(wire)
         self.server_random = hello.server_random
-        ecc = self._hybrid.ecc.derive_shared_secret(self.keys.ecc_private, hello.ecc_public_key)
-        ephemeral_pq = self._hybrid.pqc.decapsulate(self.keys.pqc_secret, hello.pqc_ciphertext)
-        identity_ciphertext, identity_secret = self._hybrid.pqc.encapsulate(self.identity_public)
+        ecc = _primitive(self._hybrid.ecc.derive_shared_secret, self.keys.ecc_private, hello.ecc_public_key)
+        ephemeral_pq = _primitive(self._hybrid.pqc.decapsulate, self.keys.pqc_secret, hello.pqc_ciphertext)
+        identity_ciphertext, identity_secret = _primitive(self._hybrid.pqc.encapsulate, self.identity_public)
         digest = self._transcript.digest()
         self.schedule = derive_schedule(ecc + ephemeral_pq + identity_secret, self.client_random,
                                         self.server_random, self.session_id, digest)
@@ -703,8 +714,8 @@ class KEMTLSServer:
         self._transcript.update(wire)
         self.server_ecc_private, server_ecc_public = self._hybrid.ecc.generate_keypair()
         self.server_random = os.urandom(32)
-        self.ecc = self._hybrid.ecc.derive_shared_secret(self.server_ecc_private, hello.ecc_public_key)
-        ciphertext, self.ephemeral_pq = self._hybrid.pqc.encapsulate(hello.pqc_public_key)
+        self.ecc = _primitive(self._hybrid.ecc.derive_shared_secret, self.server_ecc_private, hello.ecc_public_key)
+        ciphertext, self.ephemeral_pq = _primitive(self._hybrid.pqc.encapsulate, hello.pqc_public_key)
         response = ServerHello(self.server_random, hello.session_id, server_ecc_public,
                                ciphertext, self.identity_id).pack()
         self._transcript.update(response)
@@ -716,7 +727,7 @@ class KEMTLSServer:
             raise HandshakeError("Cannot process ClientKeyExchange")
         exchange = ClientKeyExchange.unpack(wire)
         digest = self._transcript.digest()
-        identity_secret = self._hybrid.pqc.decapsulate(self.identity_secret, exchange.identity_ciphertext)
+        identity_secret = _primitive(self._hybrid.pqc.decapsulate, self.identity_secret, exchange.identity_ciphertext)
         schedule = derive_schedule(self.ecc + self.ephemeral_pq + identity_secret, self.ch.client_random,
                                    self.server_random, self.ch.session_id, digest)
         try:
@@ -885,10 +896,10 @@ class KEMTLSClientV3:
         self._transcript.update(wire)
         self.server_random = hello.server_random
 
-        ecc_ss = self._hybrid.ecc.derive_shared_secret(self.keys.ecc_private, hello.ecc_public_key)
-        k_eph = self._hybrid.pqc.decapsulate(self.keys.pqc_secret, hello.pqc_ciphertext)
-        k_c = self._hybrid.pqc.decapsulate(self.client_static_secret, hello.client_ciphertext)
-        server_ct, k_s = self._hybrid.pqc.encapsulate(self.server_identity_public)
+        ecc_ss = _primitive(self._hybrid.ecc.derive_shared_secret, self.keys.ecc_private, hello.ecc_public_key)
+        k_eph = _primitive(self._hybrid.pqc.decapsulate, self.keys.pqc_secret, hello.pqc_ciphertext)
+        k_c = _primitive(self._hybrid.pqc.decapsulate, self.client_static_secret, hello.client_ciphertext)
+        server_ct, k_s = _primitive(self._hybrid.pqc.encapsulate, self.server_identity_public)
 
         digest = self._transcript.digest()
         self.schedule = derive_schedule_v3(
@@ -958,9 +969,9 @@ class KEMTLSServerV3:
 
         self.server_ecc_private, server_ecc_public = self._hybrid.ecc.generate_keypair()
         self.server_random = os.urandom(32)
-        self.ecc_ss = self._hybrid.ecc.derive_shared_secret(self.server_ecc_private, hello.ecc_public_key)
-        eph_ct, self.k_eph = self._hybrid.pqc.encapsulate(hello.pqc_public_key)
-        client_ct, self.k_c = self._hybrid.pqc.encapsulate(client_kem_public)
+        self.ecc_ss = _primitive(self._hybrid.ecc.derive_shared_secret, self.server_ecc_private, hello.ecc_public_key)
+        eph_ct, self.k_eph = _primitive(self._hybrid.pqc.encapsulate, hello.pqc_public_key)
+        client_ct, self.k_c = _primitive(self._hybrid.pqc.encapsulate, client_kem_public)
 
         response = ServerHelloV3(self.server_random, hello.session_id, server_ecc_public,
                                  eph_ct, self.identity_id, client_ct).pack()
@@ -974,7 +985,7 @@ class KEMTLSServerV3:
         exchange = ClientKeyExchangeV3.unpack(wire)
         digest = self._transcript.digest()
 
-        k_s = self._hybrid.pqc.decapsulate(self.identity_secret, exchange.server_ciphertext)
+        k_s = _primitive(self._hybrid.pqc.decapsulate, self.identity_secret, exchange.server_ciphertext)
         schedule = derive_schedule_v3(
             self.ecc_ss + self.k_eph, k_s + self.k_c,
             self.ch.client_random, self.server_random, self.ch.session_id, digest)
@@ -1142,9 +1153,9 @@ class KEMTLSClientMLDSA:
         self._transcript.update(wire)
         self.server_random = hello.server_random
 
-        ecc_ss = self._hybrid.ecc.derive_shared_secret(self.keys.ecc_private, hello.ecc_public_key)
-        k_eph = self._hybrid.pqc.decapsulate(self.keys.pqc_secret, hello.pqc_ciphertext)
-        server_ct, k_s = self._hybrid.pqc.encapsulate(self.server_identity_public)
+        ecc_ss = _primitive(self._hybrid.ecc.derive_shared_secret, self.keys.ecc_private, hello.ecc_public_key)
+        k_eph = _primitive(self._hybrid.pqc.decapsulate, self.keys.pqc_secret, hello.pqc_ciphertext)
+        server_ct, k_s = _primitive(self._hybrid.pqc.encapsulate, self.server_identity_public)
 
         digest = self._transcript.digest()
         self.schedule = derive_schedule_mldsa(
@@ -1219,8 +1230,8 @@ class KEMTLSServerMLDSA:
 
         self.server_ecc_private, server_ecc_public = self._hybrid.ecc.generate_keypair()
         self.server_random = os.urandom(32)
-        self.ecc_ss = self._hybrid.ecc.derive_shared_secret(self.server_ecc_private, hello.ecc_public_key)
-        eph_ct, self.k_eph = self._hybrid.pqc.encapsulate(hello.pqc_public_key)
+        self.ecc_ss = _primitive(self._hybrid.ecc.derive_shared_secret, self.server_ecc_private, hello.ecc_public_key)
+        eph_ct, self.k_eph = _primitive(self._hybrid.pqc.encapsulate, hello.pqc_public_key)
 
         response = ServerHelloMLDSA(self.server_random, hello.session_id, server_ecc_public,
                                     eph_ct, self.identity_id).pack()
@@ -1234,7 +1245,7 @@ class KEMTLSServerMLDSA:
         exchange = ClientKeyExchangeMLDSA.unpack(wire)
         digest = self._transcript.digest()
 
-        k_s = self._hybrid.pqc.decapsulate(self.identity_secret, exchange.server_ciphertext)
+        k_s = _primitive(self._hybrid.pqc.decapsulate, self.identity_secret, exchange.server_ciphertext)
         schedule = derive_schedule_mldsa(
             self.ecc_ss + self.k_eph + k_s,
             self.ch.client_random, self.server_random, self.ch.session_id, digest)
@@ -1404,8 +1415,8 @@ class ResumptionClientHandshake:
         accept = ResumptionAccept.unpack(wire, self._version)
         self._transcript.update(wire[:HEADER_SIZE + ResumptionAccept.SIZE - 32])  # sans mac
 
-        ecc_ss = self._hybrid.ecc.derive_shared_secret(self.keys.ecc_private, accept.ecc_public_key)
-        kem_ss = self._hybrid.pqc.decapsulate(self.keys.pqc_secret, accept.pqc_ciphertext)
+        ecc_ss = _primitive(self._hybrid.ecc.derive_shared_secret, self.keys.ecc_private, accept.ecc_public_key)
+        kem_ss = _primitive(self._hybrid.pqc.decapsulate, self.keys.pqc_secret, accept.pqc_ciphertext)
 
         schedule = derive_schedule_resume(
             self._secret, ecc_ss, kem_ss,
@@ -1449,8 +1460,8 @@ class ResumptionServerHandshake:
         server_random = os.urandom(32)
         session_id = os.urandom(32)
         server_ecc_private, server_ecc_public = self._hybrid.ecc.generate_keypair()
-        ecc_ss = self._hybrid.ecc.derive_shared_secret(server_ecc_private, hello.ecc_public_key)
-        pqc_ct, kem_ss = self._hybrid.pqc.encapsulate(hello.pqc_public_key)
+        ecc_ss = _primitive(self._hybrid.ecc.derive_shared_secret, server_ecc_private, hello.ecc_public_key)
+        pqc_ct, kem_ss = _primitive(self._hybrid.pqc.encapsulate, hello.pqc_public_key)
 
         # Build accept sans finished_mac for transcript
         accept_body = server_random + session_id + server_ecc_public + pqc_ct
