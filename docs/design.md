@@ -62,7 +62,9 @@ Desktop Milestone 3 has two deliberately separate configuration sources:
   profile plus the service-owned device identity under `/var/lib/pqvpn`.
 
 No values are merged and managed state never changes the explicit TOML workflow.
-Managed mode creates the Ed25519 device identity once under
+Since Milestone 4, managed mode normally gets its profile from the account API:
+after sign-in the GUI binds the device and imports `GET /server/info`, so no
+`.pqvpn` file is handled by hand ([accounts.md](accounts.md)). Managed mode creates the Ed25519 device identity once under
 `/var/lib/pqvpn/identity`: the directory is mode `0700`, the private raw key is
 `0600`, and the public raw key is `0644`. Existing identities are opened without
 following symlinks, validated for type/mode/length/keypair consistency, and never
@@ -117,6 +119,14 @@ and error sanitization remain. Import sends bounded profile JSON rather than a
 root-readable path. Enrollment export returns public JSON for the normal-user GUI
 to save; IPC has no generic file-write, TOML-write, command-execution, restart, or
 private-key operation.
+
+`SO_PEERCRED` authorization fails closed: the service accepts a peer only if its uid
+is 0 or listed in `PQVPN_ALLOWED_UIDS` (comma-separated digits; any malformed entry
+empties the list), set in a systemd drop-in. An unset list means root only. The
+socket itself is `0666` so any local user can connect and be refused; restricting
+it to `0660` plus a dedicated group is a tracked follow-up. In the other direction,
+`IPCClient` refuses a service whose peer uid is not 0, so a squatted socket (for
+example the `/tmp` fallback) cannot impersonate the service.
 
 ## Unsupported IPv6 and revocation
 
@@ -198,7 +208,9 @@ Wire sizes: ClientHelloV3 1,318 B, ServerHelloV3 2,310 B, ClientKeyExchangeV3 1,
 
 Key schedule: two-stage HKDF. Ephemeral handshake secret from X25519_ss + K_eph; authenticated master secret from K_S + K_C + transcript. Same label/channel separation as v2.
 
-v2 remains fully functional; `protocol_version` in config selects v2 or v3.
+v2 remains fully functional; `protocol_version` in config selects v2 or v3 (the code
+default is 2). The managed desktop client speaks v2, so a server that serves desktop
+users runs v2; a v3 server rejects v2 clients with "Unsupported version".
 
 ### Hybrid re-handshake (post-compromise security)
 

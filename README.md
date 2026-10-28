@@ -10,6 +10,15 @@ PQ-VPN is a deployable research prototype implementing a KEMTLS-inspired custom 
 
 **This is a research prototype.** It is not standardized KEMTLS, has not received independent formal review, and does not claim production-grade security.
 
+### How a connection is established
+
+<p align="center">
+  <img src="docs/media/handshake.gif" alt="Animated sequence diagram of the PQ-VPN v3 handshake: ClientHello, ServerHello, ClientKeyExchange and ServerFinished, then the encrypted tunnel opens" width="800">
+</p>
+
+The animation shows the **protocol v3** (KEMTLS-mode) handshake at 1.5× speed: four messages, 4,792 bytes, two round trips, then AES-256-GCM over UDP. The managed desktop client and the reference server currently run **protocol v2**, which uses the same hybrid session establishment but authenticates the client with Ed25519 (see [Cryptography](#cryptography)).
+The full 1:19 interactive version, which also walks through the HKDF key schedule, is [here](https://claude.ai/artifact/4qBy7s7MUmgeEXbwBoR8Rn).
+
 ---
 
 ## Features
@@ -21,9 +30,10 @@ PQ-VPN is a deployable research prototype implementing a KEMTLS-inspired custom 
 - **Post-compromise recovery** — v3 hybrid re-handshake mixes fresh DH + KEM material (passive adversary after full state compromise; active adversary after control-key-only compromise)
 - **DoS resistance** — stateless cookie challenge before resource allocation
 - **Formal model** — Tamarin Prover verifies 13 security lemmas across two theories (secrecy, forward secrecy, mutual auth, KCI resistance, PCS)
-- **Desktop GUI** — PySide6 app with managed identity, multi-profile servers, offline enrollment
-- **Account system** — HTTPS API for login, device binding, and admin approval
-- **Privilege separation** — unprivileged GUI communicates with a CAP_NET_ADMIN service over Unix socket
+- **Desktop GUI** — PySide6 app with managed identity, up to five server profiles, self-service or offline enrollment
+- **Account system** — HTTPS API with invite-only registration, login, optional TOTP, device binding (auto-approved or admin-approved), and sign-out that suspends the device
+- **Privilege separation** — unprivileged GUI talks to a CAP_NET_ADMIN service over a Unix socket; the service fails closed and only accepts root and the uids in `PQVPN_ALLOWED_UIDS`
+- **Pentested** — a 70-attack checklist was run against the code and a live test server ([pentesting/](pentesting/)); the fixes add per-IP login and TOTP throttling and revoke all sessions on password change
 
 ---
 
@@ -37,7 +47,7 @@ PQ-VPN is a deployable research prototype implementing a KEMTLS-inspired custom 
 | Traffic encryption | AES-256-GCM (directional keys) |
 | Key derivation | HKDF-SHA256 |
 
-> **Note:** v2 client authentication uses classical Ed25519 and is not post-quantum. v3 replaces it with ML-KEM-768 for fully PQ mutual authentication.
+> **Note:** v2 client authentication uses classical Ed25519 and is not post-quantum. v3 replaces it with ML-KEM-768 for fully PQ mutual authentication. The managed desktop client speaks v2, so a server serving desktop users must set `protocol_version = 2` (the code default); the example files in `config/` set 3 for TOML-mode testing. A v3 server rejects v2 clients ("Unsupported version").
 
 ---
 
@@ -81,6 +91,7 @@ PQ-VPN is a deployable research prototype implementing a KEMTLS-inspired custom 
 | Native | liboqs 0.16.0, built by `scripts/install-liboqs.sh` | same |
 | Build tools | git, CMake, Ninja, gcc/g++, OpenSSL headers, rsync | same |
 | Network tools | iproute2, nftables | iproute2, nftables |
+| DNS | `systemd-resolved` (`resolvectl`); Connect fails closed without it unless `dns_mode = "none"`, which lets DNS bypass the VPN | n/a |
 | Kernel | TUN device (`/dev/net/tun`) | TUN device |
 | Python deps | pinned in `constraints-tested.txt`; GUI extra: PySide6 | same, minus the GUI |
 | Privileges | `sudo` once, for install; the service then runs with `CAP_NET_ADMIN` only | root for install |
@@ -115,6 +126,26 @@ Launch the GUI from a terminal:
 sudo systemctl start pqvpn-client   # only if the service isn't active
 pqvpn-gui
 ```
+
+### Updating
+
+```bash
+git pull
+sudo bash scripts/install-client.sh
+```
+
+The script syncs the new code into `/opt/pqvpn`, clears any stale `build/`, `dist/` and `*.egg-info`, reinstalls into the venv and restarts the service, which drops an active tunnel. The device identity and server profile are kept, so there is no need to register again. Close and reopen the GUI so it loads the new code, then sign in again: the session token lives only in GUI memory. To confirm the installed copy matches the source:
+
+```bash
+diff -q /opt/pqvpn/app/client.py "$(/opt/pqvpn/.venv/bin/python -c 'import app.client as c; print(c.__file__)')" && echo up-to-date
+```
+
+### Distribution packages (alternative to the script)
+
+Use **either** `install-client.sh` **or** a package, not both: they install separate copies and separate `pqvpn-client` units. Neither package bundles liboqs, so install it first: `sudo bash scripts/install-liboqs.sh /usr/local`, then the `liboqs-python==0.16.0` binding where the system `python3` can import it (the packaged service runs `/usr/bin/python3 -s`). The maintainer's Arch machine uses a locally built `python-liboqs-pqvpn` package for this; its PKGBUILD is not in the repo yet.
+
+- **Arch:** `cd packaging/arch && makepkg -fC --nodeps`, then `sudo pacman -U pqvpn-3.0.0-1-x86_64.pkg.tar.zst`. Keep the `-C`: without it `makepkg` can reuse a stale `src/` build and package old code. Before the first install, create `/etc/systemd/system/pqvpn-client.service.d/allowed-uids.conf` with `[Service]` and `Environment=PQVPN_ALLOWED_UIDS=<your uid>`, or the GUI is refused.
+- **Debian / Ubuntu / Kali:** build `pqvpn_3.0.0-1_amd64.deb` from `packaging/deb/debian` with `dpkg-buildpackage -b -uc -us` (the `debian/` directory must sit at the top of the source tree), then `sudo apt install ./pqvpn_3.0.0-1_amd64.deb`. It depends on `systemd-resolved`, and when installed with `sudo` its postinst writes the allowed-uids drop-in for you. Python binding on Debian-family systems: `sudo pip install --break-system-packages liboqs-python==0.16.0`.
 
 ### Manual / development setup
 
@@ -271,7 +302,8 @@ See [ARTIFACT.md](ARTIFACT.md) for full reproducibility instructions.
 
 ```
 app/
-  client.py              Desktop GUI + privileged client service
+  client.py              Privileged client service, IPC, account client, GUI entry point
+  ui/                    PySide6 windows: login/register, main window, pages, theme
 crypto/
   hybrid_crypto.py       ML-KEM-768, X25519, AES-256-GCM, HKDF
 handshake/
@@ -287,7 +319,8 @@ vpn/
 eval/                    Evaluation campaign scripts and table generators
 formal/                  Tamarin Prover models (pqvpn_v3.spthy, pqvpn_v3_pcs.spthy)
 config/                  Default client/server TOML examples
-packaging/               Arch, Debian, desktop entry, icon, systemd units
+packaging/               Arch PKGBUILD, Debian packaging, desktop entry, icon, systemd units
+pentesting/              70-attack checklist, findings log and attack harnesses
 scripts/                 Client and server installers, native liboqs installer, network helpers
 tests/                   Pytest suite with shared fixtures
 constraints-tested.txt   Tested version pins and native validation record
@@ -301,9 +334,14 @@ constraints-tested.txt   Tested version pins and native validation record
 |---|---|
 | [docs/design.md](docs/design.md) | Protocol design, wire formats, key schedule, threat model, design decisions |
 | [docs/deployment.md](docs/deployment.md) | Server deployment, packaging, provisioning guide |
-| [docs/accounts.md](docs/accounts.md) | Account database and authorization separation |
-| [docs/security_audit.md](docs/security_audit.md) | Security audit and validation records |
+| [docs/aws.md](docs/aws.md) | Running the server on AWS EC2 |
+| [docs/accounts.md](docs/accounts.md) | Account API, invites, device binding and authorization separation |
+| [docs/security_audit.md](docs/security_audit.md) | Security audit and validation records (2026-09) |
+| [pentesting/pentest.md](pentesting/pentest.md) | 70-attack pentest checklist and status |
+| [pentesting/report.md](pentesting/report.md) | Per-attack findings and fixes |
+| [report.md](report.md) | Black-box pentest of the live test server (2026-10-24) |
 | [ARTIFACT.md](ARTIFACT.md) | Reproducibility artifact for the research evaluation |
+| [eval/results-summary/](eval/results-summary/) | Evaluation write-up, figures and validity report |
 
 ---
 
@@ -315,17 +353,20 @@ constraints-tested.txt   Tested version pins and native validation record
 - 1-RTT session resumption with ticket-based reconnect
 - Formal Tamarin model with 13 verified security lemmas
 - Evaluation campaign with wire-size, latency, throughput, memory and DoS benchmarks
-- Desktop GUI with managed identity and offline enrollment
-- Account authentication API with device binding and admin approval
+- Desktop GUI with managed identity, self-service and offline enrollment
+- Account authentication API with invite-only registration, device binding and admin approval
 - Post-compromise recovery via hybrid re-handshake (scoped: passive after full state compromise)
 - Stateless DoS-resistance cookies
 - ML-DSA-44 comparison protocol variant
+- Reference test server on AWS EC2 ([docs/aws.md](docs/aws.md))
+- 70-attack pentest; all findings fixed except two tracked follow-ups (#69 supply-chain pinning, #46 socket group permissions). The low-severity public `/openapi.json` from the live-server pass is also still open
 
 **Pending:**
 
-- Production VPS deployment
 - Independent protocol and security review
 - Routed IPv6, kill switch, dynamic PMTU discovery
+- Distribution packages for liboqs and its Python binding (both are installed manually today)
+- Moving the managed desktop client to protocol v3
 
 ---
 
@@ -338,8 +379,8 @@ constraints-tested.txt   Tested version pins and native validation record
 - Re-handshake does not recover from an active adversary who holds the full epoch state (including rekey secret); recovery is against passive adversaries after full state compromise and active adversaries after control-key-only compromise
 - Custom protocol without independent formal review
 - Up to five imported profiles; no public server discovery
-- Offline administrator-approved enrollment only
-- Packaging is foundational, not live-validated
+- The managed desktop client uses protocol v2 (classical Ed25519 client authentication)
+- The Arch package is used day to day; the Debian package builds and lints cleanly on Debian 13 but has not yet been install-tested on a real Debian-family machine
 - Python cannot guarantee complete cryptographic key zeroization
 
 Detailed milestone history is available via `git log --grep="docs(progress)"`.

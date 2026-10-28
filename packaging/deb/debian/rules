@@ -7,3 +7,10 @@ override_dh_auto_test:
 	PYTHONNOUSERSITE=1 \
 	PYTHONPATH=$$(find .pybuild -type d -name build -print -quit) \
 	python3 -c 'from crypto.hybrid_crypto import get_crypto_status; status = get_crypto_status(); print("pqc_mode:", status["pqc_mode"])'
+
+override_dh_installsystemd:
+	dh_installsystemd pqvpn-client.service
+	dh_installsystemd --no-enable --no-start pqvpn-account-api.service
+
+execute_after_dh_python3:
+	sed -i '1s|^#! \?/usr/bin/python3$$|#!/usr/bin/python3 -s|' debian/pqvpn/usr/bin/pqvpn debian/pqvpn/usr/bin/pqvpn-gui debian/pqvpn/usr/bin/pqvpn-account-api

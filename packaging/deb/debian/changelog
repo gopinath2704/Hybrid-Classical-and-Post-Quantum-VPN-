@@ -1,3 +1,12 @@
+pqvpn (3.0.0-1) experimental; urgency=medium
+
+  * Fail closed on client IPC: only root and PQVPN_ALLOWED_UIDS may connect.
+  * Throttle failed logins and TOTP codes per source IP on the account API.
+  * Revoke all sessions and suspend all devices on password change.
+  * Depend on systemd-resolved; create the allowed-uids drop-in on install.
+
+ -- PQ-VPN research project <noreply@example.invalid>  Wed, 28 Oct 2026 00:00:00 +0530
+
 pqvpn (2.0.0-1) experimental; urgency=medium
 
   * Add the Desktop Client Milestone 3 package.

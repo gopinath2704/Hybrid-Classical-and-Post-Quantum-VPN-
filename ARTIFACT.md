@@ -43,7 +43,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -c constraints-tested.txt '.[dev]'
 
-# 3. Run the test suite (594 tests expected)
+# 3. Run the test suite (740 tests collected)
 python -m pytest tests/ -q
 
 # 4. Run the evaluation campaign
@@ -59,7 +59,7 @@ python eval/run_all.py --iterations 50
 | Step | Time (4-core laptop) |
 |---|---|
 | Docker build (first time) | ~5 min |
-| Test suite (594 tests) | ~20 s |
+| Test suite (740 tests) | ~95 s |
 | Evaluation (50 iterations) | ~30 s |
 | Table/chart generation | ~2 s |
 | **Total** | **~6 min** |
@@ -71,10 +71,14 @@ python eval/run_all.py --iterations 50
 ### Test suite
 
 ```
-594 passed, 2 skipped
+737 passed, 3 skipped
 ```
 
-The 2 skips are namespace tests requiring root (`CAP_NET_ADMIN`).
+Recorded 2026-10-28 with native liboqs as a normal user. The 3 skips depend on the
+host: one root namespace test (needs root, TUN, iproute2 and nftables), one mock-PQC
+test that is skipped when native liboqs is present, and one missing-WireGuard test that
+is skipped when `wg` is installed. The 2026-10-10 evaluation run below
+predates later tests and recorded 594 passed, 2 skipped.
 
 ### Evaluation results
 
@@ -302,7 +306,7 @@ sudo python eval/run_all.py --iterations 30 --systems pqvpn,wireguard
 | Problem | Solution |
 |---|---|
 | `liboqs-python` import fails | Ensure native liboqs 0.16.0 is installed: `sudo bash scripts/install-liboqs.sh /usr/local` |
-| Tests show >2 skips | Some tests require `CAP_NET_ADMIN`; run with `sudo` for namespace tests |
+| Tests show >3 skips | Check `pytest -rs`: namespace tests need `sudo`; native-PQC tests skip without liboqs |
 | matplotlib charts missing | Install `matplotlib` via `pip install '.[dev]'` |
 | Tamarin not found | Install: `pacman -S tamarin-prover` or `brew install tamarin-prover` |
 | Docker build OOM | Increase Docker memory limit to ≥4 GB |

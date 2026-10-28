@@ -13,7 +13,7 @@ depends=('python>=3.11' 'python-argon2-cffi' 'python-cryptography' 'python-fasta
 install=pqvpn.install
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 source=("${pkgname}-${pkgver}.tar.gz")
-sha256sums=('19174dd6acabb966a14b6617c58ac34dd067adf6b1355ee4780b66ad75d76486')
+sha256sums=('912a81d9d4d3308957f229d4d6a1fcfc81e935a38080b80547f7f274d06f6cb9')
 
 build() {
   cd "${srcdir}/${pkgname}-${pkgver}"

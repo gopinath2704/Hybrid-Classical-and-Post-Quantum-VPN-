@@ -12,7 +12,7 @@ Architecture: any
 # liboqs 0.16.0 and liboqs-python are required but not in Debian repos.
 # Install before use: sudo bash scripts/install-liboqs.sh /usr/local
 # then: pip install liboqs-python==0.16.0
-Depends: ${misc:Depends}, ${python3:Depends}, python3 (>= 3.11), python3-argon2, python3-cryptography, python3-fastapi, python3-uvicorn, python3-pyside6.qtwidgets, iproute2, nftables
+Depends: ${misc:Depends}, ${python3:Depends}, python3 (>= 3.11), python3-argon2, python3-cryptography, python3-fastapi, python3-uvicorn, python3-pyside6.qtwidgets, iproute2, nftables, systemd-resolved
 Description: hybrid classical and post-quantum research VPN client
  PQ-VPN is a deployable research/prototype Linux VPN using X25519 and
  ML-KEM-768 session establishment, a pinned static ML-KEM-768 server identity,
