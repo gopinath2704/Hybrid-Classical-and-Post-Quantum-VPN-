@@ -473,7 +473,7 @@ def _make_arch_source_archive(root: Path, archive: Path) -> None:
     included = (
         "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
         "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
-        "packaging/common", "config/account-api.toml", "scripts",
+        "packaging/common", "config/account-api.toml", "scripts", "core",
     )
     subprocess.run(
         [
@@ -498,7 +498,7 @@ def _stable_archive_digest(root: Path, tmp: Path) -> str:
     included = (
         "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
         "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
-        "packaging/common", "config/account-api.toml", "scripts",
+        "packaging/common", "config/account-api.toml", "scripts", "core",
     )
     manifest = subprocess.run(
         ["git", "ls-tree", "-r", "HEAD^{tree}", "--", *included],
@@ -553,8 +553,9 @@ def test_packages_do_not_include_deployment_identity_or_config(tmp_path):
     }
     forbidden_directories = {
         ".git", "__pycache__", ".pytest_cache", ".venv", "venv",
-        "build", "dist", "pkg", "src",
+        "build", "dist", "pkg", "src", "target",
     }
+    rust_crate_src = "pqvpn-3.0.0/core/pqvpn_core/src"
     forbidden_suffixes = (
         ".key", ".pem", ".p12", ".pfx", ".crt", ".db",
         ".db-wal", ".db-shm", ".sqlite", ".sqlite3",
@@ -563,6 +564,9 @@ def test_packages_do_not_include_deployment_identity_or_config(tmp_path):
     for name in names:
         path = Path(name)
         parts = {part.lower() for part in path.parts}
+        # The Rust crate's own src/ is source code, not a leaked makepkg srcdir.
+        if name == rust_crate_src or name.startswith(rust_crate_src + "/"):
+            parts.discard("src")
         filename = path.name.lower()
         assert not parts.intersection(forbidden_directories), name
         assert filename not in forbidden_names, name

@@ -63,3 +63,6 @@ dev/accounts.db
 dev/authorized_clients.json
 dev/*.key
 config/.pqvpn_ticket.json
+
+# Rust core
+core/target/

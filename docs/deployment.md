@@ -202,7 +202,7 @@ git archive --format=tar.gz --mtime=2026-09-14T00:00:00Z \
   --output=packaging/arch/pqvpn-3.0.0.tar.gz 'HEAD^{tree}' -- \
   app benchmarks.py crypto handshake vpn pyproject.toml README.md \
   docs/design.md docs/deployment.md docs/accounts.md packaging/common \
-  config/account-api.toml scripts
+  config/account-api.toml scripts core
 (cd packaging/arch && makepkg --verifysource)
 (cd packaging/arch && makepkg --cleanbuild --syncdeps)
 ```
@@ -246,9 +246,11 @@ cd /tmp/debbuild/pqvpn-3.0.0 && dpkg-buildpackage --build=binary --no-sign
 ```
 
 On a non-Debian host, run the same build in a `debian:trixie` container after
-installing `build-essential debhelper dh-python dh-sequence-installsysusers
-pybuild-plugin-pyproject python3-all python3-build python3-cryptography
-python3-installer python3-setuptools python3-wheel`.
+installing `build-essential cargo rustc python3-maturin debhelper dh-python
+dh-sequence-installsysusers pybuild-plugin-pyproject python3-all python3-build
+python3-cryptography python3-installer python3-setuptools python3-wheel`.
+The Rust core (`core/`, built with maturin) needs network access for `cargo` at
+build time; vendored offline builds are a follow-up.
 
 The build-time check only prints the PQC mode; it does not fail when native liboqs
 is absent (a build without liboqs prints `pqc_mode: unavailable` and succeeds), so

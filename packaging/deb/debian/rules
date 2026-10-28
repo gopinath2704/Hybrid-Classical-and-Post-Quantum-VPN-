@@ -1,5 +1,8 @@
 #!/usr/bin/make -f
 
+# Same as PKGBUILD !lto: GCC LTO objects from aws-lc-sys are unlinkable from rustc.
+export DEB_BUILD_MAINT_OPTIONS = optimize=-lto
+
 %:
 	dh $@ --with python3 --buildsystem=pybuild
 
@@ -14,3 +17,10 @@ override_dh_installsystemd:
 
 execute_after_dh_python3:
 	sed -i '1s|^#! \?/usr/bin/python3$$|#!/usr/bin/python3 -s|' debian/pqvpn/usr/bin/pqvpn debian/pqvpn/usr/bin/pqvpn-gui debian/pqvpn/usr/bin/pqvpn-account-api
+
+# ponytail: cargo fetches crates at build time; vendor them for offline/sbuild builds later.
+execute_after_dh_auto_build:
+	maturin build --release --locked --compatibility linux -m core/pqvpn_core/Cargo.toml -o debian/core-wheel
+
+execute_after_dh_auto_install:
+	python3 -m zipfile -e debian/core-wheel/pqvpn_core-*.whl debian/pqvpn/usr/lib/python3/dist-packages/
