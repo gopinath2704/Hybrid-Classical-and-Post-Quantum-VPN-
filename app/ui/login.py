@@ -544,14 +544,16 @@ class LoginWindow(QWidget):
         root.setContentsMargins(40, 40, 40, 32)
         root.setSpacing(0)
 
-        logo = _PQLogo(54, 21, 14)
-        root.addWidget(logo, 0, Qt.AlignCenter)
-        root.addSpacing(16)
+        self._card_logo = _PQLogo(54, 21, 14)
+        root.addWidget(self._card_logo, 0, Qt.AlignCenter)
+        self._card_logo_gap = 16
+        root.addSpacing(self._card_logo_gap)
 
         self.stack = QStackedWidget()
         self._build_login_form()
         self._build_register_form()
         root.addWidget(self.stack)
+        self._show_page(0)
 
     def _configure_field(self, field: QLineEdit):
         from PySide6.QtGui import QPalette
@@ -714,7 +716,7 @@ class LoginWindow(QWidget):
         sub.setAlignment(Qt.AlignCenter)
         sub.setStyleSheet(f"color:{C_CARD_SUB};font-size:15px;")
         lo.addWidget(sub)
-        lo.addSpacing(28)
+        lo.addSpacing(16)
 
         for field_name, label_text, placeholder, echo in (
             ("register_username", "USERNAME", "Choose a username", False),
@@ -724,17 +726,17 @@ class LoginWindow(QWidget):
             ("register_invite", "INVITE CODE", "Code from your administrator", False),
         ):
             lo.addWidget(self._lbl(label_text))
-            lo.addSpacing(6)
+            lo.addSpacing(4)
             field = QLineEdit()
             field.setPlaceholderText(placeholder)
             field.setStyleSheet(_FIELD_QSS)
-            field.setFixedHeight(46)
+            field.setFixedHeight(42)
             self._configure_field(field)
             if echo:
                 field.setEchoMode(QLineEdit.Password)
             setattr(self, field_name, field)
             lo.addWidget(field)
-            lo.addSpacing(14)
+            lo.addSpacing(10)
 
         self.register_password.textChanged.connect(self._update_register_validation)
         self.register_confirm.textChanged.connect(self._update_register_validation)
@@ -921,12 +923,35 @@ class LoginWindow(QWidget):
         self._desc.setGeometry(lx, desc_y, min(600, left_w), 50)
 
         feat_y = desc_y + 60
-        self._feat.setGeometry(lx - 1, feat_y, min(740, left_w), 140)
+        feat_w = min(740, left_w)
+        self._feat.setGeometry(lx - 1, feat_y, feat_w, max(140, self._feat.layout().heightForWidth(feat_w)))
         self._footer.setGeometry(66, h - 56, 400, 30)
 
+        self._place_card()
+
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        self._place_card()  # first measure happens before stylesheet fonts are applied
+
+    def _place_card(self) -> None:
+        # The card must fit its visible page; shift it up rather than clip the form.
+        w, h = self.width(), self.height()
+        need = self.card.layout().totalMinimumSize().height()
         card_y = max(int(h * 123 / self._DH), 40)
-        self.card.move(card_x, card_y)
-        self.card.setFixedHeight(min(h - card_y - 30, 620))
+        self.setMinimumHeight(max(640, need + 24))
+        ch = max(min(h - card_y - 30, 620), need)
+        card_y = max(min(card_y, h - ch - 20), 10)
+        self.card.move(w - 641, card_y)
+        self.card.setFixedHeight(ch)
+
+    def _show_page(self, index: int) -> None:
+        # A QStackedWidget sizes to its tallest page; only the visible one may count.
+        self.stack.setCurrentIndex(index)
+        self._card_logo.setVisible(index == 0)  # register form needs the height
+        for i in range(self.stack.count()):
+            policy = QSizePolicy.Preferred if i == index else QSizePolicy.Ignored
+            self.stack.widget(i).setSizePolicy(policy, policy)
+        self._place_card()
 
     def eventFilter(self, obj, event):
         if obj is self.login_password and event.type() == QEvent.Type.Resize:
@@ -936,7 +961,7 @@ class LoginWindow(QWidget):
     # ── View switching ───────────────────────────────────────────────
 
     def show_login_view(self) -> None:
-        self.stack.setCurrentIndex(0)
+        self._show_page(0)
         for lbl in (self.login_error, self.login_user_error, self.login_pw_error,
                     self.login_totp_label, self.login_cooldown_label):
             lbl.hide()
@@ -955,7 +980,7 @@ class LoginWindow(QWidget):
         self.activateWindow()
 
     def show_register_view(self) -> None:
-        self.stack.setCurrentIndex(1)
+        self._show_page(1)
         self.login_error.hide()
         self.register_error.hide()
 
