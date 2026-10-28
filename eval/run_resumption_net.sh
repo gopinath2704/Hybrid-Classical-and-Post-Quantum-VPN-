@@ -38,7 +38,7 @@ cleanup() {
   ip netns del "$SERVER_NS" 2>/dev/null || true
   ip netns del "$CLIENT_NS" 2>/dev/null || true
   [[ -n "${KEEP_RUN_DIR:-}" ]] || rm -rf "$RUN_DIR"
-  [[ -n "${KEEP_RUN_DIR:-}" ]] && echo "KEPT: $RUN_DIR"
+  if [[ -n "${KEEP_RUN_DIR:-}" ]]; then echo "KEPT: $RUN_DIR"; fi
 }
 trap cleanup EXIT INT TERM
 
