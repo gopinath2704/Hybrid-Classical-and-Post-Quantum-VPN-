@@ -592,6 +592,47 @@ def test_cross_channel_ciphertext_rejected(identities):
     with pytest.raises(HandshakeError,match="channel"):server.decrypt_control(client.encrypt_frame(b"data"))
     with pytest.raises(HandshakeError,match="channel"):server.decrypt_frame(client.encrypt_control(b"control",FrameType.CONFIG))
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from handshake.kemtls import MAX_SEQUENCE
+
+def forge_data_frame(sender, sequence, payload=b"x", bad_tag=False):
+    """Seal a DATA frame at any sequence, bypassing the sender's counter and its 2^64-1 guard."""
+    direction = "c2s" if sender.role == "client" else "s2c"
+    key, base = getattr(sender.secrets, f"data_{direction}_key"), getattr(sender.secrets, f"data_{direction}_nonce_base")
+    head = struct.pack(DATA_HEADER_FORMAT, DATA_MAGIC, sender.protocol_version, Channel.DATA, FrameType.DATA,
+                       sender.send_direction, sender.session_id[:8], sender.epoch, sequence)
+    frame = bytearray(head + AESGCM(bytes(key)).encrypt(sender._nonce(base, sequence), payload, head))
+    if bad_tag: frame[-1] ^= 1
+    return bytes(frame)
+
+def test_forged_frame_does_not_advance_replay_window(identities):
+    client,server=exchange(identities)
+    for sequence in (1000, 7):
+        with pytest.raises(HandshakeError,match="decryption failed"):server.decrypt_frame(forge_data_frame(client,sequence,bad_tag=True))
+    # Neither forgery moved the window or marked a bit: both legit frames still open.
+    assert server.decrypt_frame(forge_data_frame(client,5,b"five"))[1]==b"five"
+    assert server.decrypt_frame(forge_data_frame(client,7,b"seven"))[1]==b"seven"
+
+def test_replay_window_edge_and_jump_reset(identities):
+    client,server=exchange(identities)
+    def open_at(sequence):return server.decrypt_frame(forge_data_frame(client,sequence))
+    open_at(200);open_at(200-127)
+    with pytest.raises(HandshakeError,match="outside replay window"):open_at(200-128)
+    open_at(10_000)
+    with pytest.raises(HandshakeError,match="outside replay window"):open_at(200)
+    open_at(10_000-127)
+    with pytest.raises(HandshakeError,match="replayed"):open_at(10_000-127)
+    with pytest.raises(HandshakeError,match="outside replay window"):open_at(10_000-128)
+
+def test_receive_at_top_of_sequence_space(identities):
+    client,server=exchange(identities)
+    for sequence in (MAX_SEQUENCE-1, MAX_SEQUENCE):
+        assert server.decrypt_frame(forge_data_frame(client,sequence,b"top"))[1]==b"top"
+    with pytest.raises(HandshakeError,match="replayed"):server.decrypt_frame(forge_data_frame(client,MAX_SEQUENCE))
+    client._data_send_sequence=MAX_SEQUENCE-1
+    assert header(client.encrypt_frame(b"last"))[-1]==MAX_SEQUENCE-1
+    with pytest.raises(HandshakeError,match="exhausted"):client.encrypt_frame(b"none")
+
 
 # --- v3 Protocol Tests ---
 from handshake.kemtls import (

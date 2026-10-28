@@ -154,6 +154,33 @@ def test_delayed_rekey_keeps_data_forwarding(identities):
         client.disconnect(); peer.close(); remote.close()
 
 
+@pytest.mark.data_plane
+def test_client_drops_inbound_packet_not_addressed_to_its_lease(identities):
+    cs, ss = exchange(identities)
+    client = runtime.VPNClient(ClientConfig())
+    client.session = cs
+    client.PING_INITIAL_DELAY = 3600
+    client.tun = runtime.open_tun('test', 1380, True)
+    client.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client.udp.bind(('127.0.0.1', 0))
+    remote = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    remote.bind(('127.0.0.1', 0))
+    client.server_udp = remote.getsockname()
+    client.tunnel = {'mtu': 1380, 'client_vpn_ip': '10.8.0.2'}
+    client._thread = threading.Thread(target=client._loop)
+    client._thread.start()
+    try:
+        from test_runtime import ipv4
+        for destination in ('10.8.0.9', '10.8.0.2'):
+            remote.sendto(ss.encrypt_frame(ipv4('1.1.1.1', destination, destination.encode())), client.udp.getsockname())
+        import select
+        assert select.select([client.tun._sock_remote], [], [], 2)[0]
+        assert client.tun.drain() == ipv4('1.1.1.1', '10.8.0.2', b'10.8.0.2')
+        assert not select.select([client.tun._sock_remote], [], [], .2)[0]
+    finally:
+        client.disconnect(); remote.close()
+
+
 @pytest.mark.parametrize('lock_name', ['_data_send_lock', '_data_receive_lock', '_control_send_lock', '_control_receive_lock'])
 def test_wipe_waits_for_active_record(identities, lock_name):
     client, server = exchange(identities)
