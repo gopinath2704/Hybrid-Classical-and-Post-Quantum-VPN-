@@ -235,3 +235,26 @@ def test_wireguard_script_exits_nonzero_without_wg():
     result = subprocess.run(["bash", str(script), "1", "/dev/null"],
                             env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode != 0
+
+
+# ---------------------------------------------------------------------------
+# 8. M1 net harness emits cold and warm rows that aggregate separately
+# ---------------------------------------------------------------------------
+
+def test_net_harness_emits_cold_and_warm_rows(tmp_path):
+    from eval.generate_tables import load_all_csv, group_data
+    script = (_ROOT / "eval" / "run_pqvpn_net.sh").read_text()
+    subprocess.run(["bash", "-n", str(_ROOT / "eval" / "run_pqvpn_net.sh")], check=True)
+    start = script.index("record() {")
+    record = script[start:script.index("\n}\n", start) + 3]
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "net.csv").write_text("system,profile,metric,run,value,unit\n")
+    subprocess.run(["bash", "-c", record + 'now=$(date +%s%N); record pqvpn-net 0 "$now" 1; '
+                    'record pqvpn-net-warm 0 "$now" 1; record pqvpn-net-warm 1 "" 1'],
+                   env={**os.environ, "CSV_FILE": str(raw / "net.csv"), "PROFILE": "lan"},
+                   check=True, capture_output=True)
+    groups = group_data(load_all_csv(raw))
+    assert len(groups[("pqvpn-net", "lan", "connect_time_ms")]) == 1
+    warm = groups[("pqvpn-net-warm", "lan", "connect_time_ms")]
+    assert warm[0] >= 0 and warm[1] == -1  # a missing IPC start time is a failure, not 0 ms

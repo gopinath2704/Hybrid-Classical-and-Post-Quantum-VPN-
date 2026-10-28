@@ -4,7 +4,9 @@
 # Requires root, native liboqs, and a working Python environment.
 # Creates namespace + veth + tc netem, starts the real VPN server, and
 # measures time from `vpn.cli client connect` to first successful ping
-# of 10.8.0.1 through the tunnel.
+# of 10.8.0.1 through the tunnel (pqvpn-net, cold: new process, no ticket).
+# Then measures the same from an IPC CONNECT to an already-running
+# `app.client --service` (pqvpn-net-warm, full handshake, no ticket).
 #
 # Usage:
 #   sudo eval/run_pqvpn_net.sh <profile> [--iterations N] [--out FILE]
@@ -65,6 +67,8 @@ mtu=${LINK_MTU[$PROFILE]}
 delay_each=$(( rtt / 2 ))
 
 cleanup() {
+  # The service's tmpfs /run lives in its private mount namespace, so killing it leaves no mounts.
+  [[ -s "$RUN_DIR/service.pid" ]] && PIDS+=("$(cat "$RUN_DIR/service.pid")")
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
   for pid in "${PIDS[@]:-}"; do wait "$pid" 2>/dev/null || true; done
   ip netns del "$SERVER_NS" 2>/dev/null || true
@@ -165,43 +169,97 @@ fi
 CSV_FILE="${OUT:-$RUN_DIR/results.csv}"
 echo "system,profile,metric,run,value,unit" > "$CSV_FILE"
 
-# --- Run benchmark iterations ---
-echo "Running $ITERATIONS connect-time measurements..."
+TICKET="$RUN_DIR/client/.pqvpn_ticket.json"
+
+record() {  # $1=system $2=run $3=start_ns $4=connected
+  local ms=-1
+  if (( $4 )) && [[ -n "$3" ]]; then ms=$(( ($(date +%s%N) - $3) / 1000000 )); fi
+  echo "$1,$PROFILE,connect_time_ms,$2,$ms,ms" >> "$CSV_FILE"
+  printf "  %s run %d: %s ms\n" "$1" "$2" "$ms"
+}
+
+# Poll every 10 ms (50 ms before Phase 1) so warm connects near 40 ms are resolvable.
+wait_tunnel() {
+  local attempt
+  for attempt in $(seq 1 300); do
+    ip netns exec "$CLIENT_NS" ping -c1 -W1 10.8.0.1 >/dev/null 2>&1 && return 0
+    sleep 0.01
+  done
+  return 1
+}
+
+# --- Cold: new client process per connect ---
+echo "Running $ITERATIONS cold connect-time measurements..."
 for i in $(seq 0 $(( ITERATIONS - 1 ))); do
   START_NS=$(date +%s%N)
 
-  # Ensure stale TUN device is gone before next iteration
+  # Ensure stale TUN device is gone; drop the ticket so every run is a full handshake
   ip -n "$CLIENT_NS" link del pqbench0 2>/dev/null || true
+  rm -f "$TICKET"
 
   ip netns exec "$CLIENT_NS" \
     python -m vpn.cli client connect --config "$RUN_DIR/client/client.toml" \
     >"$RUN_DIR/client.log" 2>&1 &
   CLIENT_PID=$!
 
-  # Wait for tunnel to come up — ping 10.8.0.1 through it
   CONNECTED=0
-  for attempt in $(seq 1 60); do
-    if ip netns exec "$CLIENT_NS" ping -c1 -W1 10.8.0.1 >/dev/null 2>&1; then
-      CONNECTED=1
-      break
-    fi
-    sleep 0.05
-  done
-
-  END_NS=$(date +%s%N)
-
-  if (( CONNECTED )); then
-    LATENCY_MS=$(( (END_NS - START_NS) / 1000000 ))
-    echo "pqvpn-net,$PROFILE,connect_time_ms,$i,$LATENCY_MS,ms" >> "$CSV_FILE"
-    printf "  run %d: %d ms\n" "$i" "$LATENCY_MS"
-  else
-    echo "  run $i: FAILED (timeout)" >&2
-    echo "pqvpn-net,$PROFILE,connect_time_ms,$i,-1,ms" >> "$CSV_FILE"
-  fi
+  wait_tunnel && CONNECTED=1
+  record pqvpn-net "$i" "$START_NS" "$CONNECTED"
 
   # Disconnect client
   kill "$CLIENT_PID" 2>/dev/null || true
   wait "$CLIENT_PID" 2>/dev/null || true
+  sleep 2
+done
+
+# --- Warm: CONNECT over the IPC of an already-running client service ---
+# Private mount namespace + tmpfs /run: the production socket path /run/pqvpn/client.sock,
+# its mode and the SO_PEERCRED check are unchanged, without colliding with a host service.
+ip -n "$CLIENT_NS" link del pqbench0 2>/dev/null || true
+ip netns exec "$CLIENT_NS" unshare -m --propagation private sh -c \
+  'mount -t tmpfs -o mode=0755 tmpfs /run && mkdir /run/pqvpn && echo $$ > "$1" &&
+   exec python -m app.client --service --config "$2"' \
+  sh "$RUN_DIR/service.pid" "$RUN_DIR/client/client.toml" >"$RUN_DIR/service.log" 2>&1 &
+PIDS+=("$!")
+
+# ipc COMMAND: prints wall-clock ns just before sending (so START excludes Python startup,
+# as for an already-open GUI); exits non-zero on an error reply.
+ipc() {
+  nsenter -t "$(cat "$RUN_DIR/service.pid")" -m python -c '
+import sys, socket, time; sys.path.insert(0, sys.argv[1])
+from app.client import _socket_path, ipc_send, ipc_recv
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(str(_socket_path()))
+print(time.time_ns(), flush=True); ipc_send(s, {"command": sys.argv[2]})
+reply = ipc_recv(s, 60); print(reply, file=sys.stderr); sys.exit("error" in reply)' "$ROOT_DIR" "$1"
+}
+
+for attempt in $(seq 1 100); do
+  [[ -s "$RUN_DIR/service.pid" ]] && nsenter -t "$(cat "$RUN_DIR/service.pid")" -m test -S /run/pqvpn/client.sock && break
+  sleep 0.1
+done
+if ! nsenter -t "$(cat "$RUN_DIR/service.pid")" -m test -S /run/pqvpn/client.sock; then
+  echo "FATAL: client service failed to start" >&2
+  cat "$RUN_DIR/service.log" >&2
+  exit 1
+fi
+
+# Untimed warm-up: the service imports vpn.runtime lazily on its first CONNECT.
+rm -f "$TICKET"
+ipc CONNECT >/dev/null 2>>"$RUN_DIR/ipc.log" && wait_tunnel
+ipc DISCONNECT >/dev/null 2>>"$RUN_DIR/ipc.log" || true
+sleep 2
+
+echo "Running $ITERATIONS warm connect-time measurements..."
+for i in $(seq 0 $(( ITERATIONS - 1 ))); do
+  rm -f "$TICKET"
+  ipc CONNECT >"$RUN_DIR/ipc.start" 2>>"$RUN_DIR/ipc.log" &
+  IPC_PID=$!
+  CONNECTED=0
+  wait_tunnel && CONNECTED=1
+  START_NS=$(head -n1 "$RUN_DIR/ipc.start")
+  record pqvpn-net-warm "$i" "$START_NS" "$CONNECTED"
+  wait "$IPC_PID" 2>/dev/null || true
+  ipc DISCONNECT >/dev/null 2>>"$RUN_DIR/ipc.log" || true
   sleep 2
 done
 

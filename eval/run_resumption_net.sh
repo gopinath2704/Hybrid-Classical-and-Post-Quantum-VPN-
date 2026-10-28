@@ -158,7 +158,7 @@ measure_connect() {
   ip -n "$CLIENT_NS" link del pqbench0 2>/dev/null || true
   start=$(date +%s%N)
   ( cd "$ROOT_DIR"
-    ip netns exec "$CLIENT_NS" python -m vpn.cli client connect \
+    exec ip netns exec "$CLIENT_NS" python -m vpn.cli client connect \
       --config "$RUN_DIR/client/client.toml" >"$RUN_DIR/client-$phase.log" 2>&1 ) &
   local cpid=$!
   for attempt in $(seq 1 120); do
