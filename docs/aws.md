@@ -125,8 +125,11 @@ profile by itself, so no keys or TOML files are copied by hand. To serve it:
   script says it is regenerating the certificate, every client must get the new
   `/etc/pqvpn/tls/account-api.crt` (copy it over SSH, not through the API port), and the
   copy bundled as `app/server-account-api.crt` must be replaced before rebuilding packages.
-- **Port 8443.** Open TCP 8443 in the security group. Registration is invite-only, so it
-  can be open to `0.0.0.0/0`; restrict it to known `/32`s if you can.
+- **Port 8443.** Open TCP 8443 in the security group, to trusted `/32`s where you can
+  (section 1). Opening it to `0.0.0.0/0` instead relies on invite-only registration and
+  the login/registration rate limits; the reference test server does this so users on
+  changing IPs can register, and accepts that the unauthenticated `/openapi.json` and
+  `/server/info` are then public.
 - **Invites.** Create one per user; the code prints once and only its hash is stored:
 
   ```bash
@@ -158,11 +161,12 @@ Account-schema upgrades are one-way, so rolling the code back needs the database
 
 ## SSH from changing or IPv6-only networks
 
-The SSH rule is a `/32` for your IP. On a mobile tether that IP changes often. On an
-IPv6-only network with NAT64, the address `checkip.amazonaws.com` reports may not be the one
-AWS sees for SSH to the raw IPv4 address, so a correct-looking `/32` still times out. Connect
-with the instance's public DNS name instead (`ubuntu@ec2-<a>-<b>-<c>-<d>.<region>.compute.amazonaws.com`),
-which DNS64 resolves to a NAT64 address that works, and update the `/32` when the IP changes.
+The SSH rule is a `/32` for your IP. On a mobile tether that IP changes every few
+minutes, so re-check it (`curl https://checkip.amazonaws.com`) and update the rule. On some
+carrier networks a `/32` that matches the reported IP still times out when you SSH to the
+raw IPv4 address, while SSH to the instance's public DNS name
+(`ubuntu@ec2-<a>-<b>-<c>-<d>.<region>.compute.amazonaws.com`) works: on one such tether the
+name resolved to a NAT64 (`64:ff9b::/96`) address. If the IP route fails, try the name.
 
 ## Stopping when idle
 

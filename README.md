@@ -134,7 +134,7 @@ git pull
 sudo bash scripts/install-client.sh
 ```
 
-The script syncs the new code into `/opt/pqvpn`, clears any stale `build/`, `dist/` and `*.egg-info`, reinstalls into the venv and restarts the service. You stay signed in. Close and reopen the GUI so it loads the new code. To confirm the installed copy matches the source:
+The script syncs the new code into `/opt/pqvpn`, clears any stale `build/`, `dist/` and `*.egg-info`, reinstalls into the venv and restarts the service, which drops an active tunnel. The device identity and server profile are kept, so there is no need to register again. Close and reopen the GUI so it loads the new code, then sign in again: the session token lives only in GUI memory. To confirm the installed copy matches the source:
 
 ```bash
 diff -q /opt/pqvpn/app/client.py "$(/opt/pqvpn/.venv/bin/python -c 'import app.client as c; print(c.__file__)')" && echo up-to-date
@@ -142,7 +142,7 @@ diff -q /opt/pqvpn/app/client.py "$(/opt/pqvpn/.venv/bin/python -c 'import app.c
 
 ### Distribution packages (alternative to the script)
 
-Use **either** `install-client.sh` **or** a package, not both: they install separate copies and separate `pqvpn-client` units. Neither package bundles liboqs, so install it first: `sudo bash scripts/install-liboqs.sh /usr/local`, then the `liboqs-python==0.16.0` binding system-wide.
+Use **either** `install-client.sh` **or** a package, not both: they install separate copies and separate `pqvpn-client` units. Neither package bundles liboqs, so install it first: `sudo bash scripts/install-liboqs.sh /usr/local`, then the `liboqs-python==0.16.0` binding where the system `python3` can import it (the packaged service runs `/usr/bin/python3 -s`). The maintainer's Arch machine uses a locally built `python-liboqs-pqvpn` package for this; its PKGBUILD is not in the repo yet.
 
 - **Arch:** `cd packaging/arch && makepkg -fC --nodeps`, then `sudo pacman -U pqvpn-3.0.0-1-x86_64.pkg.tar.zst`. Keep the `-C`: without it `makepkg` can reuse a stale `src/` build and package old code. Before the first install, create `/etc/systemd/system/pqvpn-client.service.d/allowed-uids.conf` with `[Service]` and `Environment=PQVPN_ALLOWED_UIDS=<your uid>`, or the GUI is refused.
 - **Debian / Ubuntu / Kali:** build `pqvpn_3.0.0-1_amd64.deb` from `packaging/deb/debian` with `dpkg-buildpackage -b -uc -us` (the `debian/` directory must sit at the top of the source tree), then `sudo apt install ./pqvpn_3.0.0-1_amd64.deb`. It depends on `systemd-resolved`, and when installed with `sudo` its postinst writes the allowed-uids drop-in for you. Python binding on Debian-family systems: `sudo pip install --break-system-packages liboqs-python==0.16.0`.
