@@ -133,16 +133,21 @@ sudo /opt/pqvpn/.venv/bin/python -m vpn.cli client authorize-request \
 ```
 
 The parser rejects malformed/oversized JSON, duplicate properties, non-Ed25519 key
-lengths, fingerprint mismatches, unknown fields, and invalid client IDs. No HTTP
-enrollment listener or automatic invite flow exists. Revocation semantics are
+lengths, fingerprint mismatches, unknown fields, and invalid client IDs. This
+offline path uses no HTTP listener; the self-service path (invite-only registration
+and device binding through the account API) is described in
+[accounts.md](accounts.md). Revocation semantics are
 unchanged: it applies to new sessions; active sessions continue until ordinary
 termination or server restart.
 
 ### Packaging foundation
 
-These files are an initial, reviewable packaging foundation for the PQ-VPN
-research/prototype. They do not establish that either package has been installed
-or live-validated.
+These files package the PQ-VPN research/prototype client. The Arch package is
+installed and used on the maintainer's machine. The Debian package (3.0.0-1) builds
+and passes lintian (only `no-manual-page` warnings) on Debian 13, but has not yet
+been install-tested on a real Debian-family host. A package is an alternative to
+`scripts/install-client.sh`, not a companion: both install a `pqvpn-client` unit, so
+use one or the other.
 
 Both distribution formats install the normal-user `pqvpn-gui` desktop launcher,
 the Python application, icon, documentation, the separately managed privileged
@@ -150,9 +155,11 @@ the Python application, icon, documentation, the separately managed privileged
 account API receives no capabilities, writes only under
 `/var/lib/pqvpn/accounts`, and ships a fail-closed TLS configuration template.
 The client service accepts local IPC only from root and the uids listed in
-`PQVPN_ALLOWED_UIDS`; packages cannot know the desktop user, so create the
-`allowed-uids.conf` drop-in shown above once after the first install (the Arch
-package prints the command). Packaging does not install a client private key, a trusted server profile, a TLS
+`PQVPN_ALLOWED_UIDS`. The Arch package cannot know the desktop user, so create the
+`allowed-uids.conf` drop-in shown above once, before the first install (the package
+prints the command). The Debian postinst writes it from `SUDO_UID` when installed
+with `sudo apt install`/`sudo dpkg -i`, never overwrites an existing drop-in, and
+otherwise prints the command. Packaging does not install a client private key, a trusted server profile, a TLS
 private key, or an authorized-client database.
 
 Native ML-KEM is fail-closed. Neither liboqs nor the Python `oqs` binding are
@@ -163,6 +170,11 @@ building or running PQ-VPN:
 sudo bash scripts/install-liboqs.sh /usr/local   # native C library (0.16.0)
 pip install liboqs-python==0.16.0                 # Python binding
 ```
+
+The packaged service runs the system `python3 -s`, so for packages the binding must
+be installed system-wide (on Debian-family systems:
+`sudo pip install --break-system-packages liboqs-python==0.16.0`). The binding that
+`install-client.sh` installs lives in `/opt/pqvpn/.venv` and is not visible to a package.
 
 Without them, PQ-VPN raises `PQCUnavailableError` at startup with an install
 hint. No application runtime download, mock fallback, hidden native copy, or
@@ -207,6 +219,13 @@ The packaged command launchers and privileged client service use Python's `-s`
 mode, so an invoking user's `~/.local` site-packages cannot shadow the
 Pacman-managed wrapper.
 
+Always rebuild with a clean `src/` (`--cleanbuild`, or `makepkg -fC --nodeps` for a
+quick local rebuild). The archive preserves its fixed 2026-09-14 mtimes, so a reused
+`src/pqvpn-3.0.0/build/lib` looks newer than the sources, setuptools skips the copy,
+and the package silently ships the previous code. Check before installing:
+`tar --zstd -xOf pqvpn-3.0.0-1-x86_64.pkg.tar.zst usr/lib/python3.14/site-packages/app/client.py | grep -c parse_allowed_uids`
+must print `2`.
+
 #### Debian / Ubuntu 26.04-class
 
 Install native liboqs 0.16.0 using the project installer before building the
@@ -216,12 +235,30 @@ main package:
 sudo bash scripts/install-liboqs.sh /usr/local
 ```
 
-Build the main package with `dpkg-buildpackage --build=binary --no-sign`.
-The build runs an explicit import check that requires `native_liboqs`, so a
-mock or missing backend cannot produce a successful build. Its Debian-only
+`dpkg-buildpackage` expects `debian/` at the top of the source tree, so build from a
+tree of committed files with `packaging/deb/debian` copied to `debian/`:
+
+```bash
+mkdir -p /tmp/debbuild/pqvpn-3.0.0
+git archive HEAD | tar -x -C /tmp/debbuild/pqvpn-3.0.0
+cp -a packaging/deb/debian /tmp/debbuild/pqvpn-3.0.0/debian
+cd /tmp/debbuild/pqvpn-3.0.0 && dpkg-buildpackage --build=binary --no-sign
+```
+
+On a non-Debian host, run the same build in a `debian:trixie` container after
+installing `build-essential debhelper dh-python dh-sequence-installsysusers
+pybuild-plugin-pyproject python3-all python3-build python3-cryptography
+python3-installer python3-setuptools python3-wheel`.
+
+The build-time check only prints the PQC mode; it does not fail when native liboqs
+is absent (a build without liboqs prints `pqc_mode: unavailable` and succeeds), so
+liboqs is enforced at runtime, not at build time. The Debian-only
 `use-debian-runtime-dependencies.patch` prevents upstream PyPI pins from
 producing dependencies unavailable in Ubuntu; the complete runtime set remains
-explicit in `packaging/deb/debian/control`. Inspect the results with
+explicit in `packaging/deb/debian/control`, including `systemd-resolved` (the client
+fails closed on managed DNS without `resolvectl`). Installing enables and starts
+`pqvpn-client`; `pqvpn-account-api` is installed but neither enabled nor started,
+since its unit points at the `/opt/pqvpn` server layout. Inspect the results with
 `dpkg-deb --info`, `dpkg-deb --contents`, and `dpkg-deb --field`; then install
 in a clean Ubuntu 26.04 environment and confirm `oqs.oqs_version()` and
 `oqs.oqs_python_version()` both return `0.16.0` and `ML-KEM-768` is enabled.

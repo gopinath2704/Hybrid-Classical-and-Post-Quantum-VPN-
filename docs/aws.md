@@ -110,6 +110,65 @@ curl -4 --max-time 10 https://checkip.amazonaws.com   # should print the Elastic
 
 Then run the real-client gates in [deployment.md](deployment.md#setup-systemd-and-real-client-gates).
 
+Sections 2–4 are the TOML-mode (v3) flow. For desktop users, follow section 4a instead.
+
+## 4a. Desktop (managed) clients
+
+The PySide6 desktop client registers through the account API and fetches its server
+profile by itself, so no keys or TOML files are copied by hand. To serve it:
+
+- **Protocol v2.** The managed client speaks `protocol_version = 2`. Set that in
+  `/etc/pqvpn/server.toml` (it is the code default; the repo example says 3) and restart
+  `pqvpn-server`. A v3 server rejects v2 clients ("Unsupported version").
+- **Account API certificate.** Deploy with the public address in the certificate SAN:
+  `sudo env PQVPN_PUBLIC_HOST=<ELASTIC_IP> bash scripts/deploy-server.sh`. If the
+  script says it is regenerating the certificate, every client must get the new
+  `/etc/pqvpn/tls/account-api.crt` (copy it over SSH, not through the API port), and the
+  copy bundled as `app/server-account-api.crt` must be replaced before rebuilding packages.
+- **Port 8443.** Open TCP 8443 in the security group. Registration is invite-only, so it
+  can be open to `0.0.0.0/0`; restrict it to known `/32`s if you can.
+- **Invites.** Create one per user; the code prints once and only its hash is stored:
+
+  ```bash
+  sudo /opt/pqvpn/.venv/bin/python -m vpn.cli account invite-create --uses 1 --expires-hours 72 \
+    --accounts-db /var/lib/pqvpn/accounts/accounts.db
+  ```
+
+  `account invites` lists ids and expiry (never codes); `account invite-revoke ID` deletes one.
+  Send the code over a private channel.
+
+Users then install the client (`sudo bash scripts/install-client.sh`), register with the
+code, and press Connect.
+
+## Updating the server
+
+Disconnect clients first: restarting `pqvpn-server` drops live tunnels.
+
+```bash
+# from the client machine: ship the committed tree
+git archive HEAD | ssh -i pqvpn.pem ubuntu@<HOST> \
+  'rm -rf /tmp/pqvpn-src && mkdir /tmp/pqvpn-src && tar -x -C /tmp/pqvpn-src'
+# on the instance: back up state, then redeploy (idempotent; restarts both services)
+sudo cp -a /var/lib/pqvpn/accounts/accounts.db{,.bak-$(date +%s)}
+sudo cp -a /var/lib/pqvpn/authorized/authorized_clients.json{,.bak-$(date +%s)}
+sudo env PQVPN_PUBLIC_HOST=<ELASTIC_IP> bash /tmp/pqvpn-src/scripts/deploy-server.sh
+```
+
+Account-schema upgrades are one-way, so rolling the code back needs the database backup.
+
+## SSH from changing or IPv6-only networks
+
+The SSH rule is a `/32` for your IP. On a mobile tether that IP changes often. On an
+IPv6-only network with NAT64, the address `checkip.amazonaws.com` reports may not be the one
+AWS sees for SSH to the raw IPv4 address, so a correct-looking `/32` still times out. Connect
+with the instance's public DNS name instead (`ubuntu@ec2-<a>-<b>-<c>-<d>.<region>.compute.amazonaws.com`),
+which DNS64 resolves to a NAT64 address that works, and update the `/32` when the IP changes.
+
+## Stopping when idle
+
+The instance bills hourly while running. Stop it when not testing (`aws ec2 stop-instances`);
+the Elastic IP stays associated, and is billed a little while the instance is stopped.
+
 ## 5. Tear down
 
 ```bash
