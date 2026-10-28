@@ -13,13 +13,13 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY=/opt/pqvpn/.venv/bin/python
 
 echo '== OS packages'
-if command -v pacman >/dev/null; then
-  pacman -S --needed --noconfirm python git cmake ninja base-devel openssl iproute2 nftables rsync
-elif command -v apt-get >/dev/null; then
+if command -v apt-get >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -q
   apt-get install -yq python3 python3-venv git cmake ninja-build build-essential libssl-dev \
     iproute2 nftables rsync libgl1 libxkbcommon-x11-0 libegl1 libdbus-1-3
+elif command -v pacman >/dev/null; then
+  pacman -S --needed --noconfirm python git cmake ninja base-devel openssl iproute2 nftables rsync
 else
   echo 'unsupported distro: need pacman or apt-get' >&2; exit 1
 fi
