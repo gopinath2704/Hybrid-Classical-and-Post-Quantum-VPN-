@@ -34,6 +34,7 @@ install -d -o root -g root -m 0755 /opt/pqvpn
 rsync -a --delete --chown=root:root --exclude=.git --exclude=.venv --exclude=venv --exclude=env \
   --exclude=ENV --exclude=__pycache__ --exclude=.pytest_cache --exclude='config/*.key' \
   --exclude=config/client.toml "$SRC/" /opt/pqvpn/
+rm -rf /opt/pqvpn/build /opt/pqvpn/dist /opt/pqvpn/*.egg-info
 python3 -m venv /opt/pqvpn/.venv
 "$PY" -m pip install -q -c /opt/pqvpn/constraints-tested.txt '/opt/pqvpn[desktop]'
 chown -R root:root /opt/pqvpn
