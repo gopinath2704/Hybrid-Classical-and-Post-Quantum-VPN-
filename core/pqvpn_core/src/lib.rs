@@ -1,15 +1,16 @@
 #![forbid(unsafe_code)]
 //! PQ-VPN Rust core. Keys go in; only ciphertext comes back out.
 
+pub mod packet;
+pub mod replay;
+pub mod session;
+
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use zeroize::Zeroizing;
 
-/// `struct.calcsize("!2sBBBB8sIQ")` in handshake/kemtls.py.
-pub const HEADER_LEN: usize = 26;
-pub const KEY_LEN: usize = 32;
+pub use session::{HEADER_LEN, KEY_LEN};
 
 /// Matches `HandshakeSession._encrypt`: nonce = base XOR (0u32 || seq u64 BE),
 /// AAD = packed header. Returns ciphertext || tag (the caller prepends the header).
@@ -23,10 +24,7 @@ pub fn seal(key: &[u8], nonce_base: &[u8], header: &[u8], sequence: u64, plainte
     if sequence == u64::MAX {
         return Err("sequence exhausted; rekey required");
     }
-    let mut nonce = Zeroizing::new(<[u8; NONCE_LEN]>::try_from(nonce_base).map_err(|_| "nonce_base must be 12 bytes")?);
-    for (n, s) in nonce[4..].iter_mut().zip(sequence.to_be_bytes()) {
-        *n ^= s;
-    }
+    let nonce = session::nonce(&<[u8; NONCE_LEN]>::try_from(nonce_base).map_err(|_| "nonce_base must be 12 bytes")?, sequence);
     let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).map_err(|_| "invalid key")?);
     let mut out = plaintext.to_vec();
     key.seal_in_place_append_tag(Nonce::assume_unique_for_key(*nonce), Aad::from(header), &mut out)
@@ -41,9 +39,53 @@ fn encrypt_frame<'py>(py: Python<'py>, key: &[u8], nonce_base: &[u8], header: &[
         .map_err(PyValueError::new_err)
 }
 
+fn role(name: &str) -> PyResult<session::Role> {
+    match name {
+        "client" => Ok(session::Role::Client),
+        "server" => Ok(session::Role::Server),
+        _ => Err(PyValueError::new_err("role must be client or server")),
+    }
+}
+
+/// One epoch of a session's data channel. Keys go in at construction; there are no getters.
+#[pyclass(frozen, name = "DataSession")]
+struct PyDataSession(session::DataSession);
+
+#[pymethods]
+impl PyDataSession {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    fn new(role_name: &str, session_id: &[u8], protocol_version: u8, epoch: u32, send_key: &[u8], send_nonce_base: &[u8],
+           recv_key: &[u8], recv_nonce_base: &[u8]) -> PyResult<Self> {
+        session::DataSession::new(role(role_name)?, session_id, protocol_version, epoch, send_key, send_nonce_base, recv_key, recv_nonce_base)
+            .map(Self)
+            .map_err(|e| PyValueError::new_err(e.as_str()))
+    }
+
+    fn seal<'py>(&self, py: Python<'py>, frame_type: u8, payload: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+        self.0.seal(frame_type, payload).map(|f| PyBytes::new(py, &f)).map_err(|e| PyValueError::new_err(e.as_str()))
+    }
+
+    /// Returns (frame_type, plaintext); raises ValueError(kind) on rejection.
+    fn open<'py>(&self, py: Python<'py>, frame: &[u8]) -> PyResult<(u8, Bound<'py, PyBytes>)> {
+        self.0.open(frame).map(|(t, p)| (t, PyBytes::new(py, &p))).map_err(|e| PyValueError::new_err(e.as_str()))
+    }
+}
+
+/// Inner-packet check after decryption: server checks the source lease, client its destination.
+#[pyfunction]
+fn inbound_ok(role_name: &str, packet: &[u8], address: [u8; 4], mtu: usize) -> PyResult<bool> {
+    Ok(match role(role_name)? {
+        session::Role::Server => packet::server_accepts(packet, address, mtu),
+        session::Role::Client => packet::client_accepts(packet, address, mtu),
+    })
+}
+
 #[pymodule]
 fn pqvpn_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(encrypt_frame, m)?)
+    m.add_function(wrap_pyfunction!(encrypt_frame, m)?)?;
+    m.add_function(wrap_pyfunction!(inbound_ok, m)?)?;
+    m.add_class::<PyDataSession>()
 }
 
 #[cfg(test)]
@@ -66,6 +108,74 @@ mod tests {
             let ct = seal(&unhex(&v["key"]), &unhex(&v["nonce_base"]), &header, v["sequence"].as_u64().unwrap(), &unhex(&v["plaintext"])).unwrap();
             assert_eq!([header, ct].concat(), unhex(&v["frame"]), "{}", v["name"]);
         }
+    }
+
+    #[test]
+    fn python_decrypt_op_scripts() {
+        let scripts: Value = serde_json::from_str(include_str!("../../../tests/vectors/frame_decrypt.json")).unwrap();
+        let scripts = scripts.as_array().unwrap();
+        assert_eq!(scripts.len(), 4);
+        for s in scripts {
+            let role = if s["role"] == "client" { session::Role::Client } else { session::Role::Server };
+            let rx = session::DataSession::new(role, &unhex(&s["session_id"]), u8::try_from(s["protocol_version"].as_u64().unwrap()).unwrap(),
+                u32::try_from(s["epoch"].as_u64().unwrap()).unwrap(), &unhex(&s["send_key"]), &unhex(&s["send_nonce_base"]),
+                &unhex(&s["recv_key"]), &unhex(&s["recv_nonce_base"])).unwrap();
+            for op in s["ops"].as_array().unwrap() {
+                let outcome = match rx.open(&unhex(&op["frame"])) {
+                    Ok((t, p)) => format!("ok {t} {}", p.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+                    Err(e) => e.as_str().to_string(),
+                };
+                let expected = match op["expect"].as_str().unwrap() {
+                    "ok" => format!("ok {} {}", op["frame_type"], op["plaintext"].as_str().unwrap()),
+                    kind => kind.to_string(),
+                };
+                assert_eq!(outcome, expected, "{} {}", s["name"], op["name"]);
+            }
+        }
+    }
+
+    fn pair() -> (session::DataSession, session::DataSession) {
+        let (sid, c2s, s2c, nc, ns) = ([9; 32], [1; 32], [2; 32], [3; 12], [4; 12]);
+        (session::DataSession::new(session::Role::Client, &sid, 0x30, 1, &c2s, &nc, &s2c, &ns).unwrap(),
+         session::DataSession::new(session::Role::Server, &sid, 0x30, 1, &s2c, &ns, &c2s, &nc).unwrap())
+    }
+
+    #[test]
+    fn concurrent_seal_never_reuses_a_sequence() {
+        let (client, server) = pair();
+        let mut frames: Vec<Vec<u8>> = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..8).map(|_| s.spawn(|| (0..500).map(|_| client.seal(1, b"x").unwrap()).collect::<Vec<_>>())).collect();
+            workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
+        });
+        let sequences: std::collections::HashSet<_> = frames.iter().map(|f| f[18..26].to_vec()).collect();
+        assert_eq!(sequences.len(), 4000);
+        frames.sort_by(|a, b| a[18..26].cmp(&b[18..26]));
+        assert!(frames.iter().all(|f| server.open(f).is_ok()));
+    }
+
+    #[test]
+    fn concurrent_duplicate_opens_exactly_once() {
+        let (client, server) = pair();
+        for _ in 0..200 {
+            let frame = client.seal(1, b"once").unwrap();
+            let results: Vec<_> = std::thread::scope(|s| {
+                let workers: Vec<_> = (0..4).map(|_| s.spawn(|| server.open(&frame))).collect();
+                workers.into_iter().map(|w| w.join().unwrap()).collect()
+            });
+            assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+            assert!(results.iter().filter(|r| r.is_err()).all(|r| *r == Err(session::Error::Replayed)));
+        }
+    }
+
+    #[test]
+    fn other_session_and_old_epoch_rejected() {
+        let (client, _) = pair();
+        let (sid, c2s, s2c, nc, ns) = ([9; 32], [1; 32], [2; 32], [3; 12], [4; 12]);
+        let next_epoch = session::DataSession::new(session::Role::Server, &sid, 0x30, 2, &s2c, &ns, &c2s, &nc).unwrap();
+        let other = session::DataSession::new(session::Role::Server, &[8; 32], 0x30, 1, &s2c, &ns, &c2s, &nc).unwrap();
+        let frame = client.seal(1, b"old").unwrap();
+        assert_eq!(next_epoch.open(&frame), Err(session::Error::Binding));
+        assert_eq!(other.open(&frame), Err(session::Error::Binding));
     }
 
     #[test]

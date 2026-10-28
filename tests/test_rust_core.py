@@ -2,16 +2,31 @@
 
 Regenerate with: PYTHONPATH=. python tests/test_rust_core.py
 """
+import collections
 import hashlib
+import ipaddress
 import json
+import random
+import struct
 from dataclasses import fields
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from handshake.kemtls import DATA_HEADER_SIZE, MAX_SEQUENCE, FrameType, HandshakeSession, TrafficSecrets
+from handshake.kemtls import (DATA_HEADER_FORMAT, DATA_HEADER_SIZE, DATA_MAGIC, MAX_SEQUENCE, Channel, FrameType,
+                              HandshakeError, HandshakeSession, TrafficSecrets)
+from vpn.runtime import validate_client_packet
 
 VECTORS = Path(__file__).parent / "vectors" / "frame_encrypt.json"
+DECRYPT_VECTORS = Path(__file__).parent / "vectors" / "frame_decrypt.json"
+# Python rejection message -> stable kind shared with pqvpn_core's ValueError text.
+KINDS = {
+    "Frame too short": "short", "invalid record protocol or channel": "header", "invalid frame type": "frame_type",
+    "wrong session, epoch, or direction": "binding", "replayed packet": "replayed",
+    "packet is outside replay window": "outside_window", "Frame decryption failed": "tag",
+    "control frame type requires encrypt_control": "control_type", "sequence exhausted; rekey required": "exhausted",
+}
 SEQUENCES = (0, (1 << 32) + 5, MAX_SEQUENCE - 1)
 
 
@@ -45,6 +60,83 @@ def test_vectors_match_python_record_layer():
     assert json.loads(VECTORS.read_text()) == build_vectors()
 
 
+def _direction(role: str) -> str:
+    return "c2s" if role == "client" else "s2c"
+
+
+def forge(sender: HandshakeSession, sequence: int, frame_type: FrameType, payload: bytes) -> bytes:
+    """Seal a DATA-channel frame at any sequence without touching the sender's counter or guard."""
+    key = getattr(sender.secrets, f"data_{_direction(sender.role)}_key")
+    base = getattr(sender.secrets, f"data_{_direction(sender.role)}_nonce_base")
+    head = struct.pack(DATA_HEADER_FORMAT, DATA_MAGIC, sender.protocol_version, Channel.DATA, frame_type,
+                       sender.send_direction, sender.session_id[:8], sender.epoch, sequence)
+    return head + AESGCM(bytes(key)).encrypt(sender._nonce(base, sequence), payload, head)
+
+
+def py_outcome(call) -> dict:
+    try:
+        frame_type, data = call()
+    except HandshakeError as exc:
+        return {"expect": KINDS[str(exc)]}
+    return {"expect": "ok", "frame_type": int(frame_type), "plaintext": data.hex()}
+
+
+def _sessions(secrets: TrafficSecrets, session_id: bytes, version: int, epoch: int) -> dict[str, HandshakeSession]:
+    return {role: HandshakeSession(session_id, secrets, b"c" * 32, b"s" * 32, role, epoch=epoch, protocol_version=version)
+            for role in ("client", "server")}
+
+
+def _keys(secrets: TrafficSecrets, role: str) -> dict[str, str]:
+    send, recv = _direction(role), _direction("server" if role == "client" else "client")
+    return {"send_key": getattr(secrets, f"data_{send}_key").hex(), "send_nonce_base": getattr(secrets, f"data_{send}_nonce_base").hex(),
+            "recv_key": getattr(secrets, f"data_{recv}_key").hex(), "recv_nonce_base": getattr(secrets, f"data_{recv}_nonce_base").hex()}
+
+
+def _edit(frame: bytes, index: int, value: int) -> bytes:
+    edited = bytearray(frame)
+    edited[index] = value
+    return bytes(edited)
+
+
+def build_decrypt_vectors() -> list[dict]:
+    secrets = TrafficSecrets(**{f.name: _fixed(f.name, 12 if f.name.endswith("nonce_base") else 32) for f in fields(TrafficSecrets)})
+    session_id = bytes(_fixed("session id", 32))
+    scripts = []
+    for version in (0x20, 0x30):
+        for receiver in ("server", "client"):
+            peers = _sessions(secrets, session_id, version, epoch=7)
+            rx, tx = peers[receiver], peers["client" if receiver == "server" else "server"]
+            bind, keepalive = ((FrameType.UDP_BIND, FrameType.PING) if receiver == "server"
+                               else (FrameType.UDP_BIND_ACK, FrameType.PONG))
+            def at(sequence, payload=b"x", frame_type=FrameType.DATA):
+                return forge(tx, sequence, frame_type, payload)
+            ops = [("data-0", at(0, b"zero")), ("replay-0", at(0, b"zero")), ("bind-1", at(1, b"bind", bind)),
+                   ("keepalive-2", at(2, b"\0" * 8, keepalive)), ("empty-3", at(3, b"")),
+                   ("large-4", at(4, bytes(range(256)) * 6)), ("bad-tag-5", _edit(at(5), -1, at(5)[-1] ^ 1)),
+                   ("data-5-after-bad-tag", at(5, b"five")),
+                   ("aad-type-changed", _edit(at(6), 4, int(keepalive))),
+                   ("wrong-epoch", _edit(at(6), 17, 8)), ("wrong-direction", _edit(at(6), 5, int(rx.send_direction))),
+                   ("wrong-session", _edit(at(6), 6, at(6)[6] ^ 1)), ("control-channel", _edit(at(6), 3, int(Channel.CONTROL))),
+                   ("wrong-version", _edit(at(6), 2, version ^ 1)), ("bad-magic", _edit(at(6), 0, 0)),
+                   ("bad-type-99", _edit(at(6), 4, 99)), ("short-41", at(6, b"")[:41]),
+                   ("forged-1000-bad-tag", _edit(at(1000), -1, at(1000)[-1] ^ 1)), ("data-8", at(8, b"eight")),
+                   ("window-200", at(200)), ("edge-73", at(200 - 127)), ("outside-72", at(200 - 128)),
+                   ("jump-10000", at(10_000)), ("stale-200", at(200)), ("edge-9873", at(10_000 - 127)),
+                   ("replay-9873", at(10_000 - 127)), ("outside-9872", at(10_000 - 128)),
+                   ("top-minus-1", at(MAX_SEQUENCE - 1, b"top")), ("top", at(MAX_SEQUENCE, b"top")),
+                   ("replay-top", at(MAX_SEQUENCE, b"top"))]
+            scripts.append({
+                "name": f"v{version:#x}-{receiver}-receives", "role": receiver, "session_id": session_id.hex(),
+                "protocol_version": version, "epoch": 7, **_keys(secrets, receiver),
+                "ops": [{"name": name, "frame": frame.hex(), **py_outcome(lambda f=frame: rx.decrypt_frame(f))} for name, frame in ops],
+            })
+    return scripts
+
+
+def test_decrypt_vectors_match_python_record_layer():
+    assert json.loads(DECRYPT_VECTORS.read_text()) == build_decrypt_vectors()
+
+
 @pytest.fixture
 def core(backend):
     if backend == "rust":
@@ -71,6 +163,96 @@ def test_rust_encrypt_frame_rejects_bad_input(core, key, nonce, header, sequence
         core.encrypt_frame(key, nonce, header, sequence, b"payload")
 
 
+def _rust_session(core, script: dict):
+    return core.DataSession(script["role"], bytes.fromhex(script["session_id"]), script["protocol_version"], script["epoch"],
+                            *(bytes.fromhex(script[k]) for k in ("send_key", "send_nonce_base", "recv_key", "recv_nonce_base")))
+
+
+def rust_outcome(call) -> dict:
+    try:
+        frame_type, data = call()
+    except ValueError as exc:
+        return {"expect": str(exc)}
+    return {"expect": "ok", "frame_type": frame_type, "plaintext": data.hex()}
+
+
+def test_rust_decrypt_vectors(core):
+    for script in json.loads(DECRYPT_VECTORS.read_text()):
+        rx = _rust_session(core, script)
+        for op in script["ops"]:
+            expected = {k: op[k] for k in ("expect", "frame_type", "plaintext") if k in op}
+            assert rust_outcome(lambda: rx.open(bytes.fromhex(op["frame"]))) == expected, (script["name"], op["name"])
+
+
+def run_differential(core, scripts: int = 10_000, ops: int = 20) -> collections.Counter:
+    """Seeded op scripts: Python HandshakeSession and Rust DataSession must agree on every seal and open."""
+    stats: collections.Counter = collections.Counter()
+    for seed in range(scripts):
+        rng = random.Random(seed)
+        secrets = TrafficSecrets(**{f.name: bytearray(rng.randbytes(12 if f.name.endswith("nonce_base") else 32)) for f in fields(TrafficSecrets)})
+        session_id, version, epoch = rng.randbytes(32), rng.choice((0x20, 0x30, 0x31)), rng.randrange(1 << 32)
+        py = _sessions(secrets, session_id, version, epoch)
+        rs = {role: _rust_session(core, {"role": role, "session_id": session_id.hex(), "protocol_version": version,
+                                         "epoch": epoch, **_keys(secrets, role)}) for role in py}
+        pool: list[bytes] = []
+        for _ in range(ops):
+            op, role = rng.choice(("seal", "seal", "deliver", "deliver", "tamper", "edit", "truncate", "forge")), rng.choice(("client", "server"))
+            if op == "seal":
+                frame_type, payload = rng.choice((1, 2, 3, 4, 5, 5, 7)), rng.randbytes(rng.choice((0, 8, 64, 1400)))
+                py_result = py_outcome(lambda: (0, py[role].encrypt_frame(payload, FrameType(frame_type))))
+                rs_result = rust_outcome(lambda: (0, rs[role].seal(frame_type, payload)))
+                assert py_result == rs_result, (seed, op)
+                stats[f"seal:{py_result['expect']}"] += 1
+                if py_result["expect"] == "ok":
+                    pool.append(bytes.fromhex(py_result["plaintext"]))
+                continue
+            if op == "forge":
+                sender = py["client" if role == "server" else "server"]
+                frame = forge(sender, rng.choice((rng.randrange(400), rng.randrange(1 << 64), MAX_SEQUENCE - rng.randrange(3))),
+                              FrameType(rng.randrange(1, 14)), rng.randbytes(rng.randrange(64)))
+            elif not pool:
+                continue
+            else:
+                frame = rng.choice(pool)
+                if op == "tamper":
+                    frame = _edit(frame, rng.randrange(len(frame)), rng.randrange(256))
+                elif op == "edit":
+                    frame = _edit(frame, rng.choice((2, 3, 4, 5, 6, 14, 17)), rng.randrange(256))
+                elif op == "truncate":
+                    frame = frame[:rng.randrange(len(frame))]
+            py_result = py_outcome(lambda: py[role].decrypt_frame(frame))
+            assert py_result == rust_outcome(lambda: rs[role].open(frame)), (seed, op, role)
+            stats[f"open:{py_result['expect']}"] += 1
+    return stats
+
+
+def test_rust_differential_against_python(core):
+    stats = run_differential(core)
+    for kind in ("ok", "replayed", "outside_window", "tag", "binding", "header", "frame_type", "short"):
+        assert stats[f"open:{kind}"] > 0, (kind, stats)
+    assert stats["seal:ok"] > 0 and stats["seal:control_type"] > 0, stats
+
+
+def _ipv4(source: str, destination: str, payload: bytes = b"", total: int | None = None, first: int = 0x45) -> bytes:
+    length = 20 + len(payload) if total is None else total
+    return (bytes([first, 0]) + struct.pack("!H", length) + bytes(8) + ipaddress.IPv4Address(source).packed
+            + ipaddress.IPv4Address(destination).packed + payload)
+
+
+def test_rust_inbound_checks_match_python(core):
+    rng, lease, mtu = random.Random(0), "10.8.0.2", 1380
+    for _ in range(5000):
+        packet = _ipv4(rng.choice((lease, "10.8.0.3")), rng.choice((lease, "1.1.1.1")), rng.randbytes(rng.choice((0, 40, 1400))),
+                       total=rng.choice((None, None, 19, 30)), first=rng.choice((0x45, 0x45, 0x46, 0x44, 0x60)))
+        packet = packet[:rng.choice((len(packet), len(packet), rng.randrange(len(packet) + 1)))]
+        python_server = len(packet) <= mtu and validate_client_packet(packet, lease)
+        python_client = (len(packet) <= mtu and len(packet) >= 20 and validate_client_packet(packet, str(ipaddress.IPv4Address(packet[12:16])))
+                         and packet[16:20] == ipaddress.IPv4Address(lease).packed)
+        assert core.inbound_ok("server", packet, ipaddress.IPv4Address(lease).packed, mtu) == python_server
+        assert core.inbound_ok("client", packet, ipaddress.IPv4Address(lease).packed, mtu) == python_client
+
+
 if __name__ == "__main__":
     VECTORS.parent.mkdir(exist_ok=True)
     VECTORS.write_text(json.dumps(build_vectors(), indent=1) + "\n")
+    DECRYPT_VECTORS.write_text(json.dumps(build_decrypt_vectors(), indent=1) + "\n")
