@@ -434,6 +434,22 @@ class HandshakeState(enum.Enum):
     FAILED = "FAILED"
 
 
+# pqvpn_core ValueError kinds -> the messages HandshakeSession raises for the same rejection.
+_RUST_REJECTIONS = {
+    "short": "Frame too short", "header": "invalid record protocol or channel", "frame_type": "invalid frame type",
+    "unexpected_type": "unexpected frame type", "binding": "wrong session, epoch, or direction",
+    "replayed": "replayed packet", "outside_window": "packet is outside replay window", "tag": "Frame decryption failed",
+    "closed": "session closed", "epoch": "non-monotonic epoch", "control_type": "control frame type requires encrypt_control",
+    "exhausted": "sequence exhausted; rekey required", "invalid_key": "invalid data-plane key",
+}
+
+
+def _rust_data_session(*args: object) -> object:
+    # Fails loudly without the Rust core: a rust-mode session never falls back to Python.
+    import pqvpn_core
+    return pqvpn_core.DataSession(*args)
+
+
 @dataclass
 class HandshakeSession:
     session_id: bytes
@@ -445,6 +461,9 @@ class HandshakeSession:
     established_at: float = field(default_factory=time.time)
     epoch: int = 0
     protocol_version: int = field(default=PROTOCOL_VERSION)
+    # Fixed at construction: with "rust", Python never holds data-channel ciphers, so no data
+    # (key, nonce) can be sealed on both sides of a handoff.
+    data_plane: str = "python"
     _data_send_sequence: int = field(default=0, repr=False)
     _control_send_sequence: int = field(default=0, repr=False)
     _control_receive_sequence: int = field(default=0, repr=False)
@@ -454,10 +473,14 @@ class HandshakeSession:
     _control_send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _control_receive_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _epoch_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    _closed: bool = field(default=False, repr=False)
+    _data: object | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.role not in {"client", "server"} or len(self.session_id) != 32:
             raise ValueError("invalid session role or id")
+        if self.data_plane not in {"python", "rust"}:
+            raise ValueError("data_plane must be python or rust")
         self._install()
 
     def _install(self) -> None:
@@ -473,10 +496,24 @@ class HandshakeSession:
             data_send_nonce, data_recv_nonce = self.secrets.data_s2c_nonce_base, self.secrets.data_c2s_nonce_base
             control_send, control_recv = self.secrets.control_s2c_key, self.secrets.control_c2s_key
             control_send_nonce, control_recv_nonce = self.secrets.control_s2c_nonce_base, self.secrets.control_c2s_nonce_base
-        self._data_send_cipher, self._data_recv_cipher = AESGCM(bytes(data_send)), AESGCM(bytes(data_recv))
         self._control_send_cipher, self._control_recv_cipher = AESGCM(bytes(control_send)), AESGCM(bytes(control_recv))
-        self._data_send_nonce_base, self._data_recv_nonce_base = data_send_nonce, data_recv_nonce
         self._control_send_nonce_base, self._control_recv_nonce_base = control_send_nonce, control_recv_nonce
+        if self.data_plane == "python":
+            self._data_send_cipher, self._data_recv_cipher = AESGCM(bytes(data_send)), AESGCM(bytes(data_recv))
+            self._data_send_nonce_base, self._data_recv_nonce_base = data_send_nonce, data_recv_nonce
+            return
+        # Rust copies the four data secrets straight from these bytearrays; then Python's copies are wiped.
+        keys = (data_send, data_send_nonce, data_recv, data_recv_nonce)
+        try:
+            if self._data is None:
+                self._data = _rust_data_session(self.role, self.session_id, self.protocol_version, self.epoch, *keys)
+            else:
+                self._data.rekey(self.epoch, *keys)
+        except ValueError as exc:
+            raise HandshakeError(_RUST_REJECTIONS.get(str(exc), str(exc))) from exc
+        finally:
+            for secret in keys:
+                _secure_zero(secret)
 
     @staticmethod
     def _nonce(base: bytearray, sequence: int) -> bytes:
@@ -484,9 +521,11 @@ class HandshakeSession:
         return bytes(a ^ b for a, b in zip(base, encoded))
 
     def _encrypt(self, plaintext: bytes, frame_type: FrameType, channel: Channel) -> bytes:
+        if channel == Channel.DATA and self.data_plane == "rust":
+            raise HandshakeError("data channel is owned by the Rust data plane")
         lock = self._data_send_lock if channel == Channel.DATA else self._control_send_lock
         with lock:
-            if self._data_send_cipher is None:
+            if self._closed:
                 raise HandshakeError("session closed")
             sequence = self._data_send_sequence if channel == Channel.DATA else self._control_send_sequence
             if sequence == MAX_SEQUENCE:
@@ -519,6 +558,8 @@ class HandshakeSession:
         return self._encrypt(plaintext, frame_type, Channel.CONTROL)
 
     def _decrypt(self, frame: bytes, channel: Channel, expected_type: FrameType | None) -> tuple[FrameType, bytes]:
+        if channel == Channel.DATA and self.data_plane == "rust":
+            raise HandshakeError("data channel is owned by the Rust data plane")
         if len(frame) < DATA_FRAME_OVERHEAD:
             raise HandshakeError("Frame too short")
         header = frame[:DATA_HEADER_SIZE]
@@ -535,7 +576,7 @@ class HandshakeSession:
             with self._data_receive_lock:
                 if session_id != self.session_id[:8] or epoch != self.epoch or direction != self.recv_direction:
                     raise HandshakeError("wrong session, epoch, or direction")
-                if self._data_recv_cipher is None:
+                if self._closed:
                     raise HandshakeError("session closed")
                 self._data_replay.check(sequence)
                 try:
@@ -564,9 +605,28 @@ class HandshakeSession:
     def decrypt_control(self, frame: bytes, expected_type: FrameType | None = None) -> tuple[FrameType, bytes]:
         return self._decrypt(frame, Channel.CONTROL, expected_type)
 
+    def seal_data(self, plaintext: bytes, frame_type: FrameType = FrameType.DATA) -> bytes:
+        """Seal on the data channel with whichever data plane owns it."""
+        if self.data_plane == "python":
+            return self.encrypt_frame(plaintext, frame_type)
+        try:
+            return self._data.seal(int(frame_type), plaintext)
+        except ValueError as exc:
+            raise HandshakeError(_RUST_REJECTIONS.get(str(exc), str(exc))) from exc
+
+    def open_data(self, frame: bytes, expected_type: FrameType | None = None) -> tuple[FrameType, bytes]:
+        """Open a data-channel frame with whichever data plane owns it."""
+        if self.data_plane == "python":
+            return self.decrypt_frame(frame, expected_type)
+        try:
+            frame_type, plaintext = self._data.open(frame, None if expected_type is None else int(expected_type))
+        except ValueError as exc:
+            raise HandshakeError(_RUST_REJECTIONS.get(str(exc), str(exc))) from exc
+        return FrameType(frame_type), plaintext
+
     def derive_next_epoch(self, epoch: int, nonce: bytes) -> TrafficSecrets:
         with self._epoch_lock:
-            if self._data_send_cipher is None:
+            if self._closed:
                 raise HandshakeError("session closed")
             if epoch != self.epoch + 1 or len(nonce) != 32:
                 raise HandshakeError("invalid rekey epoch or nonce")
@@ -578,7 +638,7 @@ class HandshakeSession:
                                   kem_shared_secret: bytes,
                                   transcript: bytes) -> TrafficSecrets:
         with self._epoch_lock:
-            if self._data_send_cipher is None:
+            if self._closed:
                 raise HandshakeError("session closed")
             if epoch != self.epoch + 1:
                 raise HandshakeError("invalid rehandshake epoch")
@@ -595,7 +655,7 @@ class HandshakeSession:
 
     def activate_epoch(self, epoch: int, secrets: TrafficSecrets) -> None:
         with self._epoch_lock, self._data_send_lock, self._data_receive_lock, self._control_send_lock, self._control_receive_lock:
-            if self._data_send_cipher is None:
+            if self._closed:
                 raise HandshakeError("session closed")
             if epoch != self.epoch + 1:
                 raise HandshakeError("non-monotonic epoch")
@@ -611,7 +671,10 @@ class HandshakeSession:
 
     def secure_wipe(self) -> None:
         with self._epoch_lock, self._data_send_lock, self._data_receive_lock, self._control_send_lock, self._control_receive_lock:
+            self._closed = True
             self.secrets.wipe()
+            if self._data is not None:
+                self._data.close()
             self._data_send_cipher = self._data_recv_cipher = None
             self._control_send_cipher = self._control_recv_cipher = None
 
@@ -622,7 +685,9 @@ class HandshakeSession:
 
 class KEMTLSClient:
     def __init__(self, server_identity_public: bytes, server_fingerprint: str,
-                 client_private_key: Ed25519PrivateKey, allow_mock_pqc: bool = False) -> None:
+                 client_private_key: Ed25519PrivateKey, allow_mock_pqc: bool = False,
+                 data_plane: str = "python") -> None:
+        self.data_plane = data_plane
         expected = fingerprint(server_identity_public)
         if len(server_identity_public) != 1184 or not hmac.compare_digest(expected, server_fingerprint.lower()):
             raise HandshakeError("server identity fingerprint mismatch")
@@ -684,12 +749,14 @@ class KEMTLSClient:
             raise HandshakeError("Server Finished MAC verification failed")
         self._transcript.update(wire)
         self._state = HandshakeState.ESTABLISHED
-        return HandshakeSession(self.session_id, self.schedule, self.client_random, self.server_random, "client")
+        return HandshakeSession(self.session_id, self.schedule, self.client_random, self.server_random, "client", data_plane=self.data_plane)
 
 
 class KEMTLSServer:
     def __init__(self, server_identity_secret: bytes, server_identity_public: bytes,
-                 authorize_client: Callable[[bytes], dict | None], allow_mock_pqc: bool = False) -> None:
+                 authorize_client: Callable[[bytes], dict | None], allow_mock_pqc: bool = False,
+                 data_plane: str = "python") -> None:
+        self.data_plane = data_plane
         if len(server_identity_public) != 1184:
             raise ValueError("invalid server identity public key")
         self.identity_secret = server_identity_secret
@@ -748,7 +815,7 @@ class KEMTLSServer:
         self._transcript.update(finished)
         self._state = HandshakeState.ESTABLISHED
         session = HandshakeSession(self.ch.session_id, schedule, self.ch.client_random,
-                                   self.server_random, "server", self.authz.get("client_id", ""))
+                                   self.server_random, "server", self.authz.get("client_id", ""), data_plane=self.data_plane)
         return finished, session
 
 
@@ -856,7 +923,9 @@ def derive_schedule_v3(hybrid_input: bytes, static_input: bytes,
 class KEMTLSClientV3:
     def __init__(self, server_identity_public: bytes, server_fingerprint: str,
                  client_static_secret: bytes, client_static_public: bytes,
-                 allow_mock_pqc: bool = False) -> None:
+                 allow_mock_pqc: bool = False,
+                 data_plane: str = "python") -> None:
+        self.data_plane = data_plane
         expected = fingerprint(server_identity_public)
         if len(server_identity_public) != 1184 or not hmac.compare_digest(expected, server_fingerprint.lower()):
             raise HandshakeError("server identity fingerprint mismatch")
@@ -927,13 +996,15 @@ class KEMTLSClientV3:
         self._state = HandshakeState.ESTABLISHED
         return HandshakeSession(self.session_id, self.schedule,
                                 self.client_random, self.server_random, "client",
-                                protocol_version=PROTOCOL_VERSION_V3)
+                                protocol_version=PROTOCOL_VERSION_V3, data_plane=self.data_plane)
 
 
 class KEMTLSServerV3:
     def __init__(self, server_identity_secret: bytes, server_identity_public: bytes,
                  find_client_kem_key: Callable[[str], tuple[bytes, dict] | None],
-                 allow_mock_pqc: bool = False) -> None:
+                 allow_mock_pqc: bool = False,
+                 data_plane: str = "python") -> None:
+        self.data_plane = data_plane
         if len(server_identity_public) != 1184:
             raise ValueError("invalid server identity public key")
         self.identity_secret = server_identity_secret
@@ -1005,7 +1076,7 @@ class KEMTLSServerV3:
         self._state = HandshakeState.ESTABLISHED
         session = HandshakeSession(self.ch.session_id, schedule, self.ch.client_random,
                                    self.server_random, "server", self.authz.get("client_id", ""),
-                                   protocol_version=PROTOCOL_VERSION_V3)
+                                   protocol_version=PROTOCOL_VERSION_V3, data_plane=self.data_plane)
         return finished, session
 
 
@@ -1110,7 +1181,9 @@ def derive_schedule_mldsa(hybrid_input: bytes, client_random: bytes, server_rand
 class KEMTLSClientMLDSA:
     def __init__(self, server_identity_public: bytes, server_fingerprint: str,
                  client_sig_secret: bytes, client_sig_public: bytes,
-                 allow_mock_pqc: bool = False) -> None:
+                 allow_mock_pqc: bool = False,
+                 data_plane: str = "python") -> None:
+        self.data_plane = data_plane
         expected = fingerprint(server_identity_public)
         if len(server_identity_public) != 1184 or not hmac.compare_digest(expected, server_fingerprint.lower()):
             raise HandshakeError("server identity fingerprint mismatch")
@@ -1187,13 +1260,15 @@ class KEMTLSClientMLDSA:
         self._state = HandshakeState.ESTABLISHED
         return HandshakeSession(self.session_id, self.schedule,
                                 self.client_random, self.server_random, "client",
-                                protocol_version=PROTOCOL_VERSION_V3_MLDSA)
+                                protocol_version=PROTOCOL_VERSION_V3_MLDSA, data_plane=self.data_plane)
 
 
 class KEMTLSServerMLDSA:
     def __init__(self, server_identity_secret: bytes, server_identity_public: bytes,
                  find_client_sig_key: Callable[[str], tuple[bytes, dict] | None],
-                 allow_mock_pqc: bool = False) -> None:
+                 allow_mock_pqc: bool = False,
+                 data_plane: str = "python") -> None:
+        self.data_plane = data_plane
         if len(server_identity_public) != 1184:
             raise ValueError("invalid server identity public key")
         self.identity_secret = server_identity_secret
@@ -1271,7 +1346,7 @@ class KEMTLSServerMLDSA:
         self._state = HandshakeState.ESTABLISHED
         session = HandshakeSession(self.ch.session_id, schedule, self.ch.client_random,
                                    self.server_random, "server", self.authz.get("client_id", ""),
-                                   protocol_version=PROTOCOL_VERSION_V3_MLDSA)
+                                   protocol_version=PROTOCOL_VERSION_V3_MLDSA, data_plane=self.data_plane)
         return finished, session
 
 
@@ -1397,7 +1472,9 @@ class ResumptionClientHandshake:
     """Client-side 1-RTT resumption handshake."""
 
     def __init__(self, resumption_secret: bytes, protocol_version: int = PROTOCOL_VERSION_V3,
-                 allow_mock_pqc: bool = False) -> None:
+                 allow_mock_pqc: bool = False,
+                 data_plane: str = "python") -> None:
+        self.data_plane = data_plane
         self._secret = resumption_secret
         self._version = protocol_version
         self._hybrid = HybridKEM("ML-KEM-768", allow_mock_pqc)
@@ -1431,7 +1508,7 @@ class ResumptionClientHandshake:
 
         return HandshakeSession(accept.session_id, schedule, self.client_random,
                                 accept.server_random, "client",
-                                protocol_version=self._version)
+                                protocol_version=self._version, data_plane=self.data_plane)
 
 
 class ResumptionServerHandshake:
@@ -1439,7 +1516,9 @@ class ResumptionServerHandshake:
 
     def __init__(self, ticket_key: ResumptionTicketKey,
                  protocol_version: int = PROTOCOL_VERSION_V3,
-                 allow_mock_pqc: bool = False) -> None:
+                 allow_mock_pqc: bool = False,
+                 data_plane: str = "python") -> None:
+        self.data_plane = data_plane
         self._ticket_key = ticket_key
         self._version = protocol_version
         self._hybrid = HybridKEM("ML-KEM-768", allow_mock_pqc)
@@ -1482,5 +1561,5 @@ class ResumptionServerHandshake:
 
         session = HandshakeSession(session_id, schedule, hello.client_random,
                                    server_random, "server", self.client_id,
-                                   protocol_version=self._version)
+                                   protocol_version=self._version, data_plane=self.data_plane)
         return accept, session

@@ -6,9 +6,11 @@ pub mod replay;
 pub mod session;
 
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use zeroize::Zeroizing;
 
 pub use session::{HEADER_LEN, KEY_LEN};
 
@@ -47,28 +49,54 @@ fn role(name: &str) -> PyResult<session::Role> {
     }
 }
 
-/// One epoch of a session's data channel. Keys go in at construction; there are no getters.
+fn kind(error: session::Error) -> PyErr {
+    PyValueError::new_err(error.as_str())
+}
+
+/// Copies a secret straight from a Python buffer (e.g. a TrafficSecrets bytearray) into wiped-on-drop
+/// memory, with no intermediate bytes object that the caller's wipe() could not reach.
+fn secret<const N: usize>(py: Python<'_>, buffer: &PyBuffer<u8>) -> PyResult<Zeroizing<[u8; N]>> {
+    let mut out = Zeroizing::new([0u8; N]);
+    buffer.copy_to_slice(py, &mut out[..]).map_err(|_| kind(session::Error::InvalidKey))?;
+    Ok(out)
+}
+
+/// A session's data channel. Keys go in at construction and on rekey; there are no getters.
 #[pyclass(frozen, name = "DataSession")]
-struct PyDataSession(session::DataSession);
+struct PyDataSession(session::Session);
 
 #[pymethods]
 impl PyDataSession {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    fn new(role_name: &str, session_id: &[u8], protocol_version: u8, epoch: u32, send_key: &[u8], send_nonce_base: &[u8],
-           recv_key: &[u8], recv_nonce_base: &[u8]) -> PyResult<Self> {
-        session::DataSession::new(role(role_name)?, session_id, protocol_version, epoch, send_key, send_nonce_base, recv_key, recv_nonce_base)
+    fn new(py: Python<'_>, role_name: &str, session_id: &[u8], protocol_version: u8, epoch: u32, send_key: PyBuffer<u8>,
+           send_nonce_base: PyBuffer<u8>, recv_key: PyBuffer<u8>, recv_nonce_base: PyBuffer<u8>) -> PyResult<Self> {
+        let (sk, sn) = (secret::<32>(py, &send_key)?, secret::<12>(py, &send_nonce_base)?);
+        let (rk, rn) = (secret::<32>(py, &recv_key)?, secret::<12>(py, &recv_nonce_base)?);
+        session::Session::new(role(role_name)?, session_id, protocol_version, epoch, &sk[..], &sn[..], &rk[..], &rn[..])
             .map(Self)
-            .map_err(|e| PyValueError::new_err(e.as_str()))
+            .map_err(kind)
+    }
+
+    fn rekey(&self, py: Python<'_>, epoch: u32, send_key: PyBuffer<u8>, send_nonce_base: PyBuffer<u8>,
+             recv_key: PyBuffer<u8>, recv_nonce_base: PyBuffer<u8>) -> PyResult<()> {
+        let (sk, sn) = (secret::<32>(py, &send_key)?, secret::<12>(py, &send_nonce_base)?);
+        let (rk, rn) = (secret::<32>(py, &recv_key)?, secret::<12>(py, &recv_nonce_base)?);
+        self.0.rekey(epoch, &sk[..], &sn[..], &rk[..], &rn[..]).map_err(kind)
+    }
+
+    fn close(&self) {
+        self.0.close();
     }
 
     fn seal<'py>(&self, py: Python<'py>, frame_type: u8, payload: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
-        self.0.seal(frame_type, payload).map(|f| PyBytes::new(py, &f)).map_err(|e| PyValueError::new_err(e.as_str()))
+        self.0.seal(frame_type, payload).map(|f| PyBytes::new(py, &f)).map_err(kind)
     }
 
     /// Returns (frame_type, plaintext); raises ValueError(kind) on rejection.
-    fn open<'py>(&self, py: Python<'py>, frame: &[u8]) -> PyResult<(u8, Bound<'py, PyBytes>)> {
-        self.0.open(frame).map(|(t, p)| (t, PyBytes::new(py, &p))).map_err(|e| PyValueError::new_err(e.as_str()))
+    #[pyo3(signature = (frame, expected_type=None))]
+    fn open<'py>(&self, py: Python<'py>, frame: &[u8], expected_type: Option<u8>) -> PyResult<(u8, Bound<'py, PyBytes>)> {
+        self.0.open(frame, expected_type).map(|(t, p)| (t, PyBytes::new(py, &p))).map_err(kind)
     }
 }
 
@@ -121,12 +149,12 @@ mod tests {
                 u32::try_from(s["epoch"].as_u64().unwrap()).unwrap(), &unhex(&s["send_key"]), &unhex(&s["send_nonce_base"]),
                 &unhex(&s["recv_key"]), &unhex(&s["recv_nonce_base"])).unwrap();
             for op in s["ops"].as_array().unwrap() {
-                let outcome = match rx.open(&unhex(&op["frame"])) {
-                    Ok((t, p)) => format!("ok {t} {}", p.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+                let outcome = match rx.open(&unhex(&op["frame"]), None) {
+                    Ok((t, p)) => format!("ok {t} {p:?}"),
                     Err(e) => e.as_str().to_string(),
                 };
                 let expected = match op["expect"].as_str().unwrap() {
-                    "ok" => format!("ok {} {}", op["frame_type"], op["plaintext"].as_str().unwrap()),
+                    "ok" => format!("ok {} {:?}", op["frame_type"], unhex(&op["plaintext"])),
                     kind => kind.to_string(),
                 };
                 assert_eq!(outcome, expected, "{} {}", s["name"], op["name"]);
@@ -150,7 +178,7 @@ mod tests {
         let sequences: std::collections::HashSet<_> = frames.iter().map(|f| f[18..26].to_vec()).collect();
         assert_eq!(sequences.len(), 4000);
         frames.sort_by(|a, b| a[18..26].cmp(&b[18..26]));
-        assert!(frames.iter().all(|f| server.open(f).is_ok()));
+        assert!(frames.iter().all(|f| server.open(f, None).is_ok()));
     }
 
     #[test]
@@ -159,7 +187,7 @@ mod tests {
         for _ in 0..200 {
             let frame = client.seal(1, b"once").unwrap();
             let results: Vec<_> = std::thread::scope(|s| {
-                let workers: Vec<_> = (0..4).map(|_| s.spawn(|| server.open(&frame))).collect();
+                let workers: Vec<_> = (0..4).map(|_| s.spawn(|| server.open(&frame, None))).collect();
                 workers.into_iter().map(|w| w.join().unwrap()).collect()
             });
             assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
@@ -174,8 +202,8 @@ mod tests {
         let next_epoch = session::DataSession::new(session::Role::Server, &sid, 0x30, 2, &s2c, &ns, &c2s, &nc).unwrap();
         let other = session::DataSession::new(session::Role::Server, &[8; 32], 0x30, 1, &s2c, &ns, &c2s, &nc).unwrap();
         let frame = client.seal(1, b"old").unwrap();
-        assert_eq!(next_epoch.open(&frame), Err(session::Error::Binding));
-        assert_eq!(other.open(&frame), Err(session::Error::Binding));
+        assert_eq!(next_epoch.open(&frame, None), Err(session::Error::Binding));
+        assert_eq!(other.open(&frame, None), Err(session::Error::Binding));
     }
 
     #[test]

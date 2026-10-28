@@ -65,7 +65,7 @@ The FFI boundary, once Phase 2 lands, is deliberately small:
 - `rekey(session_id, keys, epoch)`, `bind_endpoint(session_id, addr)`, `remove_session(session_id)`.
 - `stats()` returns counters for the eval harness; no packets or keys ever cross back into Python.
 
-Build it with maturin as an `abi3` wheel (one build covers Python 3.10 and newer), with the Rust workspace in `core/` and `Cargo.lock` committed.
+Build it with maturin as an `abi3` wheel (one build covers Python 3.11 and newer), with the Rust workspace in `core/` and `Cargo.lock` committed.
 
 ## Crate choices
 

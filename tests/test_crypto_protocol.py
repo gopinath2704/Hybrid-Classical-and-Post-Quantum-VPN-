@@ -407,9 +407,10 @@ from handshake.kemtls import (
 )
 from vpn.identity import fingerprint
 
-def exchange(ids,authorized=True):
+def exchange(ids,authorized=True,data_plane="python",server_plane=None):
     sk,pk,csk,cpk=ids
-    c=KEMTLSClient(pk,fingerprint(pk),csk,True);s=KEMTLSServer(sk,pk,lambda key:{"client_id":"alice"} if authorized and key==cpk else None,True)
+    c=KEMTLSClient(pk,fingerprint(pk),csk,True,data_plane=data_plane)
+    s=KEMTLSServer(sk,pk,lambda key:{"client_id":"alice"} if authorized and key==cpk else None,True,data_plane=server_plane or data_plane)
     ch=c.initiate_handshake();sh=s.process_client_hello(ch);cke=c.process_server_hello(sh);sf,ss=s.process_client_key_exchange(cke);cs=c.process_server_finished(sf);return cs,ss
 
 @pytest.mark.mock_pqc
@@ -642,7 +643,7 @@ from handshake.kemtls import (
 )
 
 
-def exchange_v3(ids, authorized=True):
+def exchange_v3(ids, authorized=True, data_plane="python", server_plane=None):
     sk, pk, csk, cpk = ids
     fp = fingerprint(cpk)
     def find_client(fp_hex):
@@ -651,8 +652,8 @@ def exchange_v3(ids, authorized=True):
         if fp_hex == fp:
             return cpk, {"client_id": "alice"}
         return None
-    c = KEMTLSClientV3(pk, fingerprint(pk), csk, cpk, allow_mock_pqc=True)
-    s = KEMTLSServerV3(sk, pk, find_client, allow_mock_pqc=True)
+    c = KEMTLSClientV3(pk, fingerprint(pk), csk, cpk, allow_mock_pqc=True, data_plane=data_plane)
+    s = KEMTLSServerV3(sk, pk, find_client, allow_mock_pqc=True, data_plane=server_plane or data_plane)
     ch = c.initiate_handshake()
     sh = s.process_client_hello(ch)
     cke = c.process_server_hello(sh)
@@ -1091,7 +1092,7 @@ from handshake.kemtls import (
 from crypto.hybrid_crypto import PQSignatureProvider, MLDSA44_PARAMS
 
 
-def exchange_mldsa(ids, authorized=True):
+def exchange_mldsa(ids, authorized=True, data_plane="python", server_plane=None):
     sk, pk, sig_sk, sig_pk = ids
     fp = fingerprint(sig_pk)
     def find_client(fp_hex):
@@ -1100,8 +1101,8 @@ def exchange_mldsa(ids, authorized=True):
         if fp_hex == fp:
             return sig_pk, {"client_id": "alice-mldsa"}
         return None
-    c = KEMTLSClientMLDSA(pk, fingerprint(pk), sig_sk, sig_pk, allow_mock_pqc=True)
-    s = KEMTLSServerMLDSA(sk, pk, find_client, allow_mock_pqc=True)
+    c = KEMTLSClientMLDSA(pk, fingerprint(pk), sig_sk, sig_pk, allow_mock_pqc=True, data_plane=data_plane)
+    s = KEMTLSServerMLDSA(sk, pk, find_client, allow_mock_pqc=True, data_plane=server_plane or data_plane)
     ch = c.initiate_handshake()
     sh = s.process_client_hello(ch)
     cke = c.process_server_hello(sh)

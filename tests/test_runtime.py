@@ -113,8 +113,8 @@ def test_control_loss_restores_resources(identities, ending):
 
 
 @pytest.mark.data_plane
-def test_delayed_rekey_keeps_data_forwarding(identities):
-    cs, ss = exchange(identities)
+def test_delayed_rekey_keeps_data_forwarding(data_plane, identities):
+    cs, ss = exchange(identities, data_plane=data_plane)
     client = runtime.VPNClient(ClientConfig())
     client.session = cs
     client.control, peer = socket.socketpair()
@@ -138,8 +138,8 @@ def test_delayed_rekey_keeps_data_forwarding(identities):
             packet = ipv4('1.1.1.1', '10.8.0.2', f'data-{i}'.encode())
             client.tun.inject(packet)
             data, endpoint = remote.recvfrom(4096)
-            assert ss.decrypt_frame(data)[1] == packet
-            remote.sendto(ss.encrypt_frame(packet), endpoint)
+            assert ss.open_data(data)[1] == packet
+            remote.sendto(ss.seal_data(packet), endpoint)
             import select
             assert select.select([client.tun._sock_remote], [], [], 2)[0]
             assert client.tun.drain() == packet
@@ -155,8 +155,8 @@ def test_delayed_rekey_keeps_data_forwarding(identities):
 
 
 @pytest.mark.data_plane
-def test_client_drops_inbound_packet_not_addressed_to_its_lease(identities):
-    cs, ss = exchange(identities)
+def test_client_drops_inbound_packet_not_addressed_to_its_lease(data_plane, identities):
+    cs, ss = exchange(identities, data_plane=data_plane)
     client = runtime.VPNClient(ClientConfig())
     client.session = cs
     client.PING_INITIAL_DELAY = 3600
@@ -172,7 +172,7 @@ def test_client_drops_inbound_packet_not_addressed_to_its_lease(identities):
     try:
         from test_runtime import ipv4
         for destination in ('10.8.0.9', '10.8.0.2'):
-            remote.sendto(ss.encrypt_frame(ipv4('1.1.1.1', destination, destination.encode())), client.udp.getsockname())
+            remote.sendto(ss.seal_data(ipv4('1.1.1.1', destination, destination.encode())), client.udp.getsockname())
         import select
         assert select.select([client.tun._sock_remote], [], [], 2)[0]
         assert client.tun.drain() == ipv4('1.1.1.1', '10.8.0.2', b'10.8.0.2')
@@ -192,7 +192,7 @@ def test_wipe_waits_for_active_record(identities, lock_name):
     assert not done.wait(.05)
     lock.release(); worker.join(2)
     assert done.is_set()
-    with pytest.raises(HandshakeError, match='closed'): client.encrypt_frame(b'after wipe')
+    with pytest.raises(HandshakeError, match='closed'): client.seal_data(b'after wipe')
 
 
 def test_rate_limiter_prunes_sources():
@@ -211,8 +211,8 @@ def test_server_ip_pinned_for_all_paths(monkeypatch):
     control, udp, tun, session = Mock(), Mock(), Mock(), Mock()
     info = {'server_vpn_ip':'10.8.0.1', 'client_vpn_ip':'10.8.0.2','prefix':24,'mtu':1380,'dns':[], 'udp_port':51820}
     session.decrypt_control.return_value = (FrameType.CONFIG, json.dumps(info).encode())
-    session.encrypt_frame.return_value = b'bind'
-    session.decrypt_frame.return_value = (FrameType.UDP_BIND_ACK, b'ok')
+    session.seal_data.return_value = b'bind'
+    session.open_data.return_value = (FrameType.UDP_BIND_ACK, b'ok')
     udp.recvfrom.return_value = (b'ack', ('192.0.2.10',51820))
     handshake = Mock()
     handshake.process_server_finished.return_value = session
@@ -262,13 +262,13 @@ def test_setup_uses_nondefault_toml(tmp_path):
 
 
 @pytest.mark.data_plane
-def test_server_session_timeout_disconnects_client(tmp_path):
+def test_server_session_timeout_disconnects_client(data_plane, tmp_path):
     from vpn.config import ServerConfig
     from vpn.identity import generate_server_identity, generate_client_identity, AuthorizedClients
     fp = generate_server_identity(tmp_path/'server.key',tmp_path/'server.pub',allow_mock=True)
     generate_client_identity(tmp_path/'client.key',tmp_path/'client.pub')
     AuthorizedClients(tmp_path/'clients.json').authorize((tmp_path/'client.pub').read_bytes(), 'test-client')
-    server = runtime.VPNServer(ServerConfig(listen_host='127.0.0.1',control_port=0,udp_port=0,
+    server = runtime.VPNServer(ServerConfig(data_plane=data_plane, listen_host='127.0.0.1',control_port=0,udp_port=0,
         server_identity_private_key=str(tmp_path/'server.key'),server_identity_public_key=str(tmp_path/'server.pub'),
         authorized_clients_file=str(tmp_path/'clients.json'),dev_emulated_tun=True,idle_timeout=.5,session_timeout=1))
     worker = threading.Thread(target=server.start)
@@ -277,7 +277,7 @@ def test_server_session_timeout_disconnects_client(tmp_path):
     try:
         until(lambda: server.tcp is not None and server.udp is not None)
         server.cfg.udp_port = server.udp.getsockname()[1]
-        client = runtime.VPNClient(ClientConfig(server_host='127.0.0.1', server_control_port=server.tcp.getsockname()[1],
+        client = runtime.VPNClient(ClientConfig(data_plane=data_plane, server_host='127.0.0.1', server_control_port=server.tcp.getsockname()[1],
             server_identity_public_key=str(tmp_path/'server.pub'), server_identity_fingerprint=fp,
             client_identity_private_key=str(tmp_path/'client.key'), dev_emulated_tun=True))
         client.PING_INITIAL_DELAY = .1
@@ -390,7 +390,7 @@ def test_client_rekey_protocol_uses_control_domain(monkeypatch,identities):
         responses.append(server_session.encrypt_control(payload[:4]+confirmation,FrameType.REKEY_RESPONSE));server_session.activate_epoch(epoch,keys)
     monkeypatch.setattr(runtime,"send_message",send);monkeypatch.setattr(runtime,"recv_message",lambda _:responses.pop())
     client.rekey();assert client_session.epoch==server_session.epoch==1
-    assert server_session.decrypt_frame(client_session.encrypt_frame(b"after"))[1]==b"after"
+    assert server_session.open_data(client_session.seal_data(b"after"))[1]==b"after"
 """Authenticated quiet-session liveness and rejection/expiry regressions."""
 import os
 import struct
@@ -407,13 +407,13 @@ from test_crypto_protocol import exchange
 
 
 @pytest.fixture
-def connected(tmp_path):
+def connected(data_plane, tmp_path):
     native = os.environ.get('PQVPN_TEST_NATIVE_TUN') == '1'
     previous_routes = runtime.run_ip('route', 'show').stdout if native else None
     fp = generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
     generate_client_identity(tmp_path/'client.key', tmp_path/'client.pub')
     AuthorizedClients(tmp_path/'clients.json').authorize((tmp_path/'client.pub').read_bytes(), 'idle-test')
-    server = runtime.VPNServer(ServerConfig(listen_host='127.0.0.1', control_port=51831 if native else 0, udp_port=51832 if native else 0,
+    server = runtime.VPNServer(ServerConfig(data_plane=data_plane, listen_host='127.0.0.1', control_port=51831 if native else 0, udp_port=51832 if native else 0,
         server_identity_private_key=str(tmp_path/'server.key'), server_identity_public_key=str(tmp_path/'server.pub'),
         authorized_clients_file=str(tmp_path/'clients.json'), dev_emulated_tun=not native, tun_name="pqidle0", dns_servers=[], idle_timeout=2, rekey_interval=0))
     worker = threading.Thread(target=server.start)
@@ -422,7 +422,7 @@ def connected(tmp_path):
     try:
         until(lambda: server._data_thread is not None and server._data_thread.is_alive())
         server.cfg.udp_port = server.udp.getsockname()[1]
-        client = runtime.VPNClient(ClientConfig(server_host='127.0.0.1', server_control_port=server.tcp.getsockname()[1],
+        client = runtime.VPNClient(ClientConfig(data_plane=data_plane, server_host='127.0.0.1', server_control_port=server.tcp.getsockname()[1],
             server_identity_public_key=str(tmp_path/'server.pub'), server_identity_fingerprint=fp,
             client_identity_private_key=str(tmp_path/'client.key'), dev_emulated_tun=not native, tun_name='pqidle1', full_tunnel=False))
         # Inject intervals without changing the deployed defaults.
@@ -445,6 +445,54 @@ def test_control_connection_disables_nagle_at_both_ends(connected):
     item = next(iter(server.sessions.by_id.values()))
     for sock in (client.control, item.control):
         assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
+
+
+@pytest.mark.data_plane
+@pytest.mark.parametrize('server_plane, client_plane', [('rust', 'python'), ('python', 'rust')])
+@pytest.mark.parametrize('version', [2, 3])
+def test_mixed_data_planes_interoperate_end_to_end(tmp_path, version, server_plane, client_plane):
+    pytest.importorskip('pqvpn_core')
+    from vpn.identity import generate_client_identity_kem
+    fp = generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
+    (generate_client_identity_kem if version == 3 else generate_client_identity)(tmp_path/'client.key', tmp_path/'client.pub')
+    AuthorizedClients(tmp_path/'clients.json').authorize((tmp_path/'client.pub').read_bytes(), 'mixed')
+    server = runtime.VPNServer(ServerConfig(data_plane=server_plane, protocol_version=version, listen_host='127.0.0.1',
+        control_port=0, udp_port=0, server_identity_private_key=str(tmp_path/'server.key'),
+        server_identity_public_key=str(tmp_path/'server.pub'), authorized_clients_file=str(tmp_path/'clients.json'),
+        dev_emulated_tun=True, tun_name='pqmix0', dns_servers=[], rekey_interval=0))
+    worker = threading.Thread(target=server.start)
+    worker.start()
+    client = None
+    try:
+        until(lambda: server._data_thread is not None and server._data_thread.is_alive())
+        server.cfg.udp_port = server.udp.getsockname()[1]
+        client = runtime.VPNClient(ClientConfig(data_plane=client_plane, protocol_version=version, server_host='127.0.0.1',
+            server_control_port=server.tcp.getsockname()[1], server_identity_public_key=str(tmp_path/'server.pub'),
+            server_identity_fingerprint=fp, client_identity_private_key=str(tmp_path/'client.key'),
+            client_identity_public_key=str(tmp_path/'client.pub'), dev_emulated_tun=True, tun_name='pqmix1', full_tunnel=False))
+        client.PING_INITIAL_DELAY, client.PING_INTERVAL = .1, .2
+        client.connect()
+        lease = client.tunnel['client_vpn_ip']
+        pong = Mock(wraps=client.quality.record_rtt)
+        client.quality.record_rtt = pong
+        import select
+        for epoch in (0, 1):
+            up, down = ipv4(lease, '1.1.1.1', b'up%d' % epoch), ipv4('1.1.1.1', lease, b'down%d' % epoch)
+            client.tun.inject(up)
+            assert select.select([server.tun._sock_remote], [], [], 2)[0] and server.tun.drain() == up
+            server.tun.inject(down)
+            assert select.select([client.tun._sock_remote], [], [], 2)[0] and client.tun.drain() == down
+            count = pong.call_count
+            until(lambda: pong.call_count > count)
+            if epoch == 0:
+                client.rekey()
+                item = next(iter(server.sessions.by_id.values()))
+                until(lambda: client.session.epoch == 1 and item.crypto.epoch == 1)
+    finally:
+        if client: client.disconnect()
+        server.stop()
+        worker.join(4)
+        assert not worker.is_alive()
 
 
 @pytest.mark.data_plane
@@ -507,8 +555,8 @@ def test_genuinely_idle_session_expires_and_cleans_up(connected, caplog, monkeyp
 @pytest.mark.parametrize('case', ['ping', 'data', 'replay', 'wrong_session', 'unknown_session',
     'wrong_endpoint', 'malformed_ping', 'bad_tag', 'truncated', 'spoof', 'malformed_data', 'old_epoch', 'control_domain', 'bad_bind'])
 @pytest.mark.data_plane
-def test_only_authorized_current_records_touch_activity(identities, case):
-    cs, ss = exchange(identities)
+def test_only_authorized_current_records_touch_activity(data_plane, identities, case):
+    cs, ss = exchange(identities, data_plane=data_plane)
     server = object.__new__(runtime.VPNServer)
     server.sessions = runtime.SessionManager()
     server.udp, server.tun = Mock(), Mock(mtu=1380)
@@ -516,35 +564,35 @@ def test_only_authorized_current_records_touch_activity(identities, case):
     item = runtime.ServerSession(ss, '10.8.0.2', Mock(), 'client', endpoint, last_seen=1)
     server.sessions.add(item)
     payload = struct.pack('!d', time.monotonic())
-    frame = cs.encrypt_frame(payload, FrameType.PING)
+    frame = cs.seal_data(payload, FrameType.PING)
     if case == 'replay':
         server._handle_datagram(frame, endpoint)
         item.last_seen = 1
         server.udp.reset_mock()
     elif case == 'wrong_session':
-        other, _ = exchange(identities)
-        frame = other.encrypt_frame(payload, FrameType.PING)
+        other, _ = exchange(identities, data_plane=data_plane)
+        frame = other.seal_data(payload, FrameType.PING)
         server.sessions.by_id[other.session_id[:8]] = item
     elif case == 'unknown_session':
-        other, _ = exchange(identities)
-        frame = other.encrypt_frame(payload, FrameType.PING)
+        other, _ = exchange(identities, data_plane=data_plane)
+        frame = other.seal_data(payload, FrameType.PING)
     elif case == 'wrong_endpoint': endpoint = ('127.0.0.1', 54321)
-    elif case == 'malformed_ping': frame = cs.encrypt_frame(b'bad', FrameType.PING)
+    elif case == 'malformed_ping': frame = cs.seal_data(b'bad', FrameType.PING)
     elif case == 'bad_tag': frame = frame[:-1] + bytes([frame[-1] ^ 1])
     elif case == 'truncated': frame = frame[:10]
     elif case in {'data', 'spoof', 'malformed_data'}:
-        frame = cs.encrypt_frame(b'bad' if case == 'malformed_data' else ipv4('10.8.0.3' if case == 'spoof' else item.vpn_ip))
+        frame = cs.seal_data(b'bad' if case == 'malformed_data' else ipv4('10.8.0.3' if case == 'spoof' else item.vpn_ip))
     elif case == 'old_epoch':
         ss.activate_epoch(1, ss.derive_next_epoch(1, b'n'*32))
     elif case == 'control_domain': frame = cs.encrypt_control(payload, FrameType.ERROR)
-    elif case == 'bad_bind': frame = cs.encrypt_frame(b'bad', FrameType.UDP_BIND)
+    elif case == 'bad_bind': frame = cs.seal_data(b'bad', FrameType.UDP_BIND)
     server._handle_datagram(frame, endpoint)
     if case in {'ping', 'data'}:
         assert item.last_seen > 1
         if case == 'ping':
             pong, address = server.udp.sendto.call_args.args
             assert address == endpoint
-            assert cs.decrypt_frame(pong, FrameType.PONG)[1] == payload
+            assert cs.open_data(pong, FrameType.PONG)[1] == payload
         else: server.tun.write.assert_called_once()
     else:
         assert item.last_seen == 1
@@ -609,7 +657,7 @@ def test_udp_dead_peer_cleanup(connected, traffic):
     while time.monotonic()<end and client.state=='CONNECTED':
         if traffic=='data':
             packet=ipv4('1.1.1.1',item.vpn_ip,b'valid server DATA')
-            filtered.sock.sendto(item.crypto.encrypt_frame(packet),item.endpoint)
+            filtered.sock.sendto(item.crypto.seal_data(packet),item.endpoint)
         elif traffic in ('replay','invalid') and filtered.saved:
             data,address=filtered.saved
             # First replay may be valid once; repeats cannot prolong the deadline.
@@ -640,11 +688,11 @@ def test_manual_and_automatic_rekey_during_authenticated_traffic(connected):
 
 
 @pytest.mark.data_plane
-def test_cookie_always_mode_handshake_completes(tmp_path):
+def test_cookie_always_mode_handshake_completes(data_plane, tmp_path):
     fp = generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
     generate_client_identity(tmp_path/'client.key', tmp_path/'client.pub')
     AuthorizedClients(tmp_path/'clients.json').authorize((tmp_path/'client.pub').read_bytes(), 'cookie-test')
-    server = runtime.VPNServer(ServerConfig(listen_host='127.0.0.1', control_port=0, udp_port=0,
+    server = runtime.VPNServer(ServerConfig(data_plane=data_plane, listen_host='127.0.0.1', control_port=0, udp_port=0,
         server_identity_private_key=str(tmp_path/'server.key'), server_identity_public_key=str(tmp_path/'server.pub'),
         authorized_clients_file=str(tmp_path/'clients.json'), dev_emulated_tun=True,
         cookie_mode='always', idle_timeout=5, rekey_interval=0))
@@ -654,7 +702,7 @@ def test_cookie_always_mode_handshake_completes(tmp_path):
     try:
         until(lambda: server._data_thread is not None and server._data_thread.is_alive())
         server.cfg.udp_port = server.udp.getsockname()[1]
-        client = runtime.VPNClient(ClientConfig(server_host='127.0.0.1',
+        client = runtime.VPNClient(ClientConfig(data_plane=data_plane, server_host='127.0.0.1',
             server_control_port=server.tcp.getsockname()[1],
             server_identity_public_key=str(tmp_path/'server.pub'), server_identity_fingerprint=fp,
             client_identity_private_key=str(tmp_path/'client.key'), dev_emulated_tun=True,
@@ -671,11 +719,11 @@ def test_cookie_always_mode_handshake_completes(tmp_path):
 
 
 @pytest.mark.data_plane
-def test_cookie_off_mode_no_challenge(tmp_path):
+def test_cookie_off_mode_no_challenge(data_plane, tmp_path):
     fp = generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
     generate_client_identity(tmp_path/'client.key', tmp_path/'client.pub')
     AuthorizedClients(tmp_path/'clients.json').authorize((tmp_path/'client.pub').read_bytes(), 'no-cookie')
-    server = runtime.VPNServer(ServerConfig(listen_host='127.0.0.1', control_port=0, udp_port=0,
+    server = runtime.VPNServer(ServerConfig(data_plane=data_plane, listen_host='127.0.0.1', control_port=0, udp_port=0,
         server_identity_private_key=str(tmp_path/'server.key'), server_identity_public_key=str(tmp_path/'server.pub'),
         authorized_clients_file=str(tmp_path/'clients.json'), dev_emulated_tun=True,
         cookie_mode='off', idle_timeout=5, rekey_interval=0))
@@ -686,7 +734,7 @@ def test_cookie_off_mode_no_challenge(tmp_path):
     try:
         until(lambda: server._data_thread is not None and server._data_thread.is_alive())
         server.cfg.udp_port = server.udp.getsockname()[1]
-        client = runtime.VPNClient(ClientConfig(server_host='127.0.0.1',
+        client = runtime.VPNClient(ClientConfig(data_plane=data_plane, server_host='127.0.0.1',
             server_control_port=server.tcp.getsockname()[1],
             server_identity_public_key=str(tmp_path/'server.pub'), server_identity_fingerprint=fp,
             client_identity_private_key=str(tmp_path/'client.key'), dev_emulated_tun=True,
@@ -769,7 +817,7 @@ def test_resumption_ticket_file_permissions(tmp_path):
 
 
 @pytest.mark.data_plane
-def test_v3_resumption_resumes_end_to_end_not_fallback(tmp_path, monkeypatch):
+def test_v3_resumption_resumes_end_to_end_not_fallback(data_plane, tmp_path, monkeypatch):
     """A v3 client with a saved ticket performs 1-RTT resumption over the real
     server, not a silent full-handshake fallback.
 
@@ -788,7 +836,7 @@ def test_v3_resumption_resumes_end_to_end_not_fallback(tmp_path, monkeypatch):
     AuthorizedClients(tmp_path/'clients.json').authorize(
         (tmp_path/'client.pub').read_bytes(), 'resume-test')
 
-    server = runtime.VPNServer(ServerConfig(listen_host='127.0.0.1', control_port=0, udp_port=0,
+    server = runtime.VPNServer(ServerConfig(data_plane=data_plane, listen_host='127.0.0.1', control_port=0, udp_port=0,
         server_identity_private_key=str(tmp_path/'server.key'),
         server_identity_public_key=str(tmp_path/'server.pub'),
         authorized_clients_file=str(tmp_path/'clients.json'), dev_emulated_tun=True,
@@ -812,7 +860,7 @@ def test_v3_resumption_resumes_end_to_end_not_fallback(tmp_path, monkeypatch):
         server.cfg.udp_port = server.udp.getsockname()[1]
 
         def make_client(tun_name):
-            c = runtime.VPNClient(ClientConfig(server_host='127.0.0.1',
+            c = runtime.VPNClient(ClientConfig(data_plane=data_plane, server_host='127.0.0.1',
                 server_control_port=server.tcp.getsockname()[1],
                 server_identity_public_key=str(tmp_path/'server.pub'),
                 server_identity_fingerprint=fp,
@@ -875,7 +923,7 @@ def test_from_frame_routes_all_protocol_versions(version, routed):
 # --- Device revocation ---
 
 @pytest.mark.data_plane
-def test_signed_out_client_cannot_resume_before_revocation_sweep(tmp_path):
+def test_signed_out_client_cannot_resume_before_revocation_sweep(data_plane, tmp_path):
     """A resumption ticket must not outlive the client's authorization (sign-out/revoke)."""
     from vpn.identity import (generate_server_identity, generate_client_identity_kem,
                               AuthorizedClients, fingerprint)
@@ -883,7 +931,7 @@ def test_signed_out_client_cannot_resume_before_revocation_sweep(tmp_path):
     generate_client_identity_kem(tmp_path/'client.key', tmp_path/'client.pub')
     auth = AuthorizedClients(tmp_path/'clients.json')
     auth.authorize((tmp_path/'client.pub').read_bytes(), 'alice-1')
-    server = runtime.VPNServer(ServerConfig(listen_host='127.0.0.1', control_port=0, udp_port=0,
+    server = runtime.VPNServer(ServerConfig(data_plane=data_plane, listen_host='127.0.0.1', control_port=0, udp_port=0,
         server_identity_private_key=str(tmp_path/'server.key'),
         server_identity_public_key=str(tmp_path/'server.pub'),
         authorized_clients_file=str(tmp_path/'clients.json'), dev_emulated_tun=True,
@@ -896,7 +944,7 @@ def test_signed_out_client_cannot_resume_before_revocation_sweep(tmp_path):
         server.cfg.udp_port = server.udp.getsockname()[1]
 
         def make_client(tun_name):
-            return runtime.VPNClient(ClientConfig(server_host='127.0.0.1',
+            return runtime.VPNClient(ClientConfig(data_plane=data_plane, server_host='127.0.0.1',
                 server_control_port=server.tcp.getsockname()[1],
                 server_identity_public_key=str(tmp_path/'server.pub'),
                 server_identity_fingerprint=fp,

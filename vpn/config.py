@@ -28,6 +28,7 @@ class ServerConfig:
     manage_ip_forward:bool=True
     service_user:str="pqvpn"
     experimental_suite:str=""
+    data_plane:str="python"
 @dataclass
 class ClientConfig:
     server_host:str="127.0.0.1"; server_control_port:int=51820
@@ -35,6 +36,7 @@ class ClientConfig:
     client_identity_private_key:str="config/client_identity_private.key"
     client_identity_public_key:str="config/client_identity_public.key"
     protocol_version:int=2
+    data_plane:str="python"
     full_tunnel:bool=True
     split_tunnel:list[str]=field(default_factory=list); dns_servers:list[str]=field(default_factory=list); kill_switch:bool=False
     tun_name:str="pqvpn0"; dev_emulated_tun:bool=False
@@ -108,11 +110,21 @@ def validate_server(cfg: ServerConfig, *, test_ports=False) -> None:
         raise ValueError('service_user must be a valid account name')
     if not isinstance(cfg.listen_host, str) or not cfg.listen_host: raise ValueError('listen_host must be nonempty')
     if cfg.protocol_version not in (2, 3): raise ValueError('protocol_version must be 2 or 3')
+    data_plane(cfg.data_plane)
     if cfg.cookie_mode not in ('off', 'under_load', 'always'): raise ValueError('cookie_mode must be off, under_load, or always')
     number(cfg.cookie_threshold, 'cookie_threshold', 1, integer=True)
     number(cfg.resumption_ticket_lifetime, 'resumption_ticket_lifetime', 0, 604800, True)
     if cfg.experimental_suite and cfg.experimental_suite not in _VALID_SUITES:
         raise ValueError(f'experimental_suite must be one of {sorted(_VALID_SUITES)} or empty')
+
+
+def data_plane(value: object) -> None:
+    if value not in ('python', 'rust'): raise ValueError('data_plane must be python or rust')
+    if value == 'rust':
+        try:
+            import pqvpn_core  # noqa: F401
+        except ImportError as exc:
+            raise ValueError('data_plane = "rust" requires the pqvpn_core module (build core/ with maturin)') from exc
 
 
 def validate_client(cfg: ClientConfig) -> None:
@@ -136,5 +148,6 @@ def validate_client(cfg: ClientConfig) -> None:
     for name in ('full_tunnel', 'kill_switch', 'dev_emulated_tun'):
         if type(getattr(cfg, name)) is not bool: raise ValueError(f'{name} must be boolean')
     if cfg.protocol_version not in (2, 3): raise ValueError('protocol_version must be 2 or 3')
+    data_plane(cfg.data_plane)
     if cfg.experimental_suite and cfg.experimental_suite not in _VALID_SUITES:
         raise ValueError(f'experimental_suite must be one of {sorted(_VALID_SUITES)} or empty')

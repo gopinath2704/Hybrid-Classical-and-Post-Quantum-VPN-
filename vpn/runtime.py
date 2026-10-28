@@ -422,7 +422,8 @@ class VPNServer:
                     and struct.unpack(HEADER_FORMAT, first_msg[:HEADER_SIZE])[2] == MessageType.RESUMPTION_HELLO):
                 resume = ResumptionServerHandshake(
                     self._ticket_key,
-                    PROTOCOL_VERSION_V3 if self.cfg.protocol_version == 3 else PROTOCOL_VERSION)
+                    PROTOCOL_VERSION_V3 if self.cfg.protocol_version == 3 else PROTOCOL_VERSION,
+                    data_plane=self.cfg.data_plane)
                 accept_wire, session = resume.process_hello(first_msg)
                 # Tickets outlive authorization; re-check so a revoked or signed-out
                 # client cannot resume before the revocation loop rotates the ticket key.
@@ -433,9 +434,11 @@ class VPNServer:
             else:
                 client_hello_wire = self._cookie_gate(connection, address, first_msg)
                 if self.cfg.protocol_version == 3:
-                    handshake = KEMTLSServerV3(self.identity_secret, self.identity_public, self.auth.find_by_fingerprint)
+                    handshake = KEMTLSServerV3(self.identity_secret, self.identity_public, self.auth.find_by_fingerprint,
+                                               data_plane=self.cfg.data_plane)
                 else:
-                    handshake = KEMTLSServer(self.identity_secret, self.identity_public, self.auth.find)
+                    handshake = KEMTLSServer(self.identity_secret, self.identity_public, self.auth.find,
+                                             data_plane=self.cfg.data_plane)
                 send_message(connection, handshake.process_client_hello(client_hello_wire))
                 finished, session = handshake.process_client_key_exchange(recv_message(connection))
                 send_message(connection, finished)
@@ -632,7 +635,7 @@ class VPNServer:
                         break
                     item = self.sessions.destination(packet)
                     if item and item.endpoint and len(packet) <= mtu:
-                        try: self.udp.sendto(item.crypto.encrypt_frame(packet), item.endpoint)
+                        try: self.udp.sendto(item.crypto.seal_data(packet), item.endpoint)
                         except HandshakeError: continue
 
     def _handle_datagram(self, data: bytes, address: tuple[str, int]) -> None:
@@ -642,12 +645,12 @@ class VPNServer:
         if item is None or (item.endpoint is not None and item.endpoint != address):
             return
         try:
-            frame_type, payload = item.crypto.decrypt_frame(data)
+            frame_type, payload = item.crypto.open_data(data)
             if frame_type == FrameType.UDP_BIND and payload == b"bind":
                 with self.sessions.lock:
                     item.endpoint = address
                     item.touch()
-                self.udp.sendto(item.crypto.encrypt_frame(b"ok", FrameType.UDP_BIND_ACK), address)
+                self.udp.sendto(item.crypto.seal_data(b"ok", FrameType.UDP_BIND_ACK), address)
             elif item.endpoint == address and frame_type == FrameType.DATA:
                 if len(payload) <= self.tun.mtu and validate_client_packet(payload, item.vpn_ip):
                     item.touch()
@@ -656,7 +659,7 @@ class VPNServer:
                     logger.warning("rejected spoofed/malformed inner packet client_id=%s", item.client_id)
             elif item.endpoint == address and frame_type == FrameType.PING and len(payload) == 8:
                 item.touch()
-                self.udp.sendto(item.crypto.encrypt_frame(payload, FrameType.PONG), address)
+                self.udp.sendto(item.crypto.seal_data(payload, FrameType.PONG), address)
         except (HandshakeError, OSError):
             return
 
@@ -773,7 +776,8 @@ class VPNClient:
                 ticket, resume_secret = saved
                 try:
                     resume = ResumptionClientHandshake(resume_secret,
-                        PROTOCOL_VERSION_V3 if self.cfg.protocol_version == 3 else PROTOCOL_VERSION)
+                        PROTOCOL_VERSION_V3 if self.cfg.protocol_version == 3 else PROTOCOL_VERSION,
+                        data_plane=self.cfg.data_plane)
                     send_message(self.control, resume.initiate(ticket))
                     self.session = resume.process_accept(recv_message(self.control))
                     resumed = True
@@ -788,10 +792,11 @@ class VPNClient:
                     client_secret = load_client_kem_private(Path(self.cfg.client_identity_private_key))
                     client_public = Path(self.cfg.client_identity_public_key).read_bytes()
                     handshake = KEMTLSClientV3(identity, self.cfg.server_identity_fingerprint,
-                                               client_secret, client_public)
+                                               client_secret, client_public, data_plane=self.cfg.data_plane)
                 else:
                     private = load_client_private(Path(self.cfg.client_identity_private_key))
-                    handshake = KEMTLSClient(identity, self.cfg.server_identity_fingerprint, private)
+                    handshake = KEMTLSClient(identity, self.cfg.server_identity_fingerprint, private,
+                                             data_plane=self.cfg.data_plane)
                 client_hello_wire = handshake.initiate_handshake()
                 send_message(self.control, client_hello_wire)
                 server_reply = recv_message(self.control)
@@ -833,11 +838,11 @@ class VPNClient:
             self.udp.bind(("0.0.0.0", 0))
             self.udp.settimeout(3)
             self.server_udp = (self.server_ip, self.tunnel["udp_port"])
-            self.udp.sendto(self.session.encrypt_frame(b"bind", FrameType.UDP_BIND), self.server_udp)
+            self.udp.sendto(self.session.seal_data(b"bind", FrameType.UDP_BIND), self.server_udp)
             data, address = self.udp.recvfrom(4096)
             if address != self.server_udp:
                 raise HandshakeError("UDP bind acknowledgement from unexpected endpoint")
-            _, ack = self.session.decrypt_frame(data, FrameType.UDP_BIND_ACK)
+            _, ack = self.session.open_data(data, FrameType.UDP_BIND_ACK)
             if ack != b"ok": raise HandshakeError("malformed UDP bind acknowledgement")
             self.last_authenticated_udp_rx = time.monotonic()
             self.udp.setblocking(False)
@@ -883,13 +888,13 @@ class VPNClient:
                 except BlockingIOError:
                     packet = b""
                 if packet and len(packet) <= self.tunnel["mtu"]:
-                    self.udp.sendto(self.session.encrypt_frame(packet), self.server_udp)
+                    self.udp.sendto(self.session.seal_data(packet), self.server_udp)
             if self.udp in readable:
                 data, address = self.udp.recvfrom(65535)
                 if address != self.server_udp:
                     continue
                 try:
-                    frame_type, payload = self.session.decrypt_frame(data)
+                    frame_type, payload = self.session.open_data(data)
                 except HandshakeError:
                     continue
                 if frame_type == FrameType.DATA:
@@ -915,7 +920,7 @@ class VPNClient:
                 self.quality.record_probe_sent()
                 stamp = struct.pack("!d", now)
                 self.pending_pings[stamp] = now + self.cfg.ping_timeout
-                self.udp.sendto(self.session.encrypt_frame(stamp, FrameType.PING), self.server_udp)
+                self.udp.sendto(self.session.seal_data(stamp, FrameType.PING), self.server_udp)
                 next_ping = now + self.PING_INTERVAL
 
 

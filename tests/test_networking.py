@@ -358,11 +358,11 @@ def test_udp_bind_failure_cleans_every_resource(monkeypatch,tmp_path):
     class Session:
         def __init__(self):self.wiped=False
         def decrypt_control(self,*_):return None,b'{"server_vpn_ip":"10.8.0.1","client_vpn_ip":"10.8.0.2","prefix":24,"mtu":1380,"dns":[],"udp_port":51820}'
-        def encrypt_frame(self,*_):return b"bind"
+        def seal_data(self,*_):return b"bind"
         def secure_wipe(self):self.wiped=True
     session=Session();tun=Tun()
     class Handshake:
-        def __init__(self,*_):pass
+        def __init__(self,*_,**__):pass
         def initiate_handshake(self):return b"ch"
         def process_server_hello(self,_):return b"cke"
         def process_server_finished(self,_):return session

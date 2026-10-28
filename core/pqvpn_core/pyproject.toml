@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "pqvpn-core"
 version = "0.1.0"
 description = "Rust core for PQ-VPN (AES-256-GCM data frames)"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 [tool.maturin]
 module-name = "pqvpn_core"
