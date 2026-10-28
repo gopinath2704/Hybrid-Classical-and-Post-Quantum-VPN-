@@ -13,16 +13,21 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY=/opt/pqvpn/.venv/bin/python
 
 echo '== OS packages'
-if command -v apt-get >/dev/null; then
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -q
-  apt-get install -yq python3 python3-venv git cmake ninja-build build-essential libssl-dev \
-    iproute2 nftables rsync libgl1 libxkbcommon-x11-0 libegl1 libdbus-1-3
-elif command -v pacman >/dev/null; then
-  pacman -S --needed --noconfirm python git cmake ninja base-devel openssl iproute2 nftables rsync
-else
-  echo 'unsupported distro: need pacman or apt-get' >&2; exit 1
-fi
+. /etc/os-release
+for id in $ID ${ID_LIKE:-}; do
+  case $id in
+    debian|ubuntu|kali)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -q
+      apt-get install -yq python3 python3-venv git cmake ninja-build build-essential libssl-dev \
+        iproute2 nftables rsync libgl1 libxkbcommon-x11-0 libegl1 libdbus-1-3 ;;
+    arch|manjaro|endeavouros)
+      pacman -S --needed --noconfirm python git cmake ninja base-devel openssl iproute2 nftables rsync ;;
+    *) continue ;;
+  esac
+  family=$id; break
+done
+[[ -n ${family:-} ]] || { echo "unsupported distro: ID=$ID ID_LIKE=${ID_LIKE:-}" >&2; exit 1; }
 python3 -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ required"'
 test -c /dev/net/tun || { echo '/dev/net/tun missing (modprobe tun)' >&2; exit 1; }
 
