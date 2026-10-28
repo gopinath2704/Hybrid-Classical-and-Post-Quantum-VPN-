@@ -1,0 +1,12 @@
+System                Profile       Metric                        N      Median        CI Low        CI High     
+--------------------  ------------  ----------------------------  -----  ------------  ------------  ------------
+pqvpn-net             continent     connect_time_ms               30     1123.0000     1122.0000     1123.0000   
+pqvpn-net             continent     full_connect_ms               30     1118.0000     1117.0000     1118.0000   
+pqvpn-net             continent     resume_connect_ms             30     917.0000      917.0000      917.0000    
+pqvpn-net             lan           connect_time_ms               30     127.0000      127.0000      127.0000    
+pqvpn-net             metro         connect_time_ms               30     373.0000      372.0000      373.0000    
+pqvpn-net             metro         full_connect_ms               30     368.0000      368.0000      368.0000    
+pqvpn-net             metro         resume_connect_ms             30     316.0000      316.0000      317.0000    
+pqvpn-net-warm        continent     connect_time_ms               30     1010.0000     1010.0000     1010.0000   
+pqvpn-net-warm        lan           connect_time_ms               30     16.0000       15.0000       16.0000     
+pqvpn-net-warm        metro         connect_time_ms               30     260.0000      260.0000      260.0000    
