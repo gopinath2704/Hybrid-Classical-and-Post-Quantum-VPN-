@@ -439,7 +439,7 @@ def _login_key(request: Request, identifier: str) -> str:
     return hashlib.sha256(material).hexdigest()
 
 
-def _registration_key(request: Request) -> str:
+def _source_key(request: Request) -> str:
     return hashlib.sha256(_source(request).encode("utf-8", errors="replace")).hexdigest()
 
 
@@ -535,6 +535,14 @@ def create_app(
         config.login_cooldown_seconds,
         config.login_rate_limit_entries,
     )
+    # Per-source failure budget across all identifiers, so credential stuffing is throttled.
+    # ponytail: fixed 4x the per-account budget; make it a setting if shared-NAT users hit it.
+    application.state.login_source_limiter = BoundedRateLimiter(
+        config.login_rate_limit * 4,
+        config.login_rate_window_seconds,
+        config.login_cooldown_seconds,
+        config.login_rate_limit_entries,
+    )
     application.state.registration_limiter = registration_limiter or BoundedRateLimiter(
         config.registration_rate_limit,
         config.registration_rate_window_seconds,
@@ -558,7 +566,7 @@ def create_app(
 
     @application.post("/auth/register", status_code=201)
     async def register(payload: RegisterRequest, request: Request):
-        key = _registration_key(request)
+        key = _source_key(request)
         retry = application.state.registration_limiter.retry_after(key)
         if retry:
             logger.warning("registration rate limited source=%s", _source(request))
@@ -588,7 +596,9 @@ def create_app(
     @application.post("/auth/login")
     async def login(payload: LoginRequest, request: Request):
         key = _login_key(request, payload.identifier)
-        retry = application.state.login_limiter.retry_after(key)
+        source_key = _source_key(request)
+        retry = max(application.state.login_limiter.retry_after(key),
+                    application.state.login_source_limiter.retry_after(source_key))
         if retry:
             logger.warning("login rate limited source=%s", _source(request))
             return _error(
@@ -602,6 +612,7 @@ def create_app(
             return _error(429, "account_locked", f"account is temporarily locked until {exc.locked_until}")
         if user is None:
             application.state.login_limiter.record_event(key)
+            application.state.login_source_limiter.record_event(source_key)
             logger.info("login rejected category=invalid_credentials source=%s", _source(request))
             return _error(401, "invalid_credentials", "invalid credentials")
         if user.mfa_enabled:
@@ -609,6 +620,10 @@ def create_app(
                 return _error(403, "mfa_required", "TOTP code is required")
             secret = account_store.get_totp_secret(user.id)
             if secret is None or not verify_totp(secret, payload.totp_code):
+                # The password already passed (403 mfa_required confirms it), so lockout won't
+                # fire; wrong codes must spend the same budgets or the 6 digits are brute-forceable.
+                application.state.login_limiter.record_event(key)
+                application.state.login_source_limiter.record_event(source_key)
                 logger.info("login rejected category=invalid_totp user_id=%d source=%s", user.id, _source(request))
                 return _error(401, "invalid_totp", "invalid TOTP code")
         application.state.login_limiter.reset(key)
@@ -746,6 +761,19 @@ def create_app(
         except AccountNotFound:
             return _error(401, "invalid_session", "session is no longer valid")
         logger.info("password changed user_id=%d source=%s", context.user.id, _source(request))
+        # A stolen token or attacker-bound device must not outlive the old password: end every
+        # session, then suspend every device (each is restored by its owner's next sign-in).
+        account_store.revoke_all_user_sessions(context.user.id)
+        try:
+            authorized = AuthorizedClients(config.authorized_clients_file)
+            for device in account_store.list_devices_for_user(context.user.id):
+                authorized.suspend(device.client_fingerprint)
+        except Exception:
+            logger.error("password change device suspension failed user_id=%d", context.user.id)
+            return _error(
+                503, "deauthorize_failed",
+                "password changed and sessions ended, but device VPN access could not be revoked",
+            )
         return {"status": "password_changed"}
 
     @application.post("/mfa/setup")

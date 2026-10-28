@@ -1089,3 +1089,102 @@ def test_oversized_invite_code_is_rejected(client):
     response = register(client, invite_code="x" * 129)
     assert response.status_code == 400
     assert "x" * 129 not in response.text
+
+
+def _change_password(client: TestClient, headers, new="new-secure-password-123"):
+    return client.post("/auth/change-password", headers=headers,
+                       json={"old_password": PASSWORD, "new_password": new})
+
+
+def test_change_password_revokes_sessions_and_suspends_devices(tmp_path):
+    """Pentest #65: a stolen token or attacker-bound device must not survive a password change."""
+    authorized, local_client = _auto_approve_client(tmp_path)
+    with local_client:
+        headers = bearer(local_client)
+        other = {"Authorization": f"Bearer {login(local_client).json()['access_token']}"}
+        assert bind(local_client, headers, seed=1).status_code == 201
+        assert bind(local_client, headers, seed=2, name="phone").status_code == 201
+        assert _change_password(local_client, headers).status_code == 200
+        assert local_client.get("/auth/me", headers=headers).status_code == 401
+        assert local_client.get("/auth/me", headers=other).status_code == 401
+        assert authorized.find(_public(1)) is None and authorized.find(_public(2)) is None
+
+        fresh = {"Authorization": "Bearer " + login(local_client, password="new-secure-password-123")
+                 .json()["access_token"]}
+        assert bind(local_client, fresh, seed=1).status_code == 200
+    assert authorized.find(_public(1)) is not None  # owner's sign-in restores that device only
+    assert authorized.find(_public(2)) is None
+
+
+def test_change_password_suspension_failure_still_revokes_sessions(tmp_path, monkeypatch):
+    authorized, local_client = _auto_approve_client(tmp_path)
+
+    def denied(self, fp):
+        raise PermissionError("authorized_clients.json.lock")
+
+    with local_client:
+        headers = bearer(local_client)
+        bind(local_client, headers)
+        monkeypatch.setattr(AuthorizedClients, "suspend", denied)
+        response = _change_password(local_client, headers)
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "deauthorize_failed"
+        assert "lock" not in response.text
+        assert local_client.get("/auth/me", headers=headers).status_code == 401
+
+
+def test_credential_stuffing_from_one_ip_is_throttled(config):
+    """Pentest #14: distinct identifiers from one source share a per-IP failure budget."""
+    cfg = AccountAPIConfig(**{**config.__dict__, "login_rate_limit": 2})
+    app = create_app(cfg)
+    with TestClient(app, client=("198.51.100.7", 40000)) as attacker:
+        codes = [attacker.post("/auth/login", json={"identifier": f"user{i}", "password": "leaked"}).status_code
+                 for i in range(4 * cfg.login_rate_limit + 1)]
+        assert codes[:-1] == [401] * (4 * cfg.login_rate_limit)
+        assert codes[-1] == 429
+    with TestClient(app, client=("203.0.113.9", 40001)) as fresh:
+        assert register(fresh).status_code == 201
+        assert login(fresh).status_code == 200
+
+
+def _mfa_app(config, **overrides):
+    """App with alice registered and MFA enabled; returns (app, secret)."""
+    app = create_app(AccountAPIConfig(**{**config.__dict__, **overrides}))
+    with TestClient(app, client=("192.0.2.50", 1)) as setup:
+        register(setup)
+        headers = {"Authorization": f"Bearer {login(setup).json()['access_token']}"}
+        secret = setup.post("/mfa/setup", headers=headers).json()["secret"]
+        setup.post("/mfa/confirm", json={"secret": secret, "code": compute_totp(secret)}, headers=headers)
+    return app, secret
+
+
+def _wrong_totp(secret: str) -> str:
+    return f"{(int(compute_totp(secret)) + 1) % 1_000_000:06d}"
+
+
+def _totp_login(client: TestClient, code: str | None, identifier="alice"):
+    body = {"identifier": identifier, "password": PASSWORD}
+    if code is not None:
+        body["totp_code"] = code
+    return client.post("/auth/login", json=body)
+
+
+def test_wrong_totp_codes_are_rate_limited(config):
+    """A known password must not allow unthrottled TOTP guessing (403 mfa_required confirms it)."""
+    app, secret = _mfa_app(config, login_rate_limit=3)
+    with TestClient(app, client=("198.51.100.20", 1)) as attacker:
+        assert [_totp_login(attacker, None).status_code for _ in range(5)] == [403] * 5  # two-step flow not penalized
+        codes = [_totp_login(attacker, _wrong_totp(secret)).status_code for _ in range(4)]
+        assert codes == [401, 401, 401, 429]
+        assert _totp_login(attacker, compute_totp(secret)).status_code == 429
+    with TestClient(app, client=("203.0.113.20", 1)) as owner:
+        assert _totp_login(owner, compute_totp(secret)).status_code == 200
+
+
+def test_wrong_totp_codes_count_against_the_per_ip_budget(config):
+    app, secret = _mfa_app(config, login_rate_limit=50)
+    app.state.login_source_limiter = BoundedRateLimiter(2, 60, 60, 16)
+    with TestClient(app, client=("198.51.100.21", 1)) as attacker:
+        assert _totp_login(attacker, _wrong_totp(secret)).status_code == 401
+        assert _totp_login(attacker, _wrong_totp(secret), "alice@example.com").status_code == 401
+        assert _totp_login(attacker, _wrong_totp(secret)).status_code == 429

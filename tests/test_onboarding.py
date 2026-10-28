@@ -397,6 +397,7 @@ def test_ipc_rejects_unknown_fields_and_generic_file_writes(tmp_path):
 
 def test_public_enrollment_roundtrip_over_real_ipc_frame(tmp_path):
     service = ClientService(None, state_dir=tmp_path / "state")
+    service.ALLOWED_UIDS = {os.getuid()}
     client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         ipc_send(client, {
@@ -462,6 +463,10 @@ def test_packaging_foundation_has_safe_launcher_and_managed_service():
     assert '"cryptography==50.0.1"' in debian_dependency_patch
     assert '"liboqs-python==0.16.0"' in debian_dependency_patch
     assert "get_crypto_status" in debian_rules
+    installer = (root / "scripts/install-client.sh").read_text()
+    assert "Environment=PQVPN_ALLOWED_UIDS=%s" in installer and '"$SUDO_UID"' in installer
+    assert "install=pqvpn.install" in arch
+    assert "PQVPN_ALLOWED_UIDS" in (root / "packaging/arch/pqvpn.install").read_text()
 
 
 def _make_arch_source_archive(root: Path, archive: Path) -> None:
@@ -515,7 +520,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
     # changes: python -m pytest -q tests/test_onboarding.py -k checksum  (the
     # failure message prints the new digest).
     digest = _stable_archive_digest(root, tmp_path)
-    assert digest == "e2cbb5e54f00b8ece50dcac742515003bd6443608498b89b5c6817171e86a7a2"
+    assert digest == "de89f8df57f12826dae94a726baf730345297e77a28df5cc9d8f31aebf9ff906"
 
     with tarfile.open(archive, "r:gz") as source:
         names = source.getnames()

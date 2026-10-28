@@ -67,7 +67,7 @@ def load_client_config(path): return _load(path,"client",ClientConfig)
 
 
 def interface_name(value: str, field_name: str = "tun_name") -> None:
-    if not isinstance(value, str) or not re.fullmatch(r"[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,14}", value):
+    if not isinstance(value, str) or not re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,14}", value):
         raise ValueError(f"{field_name}: expected a Linux interface name of 1-15 characters")
 
 

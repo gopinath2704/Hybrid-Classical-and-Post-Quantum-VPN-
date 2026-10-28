@@ -475,3 +475,16 @@ def test_native_tun_opens_nonblocking():
     import inspect
     src = inspect.getsource(tun.open)
     assert "O_NONBLOCK" in src, "native TUN must open with O_NONBLOCK for batched drain"
+
+
+@pytest.mark.parametrize("bad", ["-x", "--help", "", "a;reboot", "x" * 16])
+def test_interface_name_rejects_option_shapes(bad):
+    from vpn.config import interface_name
+    with pytest.raises(ValueError):
+        interface_name(bad)
+
+
+@pytest.mark.parametrize("good", ["pqvpn0", "tun0", "_t", "wg-0.1"])
+def test_interface_name_accepts_linux_names(good):
+    from vpn.config import interface_name
+    interface_name(good)

@@ -10,9 +10,10 @@ license=('custom')
 # Install before building: sudo bash scripts/install-liboqs.sh /usr/local
 # then: pip install liboqs-python==0.16.0
 depends=('python>=3.11' 'python-argon2-cffi' 'python-cryptography' 'python-fastapi' 'uvicorn' 'pyside6' 'iproute2' 'nftables')
+install=pqvpn.install
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 source=("${pkgname}-${pkgver}.tar.gz")
-sha256sums=('5595baf75e93918be1827146a0a540509a3034b6e478cd8ef3615f973ced83b1')
+sha256sums=('19174dd6acabb966a14b6617c58ac34dd067adf6b1355ee4780b66ad75d76486')
 
 build() {
   cd "${srcdir}/${pkgname}-${pkgver}"

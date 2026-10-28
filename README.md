@@ -102,7 +102,8 @@ sudo bash scripts/install-client.sh
 ```
 
 The script installs the system packages, builds liboqs, copies the app to `/opt/pqvpn`
-with its own venv, and starts the privileged `pqvpn-client` service. It is safe to
+with its own venv, and starts the privileged `pqvpn-client` service, authorizing only the user who ran
+`sudo` (via `PQVPN_ALLOWED_UIDS` in a systemd drop-in). It is safe to
 re-run to upgrade; the device identity and state in `/var/lib/pqvpn` are kept.
 
 Then launch **PQ-VPN** from the app menu (or run `pqvpn-gui`), register with your
@@ -173,7 +174,7 @@ the GUI. To run from a source checkout instead:
 pip install -c constraints-tested.txt '.[desktop]'
 
 # Terminal 1: start the privileged service
-sudo .venv/bin/python -m app.client --service
+sudo PQVPN_ALLOWED_UIDS=$(id -u) .venv/bin/python -m app.client --service
 
 # Terminal 2: launch the GUI
 .venv/bin/python -m app.client
@@ -186,7 +187,7 @@ For production, use the systemd unit: `packaging/common/pqvpn-client-deploy.serv
 Pass `--config` explicitly to use a TOML file instead of managed profiles:
 
 ```bash
-sudo .venv/bin/python -m app.client --service --config config/client.toml
+sudo PQVPN_ALLOWED_UIDS=$(id -u) .venv/bin/python -m app.client --service --config config/client.toml
 ```
 
 ### Client enrollment

@@ -50,6 +50,9 @@ unit, start it separately, and launch the GUI only as the normal desktop user:
 
 ```bash
 sudo install -o root -g root -m 0644 packaging/common/pqvpn-client-deploy.service /etc/systemd/system/pqvpn-client.service
+# The service accepts IPC only from root and the uids in PQVPN_ALLOWED_UIDS (comma-separated).
+sudo install -d /etc/systemd/system/pqvpn-client.service.d
+printf '[Service]\nEnvironment=PQVPN_ALLOWED_UIDS=%s\n' "$(id -u)" | sudo tee /etc/systemd/system/pqvpn-client.service.d/allowed-uids.conf
 sudo systemctl daemon-reload
 sudo systemctl enable --now pqvpn-client.service
 systemctl status pqvpn-client.service
@@ -74,7 +77,7 @@ disconnect first.
 An explicit TOML is still supported for development:
 
 ```bash
-sudo .venv/bin/python -m app.client --service --config config/client.toml
+sudo PQVPN_ALLOWED_UIDS=$(id -u) .venv/bin/python -m app.client --service --config config/client.toml
 sudo .venv/bin/python -m vpn.cli client connect --config config/client.toml
 ```
 
@@ -146,7 +149,10 @@ the Python application, icon, documentation, the separately managed privileged
 `pqvpn-client.service`, and the unprivileged `pqvpn-account-api.service`. The
 account API receives no capabilities, writes only under
 `/var/lib/pqvpn/accounts`, and ships a fail-closed TLS configuration template.
-Packaging does not install a client private key, a trusted server profile, a TLS
+The client service accepts local IPC only from root and the uids listed in
+`PQVPN_ALLOWED_UIDS`; packages cannot know the desktop user, so create the
+`allowed-uids.conf` drop-in shown above once after the first install (the Arch
+package prints the command). Packaging does not install a client private key, a trusted server profile, a TLS
 private key, or an authorized-client database.
 
 Native ML-KEM is fail-closed. Neither liboqs nor the Python `oqs` binding are

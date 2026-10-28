@@ -156,13 +156,25 @@ def get_peer_uid(sock: socket.socket) -> int | None:
         return None
 
 
+def parse_allowed_uids(value: str) -> set[int]:
+    """Parse comma-separated uids; any malformed entry yields an empty set (fail closed)."""
+    value = value.replace(" ", "")
+    if not value:
+        return set()
+    if not re.fullmatch(r"[0-9]+(,[0-9]+)*", value):
+        logger.warning("Ignoring malformed PQVPN_ALLOWED_UIDS; only root may use the IPC socket")
+        return set()
+    return {int(uid) for uid in value.split(",")}
+
+
 class ClientService:
     """Privileged daemon managing VPNClient via local IPC."""
 
-    ALLOWED_UIDS: set[int] | None = None  # None = any local user (dev mode)
+    ALLOWED_UIDS: set[int] = set()  # non-root uids allowed on the IPC socket
 
     def __init__(self, config_path: str | None = None, state_dir: Path | None = None) -> None:
         self.managed_mode = config_path is None
+        self.ALLOWED_UIDS = parse_allowed_uids(os.environ.get("PQVPN_ALLOWED_UIDS", ""))
         self.config_path = config_path
         self.state_dir = Path(
             state_dir or os.environ.get("PQVPN_STATE_DIR", DEFAULT_STATE_DIR)
@@ -443,15 +455,7 @@ class ClientService:
     def _authorize_peer(self, conn: socket.socket) -> bool:
         """Check that the connecting peer is authorized."""
         uid = get_peer_uid(conn)
-        if uid is None:
-            return False
-        # Root is always authorized
-        if uid == 0:
-            return True
-        if self.ALLOWED_UIDS is not None:
-            return uid in self.ALLOWED_UIDS
-        # In development mode (no explicit allowlist), accept any local user
-        return True
+        return uid is not None and (uid == 0 or uid in self.ALLOWED_UIDS)
 
     def start(self) -> None:
         """Bind the IPC socket and serve client requests."""
@@ -474,13 +478,15 @@ class ClientService:
         self._server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server_sock.bind(str(sock_path))
 
-        # Allow local clients to connect; authorization is enforced via SO_PEERCRED
+        # Reachable by any local user; SO_PEERCRED + ALLOWED_UIDS authorize before any command
         os.chmod(str(sock_path), 0o666)
 
         self._server_sock.listen(4)
         self._server_sock.settimeout(1.0)
 
         logger.info("Client service listening on %s", sock_path)
+        if not self.ALLOWED_UIDS:
+            logger.warning("PQVPN_ALLOWED_UIDS is unset: only root may use the IPC socket")
         self._record_event("info", "Client service started")
 
         try:
@@ -773,8 +779,18 @@ class IPCClient:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.connect(str(_socket_path()))
-            ipc_send(sock, {"command": command, **fields})
-            return ipc_recv(sock)
+            # The /tmp fallback is squattable; only a root-owned service is trusted.
+            if get_peer_uid(sock) != 0:
+                return {"error": "Refusing IPC service that is not running as root"}
+            try:
+                ipc_send(sock, {"command": command, **fields})
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # a rejected peer is answered and closed unread; the reply is still buffered
+            resp = ipc_recv(sock)
+            if resp.get("error") == "unauthorized":
+                return {"error": "This user is not authorized by the PQ-VPN service; add your uid to "
+                                 "PQVPN_ALLOWED_UIDS (see docs/deployment.md)"}
+            return resp
         except (ConnectionRefusedError, FileNotFoundError):
             return {"error": "Service not running. Start with: python -m app.client --service"}
         except Exception as exc:
