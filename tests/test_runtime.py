@@ -112,6 +112,7 @@ def test_control_loss_restores_resources(identities, ending):
     peer.close()
 
 
+@pytest.mark.data_plane
 def test_delayed_rekey_keeps_data_forwarding(identities):
     cs, ss = exchange(identities)
     client = runtime.VPNClient(ClientConfig())
@@ -233,6 +234,7 @@ def test_setup_uses_nondefault_toml(tmp_path):
     assert 'server-network.sh setup /etc/pqvpn/server.toml' in Path('packaging/common/pqvpn-server.service').read_text()
 
 
+@pytest.mark.data_plane
 def test_server_session_timeout_disconnects_client(tmp_path):
     from vpn.config import ServerConfig
     from vpn.identity import generate_server_identity, generate_client_identity, AuthorizedClients
@@ -409,6 +411,7 @@ def connected(tmp_path):
             assert runtime.run_ip("route", "show").stdout == previous_routes
 
 
+@pytest.mark.data_plane
 def test_authenticated_keepalive_prevents_idle_expiry(connected):
     server, client = connected
     client.connect()
@@ -428,6 +431,7 @@ def test_authenticated_keepalive_prevents_idle_expiry(connected):
     until(lambda: pong.call_count > count)
 
 
+@pytest.mark.data_plane
 def test_genuinely_idle_session_expires_and_cleans_up(connected, caplog, monkeypatch):
     server, client = connected
     client.PING_INITIAL_DELAY = 3600
@@ -466,6 +470,7 @@ def test_genuinely_idle_session_expires_and_cleans_up(connected, caplog, monkeyp
 
 @pytest.mark.parametrize('case', ['ping', 'data', 'replay', 'wrong_session', 'unknown_session',
     'wrong_endpoint', 'malformed_ping', 'bad_tag', 'truncated', 'spoof', 'malformed_data', 'old_epoch', 'control_domain', 'bad_bind'])
+@pytest.mark.data_plane
 def test_only_authorized_current_records_touch_activity(identities, case):
     cs, ss = exchange(identities)
     server = object.__new__(runtime.VPNServer)
@@ -511,6 +516,7 @@ def test_only_authorized_current_records_touch_activity(identities, case):
         server.tun.write.assert_not_called()
 
 
+@pytest.mark.data_plane
 @pytest.mark.parametrize('valid', [True, False])
 def test_control_activity_is_counted_after_validation(connected, valid):
     server, client = connected
@@ -547,6 +553,7 @@ class PongFilter:
         return self.sock.sendto(data,address)
 
 
+@pytest.mark.data_plane
 @pytest.mark.parametrize('traffic', ['healthy','blackhole','data','replay','invalid'])
 def test_udp_dead_peer_cleanup(connected, traffic):
     server,client=connected
@@ -583,6 +590,7 @@ def test_udp_dead_peer_cleanup(connected, traffic):
         until(lambda:not server.sessions.by_id)
 
 
+@pytest.mark.data_plane
 def test_manual_and_automatic_rekey_during_authenticated_traffic(connected):
     server,client=connected
     server.cfg.rekey_interval=1
@@ -595,6 +603,7 @@ def test_manual_and_automatic_rekey_during_authenticated_traffic(connected):
     until(lambda:next(iter(server.sessions.by_id.values())).crypto.epoch==client.session.epoch)
 
 
+@pytest.mark.data_plane
 def test_cookie_always_mode_handshake_completes(tmp_path):
     fp = generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
     generate_client_identity(tmp_path/'client.key', tmp_path/'client.pub')
@@ -625,6 +634,7 @@ def test_cookie_always_mode_handshake_completes(tmp_path):
     assert not worker.is_alive()
 
 
+@pytest.mark.data_plane
 def test_cookie_off_mode_no_challenge(tmp_path):
     fp = generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
     generate_client_identity(tmp_path/'client.key', tmp_path/'client.pub')
@@ -654,6 +664,7 @@ def test_cookie_off_mode_no_challenge(tmp_path):
         server.stop(); worker.join(3)
 
 
+@pytest.mark.data_plane
 def test_rehandshake_succeeds_and_advances_epoch(connected):
     server, client = connected
     client.connect()
@@ -665,6 +676,7 @@ def test_rehandshake_succeeds_and_advances_epoch(connected):
     assert client.state == 'CONNECTED'
 
 
+@pytest.mark.data_plane
 def test_rehandshake_tampered_confirmation_fails_client(connected, monkeypatch):
     server, client = connected
     client.connect()
@@ -691,6 +703,7 @@ def test_rehandshake_tampered_confirmation_fails_client(connected, monkeypatch):
     until(lambda: client.state != 'CONNECTED')
 
 
+@pytest.mark.data_plane
 def test_rehandshake_after_rekey(connected):
     server, client = connected
     client.connect()
@@ -719,6 +732,7 @@ def test_resumption_ticket_file_permissions(tmp_path):
     assert mode == 0o600, f"ticket file mode is {oct(mode)}, expected 0o600"
 
 
+@pytest.mark.data_plane
 def test_v3_resumption_resumes_end_to_end_not_fallback(tmp_path, monkeypatch):
     """A v3 client with a saved ticket performs 1-RTT resumption over the real
     server, not a silent full-handshake fallback.
@@ -824,6 +838,7 @@ def test_from_frame_routes_all_protocol_versions(version, routed):
 
 # --- Device revocation ---
 
+@pytest.mark.data_plane
 def test_signed_out_client_cannot_resume_before_revocation_sweep(tmp_path):
     """A resumption ticket must not outlive the client's authorization (sign-out/revoke)."""
     from vpn.identity import (generate_server_identity, generate_client_identity_kem,

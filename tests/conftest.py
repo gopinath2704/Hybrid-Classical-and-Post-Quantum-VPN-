@@ -22,3 +22,26 @@ def mldsa_identities():
     sig = PQSignatureProvider(allow_mock=True)
     client_sig_sk, client_sig_pk = sig.generate_keypair()
     return server_sk, server_pk, client_sig_sk, client_sig_pk
+
+def pytest_addoption(parser):
+    parser.addoption("--backend", choices=("python", "rust"), default="python", help="record-layer backend under test")
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "data_plane: runs the per-packet data loop; skipped under --backend rust until the Rust data plane exists")
+    if config.getoption("backend") == "rust":
+        try:
+            import pqvpn_core  # noqa: F401
+        except ImportError as exc:
+            raise pytest.UsageError(f"--backend rust requires pqvpn_core (maturin develop -m core/pqvpn_core/Cargo.toml): {exc}") from exc
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("backend") != "rust":
+        return
+    skip = pytest.mark.skip(reason="--backend rust: Rust data plane not built yet (Phase 2); not run against the Python loop")
+    for item in items:
+        if "data_plane" in item.keywords:
+            item.add_marker(skip)
+
+@pytest.fixture
+def backend(request) -> str:
+    return request.config.getoption("backend")

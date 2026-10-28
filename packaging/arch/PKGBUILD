@@ -11,18 +11,23 @@ license=('custom')
 # then: pip install liboqs-python==0.16.0
 depends=('python>=3.11' 'python-argon2-cffi' 'python-cryptography' 'python-fastapi' 'uvicorn' 'pyside6' 'iproute2' 'nftables')
 install=pqvpn.install
-makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
+# aws-lc-sys C objects built with makepkg's -flto are unlinkable from rustc (undefined aws_lc_* symbols).
+options=('!lto')
+makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel' 'cargo' 'maturin')
 source=("${pkgname}-${pkgver}.tar.gz")
-sha256sums=('912a81d9d4d3308957f229d4d6a1fcfc81e935a38080b80547f7f274d06f6cb9')
+sha256sums=('846e768c39d063b20f3e2403f2eae74ff34c1379a0c865e9ce2396925e18d5de')
 
 build() {
   cd "${srcdir}/${pkgname}-${pkgver}"
   PYTHONNOUSERSITE=1 python -m build --wheel --no-isolation
+  # ponytail: cargo fetches crates at build time; vendor them for offline builds later.
+  maturin build --release --locked --compatibility linux -m core/pqvpn_core/Cargo.toml -o dist-core
 }
 
 package() {
   cd "${srcdir}/${pkgname}-${pkgver}"
   PYTHONNOUSERSITE=1 python -m installer --destdir="${pkgdir}" dist/*.whl
+  PYTHONNOUSERSITE=1 python -m installer --destdir="${pkgdir}" dist-core/*.whl
   # Pacman-managed launchers must not import packages from the invoking user's ~/.local.
   sed -i '1c #!/usr/bin/python -s' "${pkgdir}/usr/bin/pqvpn" "${pkgdir}/usr/bin/pqvpn-gui" "${pkgdir}/usr/bin/pqvpn-account-api"
   install -Dm644 packaging/common/pqvpn.desktop "${pkgdir}/usr/share/applications/pqvpn.desktop"
