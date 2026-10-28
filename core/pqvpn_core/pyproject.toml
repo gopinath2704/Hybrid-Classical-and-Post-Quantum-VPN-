@@ -9,5 +9,4 @@ description = "Rust core for PQ-VPN (AES-256-GCM data frames)"
 requires-python = ">=3.10"
 
 [tool.maturin]
-manifest-path = "pqvpn_core/Cargo.toml"
 module-name = "pqvpn_core"
