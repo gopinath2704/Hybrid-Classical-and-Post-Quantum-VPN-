@@ -369,6 +369,7 @@ def test_udp_bind_failure_cleans_every_resource(monkeypatch,tmp_path):
     class Control:
         closed=False
         def settimeout(self,_):pass
+        def setsockopt(self,*_):pass
         def close(self):self.closed=True
     control=Control()
     class UDP:

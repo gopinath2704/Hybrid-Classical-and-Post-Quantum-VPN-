@@ -42,6 +42,13 @@ def send_message(sock: socket.socket, data: bytes) -> None:
     sock.sendall(struct.pack("!I", len(data)) + data)
 
 
+def set_nodelay(sock: socket.socket) -> socket.socket:
+    # ServerFinished, CONFIG and the ticket are separate small writes; with Nagle, CONFIG waits
+    # for the peer's delayed ACK (~40 ms + 1 RTT). Framing is unchanged: recv_exact reassembles.
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return sock
+
+
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     chunks = bytearray()
     while len(chunks) < size:
@@ -402,6 +409,7 @@ class VPNServer:
         with self._pending_lock:
             self._pending_handshakes += 1
         try:
+            set_nodelay(connection)
             connection.settimeout(self.cfg.handshake_timeout)
             first_msg = recv_message(connection)
             # Detect 1-RTT resumption attempt.
@@ -757,7 +765,7 @@ class VPNClient:
                 ipv6_preflight(effective_policy(self.cfg.full_tunnel, self.cfg.ipv6_policy))
             identity = Path(self.cfg.server_identity_public_key).read_bytes()
             self.server_ip = socket.gethostbyname(self.cfg.server_host)
-            self.control = socket.create_connection((self.server_ip, self.cfg.server_control_port), timeout=10)
+            self.control = set_nodelay(socket.create_connection((self.server_ip, self.cfg.server_control_port), timeout=10))
             # Try 1-RTT resumption first, fall back to full handshake
             resumed = False
             saved = self._load_ticket(self.cfg.server_identity_fingerprint)
@@ -773,8 +781,8 @@ class VPNClient:
                 except (HandshakeError, OSError) as exc:
                     logger.info("resumption failed (%s), falling back to full handshake", exc)
                     self.control.close()
-                    self.control = socket.create_connection(
-                        (self.server_ip, self.cfg.server_control_port), timeout=10)
+                    self.control = set_nodelay(socket.create_connection(
+                        (self.server_ip, self.cfg.server_control_port), timeout=10))
             if not resumed:
                 if self.cfg.protocol_version == 3:
                     client_secret = load_client_kem_private(Path(self.cfg.client_identity_private_key))
