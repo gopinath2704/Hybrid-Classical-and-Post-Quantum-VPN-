@@ -1,0 +1,22 @@
+# perf record -F 999 -g -a during eval/measure_throughput.py --protocol v2-ed25519 --profiles lan --duration 10
+# share of all samples by thread
+    34.47%  pqvpn-client-da
+    34.05%  pqvpn-data     
+    20.97%  iperf3         
+     5.95%  swapper        
+     1.15%  python         
+     0.52%  mi-scavenger   
+# pqvpn-data by library
+    21.80%  libpython3.14.so.1.0                   
+     5.58%  [kernel.kallsyms]                      
+     2.13%  libc.so.6                              
+     1.96%  libcrypto.so.3                         
+     1.00%  ld-linux-x86-64.so.2                   
+     0.65%  _rust.abi3.so                          
+# pqvpn-client-da by library
+    19.06%  libpython3.14.so.1.0                   
+     8.03%  [kernel.kallsyms]                      
+     2.32%  libc.so.6                              
+     2.12%  libcrypto.so.3                         
+     0.85%  ld-linux-x86-64.so.2                   
+     0.68%  _rust.abi3.so                          
