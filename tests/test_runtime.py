@@ -412,6 +412,15 @@ def connected(tmp_path):
 
 
 @pytest.mark.data_plane
+def test_control_connection_disables_nagle_at_both_ends(connected):
+    server, client = connected
+    client.connect()
+    item = next(iter(server.sessions.by_id.values()))
+    for sock in (client.control, item.control):
+        assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
+
+
+@pytest.mark.data_plane
 def test_authenticated_keepalive_prevents_idle_expiry(connected):
     server, client = connected
     client.connect()
