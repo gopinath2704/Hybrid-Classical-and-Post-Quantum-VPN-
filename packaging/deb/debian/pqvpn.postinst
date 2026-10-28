@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = configure ]; then
+	command -v systemd-sysusers >/dev/null && systemd-sysusers pqvpn.conf || true
+
+	dropin=/etc/systemd/system/pqvpn-client.service.d/allowed-uids.conf
+	if [ ! -e "$dropin" ]; then
+		case ${SUDO_UID:-} in
+		'' | 0* | *[!0-9]*)
+			echo "pqvpn: GUI access is refused until you create $dropin containing:" >&2
+			printf '  [Service]\n  Environment=PQVPN_ALLOWED_UIDS=<your uid>\n' >&2
+			echo "pqvpn: then run: systemctl daemon-reload && systemctl restart pqvpn-client" >&2
+			;;
+		*)
+			install -d -m 0755 "${dropin%/*}"
+			printf '[Service]\nEnvironment=PQVPN_ALLOWED_UIDS=%s\n' "$SUDO_UID" > "$dropin"
+			;;
+		esac
+	fi
+
+	python3 -s -B -c 'from crypto.hybrid_crypto import get_crypto_status as s; raise SystemExit(not s()["liboqs_available"])' >/dev/null 2>&1 \
+		|| echo "pqvpn: native liboqs 0.16.0 not found; run /usr/share/pqvpn/install-liboqs.sh /usr/local and pip install liboqs-python==0.16.0" >&2
+fi
+
+#DEBHELPER#
+
+exit 0
