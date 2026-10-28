@@ -922,6 +922,10 @@ class MainWindow(QMainWindow):
             self._account_devices = data
             self._set_account_api_available(True)
             self._render_account_device()
+            device = self._current_account_device()
+            if (device and device.get("status") == "approved"
+                    and self._last_status.state == ConnectionState.SETUP_REQUIRED.value):
+                self._fetch_server_info_for_profile()
         elif status_code == 401:
             self._end_account_session(expired=True)
         else:
