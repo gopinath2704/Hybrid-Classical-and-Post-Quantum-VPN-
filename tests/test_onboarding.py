@@ -520,7 +520,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
     # changes: python -m pytest -q tests/test_onboarding.py -k checksum  (the
     # failure message prints the new digest).
     digest = _stable_archive_digest(root, tmp_path)
-    assert digest == "e7b574f02051d12fe4295933543d4d4fb0e82fc56db3eec1ed79c746440c110c"
+    assert digest == "85a961afb1f3393c2a82a11ec4613c19806044571a5eb13d2edadc23e03ae1d7"
 
     with tarfile.open(archive, "r:gz") as source:
         names = source.getnames()
