@@ -36,6 +36,9 @@ logger = logging.getLogger("pqvpn.runtime")
 MAX_CONTROL_MESSAGE = 16384
 # The Python loop warns per rejected inner packet; the Rust loop's count is logged at most this often.
 INNER_REJECT_LOG_INTERVAL = 10.0
+# ponytail: control accept backlog, fixed rather than max_clients (enforced at admission). M7 at a
+# 10k/s flood: 64 beat 512 and 4096, whose deeper queue makes legitimate connects wait behind it.
+CONTROL_LISTEN_BACKLOG = 64
 
 
 def send_message(sock: socket.socket, data: bytes) -> None:
@@ -396,7 +399,7 @@ class VPNServer:
             self.tcp = socket.socket()
             self.tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.tcp.bind((self.cfg.listen_host, self.cfg.control_port))
-            self.tcp.listen(self.cfg.max_clients)
+            self.tcp.listen(CONTROL_LISTEN_BACKLOG)
             self.tcp.settimeout(1)
             listener = self.tcp
             self._data_thread = threading.Thread(target=self._watch_data_plane if self._dp else self._data_loop,

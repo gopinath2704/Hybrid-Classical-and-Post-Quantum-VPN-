@@ -335,11 +335,12 @@ class FakeTun:
     def close(self):self.closed=True
 
 class FakeSocket:
+    backlog=None
     def __init__(self):self.closed=False
     def bind(self,_):pass
     def setblocking(self,_):pass
     def setsockopt(self,*_):pass
-    def listen(self,_):pass
+    def listen(self,backlog):self.backlog=backlog
     def settimeout(self,_):pass
     def accept(self):
         if self.closed:raise OSError(9,"closed")
@@ -351,7 +352,7 @@ def test_graceful_server_stop_has_no_exception(monkeypatch,tmp_path):
     from vpn.identity import generate_server_identity
     generate_server_identity(secret, public, allow_mock=True)
     clients.write_text('{"clients":[]}')
-    cfg=ServerConfig(server_identity_private_key=str(secret),server_identity_public_key=str(public),authorized_clients_file=str(clients),dev_emulated_tun=True)
+    cfg=ServerConfig(server_identity_private_key=str(secret),server_identity_public_key=str(public),authorized_clients_file=str(clients),dev_emulated_tun=True,max_clients=8)
     tun=FakeTun();sockets=[]
     monkeypatch.setattr(runtime,"open_tun",lambda *_:tun);monkeypatch.setattr(runtime,"configure_tun",lambda *_:None)
     def make_socket(*_):value=FakeSocket();sockets.append(value);return value
@@ -363,6 +364,7 @@ def test_graceful_server_stop_has_no_exception(monkeypatch,tmp_path):
         except Exception as exc:failures.append(exc)
     thread=threading.Thread(target=run);thread.start();time.sleep(.03);server.stop();thread.join(2)
     assert not thread.is_alive() and not failures and tun.closed and all(item.closed for item in sockets)
+    assert [item.backlog for item in sockets if item.backlog is not None]==[runtime.CONTROL_LISTEN_BACKLOG]
 
 def test_source_rate_limiter_window():
     limiter=runtime.SourceRateLimiter(2,10);assert limiter.allow("a",0) and limiter.allow("a",1);assert not limiter.allow("a",2);assert limiter.allow("a",11)
