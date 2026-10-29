@@ -258,13 +258,26 @@ if __name__ == "__main__":
     DECRYPT_VECTORS.write_text(json.dumps(build_decrypt_vectors(), indent=1) + "\n")
 
 
+@pytest.mark.parametrize("resumed", [False, True], ids=["full", "resumed"])
 @pytest.mark.parametrize("client_plane, server_plane", [("python", "rust"), ("rust", "python")])
 @pytest.mark.parametrize("suite", ["v2", "v3-kem", "v3-mldsa"])
-def test_mixed_data_planes_interoperate_across_rekey(core, request, suite, client_plane, server_plane):
+def test_mixed_data_planes_interoperate_across_rekey(core, request, suite, client_plane, server_plane, resumed):
+    from handshake.kemtls import (PROTOCOL_VERSION, PROTOCOL_VERSION_V3, PROTOCOL_VERSION_V3_MLDSA,
+                                  ResumptionClientHandshake, ResumptionServerHandshake, ResumptionTicketKey)
     from test_crypto_protocol import exchange, exchange_mldsa, exchange_v3
-    make, ids = {"v2": (exchange, "identities"), "v3-kem": (exchange_v3, "v3_identities"),
-                 "v3-mldsa": (exchange_mldsa, "mldsa_identities")}[suite]
+    make, ids, version = {"v2": (exchange, "identities", PROTOCOL_VERSION),
+                          "v3-kem": (exchange_v3, "v3_identities", PROTOCOL_VERSION_V3),
+                          "v3-mldsa": (exchange_mldsa, "mldsa_identities", PROTOCOL_VERSION_V3_MLDSA)}[suite]
     client, server = make(request.getfixturevalue(ids), data_plane=client_plane, server_plane=server_plane)
+    if resumed:
+        # The 1-RTT ticket path, with each side's data plane still the opposite of the other's.
+        ticket_key = ResumptionTicketKey()
+        ticket = ticket_key.issue(bytes(server.secrets.rekey_secret), "alice", version, 3600, "10.8.0.2")
+        resume = ResumptionClientHandshake(bytes(client.secrets.rekey_secret), version, True, data_plane=client_plane)
+        accept, server = ResumptionServerHandshake(ticket_key, version, True, data_plane=server_plane).process_hello(
+            resume.initiate(ticket))
+        client = resume.process_accept(accept)
+        assert (client.data_plane, server.data_plane) == (client_plane, server_plane)
     for epoch in (0, 1):
         assert server.open_data(client.seal_data(b"up"))[1] == b"up"
         assert client.open_data(server.seal_data(b"down", FrameType.PONG), FrameType.PONG)[1] == b"down"

@@ -295,6 +295,31 @@ mod tests {
         assert_eq!(server.rekey(2, &s2c, &ns, &c2s, &nc), Err(Error::Closed));
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// (d) At the top of the space the sender never wraps: it issues unique sequences up to
+        /// u64::MAX - 1, then refuses forever, and the receiver accepts each issued frame exactly once.
+        #[test]
+        fn never_wraps_and_every_issued_frame_opens_once(headroom in 0u64..100, attempts in 1usize..150) {
+            let (client, server) = pair();
+            client.next_sequence.store(u64::MAX - headroom, Ordering::Relaxed);
+            let frames: Vec<_> = (0..attempts).map(|_| client.seal(1, b"x")).collect();
+            let issued = usize::try_from(headroom).unwrap().min(attempts);
+            for (i, frame) in frames.iter().enumerate() {
+                if i < issued {
+                    let frame = frame.as_ref().unwrap();
+                    let expected = u64::MAX - headroom + u64::try_from(i).unwrap();
+                    proptest::prop_assert_eq!(&frame[18..26], &expected.to_be_bytes());
+                    proptest::prop_assert!(server.open(frame, None).is_ok());
+                    proptest::prop_assert_eq!(server.open(frame, None), Err(Error::Replayed));
+                } else {
+                    proptest::prop_assert_eq!(frame, &Err(Error::Exhausted));
+                }
+            }
+        }
+    }
+
     #[test]
     fn sender_refuses_at_top_of_sequence_space() {
         let (client, _) = pair();

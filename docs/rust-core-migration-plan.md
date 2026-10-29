@@ -156,10 +156,11 @@ The rewrite must not weaken a single property in the security gap analysis. Thes
 Test strategy, on top of the existing 560 tests and 70-attack pentest suite:
 
 - [x] Run the whole Python suite against both backends via a `--backend` pytest option.
-- [ ] Cross-implementation interop: Python client to Rust server and the reverse, for v2, v3-kem and v3-mldsa, including rekey and resumption.
+- [x] Cross-implementation interop: Python client to Rust server and the reverse, for v2, v3-kem and v3-mldsa, including rekey and resumption.
 - [ ] Known-answer vectors exported from the Python code for HKDF output, frame encryption and transcripts, checked in Rust unit tests.
 - [ ] Differential fuzzing with `cargo-fuzz` on frame decryption, the replay window and handshake parsing, comparing Rust against Python where both exist.
-- [ ] Property tests (`proptest`) for the replay window and sequence handling at the 64-bit edge.
+  cargo-fuzz smoke 2026-10-29: dispatch 1.63M runs, open 6.70M runs, 60 s each, no crashes; cargo deny + cargo audit clean.
+- [x] Property tests (`proptest`) for the replay window and sequence handling at the 64-bit edge.
 - [ ] Re-run the Tamarin models only where the protocol changes (the folded `UDP_BIND` in Phase 1); a pure port changes no model.
 
 ## Keeping the IEEE evaluation reproducible
@@ -188,8 +189,8 @@ Treat the Python and Rust backends as two configurations of one artifact, not as
 
 ## Next steps
 
-- [ ] Phase 0: re-run M1 to M8 on current main with flame graphs, then tag `v3-paper-artifact` (needs root on your machine).
-- [ ] Phase 1: open one PR per quick win, starting with warm connect through `ClientService` and pyroute2.
+- [x] Phase 0: re-run M1 to M8 on current main with flame graphs, then tag `v3-paper-artifact` (needs root on your machine). Baseline b726b42 in `eval/results-summary/phase0-2026-10-28/`; the `v3-paper-artifact` tag already existed and is public, so it was not moved.
+- [x] Phase 1: open one PR per quick win, starting with warm connect through `ClientService` and pyroute2. Merged: #28 warm connect, #29 TCP_NODELAY.
 - [x] Phase 2 spike: a `core/` skeleton with maturin, one known-answer test for frame encryption, and a `--backend` pytest option, to prove the build and packaging path before the real port.
 
 Open question: which venue and deadline is the paper aiming for? That decides whether to freeze after Phase 2, Phase 3 or Phase 4.
