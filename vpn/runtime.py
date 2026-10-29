@@ -661,31 +661,34 @@ class VPNServer:
     def _data_loop(self) -> None:
         batch = self._BATCH_SIZE
         while not self.stop_event.is_set():
-            descriptors = [self.udp]
-            if self.tun:
-                descriptors.append(self.tun.fileno())
-            try:
-                readable, _, _ = select.select(descriptors, [], [], 0.2)
-            except (OSError, ValueError):
+            # One snapshot per pass: stop() closes and nulls these concurrently. A closed socket raises
+            # OSError and a closed TUNInterface RuntimeError; both end the loop instead of crashing it.
+            udp, tun = self.udp, self.tun
+            if udp is None:
                 break
-            if self.udp in readable:
+            try:
+                tun_fd = tun.fileno() if tun else None
+                readable, _, _ = select.select([udp] if tun_fd is None else [udp, tun_fd], [], [], 0.2)
+            except (OSError, ValueError, RuntimeError):
+                break
+            if udp in readable:
                 for _ in range(batch):
                     try:
-                        data, address = self.udp.recvfrom(65535)
+                        data, address = udp.recvfrom(65535)
                     except (BlockingIOError, OSError):
                         break
                     self._handle_datagram(data, address)
-            if self.tun and self.tun.fileno() in readable:
-                mtu = self.tun.mtu
+            if tun_fd is not None and tun_fd in readable:
+                mtu = tun.mtu
                 for _ in range(batch):
                     try:
-                        packet = self.tun.read()
-                    except (BlockingIOError, OSError):
+                        packet = tun.read()
+                    except (BlockingIOError, OSError, RuntimeError):
                         break
                     item = self.sessions.destination(packet)
                     if item and item.endpoint and len(packet) <= mtu:
-                        try: self.udp.sendto(item.crypto.seal_data(packet), item.endpoint)
-                        except HandshakeError: continue
+                        try: udp.sendto(item.crypto.seal_data(packet), item.endpoint)
+                        except (HandshakeError, OSError): continue
 
     def _handle_datagram(self, data: bytes, address: tuple[str, int]) -> None:
         # Lock-free session lookup (snapshot dict), then decrypt.
