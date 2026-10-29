@@ -1,0 +1,8 @@
+system,profile,metric,run,value,unit
+pqvpn,lan,bare_rtt_ms,0,0.030,ms
+pqvpn,lan,tunnel_rtt_ms,1,0.465,ms
+pqvpn,lan,tcp_sent_mbps,2,634.4,Mbps
+pqvpn,lan,tcp_received_mbps,3,633.5,Mbps
+pqvpn,lan,udp_throughput_mbps,4,15989.0,Mbps
+pqvpn,lan,udp_jitter_ms,5,0.013,ms
+pqvpn,lan,udp_lost_pct,6,92.4,%
