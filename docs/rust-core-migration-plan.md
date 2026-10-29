@@ -141,6 +141,83 @@ Phase 2 gates (final bench above):
 - [x] M5 LAN TCP 1.5 Gbps or more, both suites
 - [ ] Tunnel RTT overhead 0.2 ms or less, both suites. Missed: v3-kem 0.213 ms (v2 0.177 ms); host wake-up latency, see above.
 
+### Phase 3 design
+
+**Bottom line.** Phase 2 already clears the Phase 3 throughput gate: one worker does about 3.8 Gbps against a target of 3 Gbps or more. The other two gate items do not depend on the data plane. The fixed-rate UDP sweep is harness work, and M7 at 10k/s exercises the Python control plane. Every data-plane change below is therefore headroom or multi-client scaling, not gate work. Recommendation: (a) UDP GSO/GRO, then (b) a measured direction split. Defer multi-queue N workers and TUN offload.
+
+Evidence: M5 TCP-only, 10 s, single stream, release build, unprivileged netns (`unshare -rnm`), powersave governor; 3.74 Gbps. This ran against sentinel-74's in-progress `measure_throughput.py`, TCP part only. A temporary build timed each loop phase in wall-clock time, so kernel work done inside a syscall counts towards that phase. Both workers were saturated: busy about 97% (client) and 90% (server) of the run.
+
+| Phase, share of busy time | Client (data out) | Server (data in) |
+| --- | --- | --- |
+| UDP send (`sendmmsg`) | 42% | 18% (ACKs) |
+| TUN write | 22% (ACKs) | 39% (0.99 µs per packet) |
+| AES-GCM seal + open, including the per-packet copy | 16% | 18% |
+| TUN read | 12% | 5% |
+| UDP receive (`recvmmsg`) | 5% | 15% |
+
+**1. Where the time goes.** About 80% of worker time is per-packet kernel work inside syscalls, and about 15% is crypto plus copies. The phases also include softirq work done for the peer: a veth send runs the receiver's stack, and a TUN write runs TCP receive. So the gains below are veth upper bounds; on EC2, ENA has no USO, so expect less there. The supervisor polls at 5 Hz and is off the packet path. Levers, by expected gain:
+
+1. UDP GSO and GRO. A veth microbenchmark showed sending about 7× cheaper per byte and receiving about 9× cheaper. Estimated M5 gain: about 1.4×, after which the server is TUN-write-bound.
+2. Direction split (one thread per direction). Estimated from summed phase times: about 1.4–1.8× on top of (1).
+3. TUN offload. The TUN write is 39% of the server and the biggest remaining lever, but also the riskiest; see item 5.
+4. N workers. No M5 gain at all: one stream is one session, one inner flow, one TUN queue and one socket.
+5. Removing allocations. Bounded by the 15% crypto bucket; skip.
+
+**2. Multi-queue TUN.** Feasible without new unsafe code. Python opens N fds with `TUNSETIFF` plus `IFF_MULTI_QUEUE` under the same name (verified unprivileged: 4 queues), `TUNSETQUEUE` with `IFF_DETACH_QUEUE`/`IFF_ATTACH_QUEUE` toggles a queue, and Rust adopts each one through the unchanged 10:200 `check`. Observed kernel behaviour:
+- each inner flow stays on one queue (32 flows spread 8/12/5/7);
+- automatic queue selection steers a flow's replies to the queue that last wrote that flow (16 of 16).
+
+Emulated TUN has no kernel hashing, so N socketpairs stand in for it, and steering tests use a native TUN under `unshare -rn`. **Decision: defer** (see item 3).
+
+**3. Workers and sockets** (for when multi-client scaling gets a gate):
+- **Layout:** N workers, each with an `SO_REUSEPORT` UDP socket (set and bound by Python) and its own TUN queue.
+- **Inbound affinity:** reuseport hashes the client's 4-tuple, so each session's inbound traffic lands on one worker. Its replay window stays single-threaded and in order.
+- **Replies:** any reuseport socket has the same source address, so a reply leaves correctly from the worker that received the request.
+- **Table:** the ArcSwap table is shared unchanged.
+- **Stats:** per-worker counters, summed in `stats()`.
+- **Nonces stay safe:** the counter is atomic in the shared `Session`, and `rekey_under_load_never_repeats_a_nonce` proves it.
+- **Ordering does not:** a session's inner flows can land on different TUN queues, so several workers seal for one session. Their batches interleave sequence numbers past the 128-entry window, and the receiver (Python-plane receivers keep 128 too) drops valid frames as outside the window. Multi-worker therefore needs home-worker sealing: hand the packet to the worker that owns the session. That handoff is the real cost.
+- **Default N = 1, with no knob in Phase 3.** On a 2-vCPU t3.small the direction split already uses both cores.
+
+**4. UDP GSO and GRO** (nix =0.31.3, measured on this kernel):
+- **API:** nix exposes `sockopt::UdpGsoSegment` / `UdpGroSegment`, `ControlMessage::UdpGsoSegments(&u16)` for sending and `ControlMessageOwned::UdpGroSegments` for receiving.
+- **Send path:** use `sendmsg` with a per-call segment-size cmsg over a run of consecutive frames with the same destination and the same length; the last frame may be shorter. Not `sendmmsg`, because nix shares cmsgs across the whole batch. Not the socket-level `UDP_SEGMENT` option either, which would split every longer datagram.
+- **Limits:** cap a run at 64 segments and 65,000 bytes. This kernel rejects more than 128 segments (EINVAL) or more than about 64 KB (EMSGSIZE).
+- **Parity at mtu-1280:** GSO succeeds only when each segment fits the path MTU. Measured: 1,252 B works, 1,253 B fails with EMSGSIZE, and a plain datagram of the same size is sent and fragmented. So a frame larger than MTU − 28 always goes through plain `sendmmsg`, and `IP_MTU_DISCOVER` stays untouched. On EMSGSIZE, EINVAL or EIO from a GSO send, resend that run with `sendmmsg` and remember a per-peer GSO size limit. If the start-up probe `setsockopt` fails, GSO is off.
+- **Receive path:** Rust sets `UDP_GRO` after adopting the socket (Python's last read happens at connect, before the data plane exists). It splits each coalesced buffer by its segment size and sends every segment through the existing `open`, so authenticate-then-commit is unchanged. Receive memory stays at today's 64 × 64 KB.
+- **No quinn-udp:** current versions need rustc 1.88, and older ones force DF.
+
+**5. TUN offload** (`IFF_VNET_HDR`, `TUNSETOFFLOAD`, `virtio_net_hdr`). **Defer to its own phase.** It needs userspace TCP segmentation and checksums on TUN → UDP, in-order coalescing on UDP → TUN, and parsing of `virtio_net_hdr` from the kernel. It is the largest remaining lever (the server's TUN write) and the riskiest, and the gate does not need it. The Python-side ioctls already work unprivileged (`vnet_hdr` with CSUM, TSO4 and TSO6), so a later phase can keep the unsafe inventory at 3.
+
+**6. Python surface.** Phase 3 adds no config knob. The direction split stays internal to `DataPlane`, with the same API:
+- `stop()` sets the flag and joins both threads;
+- each thread is guarded, the first error wins and also sets the stop flag so its sibling exits;
+- the supervisor and the teardown order are unchanged.
+
+A later multi-worker phase would add one knob, `data_plane_workers` (an int or `auto`).
+
+**7. Invariants that must not move:**
+- **Authenticate, then commit, per session:** every GRO segment goes through `open` on its own, and the replay window is touched only by the receiving thread.
+- **One sealer per key:** still the single shared `Session`; seals from other threads stay nonce-safe through the atomic counter.
+- **New ordering rule:** frames sealed but not yet sent for one session, across all sealers, stay well under 128. A GSO run is at most 64 frames, and with the split the second sealer seals only rare control replies (PONG, BIND_ACK).
+- **Inner-packet checks:** unchanged, applied per segment.
+- **Revocation:** `remove_session` reaches every thread through the shared table within one loop cycle.
+- **Bounded memory:** at most 64 receive buffers and 64 staged send frames, and no unbounded queues.
+- **Unchanged:** unsafe stays at 3 blocks, MSRV stays 1.85, and the nix pin stays exact.
+
+**8. Slices** (one commit each, every one shippable behind `data_plane`):
+- **(a) UDP GSO send plus GRO receive, with fallback.**
+  - Cargo tests: GSO run grouping (destination, length, caps); GRO split, where a tampered segment drops only itself; the EMSGSIZE fallback.
+  - Python under `unshare -rn`: frames larger than MTU − 28 at mtu-1280 are still delivered.
+  - Reordering: iperf3 JSON `retransmits` plus `nstat` TcpExt reorder and out-of-order counters in the client netns, compared across python, rust and rust+GSO.
+  - Performance: an unprivileged M5 A/B.
+- **(b) Direction split**, optional and kept only if the M5 A/B shows at least 1.3× over (a).
+  - Race tests run with the split.
+  - A receiver-side sequence-distance assertion (≤ 128) while control replies interleave with bulk data.
+  - A crash in either thread surfaces in Python and stops both.
+- **(c) Gate run** on sentinel-74's harness: M5, the fixed-rate UDP sweep, and M7 at 10k/s in rust mode.
+- **Deferred:** multi-queue N workers (needs home-worker sealing and a multi-client gate first) and TUN offload (its own phase).
+
 ## Security invariants and tests
 
 The rewrite must not weaken a single property in the security gap analysis. These are the invariants each Rust PR is checked against:
