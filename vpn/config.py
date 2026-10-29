@@ -1,6 +1,7 @@
 """TOML configuration models with deployment-safe defaults."""
 from __future__ import annotations
 import tomllib
+import importlib
 import ipaddress
 import math
 import re
@@ -122,7 +123,7 @@ def data_plane(value: object) -> None:
     if value not in ('python', 'rust'): raise ValueError('data_plane must be python or rust')
     if value == 'rust':
         try:
-            import pqvpn_core  # noqa: F401
+            importlib.import_module('pqvpn_core')
         except ImportError as exc:
             raise ValueError('data_plane = "rust" requires the pqvpn_core module (build core/ with maturin)') from exc
 
