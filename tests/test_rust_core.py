@@ -296,16 +296,12 @@ def test_rust_mode_python_never_holds_data_ciphers(core, identities):
 
 
 def test_rust_mode_fails_loudly_without_pqvpn_core(identities, monkeypatch):
-    import builtins
+    import sys
     from test_crypto_protocol import exchange
     from vpn.config import ServerConfig, validate_server
-    real_import = builtins.__import__
-    def no_core(name, *args, **kwargs):
-        if name == "pqvpn_core":
-            raise ImportError("pqvpn_core hidden by test")
-        return real_import(name, *args, **kwargs)
-    monkeypatch.setattr(builtins, "__import__", no_core)
-    with pytest.raises(ImportError, match="hidden"):
+    # None in sys.modules makes every import style (statement or importlib) raise ImportError.
+    monkeypatch.setitem(sys.modules, "pqvpn_core", None)
+    with pytest.raises(ImportError, match="pqvpn_core"):
         exchange(identities, data_plane="rust")
     with pytest.raises(ValueError, match="requires the pqvpn_core module"):
         validate_server(ServerConfig(data_plane="rust"))
