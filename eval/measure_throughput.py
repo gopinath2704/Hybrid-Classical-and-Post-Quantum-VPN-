@@ -19,6 +19,8 @@ Usage:
     sudo env PATH="$PATH" python eval/measure_throughput.py \
         --profiles lan,metro --duration 20 --out results/m5/raw/throughput.csv
 
+    --udp-rates 100M,500M,1G replaces the `-b 0` UDP flood with a fixed-rate goodput sweep.
+
     --data-plane rust needs pqvpn_core, so run the venv interpreter: sudo .venv/bin/python ...
 """
 from __future__ import annotations
@@ -50,6 +52,59 @@ PROFILES = {
 }
 
 PING_COUNT = 50
+UDP_LOSS_LIMIT_PCT = 1.0
+
+
+def udp_rate_mbps(rate: str) -> int:
+    """'500M' / '1G' / '2.5G' -> offered rate in Mbit/s (the number in udp_*@<rate> metric names)."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([MG])", rate.strip(), re.IGNORECASE)
+    if not m:
+        raise ValueError(f"UDP rate must look like 500M or 2G, got {rate!r}")
+    return round(float(m.group(1)) * (1000 if m.group(2).upper() == "G" else 1))
+
+
+def udp_payload_len(profile: str) -> int:
+    """Largest UDP payload whose inner packet fits the tunnel and whose outer packet fits the veth."""
+    from vpn.config import ServerConfig
+    from vpn.network import DATA_FRAME_OVERHEAD
+    ip_udp = 20 + 8
+    inner_mtu = min(ServerConfig().mtu, PROFILES[profile]["mtu"] - ip_udp - DATA_FRAME_OVERHEAD)
+    return inner_mtu - ip_udp
+
+
+def parse_iperf3_udp(stdout: str) -> dict:
+    """iperf3 -u -J: sender rate, receiver goodput, jitter and loss (receiver-side, as iperf3 reports)."""
+    data = json.loads(stdout)
+    end = data["end"]
+    summary = end["sum"]
+    lost = summary.get("lost_percent", 0)
+    sent = end.get("sum_sent", summary)["bits_per_second"] / 1e6
+    received = end.get("sum_received")
+    return {
+        "throughput_mbps": summary["bits_per_second"] / 1e6,
+        "sent_mbps": sent,
+        "goodput_mbps": received["bits_per_second"] / 1e6 if received else sent * (1 - lost / 100),
+        "jitter_ms": summary.get("jitter_ms", 0),
+        "lost_pct": lost,
+    }
+
+
+def udp_sweep_rows(profile: str, results: dict[int, dict | None], run_idx: int) -> tuple[list, int]:
+    """Per-rate rows plus the highest rate iperf3 really sent (>=95%) with loss under UDP_LOSS_LIMIT_PCT."""
+    rows = []
+    for mbps, udp in results.items():
+        if udp is None:
+            continue
+        for metric, key, fmt, unit in (("udp_sent_mbps", "sent_mbps", ".1f", "Mbps"),
+                                       ("udp_goodput_mbps", "goodput_mbps", ".1f", "Mbps"),
+                                       ("udp_lost_pct", "lost_pct", ".3f", "%"),
+                                       ("udp_jitter_ms", "jitter_ms", ".3f", "ms")):
+            rows.append(["pqvpn", profile, f"{metric}@{mbps}", run_idx, format(udp[key], fmt), unit])
+            run_idx += 1
+    passing = [mbps for mbps, udp in results.items()
+               if udp and udp["lost_pct"] < UDP_LOSS_LIMIT_PCT and udp["sent_mbps"] >= 0.95 * mbps]
+    rows.append(["pqvpn", profile, "udp_max_rate_under_1pct_loss_mbps", run_idx, max(passing, default=0), "Mbps"])
+    return rows, run_idx + 1
 
 
 def setup_topology(run_dir: str, profile: str, protocol: str = "v2-ed25519",
@@ -268,7 +323,8 @@ def measure_iperf3_tcp(topo: dict, duration: int) -> dict | None:
         return None
 
 
-def measure_iperf3_udp(topo: dict, duration: int) -> dict | None:
+def measure_iperf3_udp(topo: dict, duration: int, rate: str = "0",
+                       length: int | None = None) -> dict | None:
     srv_proc = subprocess.Popen(
         ["ip", "netns", "exec", topo["srv_ns"],
          "iperf3", "-s", "-1"],
@@ -278,8 +334,8 @@ def measure_iperf3_udp(topo: dict, duration: int) -> dict | None:
     try:
         ret = subprocess.run(
             ["ip", "netns", "exec", topo["cli_ns"],
-             "iperf3", "-c", "10.8.0.1", "-u", "-b", "0",
-             "-t", str(duration), "-J"],
+             "iperf3", "-c", "10.8.0.1", "-u", "-b", rate,
+             "-t", str(duration), "-J"] + (["-l", str(length)] if length else []),
             capture_output=True, text=True, timeout=duration + 30)
     except subprocess.TimeoutExpired:
         srv_proc.kill()
@@ -297,13 +353,7 @@ def measure_iperf3_udp(topo: dict, duration: int) -> dict | None:
         return None
 
     try:
-        data = json.loads(ret.stdout)
-        summary = data["end"]["sum"]
-        return {
-            "throughput_mbps": summary["bits_per_second"] / 1e6,
-            "jitter_ms": summary.get("jitter_ms", 0),
-            "lost_pct": summary.get("lost_percent", 0),
-        }
+        return parse_iperf3_udp(ret.stdout)
     except (json.JSONDecodeError, KeyError) as e:
         print(f"  iperf3 UDP parse error: {e}", file=sys.stderr)
         return None
@@ -324,7 +374,7 @@ def cleanup(topo: dict, procs: list[subprocess.Popen]):
 
 def run_profile(profile: str, run_dir: str, duration: int,
                 run_idx: int, protocol: str = "v2-ed25519",
-                data_plane: str = "python") -> tuple[list, int]:
+                data_plane: str = "python", udp_rates: list[str] | None = None) -> tuple[list, int]:
     mode_dir = os.path.join(run_dir, profile)
     os.makedirs(mode_dir, exist_ok=True)
     rows = []
@@ -384,6 +434,21 @@ def run_profile(profile: str, run_dir: str, duration: int,
 
         time.sleep(2)
 
+        if udp_rates:
+            length = udp_payload_len(profile)
+            sweep = {}
+            for rate in udp_rates:
+                print(f"  iperf3 UDP -b {rate} -l {length} ({duration}s)...", end="", flush=True)
+                udp = measure_iperf3_udp(topo, duration, rate, length)
+                sweep[udp_rate_mbps(rate)] = udp
+                print(f" sent={udp['sent_mbps']:.1f} goodput={udp['goodput_mbps']:.1f} Mbps,"
+                      f" loss={udp['lost_pct']:.3f}%" if udp else " FAILED")
+                time.sleep(1)
+            sweep_rows, run_idx = udp_sweep_rows(profile, sweep, run_idx)
+            rows += sweep_rows
+            print(f"  max rate with loss <{UDP_LOSS_LIMIT_PCT:g}%: {sweep_rows[-1][4]} Mbps")
+            return rows, run_idx
+
         # iperf3 UDP
         print(f"  iperf3 UDP ({duration}s)...", end="", flush=True)
         udp = measure_iperf3_udp(topo, duration)
@@ -427,7 +492,16 @@ def main():
     parser.add_argument("--data-plane", default="python", choices=["python", "rust"],
                         help="per-packet loop on both ends (default: python); "
                              "rust needs pqvpn_core in the running interpreter")
+    parser.add_argument("--udp-rates", default="",
+                        help="comma-separated fixed UDP rates, e.g. 100M,500M,1G,2G,3G,4G: a goodput "
+                             "sweep instead of the -b 0 flood (default: the -b 0 flood)")
     args = parser.parse_args()
+    udp_rates = [r.strip() for r in args.udp_rates.split(",") if r.strip()]
+    try:
+        for rate in udp_rates:
+            udp_rate_mbps(rate)
+    except ValueError as e:
+        parser.error(str(e))
 
     if subprocess.run(["which", "iperf3"], capture_output=True).returncode != 0:
         print("FATAL: iperf3 not found. Install with: apt install iperf3",
@@ -459,7 +533,7 @@ def main():
     run_idx = 0
     for profile in profiles:
         rows, run_idx = run_profile(profile, run_dir, args.duration, run_idx,
-                                    args.protocol, args.data_plane)
+                                    args.protocol, args.data_plane, udp_rates)
         for row in rows:
             writer.writerow(row)
         csv_f.flush()

@@ -44,6 +44,8 @@ CH_WIRE_SIZE = HEADER_SIZE + CH_PAYLOAD_SIZE  # 1318
 TCP_LENGTH_PREFIX = 4
 
 CSV_COLUMNS = ["system", "profile", "metric", "run", "value", "unit"]
+# ponytail: per-process share of the flood rate; lower it if flood_rate_per_s misses its target.
+RATE_PER_SENDER = 2500
 
 
 def craft_clienthello() -> bytes:
@@ -58,60 +60,84 @@ def tcp_frame(msg: bytes) -> bytes:
     return struct.pack("!I", len(msg)) + msg
 
 
+# Open loop: connects are non-blocking, so SYNs the server drops (full accept queue) never slow
+# the offered rate. Prints "attempted sent local refused timeouts elapsed": attempted = SYNs sent,
+# sent = ClientHellos delivered, local = sockets that never left this host (EMFILE, EADDRNOTAVAIL).
 _FLOOD_SCRIPT = r"""
-import os,signal,socket,struct,sys,time
-target_ip,target_port,rate = sys.argv[1],int(sys.argv[2]),int(sys.argv[3])
-MAGIC=0x4856; VER=0x20; CH=1; PLEN=1312
+import errno,os,resource,selectors,signal,socket,struct,sys,time
+target,rate = (sys.argv[1],int(sys.argv[2])),int(sys.argv[3])
+MAGIC=0x4856; VER=0x20; CH=1; PLEN=1312; TIMEOUT=1.0
 hdr=struct.pack("!HBBH",MAGIC,VER,CH,PLEN)
 payload=os.urandom(PLEN)
 frame=struct.pack("!I",len(hdr)+len(payload))+hdr+payload
-interval=1.0/rate if rate>0 else 0
-sent=errors=0
+soft,hard=resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE,(hard,hard))
+sel=selectors.DefaultSelector(); pending={}
+attempted=sent=local=refused=timeouts=0
 stop=False
 def _stop(sig,frm):
     global stop; stop=True
 signal.signal(signal.SIGTERM,_stop)
 signal.signal(signal.SIGINT,_stop)
+def done(s):
+    del pending[s]; sel.unregister(s); s.close()
+start=nxt=time.monotonic()
 while not stop:
-    try:
-        s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-        s.settimeout(2)
-        s.connect((target_ip,target_port))
-        s.sendall(frame)
-        sent+=1
-        s.close()
-    except OSError:
-        errors+=1
-    if interval>0:
-        nxt=time.monotonic()+interval
-        while time.monotonic()<nxt and not stop:time.sleep(0.0001)
-print(f"{sent} {errors}",flush=True)
+    now=time.monotonic()
+    while nxt<=now:
+        nxt+=1.0/rate
+        try:
+            s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.setblocking(False)
+        except OSError:
+            local+=1; continue
+        if s.connect_ex(target) not in (0,errno.EINPROGRESS):
+            s.close(); local+=1; continue
+        attempted+=1; pending[s]=now+TIMEOUT; sel.register(s,selectors.EVENT_WRITE)
+    for key,_ in sel.select(max(0.0,nxt-time.monotonic())):
+        s=key.fileobj
+        try:
+            ok=not s.getsockopt(socket.SOL_SOCKET,socket.SO_ERROR) and s.send(frame)==len(frame)
+        except OSError:
+            ok=False
+        sent+=ok; refused+=not ok; done(s)
+    now=time.monotonic()
+    for s in [s for s,t in pending.items() if t<now]: timeouts+=1; done(s)
+print(f"{attempted} {sent} {local} {refused} {timeouts} {time.monotonic()-start:.3f}",flush=True)
 """
 
 
 def start_flood(flood_ns: str, target_ip: str, target_port: int,
-                rate: int) -> subprocess.Popen:
-    """Start a flood process inside *flood_ns*.  Runs until SIGTERM."""
-    return subprocess.Popen(
+                rate: int) -> list[subprocess.Popen]:
+    """Start ceil(rate / RATE_PER_SENDER) flood processes in *flood_ns* sharing *rate*.  Run until SIGTERM."""
+    senders = -(-rate // RATE_PER_SENDER)
+    return [subprocess.Popen(
         ["ip", "netns", "exec", flood_ns,
          sys.executable, "-u", "-c", _FLOOD_SCRIPT,
-         target_ip, str(target_port), str(rate)],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+         target_ip, str(target_port), str(rate // senders + (i < rate % senders))],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) for i in range(senders)]
 
 
-def stop_flood_proc(proc: subprocess.Popen) -> tuple[int, int]:
-    """Send SIGTERM, read stats line, return (sent, errors)."""
-    proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-    out = proc.stdout.read().strip()
-    parts = out.split()
-    if len(parts) == 2:
-        return int(parts[0]), int(parts[1])
-    return 0, 0
+FLOOD_COUNTS = ("attempted", "sent", "local_errors", "refused", "timeouts")
+
+
+def stop_flood_procs(procs: list[subprocess.Popen]) -> tuple[dict[str, int], float]:
+    """SIGTERM every sender, sum their stats lines: (FLOOD_COUNTS totals, longest sender elapsed s)."""
+    for proc in procs:
+        proc.terminate()
+    counts = dict.fromkeys(FLOOD_COUNTS, 0)
+    elapsed = 0.0
+    for proc in procs:
+        try:
+            out, _ = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _ = proc.communicate()
+        parts = out.split()
+        if len(parts) == len(FLOOD_COUNTS) + 1:
+            for key, value in zip(FLOOD_COUNTS, parts):
+                counts[key] += int(value)
+            elapsed = max(elapsed, float(parts[-1]))
+    return counts, elapsed
 
 
 def legit_connect(run_dir: str, client_ns: str, config_path: str,
@@ -200,6 +226,10 @@ def setup_topology(run_dir: str, cookie_mode: str, data_plane: str = "python") -
 
     subprocess.run(["ip", "netns", "exec", srv_ns,
                      "sysctl", "-q", "-w", "net.ipv4.ip_forward=1"], check=True)
+    # A flood opens one TCP connection per ClientHello and closes first, so its TIME_WAIT
+    # sockets would exhaust the default ephemeral ports in seconds at 10k/s.
+    subprocess.run(["ip", "netns", "exec", fld_ns, "sysctl", "-q", "-w", "net.ipv4.tcp_tw_reuse=1",
+                    "net.ipv4.ip_local_port_range=1024 65535"], check=True)
 
     srv_dir = os.path.join(run_dir, "server")
     cli_dir = os.path.join(run_dir, "client")
@@ -299,11 +329,12 @@ def cleanup_topology(topo: dict):
 def run_flood_trial(topo: dict, run_dir: str, rate: int, duration: float,
                     connects: int, server_proc: subprocess.Popen) -> dict:
     """Run one trial: flood at *rate* while measuring *connects* legit connects."""
-    flood_proc = None
-    flood_sent = flood_errors = 0
+    flood_procs: list[subprocess.Popen] = []
+    flood = dict.fromkeys(FLOOD_COUNTS, 0)
+    flood_elapsed = 0.0
 
     if rate > 0:
-        flood_proc = start_flood(
+        flood_procs = start_flood(
             topo["fld_ns"], "192.0.3.1", 51820, rate)
         time.sleep(1)
 
@@ -320,8 +351,8 @@ def run_flood_trial(topo: dict, run_dir: str, rate: int, duration: float,
     wall_elapsed = time.monotonic() - wall_start
     cpu_after = read_server_cpu(server_proc.pid)
 
-    if flood_proc is not None:
-        flood_sent, flood_errors = stop_flood_proc(flood_proc)
+    if flood_procs:
+        flood, flood_elapsed = stop_flood_procs(flood_procs)
 
     cpu_pct = None
     if cpu_before is not None and cpu_after is not None and wall_elapsed > 0:
@@ -339,8 +370,10 @@ def run_flood_trial(topo: dict, run_dir: str, rate: int, duration: float,
         "avg_latency_ms": avg_latency,
         "median_latency_ms": median_latency,
         "cpu_pct": cpu_pct,
-        "flood_sent": flood_sent,
-        "flood_errors": flood_errors,
+        "flood": flood,
+        "flood_sent": flood["sent"],
+        "flood_rate": flood["attempted"] / flood_elapsed if flood_elapsed > 0 else 0.0,
+        "flood_delivered_rate": flood["sent"] / flood_elapsed if flood_elapsed > 0 else 0.0,
         "results": results,
     }
 
@@ -437,13 +470,35 @@ def main():
                     trial["flood_sent"], "count"])
                 run_idx += 1
 
+                for key in ("attempted", "local_errors", "refused", "timeouts"):
+                    writer.writerow([
+                        f"pqvpn-{label}", f"flood-{rate}",
+                        f"flood_{key}", run_idx,
+                        trial["flood"][key], "count"])
+                    run_idx += 1
+
+                writer.writerow([
+                    f"pqvpn-{label}", f"flood-{rate}",
+                    "flood_rate_per_s", run_idx,
+                    f"{trial['flood_rate']:.0f}", "per_s"])
+                run_idx += 1
+
+                writer.writerow([
+                    f"pqvpn-{label}", f"flood-{rate}",
+                    "flood_delivered_per_s", run_idx,
+                    f"{trial['flood_delivered_rate']:.0f}", "per_s"])
+                run_idx += 1
+
                 ok = trial["connects_succeeded"]
                 n = trial["connects_attempted"]
                 lat = trial["median_latency_ms"]
                 cpu = trial["cpu_pct"]
                 cpu_s = f"{cpu:.0f}%" if cpu is not None else "n/a"
                 print(f"{ok}/{n} connects  median={lat:.0f}ms  "
-                      f"cpu={cpu_s}  flood_sent={trial['flood_sent']}")
+                      f"cpu={cpu_s}  flood_sent={trial['flood_sent']}  "
+                      f"offered={trial['flood_rate']:.0f}/s  delivered={trial['flood_delivered_rate']:.0f}/s  "
+                      f"local={trial['flood']['local_errors']}  refused={trial['flood']['refused']}  "
+                      f"timeouts={trial['flood']['timeouts']}")
 
         finally:
             server_proc.terminate()

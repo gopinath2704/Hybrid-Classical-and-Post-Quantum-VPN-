@@ -14,7 +14,8 @@ use std::thread::JoinHandle;
 use arc_swap::ArcSwap;
 use nix::errno::Errno;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use nix::sys::socket::{ControlMessage, MsgFlags, MultiHeaders, SockaddrIn, recvmmsg, sendmmsg};
+use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, MultiHeaders, SockaddrIn, getsockopt, recvmmsg, sendmmsg,
+                       sendmsg, setsockopt, sockopt};
 use nix::time::{ClockId, clock_gettime};
 use nix::unistd::{read, write};
 
@@ -22,6 +23,9 @@ use crate::packet;
 use crate::session::{Error, HEADER_LEN, Role, Session};
 
 pub const BATCH: usize = 64;
+/// One UDP GSO send: at most this many frames and bytes (this kernel allows 128 and ~64 KB).
+const GSO_MAX_SEGMENTS: usize = 64;
+const GSO_MAX_BYTES: usize = 65_000;
 const MAX_DATAGRAM: usize = 65535;
 const POLL_MS: f64 = 100.0;
 const MAX_PENDING_RTTS: usize = 1024;
@@ -70,6 +74,9 @@ pub struct Counters {
     pub replay_rejects: AtomicU64,
     /// Authenticated DATA whose inner packet is spoofed or malformed (Python logs these per packet).
     pub inner_rejects: AtomicU64,
+    /// UDP GSO sends (each carrying 2..=64 frames) and GRO receives that coalesced 2 or more frames.
+    pub gso_sends: AtomicU64,
+    pub gro_receives: AtomicU64,
 }
 
 /// Client keepalive results since the last drain, for Python's `NetworkQualityMonitor`.
@@ -312,6 +319,33 @@ struct Loop<'a> {
     worker: &'a Worker,
     tx_headers: MultiHeaders<SockaddrIn>,
     outgoing: Vec<(Vec<u8>, SocketAddrV4)>,
+    /// False once the kernel or path refuses UDP GSO; every frame then goes through `sendmmsg`.
+    gso: bool,
+    /// Largest frame a GSO send may carry per destination, learned from EMSGSIZE (path MTU).
+    gso_limits: HashMap<SocketAddrV4, usize>,
+}
+
+/// End (exclusive) of the GSO run starting at `start`: consecutive frames to one destination,
+/// all as long as the first except a shorter last one, within the per-send caps and the
+/// destination's learned limit. A run of one frame means "send it plainly".
+fn gso_run_end(frames: &[(Vec<u8>, SocketAddrV4)], start: usize, limits: &HashMap<SocketAddrV4, usize>) -> usize {
+    let (size, to) = (frames[start].0.len(), frames[start].1);
+    if size > limits.get(&to).copied().unwrap_or(usize::MAX) {
+        return start + 1;
+    }
+    let (mut end, mut total) = (start + 1, size);
+    while end < frames.len() && end - start < GSO_MAX_SEGMENTS {
+        let (frame, dest) = (&frames[end].0, frames[end].1);
+        if dest != to || frame.len() > size || total + frame.len() > GSO_MAX_BYTES {
+            break;
+        }
+        total += frame.len();
+        end += 1;
+        if frame.len() < size {
+            break;
+        }
+    }
+    end
 }
 
 impl Loop<'_> {
@@ -338,10 +372,73 @@ impl Loop<'_> {
         Ok(())
     }
 
+    /// Sends in seal order: GSO for each run of two or more, `sendmmsg` for everything between.
+    /// Called at the end of every poll pass, so a lone frame never waits for a batch to fill.
     fn flush(&mut self) -> Result<(), String> {
+        let frames = std::mem::take(&mut self.outgoing);
+        let (mut start, mut plain_from) = (0, 0);
+        while start < frames.len() {
+            let end = if self.gso { gso_run_end(&frames, start, &self.gso_limits) } else { start + 1 };
+            if end - start >= 2 {
+                self.send_plain(&frames[plain_from..start])?;
+                if !self.send_gso(&frames[start..end])? {
+                    self.send_plain(&frames[start..end])?;
+                }
+                plain_from = end;
+            }
+            start = end;
+        }
+        self.send_plain(&frames[plain_from..])?;
+        self.outgoing = frames;
+        self.outgoing.clear();
+        Ok(())
+    }
+
+    /// True if the run was handed to the kernel (or dropped as one would drop a plain frame);
+    /// false asks the caller to resend it plainly: a path-MTU refusal keeps IP fragmentation parity.
+    fn send_gso(&mut self, run: &[(Vec<u8>, SocketAddrV4)]) -> Result<bool, String> {
+        let (size, to) = (run[0].0.len(), run[0].1);
+        let Ok(segment) = u16::try_from(size) else { return Ok(false) };
+        let iov: Vec<IoSlice> = run.iter().map(|(frame, _)| IoSlice::new(frame)).collect();
+        loop {
+            match sendmsg(self.worker.udp.as_raw_fd(), &iov, &[ControlMessage::UdpGsoSegments(&segment)], MsgFlags::MSG_DONTWAIT,
+                          Some(&SockaddrIn::from(to))) {
+                Ok(_) => {
+                    self.shared.counters.gso_sends.fetch_add(1, Relaxed);
+                    self.count_sent(run);
+                    return Ok(true);
+                }
+                Err(Errno::EINTR) => continue,
+                Err(Errno::EMSGSIZE) => {
+                    self.gso_limits.insert(to, size - 1);
+                    return Ok(false);
+                }
+                Err(Errno::EINVAL | Errno::EIO | Errno::ENOPROTOOPT | Errno::EOPNOTSUPP) => {
+                    self.gso = false;
+                    return Ok(false);
+                }
+                Err(e) if transient(e) => {
+                    self.shared.counters.drops.fetch_add(run.len() as u64, Relaxed);
+                    return Ok(true);
+                }
+                Err(e) => return Err(format!("udp send failed: {e}")),
+            }
+        }
+    }
+
+    fn count_sent(&self, frames: &[(Vec<u8>, SocketAddrV4)]) {
+        for (frame, _) in frames {
+            if frame[4] == DATA {
+                self.shared.counters.tx_packets.fetch_add(1, Relaxed);
+                self.shared.counters.tx_bytes.fetch_add((frame.len() - HEADER_LEN - crate::session::TAG_LEN) as u64, Relaxed);
+            }
+        }
+    }
+
+    fn send_plain(&mut self, frames: &[(Vec<u8>, SocketAddrV4)]) -> Result<(), String> {
         let mut start = 0;
-        while start < self.outgoing.len() {
-            let batch = &self.outgoing[start..];
+        while start < frames.len() {
+            let batch = &frames[start..];
             let slices: Vec<[IoSlice; 1]> = batch.iter().map(|(frame, _)| [IoSlice::new(frame)]).collect();
             let addresses: Vec<Option<SockaddrIn>> = batch.iter().map(|(_, to)| Some(SockaddrIn::from(*to))).collect();
             let no_cmsgs: [ControlMessage; 0] = [];
@@ -355,26 +452,52 @@ impl Loop<'_> {
                 }
                 Err(e) => return Err(format!("udp send failed: {e}")),
             };
-            for (frame, _) in &batch[..sent] {
-                if frame[4] == DATA {
-                    self.shared.counters.tx_packets.fetch_add(1, Relaxed);
-                    self.shared.counters.tx_bytes.fetch_add((frame.len() - HEADER_LEN - crate::session::TAG_LEN) as u64, Relaxed);
-                }
-            }
+            self.count_sent(&batch[..sent]);
             start += sent.max(1);
         }
-        self.outgoing.clear();
         Ok(())
     }
 }
 
+/// One `recvmmsg` batch: (bytes, source, GRO segment size, truncated) per datagram.
+type Received = (usize, Option<SockaddrIn>, Option<usize>, bool);
+
+fn receive(udp: &OwnedFd, buffers: &mut [Vec<u8>], headers: &mut MultiHeaders<SockaddrIn>) -> Result<Vec<Received>, String> {
+    let mut slices: Vec<[IoSliceMut; 1]> = buffers.iter_mut().map(|b| [IoSliceMut::new(b)]).collect();
+    match recvmmsg(udp.as_raw_fd(), headers, slices.iter_mut(), MsgFlags::MSG_DONTWAIT, None) {
+        Ok(results) => Ok(results
+            .map(|m| {
+                let segment = m.cmsgs().ok().and_then(|mut cmsgs| cmsgs.find_map(|c| match c {
+                    ControlMessageOwned::UdpGroSegments(size) => usize::try_from(size).ok().filter(|s| *s > 0),
+                    _ => None,
+                }));
+                (m.bytes, m.address, segment, m.flags.contains(MsgFlags::MSG_TRUNC))
+            })
+            .collect()),
+        Err(e) if transient(e) => Ok(Vec::new()),
+        Err(e) => Err(format!("udp receive failed: {e}")),
+    }
+}
+
+/// Turns on UDP GRO (coalesced receive) and reports whether UDP GSO is available. Both are
+/// optional: without them the loop is exactly the Phase 2 one.
+fn offloads(udp: &OwnedFd) -> bool {
+    let _ = setsockopt(udp, sockopt::UdpGroSegment, &true);
+    // A GRO datagram is up to 46 frames, so the default ~208 KB receive queue overflows a burst at a
+    // time. The kernel caps this at net.core.rmem_max (Debian's default keeps ~208 KB); it bounds
+    // queued data, it allocates nothing.
+    let _ = setsockopt(udp, sockopt::RcvBuf, &(4 << 20));
+    getsockopt(udp, sockopt::UdpGsoSegment).is_ok()
+}
+
 pub fn run(shared: &Shared, worker: &Worker) -> Result<(), String> {
     let mut buffers = vec![vec![0u8; MAX_DATAGRAM]; BATCH];
-    let mut rx_headers = MultiHeaders::<SockaddrIn>::preallocate(BATCH, None);
+    let mut rx_headers = MultiHeaders::<SockaddrIn>::preallocate(BATCH, Some(nix::cmsg_space!(i32)));
     let mut tun_buffer = vec![0u8; MAX_DATAGRAM];
     let mut pending: HashMap<[u8; 8], f64> = HashMap::new();
     let mut next_ping = worker.ping.as_ref().map(|p| now() + p.initial);
-    let mut io = Loop { shared, worker, tx_headers: MultiHeaders::preallocate(BATCH, None), outgoing: Vec::with_capacity(BATCH) };
+    let mut io = Loop { shared, worker, tx_headers: MultiHeaders::preallocate(BATCH, None), outgoing: Vec::with_capacity(BATCH),
+                        gso: offloads(&worker.udp), gso_limits: HashMap::new() };
     while !shared.stop.load(Relaxed) {
         let wait = next_ping.map_or(POLL_MS, |at| ((at - now()) * 1000.0).clamp(0.0, POLL_MS));
         let mut fds = [PollFd::new(worker.udp.as_fd(), PollFlags::POLLIN), PollFd::new(worker.tun.as_fd(), PollFlags::POLLIN)];
@@ -387,23 +510,31 @@ pub fn run(shared: &Shared, worker: &Worker) -> Result<(), String> {
             return Err("udp or tun descriptor failed".into());
         }
         if udp_events.intersects(PollFlags::POLLIN | PollFlags::POLLERR) {
-            let received: Vec<(usize, Option<SockaddrIn>)> = {
-                let mut slices: Vec<[IoSliceMut; 1]> = buffers.iter_mut().map(|b| [IoSliceMut::new(b)]).collect();
-                match recvmmsg(worker.udp.as_raw_fd(), &mut rx_headers, slices.iter_mut(), MsgFlags::MSG_DONTWAIT, None) {
-                    Ok(results) => results.map(|m| (m.bytes, m.address)).collect(),
-                    Err(e) if transient(e) => Vec::new(),
-                    Err(e) => return Err(format!("udp receive failed: {e}")),
-                }
-            };
+            let received = receive(&worker.udp, &mut buffers, &mut rx_headers)?;
+            // nix's recvmmsg resets each slot's iovec but not msg_controllen, which the kernel shrinks to 0
+            // for a datagram without a cmsg; that slot could then never deliver a GRO segment size again.
+            if received.iter().any(|r| r.2.is_none()) {
+                rx_headers = MultiHeaders::preallocate(BATCH, Some(nix::cmsg_space!(i32)));
+            }
             let now = now();
-            for (buffer, (len, from)) in buffers.iter().zip(received) {
-                let Some(from) = from else { continue };
-                let (frame, from) = (&buffer[..len], SocketAddrV4::from(from));
-                let out = match shared.role {
-                    Role::Server => shared.server_inbound(frame, from, now),
-                    Role::Client => shared.client_inbound(frame, from, now, &mut pending),
+            for (buffer, (len, from, segment, truncated)) in buffers.iter().zip(received) {
+                let Some(from) = from.filter(|_| !truncated) else {
+                    shared.drop_packet();
+                    continue;
                 };
-                io.deliver(out)?;
+                let from = SocketAddrV4::from(from);
+                // A GRO datagram is several frames back to back; each is authenticated on its own.
+                let size = segment.unwrap_or(len).min(len).max(1);
+                if size < len {
+                    shared.counters.gro_receives.fetch_add(1, Relaxed);
+                }
+                for frame in buffer[..len].chunks(size) {
+                    let out = match shared.role {
+                        Role::Server => shared.server_inbound(frame, from, now),
+                        Role::Client => shared.client_inbound(frame, from, now, &mut pending),
+                    };
+                    io.deliver(out)?;
+                }
             }
         }
         if tun_events.contains(PollFlags::POLLIN) {
@@ -846,5 +977,117 @@ mod tests {
         upstream.join().unwrap();
         assert_eq!(client.error().as_deref(), Some("seal failed: closed"));
         assert_eq!(client_session.seal(DATA, b"after close"), Err(Error::Closed));
+    }
+
+    fn frames(spec: &[(usize, u16)]) -> Vec<(Vec<u8>, SocketAddrV4)> {
+        spec.iter().enumerate().map(|(i, &(len, port))| (vec![u8::try_from(i % 251).unwrap(); len], addr(port))).collect()
+    }
+
+    #[test]
+    fn gso_runs_group_by_destination_and_length_within_the_caps() {
+        let none = HashMap::new();
+        let f = frames(&[(1400, 1), (1400, 1), (1400, 1), (600, 1), (1400, 1), (1400, 2), (1400, 2)]);
+        assert_eq!(gso_run_end(&f, 0, &none), 4, "a shorter frame ends a run, and is its last segment");
+        assert_eq!(gso_run_end(&f, 4, &none), 5, "a different destination starts a new run");
+        assert_eq!(gso_run_end(&f, 5, &none), 7);
+        let longer = frames(&[(600, 1), (1400, 1)]);
+        assert_eq!(gso_run_end(&longer, 0, &none), 1, "a longer frame never joins");
+        let many = frames(&[(100, 1); 70]);
+        assert_eq!(gso_run_end(&many, 0, &none), GSO_MAX_SEGMENTS);
+        let big = frames(&[(1400, 1); 60]);
+        assert_eq!(gso_run_end(&big, 0, &none), GSO_MAX_BYTES / 1400, "the byte cap holds before 64 segments");
+        let limited = HashMap::from([(addr(1), 1399)]);
+        assert_eq!(gso_run_end(&big, 0, &limited), 1, "above the learned path limit, plain sends only");
+    }
+
+    fn sending_loop<'a>(shared: &'a Shared, worker: &'a Worker) -> Loop<'a> {
+        Loop { shared, worker, tx_headers: MultiHeaders::preallocate(BATCH, None), outgoing: Vec::new(), gso: offloads(&worker.udp),
+               gso_limits: HashMap::new() }
+    }
+
+    fn receive_all(socket: &UdpSocket, count: usize) -> Vec<Vec<u8>> {
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buffer = vec![0u8; MAX_DATAGRAM];
+        (0..count).map(|_| { let len = socket.recv(&mut buffer).unwrap(); buffer[..len].to_vec() }).collect()
+    }
+
+    #[test]
+    fn flush_keeps_seal_order_and_falls_back_on_emsgsize() {
+        let (sink, sender) = (UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap());
+        let port = v4(&sink).port();
+        let shared = Shared::new(Role::Server, 1380, None);
+        let (tun, _wire) = UnixDatagram::pair().unwrap();
+        let worker = worker(&sender, tun, None);
+        let mut io = sending_loop(&shared, &worker);
+        assert!(io.gso, "this kernel supports UDP GSO");
+
+        // Runs and lone frames interleaved: the receiver (no GRO) sees exactly the sealed order.
+        io.outgoing = frames(&[(1400, port), (1400, port), (1400, port), (90, port), (500, port), (500, port), (1400, port)]);
+        let sent: Vec<Vec<u8>> = io.outgoing.iter().map(|(f, _)| f.clone()).collect();
+        io.flush().unwrap();
+        assert_eq!(receive_all(&sink, sent.len()), sent);
+        assert_eq!(shared.counters.gso_sends.load(Relaxed), 2);
+
+        // 47 x 1400 B exceeds a UDP datagram: EMSGSIZE, the limit is learned, the run goes out plainly.
+        let run = frames(&[(1400, port); 47]);
+        assert_eq!(io.send_gso(&run), Ok(false));
+        assert_eq!(io.gso_limits.get(&addr(port)), Some(&1399));
+        io.outgoing = run.clone();
+        io.flush().unwrap();
+        assert_eq!(receive_all(&sink, run.len()), run.into_iter().map(|(f, _)| f).collect::<Vec<_>>());
+        assert_eq!(shared.counters.gso_sends.load(Relaxed), 2, "frames above the learned limit skip GSO");
+    }
+
+    #[test]
+    fn gro_coalesced_frames_are_authenticated_one_by_one() {
+        let (client_session, server_session) = sessions(0);
+        let (server_udp, peer) = (UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap());
+        let (server_tun, server_wire) = UnixDatagram::pair().unwrap();
+        let server = Arc::new(Shared::new(Role::Server, 1380, None));
+        server.add(server_session, &SID, LEASE);
+        peer.send_to(&client_session.seal(BIND, b"bind").unwrap(), v4(&server_udp)).unwrap();
+        let handle = spawn(server.clone(), worker(&server_udp, server_tun, None)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.last_seen(&SID).is_none() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let packets: Vec<Vec<u8>> = (0..3u8).map(|i| ipv4(LEASE, [1, 1, 1, 1], &[i; 200])).collect();
+        let mut sealed: Vec<Vec<u8>> = packets.iter().map(|p| client_session.seal(DATA, p).unwrap()).collect();
+        *sealed[1].last_mut().unwrap() ^= 1;
+        let segment = u16::try_from(sealed[0].len()).unwrap();
+        let iov: Vec<IoSlice> = sealed.iter().map(|f| IoSlice::new(f)).collect();
+        sendmsg(peer.as_raw_fd(), &iov, &[ControlMessage::UdpGsoSegments(&segment)], MsgFlags::empty(),
+                Some(&SockaddrIn::from(v4(&server_udp)))).unwrap();
+        assert_eq!(recv(&server_wire), packets[0]);
+        assert_eq!(recv(&server_wire), packets[2]);
+        server.request_stop();
+        handle.join().unwrap();
+        assert_eq!(server.counters.gro_receives.load(Relaxed), 1, "the three frames arrived as one GRO datagram");
+        assert_eq!(server.counters.rx_packets.load(Relaxed), 2);
+        assert!(server.error().is_none());
+    }
+
+    /// Fragmentation parity at a 1280-byte path MTU (needs a namespace whose `lo` has mtu 1280):
+    ///   cargo test -p pqvpn_core --no-run && unshare -rnm sh -c 'mount -t sysfs sysfs /sys &&
+    ///     ip link set lo mtu 1280 up && target/debug/deps/pqvpn_core-* --ignored mtu_1280'
+    /// Frames above MTU - 28 still arrive (as IP fragments, sent plainly); smaller ones use GSO.
+    #[test]
+    #[ignore = "needs a network namespace with lo at mtu 1280"]
+    fn mtu_1280_large_frames_still_arrive_and_small_ones_use_gso() {
+        assert_eq!(std::fs::read_to_string("/sys/class/net/lo/mtu").unwrap().trim(), "1280");
+        let (sink, sender) = (UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap());
+        let port = v4(&sink).port();
+        let shared = Shared::new(Role::Client, 1380, None);
+        let (tun, _wire) = UnixDatagram::pair().unwrap();
+        let worker = worker(&sender, tun, None);
+        let mut io = sending_loop(&shared, &worker);
+        for size in [1442, 1252, 1253, 1042] {
+            io.outgoing = frames(&[(size, port); 8]);
+            io.flush().unwrap();
+            assert_eq!(receive_all(&sink, 8).iter().map(Vec::len).collect::<Vec<_>>(), vec![size; 8], "size {size}");
+        }
+        assert_eq!(shared.counters.gso_sends.load(Relaxed), 2, "1252 and 1042 via GSO; 1442 and 1253 fragmented plainly");
+        assert_eq!(io.gso_limits.get(&addr(port)), Some(&1252));
     }
 }
