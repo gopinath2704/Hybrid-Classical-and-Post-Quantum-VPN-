@@ -309,3 +309,30 @@ def test_rust_mode_fails_loudly_without_pqvpn_core(identities, monkeypatch):
         exchange(identities, data_plane="rust")
     with pytest.raises(ValueError, match="requires the pqvpn_core module"):
         validate_server(ServerConfig(data_plane="rust"))
+
+
+def test_data_plane_owns_both_descriptors_or_neither():
+    import os
+    import socket
+    from vpn.network import TUNInterface, TUNMode
+    from vpn.runtime import rust_data_plane
+    pqvpn_core = pytest.importorskip("pqvpn_core")
+    udp, stream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM), socket.socketpair()[0]
+    udp_fd, stream_fd = os.dup(udp.fileno()), os.dup(stream.fileno())
+    with pytest.raises(OSError, match="EmulatedTun"):
+        pqvpn_core.DataPlane("server", udp_fd, stream_fd, 1380, emulated_tun=True)
+    os.close(udp_fd)  # rejected: both are still ours
+    os.close(stream_fd)
+    with TUNInterface(mode=TUNMode.SOCKET_PIPE) as tun:
+        before = set(os.listdir("/proc/self/fd"))
+        with pytest.raises(ValueError, match="role"):
+            rust_data_plane("relay", udp, tun, 1380)
+        with pytest.raises(ValueError, match="peer and ping"):
+            rust_data_plane("client", udp, tun, 1380)
+        assert set(os.listdir("/proc/self/fd")) == before  # rust_data_plane closed its dups
+        dp = rust_data_plane("server", udp, tun, 1380)
+        dp.start()
+        dp.stop()
+        assert set(os.listdir("/proc/self/fd")) == before  # the worker closed the ones it owned
+    udp.close()
+    stream.close()

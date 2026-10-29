@@ -165,7 +165,7 @@ def read_server_cpu(pid: int) -> float | None:
         return None
 
 
-def setup_topology(run_dir: str, cookie_mode: str) -> dict:
+def setup_topology(run_dir: str, cookie_mode: str, data_plane: str = "python") -> dict:
     """Create namespaces, veth pairs, identities, configs.  Returns info dict."""
     tag = os.getpid()
     srv_ns = f"m7srv-{tag}"
@@ -259,6 +259,10 @@ def setup_topology(run_dir: str, cookie_mode: str) -> dict:
             dns_servers = []
             tun_name = "pqbench0"
         """))
+    if data_plane == "rust":
+        for path in (f"{srv_dir}/server.toml", f"{cli_dir}/client.toml"):
+            with open(path, "a") as f:
+                f.write('data_plane = "rust"\n')
 
     return {
         "srv_ns": srv_ns, "cli_ns": cli_ns, "fld_ns": fld_ns,
@@ -352,6 +356,8 @@ def main():
                         help="Legitimate connects per trial")
     parser.add_argument("--out", default="",
                         help="CSV output path")
+    parser.add_argument("--data-plane", default="python", choices=["python", "rust"],
+                        help="per-packet loop on both ends; rust needs pqvpn_core (sudo .venv/bin/python)")
     args = parser.parse_args()
 
     rates = [int(r) for r in args.rates.split(",")]
@@ -374,7 +380,7 @@ def main():
         print(f"\n--- cookie_mode={cookie_mode} ---")
         mode_dir = os.path.join(run_dir, cookie_mode)
         os.makedirs(mode_dir, exist_ok=True)
-        topo = setup_topology(mode_dir, cookie_mode)
+        topo = setup_topology(mode_dir, cookie_mode, args.data_plane)
         server_proc = start_server(topo, mode_dir)
 
         try:

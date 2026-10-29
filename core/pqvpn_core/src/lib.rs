@@ -1,15 +1,20 @@
 #![forbid(unsafe_code)]
 //! PQ-VPN Rust core. Keys go in; only ciphertext comes back out.
 
+pub mod dataplane;
 pub mod packet;
 pub mod replay;
 pub mod session;
 
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 use zeroize::Zeroizing;
 
 pub use session::{HEADER_LEN, KEY_LEN};
@@ -62,8 +67,9 @@ fn secret<const N: usize>(py: Python<'_>, buffer: &PyBuffer<u8>) -> PyResult<Zer
 }
 
 /// A session's data channel. Keys go in at construction and on rekey; there are no getters.
+/// A `DataPlane` shares this same object, so there is only ever one sealer per data key.
 #[pyclass(frozen, name = "DataSession")]
-struct PyDataSession(session::Session);
+struct PyDataSession(Arc<session::Session>);
 
 #[pymethods]
 impl PyDataSession {
@@ -74,7 +80,7 @@ impl PyDataSession {
         let (sk, sn) = (secret::<32>(py, &send_key)?, secret::<12>(py, &send_nonce_base)?);
         let (rk, rn) = (secret::<32>(py, &recv_key)?, secret::<12>(py, &recv_nonce_base)?);
         session::Session::new(role(role_name)?, session_id, protocol_version, epoch, &sk[..], &sn[..], &rk[..], &rn[..])
-            .map(Self)
+            .map(|s| Self(Arc::new(s)))
             .map_err(kind)
     }
 
@@ -100,6 +106,115 @@ impl PyDataSession {
     }
 }
 
+fn ipv4(address: &str) -> PyResult<Ipv4Addr> {
+    address.parse().map_err(|_| PyValueError::new_err("expected an IPv4 address"))
+}
+
+/// The UDP <-> TUN loop for one role on its own thread. On success Rust owns and closes both
+/// descriptors; if construction raises it owns neither. Call `stop()` before Python-side cleanup.
+#[pyclass(frozen, name = "DataPlane")]
+struct PyDataPlane {
+    shared: Arc<dataplane::Shared>,
+    /// The descriptors until `start()` moves them into the worker.
+    idle: Mutex<Option<dataplane::Worker>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[pymethods]
+impl PyDataPlane {
+    #[new]
+    #[pyo3(signature = (role_name, udp_fd, tun_fd, mtu, emulated_tun=false, peer=None, ping=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(role_name: &str, udp_fd: i32, tun_fd: i32, mtu: usize, emulated_tun: bool, peer: Option<(String, u16)>,
+           ping: Option<(f64, f64, f64)>) -> PyResult<Self> {
+        let role = role(role_name)?;
+        let (server, ping) = match (role, peer, ping) {
+            (session::Role::Client, Some((host, port)), Some((initial, interval, timeout))) => {
+                (Some(SocketAddrV4::new(ipv4(&host)?, port)), Some(dataplane::Ping { initial, interval, timeout }))
+            }
+            (session::Role::Server, None, None) => (None, None),
+            _ => return Err(PyValueError::new_err("a client needs peer and ping; a server takes neither")),
+        };
+        // Every check (both descriptors included) passes before either is owned: all or nothing.
+        let udp = pqvpn_fd::check(udp_fd, pqvpn_fd::Kind::Udp).map_err(PyOSError::new_err)?;
+        let tun = pqvpn_fd::check(tun_fd, if emulated_tun { pqvpn_fd::Kind::EmulatedTun } else { pqvpn_fd::Kind::Tun })
+            .map_err(PyOSError::new_err)?;
+        let (udp, tun) = (pqvpn_fd::own(udp), pqvpn_fd::own(tun));
+        Ok(Self {
+            shared: Arc::new(dataplane::Shared::new(role, mtu, server)),
+            idle: Mutex::new(Some(dataplane::Worker { udp, tun, ping })),
+            worker: Mutex::new(None),
+        })
+    }
+
+    fn add_session(&self, session: &Bound<'_, PyDataSession>, session_id: &[u8], lease: &str) -> PyResult<()> {
+        let id = session_id.try_into().map_err(|_| kind(session::Error::InvalidKey))?;
+        self.shared.add(session.get().0.clone(), id, ipv4(lease)?.octets());
+        Ok(())
+    }
+
+    fn remove_session(&self, session_id: &[u8]) {
+        self.shared.remove(session_id);
+    }
+
+    /// Monotonic seconds of the session's last authenticated activity, or None.
+    fn last_seen(&self, session_id: &[u8]) -> Option<f64> {
+        self.shared.last_seen(session_id)
+    }
+
+    fn start(&self) -> PyResult<()> {
+        let worker = self.idle.lock().map_err(|_| PyRuntimeError::new_err("poisoned"))?.take()
+            .ok_or_else(|| PyRuntimeError::new_err("data plane already started or stopped"))?;
+        let handle = dataplane::spawn(self.shared.clone(), worker).map_err(PyOSError::new_err)?;
+        *self.worker.lock().map_err(|_| PyRuntimeError::new_err("poisoned"))? = Some(handle);
+        Ok(())
+    }
+
+    /// Stops and joins the worker (GIL released) and closes the descriptors. Idempotent.
+    fn stop(&self, py: Python<'_>) {
+        self.shared.request_stop();
+        if let Ok(mut idle) = self.idle.lock() {
+            idle.take();
+        }
+        let handle = self.worker.lock().ok().and_then(|mut w| w.take());
+        if let Some(handle) = handle {
+            // `guarded` already recorded any panic; a join error carries nothing more.
+            let _ = py.detach(|| handle.join());
+        }
+    }
+
+    /// The worker's fatal error or panic, once it has stopped by itself.
+    fn error(&self) -> Option<String> {
+        self.shared.error()
+    }
+
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = &self.shared.counters;
+        let stats = PyDict::new(py);
+        for (name, value) in [("rx_packets", &c.rx_packets), ("rx_bytes", &c.rx_bytes), ("tx_packets", &c.tx_packets),
+                              ("tx_bytes", &c.tx_bytes), ("drops", &c.drops), ("replay_rejects", &c.replay_rejects)] {
+            stats.set_item(name, value.load(Relaxed))?;
+        }
+        stats.set_item("last_rx", self.shared.last_rx())?;
+        Ok(stats)
+    }
+
+    /// Client keepalive results since the last call: (probes sent, probes lost, RTTs in ms).
+    fn drain_probes(&self) -> (u64, u64, Vec<f64>) {
+        let mut probes = self.shared.probes.lock().unwrap_or_else(|p| p.into_inner());
+        let drained = std::mem::take(&mut *probes);
+        (drained.sent, drained.lost, drained.rtts_ms)
+    }
+}
+
+impl Drop for PyDataPlane {
+    /// Never leave a worker (and its descriptors) running after Python drops the object.
+    fn drop(&mut self) {
+        self.shared.request_stop();
+    }
+}
+
 /// Inner-packet check after decryption: server checks the source lease, client its destination.
 #[pyfunction]
 fn inbound_ok(role_name: &str, packet: &[u8], address: [u8; 4], mtu: usize) -> PyResult<bool> {
@@ -113,7 +228,8 @@ fn inbound_ok(role_name: &str, packet: &[u8], address: [u8; 4], mtu: usize) -> P
 fn pqvpn_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encrypt_frame, m)?)?;
     m.add_function(wrap_pyfunction!(inbound_ok, m)?)?;
-    m.add_class::<PyDataSession>()
+    m.add_class::<PyDataSession>()?;
+    m.add_class::<PyDataPlane>()
 }
 
 #[cfg(test)]

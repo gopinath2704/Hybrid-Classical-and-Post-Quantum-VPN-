@@ -1,5 +1,5 @@
 [workspace]
-members = ["pqvpn_core"]
+members = ["pqvpn_core", "pqvpn_fd"]
 resolver = "3"
 
 [profile.release]

@@ -127,6 +127,21 @@ def validate_client_packet(packet: bytes, assigned_ip: str) -> bool:
     return source == assigned_ip
 
 
+def rust_data_plane(role: str, udp: socket.socket, tun: TUNInterface, mtu: int, **client: object) -> object:
+    """pqvpn_core.DataPlane over dups of `udp` and `tun`. Rust owns the dups only once it is built;
+    until then they are ours to close. Python's originals stay open for the existing cleanup."""
+    import pqvpn_core
+    fds: list[int] = []
+    try:
+        fds.append(os.dup(udp.fileno()))
+        fds.append(os.dup(tun.fileno()))
+        return pqvpn_core.DataPlane(role, *fds, mtu, emulated_tun=tun.mode != TUNMode.NATIVE, **client)
+    except BaseException:
+        for fd in fds:
+            os.close(fd)
+        raise
+
+
 def run_ip(*args: str, check: bool = True):
     return subprocess.run(["ip", *args], check=check, capture_output=True, text=True)
 
@@ -258,6 +273,8 @@ class SessionManager:
         self._snap_id: dict[bytes, ServerSession] = {}
         self._snap_ip: dict[str, ServerSession] = {}
         self.lock = threading.RLock()
+        # The Rust data plane (pqvpn_core.DataPlane) when data_plane="rust"; it mirrors this table.
+        self.dp = None
 
     def _publish(self) -> None:
         """Publish immutable snapshots after a mutation (called under lock)."""
@@ -270,12 +287,18 @@ class SessionManager:
             if key in self.by_id or item.vpn_ip in self.by_ip:
                 raise RuntimeError("duplicate session or VPN IP")
             self.by_id[key], self.by_ip[item.vpn_ip] = item, item
+            if self.dp:
+                self.dp.add_session(item.crypto._data, item.crypto.session_id, item.vpn_ip)
             self._publish()
 
     def remove(self, item: ServerSession) -> None:
         with self.lock:
             self.by_id.pop(item.crypto.session_id[:8], None)
             self.by_ip.pop(item.vpn_ip, None)
+            if self.dp:
+                # Keep the record's final data-path activity once Rust forgets the session.
+                item.last_seen = max(item.last_seen, self.dp.last_seen(item.crypto.session_id) or 0.0)
+                self.dp.remove_session(item.crypto.session_id)
             self._publish()
 
     def from_frame(self, data: bytes) -> ServerSession | None:
@@ -348,6 +371,7 @@ class VPNServer:
         records = self.auth._load(required=True, subnet=config.vpn_subnet, server_ip=config.server_vpn_ip)
         self.pool.reserved = {item['assigned_ip']: item['client_id'] for item in records['clients'] if item.get('assigned_ip')}
         self._data_thread = None
+        self._dp = None
         self._client_threads: list[threading.Thread] = []
         self._cookie = CookieProtector() if config.cookie_mode != "off" else None
         self._ticket_key = ResumptionTicketKey() if config.resumption_ticket_lifetime > 0 else None
@@ -363,13 +387,18 @@ class VPNServer:
             self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.udp.bind((self.cfg.listen_host, self.cfg.udp_port))
             self.udp.setblocking(False)
+            if self.cfg.data_plane == "rust":
+                self._dp = rust_data_plane("server", self.udp, self.tun, self.cfg.mtu)
+                self.sessions.dp = self._dp
+                self._dp.start()
             self.tcp = socket.socket()
             self.tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.tcp.bind((self.cfg.listen_host, self.cfg.control_port))
             self.tcp.listen(self.cfg.max_clients)
             self.tcp.settimeout(1)
             listener = self.tcp
-            self._data_thread = threading.Thread(target=self._data_loop, daemon=True, name="pqvpn-data")
+            self._data_thread = threading.Thread(target=self._watch_data_plane if self._dp else self._data_loop,
+                                                 daemon=True, name="pqvpn-data")
             self._data_thread.start()
             self._revocation_thread = threading.Thread(target=self._revocation_loop, daemon=True, name="pqvpn-revoke")
             self._revocation_thread.start()
@@ -464,7 +493,7 @@ class VPNServer:
             while not self.stop_event.is_set():
                 with self.sessions.lock:
                     now = time.monotonic()
-                    reason = ("idle timeout" if now - item.last_seen > self.cfg.idle_timeout else
+                    reason = ("idle timeout" if now - self._last_activity(item) > self.cfg.idle_timeout else
                               "session timeout" if now - item.created > self.cfg.session_timeout else None)
                     if reason:
                         self.sessions.remove(item)
@@ -605,6 +634,19 @@ class VPNServer:
             except Exception:
                 logger.exception("revocation check failed")
 
+    def _last_activity(self, item: ServerSession) -> float:
+        """Control activity is touched here; data-path activity lives in the Rust data plane."""
+        seen = self._dp.last_seen(item.crypto.session_id) if self._dp else None
+        return max(item.last_seen, seen or 0.0)
+
+    def _watch_data_plane(self) -> None:
+        while not self.stop_event.wait(0.2):
+            error = self._dp.error()
+            if error:
+                logger.error("rust data plane failed; stopping server: %s", error)
+                self.stop()
+                return
+
     # ponytail: batch size for draining sockets per wakeup; tune up if
     # profiling shows select() round-trips are still the bottleneck
     _BATCH_SIZE = 64
@@ -664,6 +706,8 @@ class VPNServer:
             return
 
     def _close_listeners(self) -> None:
+        if self._dp:
+            self._dp.stop()
         for name in ("tcp", "udp"):
             obj = getattr(self, name, None)
             if obj:
@@ -709,6 +753,7 @@ class VPNClient:
         self.pending_pings = {}
         self.control = self.session = self.tun = self.network = self.udp = None
         self._thread = None
+        self._dp = None
         self._rekey_lock = threading.Lock()
         self.rekey_state = RekeyState.IDLE
         self.next_rekey = None
@@ -865,9 +910,43 @@ class VPNClient:
 
     def _loop(self) -> None:
         try:
-            self._forward_data()
-        except Exception:
+            if self.session.data_plane == "rust":
+                self._forward_rust()
+            else:
+                self._forward_data()
+        except Exception as exc:
+            logger.error("data transport failed: %s", exc)
             self._fail("data transport failed")
+
+    def _forward_rust(self) -> None:
+        """Supervise the Rust loop: surface its errors, feed quality, enforce the dead-peer timeout."""
+        dp = rust_data_plane("client", self.udp, self.tun, self.tunnel["mtu"], peer=self.server_udp,
+                             ping=(self.PING_INITIAL_DELAY, self.PING_INTERVAL, self.cfg.ping_timeout))
+        dp.add_session(self.session._data, self.session.session_id, self.tunnel["client_vpn_ip"])
+        # Whichever runs last, this finally or _cleanup_owned, stops it; stop() is idempotent.
+        self._dp = dp
+        try:
+            dp.start()
+            while not self.stop_event.wait(0.2):
+                error = dp.error()
+                if error:
+                    raise RuntimeError(f"rust data plane: {error}")
+                sent, lost, rtts = dp.drain_probes()
+                for _ in range(sent):
+                    self.quality.record_probe_sent()
+                for _ in range(lost):
+                    self.quality.record_loss()
+                for rtt in rtts:
+                    self.quality.record_rtt(rtt)
+                last_rx = dp.stats()["last_rx"]
+                if last_rx:
+                    self.last_authenticated_udp_rx = max(self.last_authenticated_udp_rx or 0.0, last_rx)
+                if (self.state == "CONNECTED" and self.last_authenticated_udp_rx is not None
+                        and time.monotonic() - self.last_authenticated_udp_rx > self.cfg.dead_peer_timeout):
+                    self._fail("authenticated UDP dead-peer timeout")
+                    return
+        finally:
+            dp.stop()
 
     def _forward_data(self) -> None:
         next_ping = time.monotonic() + self.PING_INITIAL_DELAY
@@ -1095,6 +1174,10 @@ class VPNClient:
             self._cleanup_lock.release()
 
     def _cleanup_owned(self, send_close: bool) -> None:
+        # Stop the Rust loop before anything it uses (session, sockets, TUN) is torn down.
+        dp, self._dp = self._dp, None
+        if dp:
+            dp.stop()
         if self.state != "FAILED":
             self.state = "DISCONNECTED"
         try: self._responses.put_nowait(None)

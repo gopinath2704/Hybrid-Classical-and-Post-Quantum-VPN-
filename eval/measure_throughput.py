@@ -18,6 +18,8 @@ Outputs unified CSV: system,profile,metric,run,value,unit
 Usage:
     sudo env PATH="$PATH" python eval/measure_throughput.py \
         --profiles lan,metro --duration 20 --out results/m5/raw/throughput.csv
+
+    --data-plane rust needs pqvpn_core, so run the venv interpreter: sudo .venv/bin/python ...
 """
 from __future__ import annotations
 
@@ -50,7 +52,8 @@ PROFILES = {
 PING_COUNT = 50
 
 
-def setup_topology(run_dir: str, profile: str, protocol: str = "v2-ed25519") -> dict:
+def setup_topology(run_dir: str, profile: str, protocol: str = "v2-ed25519",
+                   data_plane: str = "python") -> dict:
     """Create server + client namespaces with veth + netem."""
     p = PROFILES[profile]
     tag = os.getpid()
@@ -162,6 +165,10 @@ def setup_topology(run_dir: str, profile: str, protocol: str = "v2-ed25519") -> 
         with open(f"{cli_dir}/client.toml", "a") as f:
             f.write("protocol_version = 3\n")
             f.write('client_identity_public_key = "client.pub"\n')
+    if data_plane == "rust":
+        for path in (f"{srv_dir}/server.toml", f"{cli_dir}/client.toml"):
+            with open(path, "a") as f:
+                f.write('data_plane = "rust"\n')
 
     subprocess.run(["ip", "netns", "exec", srv_ns,
                      "sysctl", "-q", "-w", "net.ipv4.ip_forward=1"],
@@ -316,16 +323,17 @@ def cleanup(topo: dict, procs: list[subprocess.Popen]):
 
 
 def run_profile(profile: str, run_dir: str, duration: int,
-                run_idx: int, protocol: str = "v2-ed25519") -> tuple[list, int]:
+                run_idx: int, protocol: str = "v2-ed25519",
+                data_plane: str = "python") -> tuple[list, int]:
     mode_dir = os.path.join(run_dir, profile)
     os.makedirs(mode_dir, exist_ok=True)
     rows = []
 
-    print(f"\n--- Profile: {profile} ({protocol}) ---")
+    print(f"\n--- Profile: {profile} ({protocol}, {data_plane} data plane) ---")
     p = PROFILES[profile]
     print(f"  netem: rtt={p['rtt_ms']}ms  loss={p['loss_pct']}%  mtu={p['mtu']}")
     print("  Setting up topology...", flush=True)
-    topo = setup_topology(mode_dir, profile, protocol)
+    topo = setup_topology(mode_dir, profile, protocol, data_plane)
     server_proc = start_server(topo, mode_dir)
     client_proc = connect_client(topo)
     procs = [server_proc, client_proc]
@@ -416,6 +424,9 @@ def main():
                         help="handshake suite (default: v2-ed25519). "
                              "Data-plane throughput is the same either way; "
                              "v3-kem exercises the v3 data path end-to-end.")
+    parser.add_argument("--data-plane", default="python", choices=["python", "rust"],
+                        help="per-packet loop on both ends (default: python); "
+                             "rust needs pqvpn_core in the running interpreter")
     args = parser.parse_args()
 
     if subprocess.run(["which", "iperf3"], capture_output=True).returncode != 0:
@@ -436,6 +447,7 @@ def main():
     print("=== M5 Data-Plane Throughput ===")
     print(f"Profiles: {profiles}")
     print(f"Protocol: {args.protocol}")
+    print(f"Data plane: {args.data_plane}")
     print(f"iperf3 duration: {args.duration}s")
 
     csv_path = args.out or os.path.join(run_dir, "throughput.csv")
@@ -447,7 +459,7 @@ def main():
     run_idx = 0
     for profile in profiles:
         rows, run_idx = run_profile(profile, run_dir, args.duration, run_idx,
-                                    args.protocol)
+                                    args.protocol, args.data_plane)
         for row in rows:
             writer.writerow(row)
         csv_f.flush()

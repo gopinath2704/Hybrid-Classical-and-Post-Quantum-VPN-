@@ -9,31 +9,41 @@
 # `app.client --service` (pqvpn-net-warm, full handshake, no ticket).
 #
 # Usage:
-#   sudo eval/run_pqvpn_net.sh <profile> [--iterations N] [--out FILE]
+#   sudo eval/run_pqvpn_net.sh <profile> [--iterations N] [--out FILE] [--data-plane python|rust]
+#
+# --data-plane rust runs both ends on the Rust loop; it needs pqvpn_core, so every Python step
+# then uses $ROOT_DIR/.venv/bin/python (override with PYTHON=...), never sudo's system python.
 #
 # Profiles: lan, metro, continent, lossy-1, lossy-5, mtu-1280
 set -euo pipefail
 
-PROFILE=${1:?usage: run_pqvpn_net.sh <profile> [--iterations N] [--out FILE]}
+PROFILE=${1:?usage: run_pqvpn_net.sh <profile> [--iterations N] [--out FILE] [--data-plane python|rust]}
 shift
 ITERATIONS=30
 OUT=""
+DATA_PLANE=python
 while [[ $# -gt 0 ]]; do
   case $1 in
     --iterations) ITERATIONS=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
+    --data-plane) DATA_PLANE=$2; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
 done
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+case $DATA_PLANE in
+  python) PY=${PYTHON:-python} ;;
+  rust) PY=${PYTHON:-$ROOT_DIR/.venv/bin/python} ;;
+  *) echo "unknown data plane: $DATA_PLANE" >&2; exit 1 ;;
+esac
 RUN_DIR=$(mktemp -d /tmp/pqvpn-net.XXXXXX)
 SERVER_NS=pqnet-srv-$$
 CLIENT_NS=pqnet-cli-$$
 PIDS=()
 
-# --- Verify native PQC ---
-python3 -c "
+# --- Verify native PQC (and the Rust core when asked for) ---
+"$PY" -c "
 import sys; sys.path.insert(0, '$ROOT_DIR')
 from crypto.hybrid_crypto import get_crypto_status
 s = get_crypto_status()
@@ -47,6 +57,9 @@ try:
 except Exception:
     v = 'unknown'
 print(f'liboqs_version={v}')
+if '$DATA_PLANE' == 'rust':
+    import pqvpn_core
+    print('data_plane=rust')
 "
 
 # --- Profile parameters ---
@@ -111,11 +124,11 @@ ip netns exec "$CLIENT_NS" ping -c 1 -W 3 192.0.2.1 >/dev/null
 # --- Generate identities (no ALLOW_MOCK_PQC) ---
 mkdir -p "$RUN_DIR/server" "$RUN_DIR/client"
 cd "$ROOT_DIR"
-python -m vpn.cli identity generate \
+"$PY" -m vpn.cli identity generate \
   --private "$RUN_DIR/server/server.key" --public "$RUN_DIR/server/server.pub"
-python -m vpn.cli client-key generate \
+"$PY" -m vpn.cli client-key generate \
   --private "$RUN_DIR/client/client.key" --public "$RUN_DIR/client/client.pub"
-python -m vpn.cli client authorize \
+"$PY" -m vpn.cli client authorize \
   "$(base64 -w0 "$RUN_DIR/client/client.pub")" \
   --database "$RUN_DIR/server/authorized.json" --client-id bench-client
 FINGERPRINT=$(sha256sum "$RUN_DIR/server/server.pub" | awk '{print $1}')
@@ -150,11 +163,15 @@ dns_mode = "none"
 dns_servers = []
 tun_name = "pqbench0"
 EOF
+if [[ $DATA_PLANE == rust ]]; then
+  echo 'data_plane = "rust"' >>"$RUN_DIR/server/server.toml"
+  echo 'data_plane = "rust"' >>"$RUN_DIR/client/client.toml"
+fi
 
 # --- Start server ---
 ip netns exec "$SERVER_NS" sysctl -q -w net.ipv4.ip_forward=1
 ip netns exec "$SERVER_NS" \
-  python -m vpn.cli server --config "$RUN_DIR/server/server.toml" \
+  "$PY" -m vpn.cli server --config "$RUN_DIR/server/server.toml" \
   >"$RUN_DIR/server.log" 2>&1 &
 PIDS+=("$!")
 sleep 2
@@ -198,7 +215,7 @@ for i in $(seq 0 $(( ITERATIONS - 1 ))); do
   rm -f "$TICKET"
 
   ip netns exec "$CLIENT_NS" \
-    python -m vpn.cli client connect --config "$RUN_DIR/client/client.toml" \
+    "$PY" -m vpn.cli client connect --config "$RUN_DIR/client/client.toml" \
     >"$RUN_DIR/client.log" 2>&1 &
   CLIENT_PID=$!
 
@@ -218,14 +235,14 @@ done
 ip -n "$CLIENT_NS" link del pqbench0 2>/dev/null || true
 ip netns exec "$CLIENT_NS" unshare -m --propagation private sh -c \
   'mount -t tmpfs -o mode=0755 tmpfs /run && mkdir /run/pqvpn && echo $$ > "$1" &&
-   exec python -m app.client --service --config "$2"' \
-  sh "$RUN_DIR/service.pid" "$RUN_DIR/client/client.toml" >"$RUN_DIR/service.log" 2>&1 &
+   exec "$3" -m app.client --service --config "$2"' \
+  sh "$RUN_DIR/service.pid" "$RUN_DIR/client/client.toml" "$PY" >"$RUN_DIR/service.log" 2>&1 &
 PIDS+=("$!")
 
 # ipc COMMAND: prints wall-clock ns just before sending (so START excludes Python startup,
 # as for an already-open GUI); exits non-zero on an error reply.
 ipc() {
-  nsenter -t "$(cat "$RUN_DIR/service.pid")" -m python -c '
+  nsenter -t "$(cat "$RUN_DIR/service.pid")" -m "$PY" -c '
 import sys, socket, time; sys.path.insert(0, sys.argv[1])
 from app.client import _socket_path, ipc_send, ipc_recv
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(str(_socket_path()))

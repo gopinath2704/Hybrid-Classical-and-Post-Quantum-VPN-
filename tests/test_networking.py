@@ -160,7 +160,10 @@ def test_actual_client_cleanup_removes_guard(connected, kernel, monkeypatch, end
         assert client.network.ipv6.table in kernel.tables
         if ending=='disconnect':client.disconnect()
         elif ending=='dead-peer':
-            filtered=PongFilter(server.udp);filtered.drop=True;server.udp=filtered
+            if server._dp:  # the Rust loop sends on its own socket; stop it answering instead
+                server._dp.remove_session(next(iter(server.sessions.by_id.values())).crypto.session_id)
+            else:
+                filtered=PongFilter(server.udp);filtered.drop=True;server.udp=filtered
         elif ending=='control-loss':
             next(iter(server.sessions.by_id.values())).control.shutdown(socket.SHUT_RDWR)
         else:
