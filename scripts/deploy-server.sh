@@ -5,6 +5,7 @@
 # Usage (root, from a clean checkout):
 #   sudo bash scripts/deploy-server.sh                              # install only
 #   sudo bash scripts/deploy-server.sh /tmp/alice_public.key alice  # + authorize, doctor, start
+#   sudo env PQVPN_DATA_PLANE=rust bash scripts/deploy-server.sh    # build core/, set data_plane (or =python)
 #
 # Re-running is safe: an existing identity, server.toml and client database are kept;
 # a legacy /etc/pqvpn/authorized_clients.json is migrated to /var/lib/pqvpn/authorized/.
@@ -14,6 +15,8 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLIENT_KEY=${1:-}; CLIENT_ID=${2:-}
 [[ -z $CLIENT_KEY || -n $CLIENT_ID ]] || { echo 'usage: deploy-server.sh [client_public.key client_id]' >&2; exit 1; }
 PY=/opt/pqvpn/.venv/bin/python
+DATA_PLANE=${PQVPN_DATA_PLANE:-}
+[[ $DATA_PLANE =~ ^(|python|rust)$ ]] || { echo 'PQVPN_DATA_PLANE must be python or rust' >&2; exit 1; }
 
 echo '== OS packages'
 export DEBIAN_FRONTEND=noninteractive
@@ -32,9 +35,17 @@ id pqvpn >/dev/null 2>&1 || useradd --system --home /opt/pqvpn --shell /usr/sbin
 install -d -o root -g root -m 0755 /opt/pqvpn
 install -d -o root -g pqvpn -m 0750 /etc/pqvpn
 rsync -a --delete --chown=root:root --exclude=.git --exclude=.venv --exclude=venv --exclude=env \
-  --exclude=ENV --exclude=__pycache__ --exclude=.pytest_cache "$SRC/" /opt/pqvpn/
+  --exclude=ENV --exclude=__pycache__ --exclude=.pytest_cache --exclude=target "$SRC/" /opt/pqvpn/
 python3 -m venv /opt/pqvpn/.venv
 "$PY" -m pip install -q -c /opt/pqvpn/constraints-tested.txt /opt/pqvpn
+# Rebuild the Rust core on every deploy of a Rust server so it never lags the Python code;
+# PQVPN_DATA_PLANE=python skips it so a rollback never depends on cargo.
+if [[ $DATA_PLANE == rust ]] || { [[ -z $DATA_PLANE ]] && grep -Eq '^[[:space:]]*data_plane[[:space:]]*=[[:space:]]*"rust"' /etc/pqvpn/server.toml 2>/dev/null; }; then
+  echo '== Rust core (pqvpn_core)'
+  export PATH=/root/.cargo/bin:$PATH RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo
+  command -v cargo >/dev/null || { echo 'cargo missing: install rustup for root (docs/deployment.md, Rust data plane)' >&2; exit 1; }
+  "$PY" -m pip install --no-deps --force-reinstall --config-settings=build-args=--locked /opt/pqvpn/core/pqvpn_core
+fi
 chown -R root:root /opt/pqvpn
 chmod -R u=rwX,go=rX /opt/pqvpn
 cd /opt/pqvpn
@@ -93,6 +104,18 @@ retarget() {
   RESTART=1; echo "repointed $1 (backup $1.bak.$STAMP)"
 }
 retarget /etc/pqvpn/server.toml
+if [[ -n $DATA_PLANE ]] && ! grep -Eq "^data_plane = \"$DATA_PLANE\"\$" /etc/pqvpn/server.toml; then
+  cp -p /etc/pqvpn/server.toml "/etc/pqvpn/server.toml.bak.$STAMP"
+  if grep -Eq '^[[:space:]]*data_plane[[:space:]]*=' /etc/pqvpn/server.toml; then
+    sed -E -i "s/^[[:space:]]*data_plane[[:space:]]*=.*/data_plane = \"$DATA_PLANE\"/" /etc/pqvpn/server.toml
+  else
+    sed -i "/^\[server\]/a data_plane = \"$DATA_PLANE\"" /etc/pqvpn/server.toml
+  fi
+  RESTART=1; echo "data_plane = \"$DATA_PLANE\" (backup /etc/pqvpn/server.toml.bak.$STAMP)"
+fi
+[[ -z $DATA_PLANE ]] || "$PY" -c 'import sys; from vpn.config import load_server_config as load
+sys.exit(f"data_plane is not {sys.argv[2]} in {sys.argv[1]}" if load(sys.argv[1]).data_plane != sys.argv[2] else 0)' \
+  /etc/pqvpn/server.toml "$DATA_PLANE"
 
 echo '== account API setup'
 id pqvpn-account >/dev/null 2>&1 || useradd --system --home /nonexistent --shell /usr/sbin/nologin pqvpn-account

@@ -308,6 +308,34 @@ Docker routes), command availability, WAN/default route, ports, forwarding state
 and service-user readability. Port availability is a snapshot, not a reservation;
 provider policy and hidden networks cannot be inferred from local checks.
 
+### Rust data plane
+
+`scripts/deploy-server.sh` leaves `data_plane` alone unless `PQVPN_DATA_PLANE` is set.
+With `PQVPN_DATA_PLANE=rust` it builds `core/pqvpn_core` into `/opt/pqvpn/.venv`
+(pip runs maturin with `--locked`), sets `data_plane = "rust"` in
+`/etc/pqvpn/server.toml` (backup `server.toml.bak.<stamp>`, every other line kept),
+validates the config (which imports `pqvpn_core`) and restarts `pqvpn-server`, which
+drops live tunnels. Later deploys without the variable rebuild the core while
+`server.toml` says rust, so it never lags the Python code. Deploy only from a
+committed tree: `--locked` fails on a stale `core/Cargo.lock`.
+
+The build needs a root Rust toolchain at least as new as the 1.85 MSRV;
+`core/rust-toolchain.toml` pins the version used. The script installs cmake and a C
+compiler, never rustup. Install it once:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+sudo env RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal --default-toolchain "$(sed -n 's/^channel = "\(.*\)"/\1/p' core/rust-toolchain.toml)"
+```
+
+The release profile uses thin LTO and one codegen unit. On a 2 GB host, add swap
+before the first build if `free -m` shows under about 1.5 GB available and no swap.
+Check the switch with
+`ps -L -o comm= -p "$(systemctl show -p MainPID --value pqvpn-server)" | grep -x pqvpn-dp`
+(the Rust loop's thread); `journalctl -u pqvpn-server` must not show `rust data plane failed`.
+Roll back with `sudo env PQVPN_DATA_PLANE=python bash scripts/deploy-server.sh`, or by hand:
+`sudo sed -i 's/^data_plane = "rust"/data_plane = "python"/' /etc/pqvpn/server.toml && sudo systemctl restart pqvpn-server`.
+
 ## Native and root namespace gate
 
 Install dev dependencies in a fresh validation environment with the same Python:
