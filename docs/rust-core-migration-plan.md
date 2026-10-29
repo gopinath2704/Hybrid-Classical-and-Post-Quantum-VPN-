@@ -218,6 +218,33 @@ A later multi-worker phase would add one knob, `data_plane_workers` (an int or `
 - **(c) Gate run** on sentinel-74's harness: M5, the fixed-rate UDP sweep, and M7 at 10k/s in rust mode.
 - **Deferred:** multi-queue N workers (needs home-worker sealing and a multi-client gate first) and TUN offload (its own phase).
 
+### Phase 3 results
+
+Gate run: commit 2e0a5e5 (clean), governor pinned to performance, median of 5 runs per cell (`sudo env PHASE=3 scripts/bench_dataplane.sh`, raw data and `environment.txt` in `eval/results-summary/phase3-2026-10-29/`). Shipped: slice (a) UDP GSO/GRO with a 4 MB `SO_RCVBUF`, and the control accept backlog fixed at 64 (`CONTROL_LISTEN_BACKLOG`). Slice (b) was skipped: a profile put it at about 1.1 to 1.25x, below its 1.3x bar. Raising TUN `txqueuelen` to 4000 removed the TUN drops but did not add throughput, and it adds about 7 ms of standing queue, so it was not shipped either.
+
+| Suite | Data plane | TCP (Mbps) | Tunnel RTT overhead (ms) | UDP, highest rate with <1% loss |
+| --- | --- | --- | --- | --- |
+| v2-ed25519 | Python | 684 | 0.452 | not measured |
+| v2-ed25519 | Rust, Phase 2 (baseline run) | 4,057 | 0.213 | 4,000 Mbps (the top of that sweep) |
+| v2-ed25519 | Rust, Phase 3 | 6,670 | 0.235 | 8,000 Mbps (0.10% loss) |
+| v3-kem | Python | 686 | 0.455 | not measured |
+| v3-kem | Rust, Phase 2 (baseline run) | 4,058 | 0.224 | 4,000 Mbps (the top of that sweep) |
+| v3-kem | Rust, Phase 3 | 6,834 | 0.217 | 8,000 Mbps (0.67% loss) |
+
+The Phase 2 baseline row comes from a run the same day on 4566b93 plus the uncommitted harness. It was not committed because its tree was dirty. 8,000 Mbps is the highest rate the sweep offers, so the UDP ceiling may be higher still.
+
+M7 under a real 10k/s ClientHello flood (open-loop sender, offered 9,997 to 9,998 per second): 5 of 5 legitimate connects succeed in both cookie modes. With `cookie_mode = "always"` every connect takes 156 ms. With `cookie_mode = "off"` the connects take 156, 156, 1,186, 1,186 and 2,266 ms, so the median is 1,186 ms: the flood overflows the accept queue and drops the legitimate SYN, which costs one or two 1-second SYN retransmits. Cookies let the server shed flood connections faster (8,070 against 5,650 delivered per second), so the queue drains. `cookie_mode` defaults to `"off"`, which makes the default configuration the weaker one under a flood. An accept-backlog sweep at 10k/s found 64 better than 512 or 4096, because a deeper queue makes legitimate connects wait behind the flood.
+
+M1 on LAN, rust data plane, 30 connects each: cold 126 ms, warm 15 ms.
+
+Phase 3 gates:
+
+- [x] M5 LAN TCP 3 Gbps or more: 6,670 and 6,834 Mbps.
+- [x] A fixed-rate UDP goodput sweep replaces the `-b 0` flood numbers: under 1% loss at 8,000 Mbps on both suites.
+- [x] M7 100% of legitimate connects under a 10k/s flood, in both cookie modes. The median latency is 156 ms with cookies always on and 1,186 ms with cookies off.
+
+All numbers are from veth on one host. EC2's ENA has no UDP segmentation offload, so the gain from GSO/GRO will be smaller there.
+
 ## Security invariants and tests
 
 The rewrite must not weaken a single property in the security gap analysis. These are the invariants each Rust PR is checked against:
