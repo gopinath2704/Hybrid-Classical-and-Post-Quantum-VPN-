@@ -18,7 +18,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PHASE=${PHASE:-2}
 [[ $PHASE == 2 || $PHASE == 3 ]] || { echo "PHASE must be 2 or 3" >&2; exit 1; }
-UDP_RATES=${UDP_RATES:-100M,500M,1G,2G,3G,4G}
+UDP_RATES=${UDP_RATES:-100M,500M,1G,2G,3G,4G,5G,6G,8G}
 OUT=${1:-$ROOT/eval/results-summary/phase$PHASE-$(date +%F)}
 PY=$ROOT/.venv/bin/python
 RUNS=5
