@@ -34,6 +34,8 @@ from vpn.network import IPv6Guard, effective_policy, preflight as ipv6_preflight
 
 logger = logging.getLogger("pqvpn.runtime")
 MAX_CONTROL_MESSAGE = 16384
+# The Python loop warns per rejected inner packet; the Rust loop's count is logged at most this often.
+INNER_REJECT_LOG_INTERVAL = 10.0
 
 
 def send_message(sock: socket.socket, data: bytes) -> None:
@@ -640,12 +642,17 @@ class VPNServer:
         return max(item.last_seen, seen or 0.0)
 
     def _watch_data_plane(self) -> None:
+        logged, logged_at = 0, float("-inf")
         while not self.stop_event.wait(0.2):
             error = self._dp.error()
             if error:
                 logger.error("rust data plane failed; stopping server: %s", error)
                 self.stop()
                 return
+            rejects = self._dp.stats()["inner_rejects"]
+            if rejects > logged and time.monotonic() - logged_at >= INNER_REJECT_LOG_INTERVAL:
+                logger.warning("rejected %d spoofed/malformed inner packets", rejects - logged)
+                logged, logged_at = rejects, time.monotonic()
 
     # ponytail: batch size for draining sockets per wakeup; tune up if
     # profiling shows select() round-trips are still the bottleneck

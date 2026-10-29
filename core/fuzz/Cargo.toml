@@ -1,0 +1,31 @@
+# Not in the core workspace or any release build. Needs nightly and cargo-fuzz:
+#   cargo +nightly fuzz run dispatch -- -max_total_time=60
+[package]
+name = "pqvpn_core_fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+pqvpn_core = { path = "../pqvpn_core" }
+
+[[bin]]
+name = "dispatch"
+path = "fuzz_targets/dispatch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open"
+path = "fuzz_targets/open.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

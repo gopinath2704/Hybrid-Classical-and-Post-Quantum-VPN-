@@ -66,6 +66,8 @@ pub struct Counters {
     pub tx_bytes: AtomicU64,
     pub drops: AtomicU64,
     pub replay_rejects: AtomicU64,
+    /// Authenticated DATA whose inner packet is spoofed or malformed (Python logs these per packet).
+    pub inner_rejects: AtomicU64,
 }
 
 /// Client keepalive results since the last drain, for Python's `NetworkQualityMonitor`.
@@ -205,7 +207,11 @@ impl Shared {
                 touch();
                 self.reply(&peer, BIND_ACK, b"ok", from)
             }
-            DATA if bound && packet::server_accepts(&payload, peer.lease, self.mtu) => {
+            DATA if bound => {
+                if !packet::server_accepts(&payload, peer.lease, self.mtu) {
+                    self.counters.inner_rejects.fetch_add(1, Relaxed);
+                    return self.drop_packet();
+                }
                 touch();
                 Out::Tun(payload)
             }
@@ -435,6 +441,34 @@ pub fn spawn(shared: Arc<Shared>, worker: Worker) -> std::io::Result<JoinHandle<
     std::thread::Builder::new().name("pqvpn-dp".into()).spawn(move || guarded(&shared, || run(&shared, &worker)))
 }
 
+/// cargo-fuzz entry (core/fuzz): arbitrary bytes through both roles' dispatch. Odd first byte:
+/// seal the rest under the peer's key first, so the post-authentication branches see fuzzed payloads.
+#[cfg(fuzzing)]
+pub fn fuzz_dispatch(data: &[u8]) {
+    let (sid, lease, from) = ([7u8; 32], [10, 8, 0, 2], SocketAddrV4::new([127, 0, 0, 1].into(), 1));
+    let session = |role, epoch_keys: ([u8; 32], [u8; 12], [u8; 32], [u8; 12])| {
+        Arc::new(Session::new(role, &sid, 0x20, 0, &epoch_keys.0, &epoch_keys.1, &epoch_keys.2, &epoch_keys.3).unwrap())
+    };
+    let (c2s, s2c) = (([1; 32], [3; 12], [2; 32], [4; 12]), ([2; 32], [4; 12], [1; 32], [3; 12]));
+    let (client, server) = (session(Role::Client, c2s), session(Role::Server, s2c));
+    let (frame_for_server, frame_for_client) = match data.split_first() {
+        Some((&mode, rest)) if mode & 1 == 1 => {
+            let frame_type = rest.first().copied().unwrap_or(0);
+            let payload = rest.get(1..).unwrap_or_default();
+            (client.seal(frame_type, payload).unwrap_or_default(), server.seal(frame_type, payload).unwrap_or_default())
+        }
+        _ => (data.to_vec(), data.to_vec()),
+    };
+    let server_side = Shared::new(Role::Server, 1380, None);
+    server_side.add(server, &sid, lease);
+    let _ = server_side.server_inbound(&frame_for_server, from, 1.0);
+    let _ = server_side.server_outbound(data);
+    let client_side = Shared::new(Role::Client, 1380, Some(from));
+    client_side.add(client, &sid, lease);
+    let _ = client_side.client_inbound(&frame_for_client, from, 1.0, &mut HashMap::new());
+    let _ = client_side.client_outbound(data);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +556,8 @@ mod tests {
                     assert_eq!(seen, None, "{case}");
                 }
             }
+            let inner = shared.counters.inner_rejects.load(Relaxed);
+            assert_eq!(inner, u64::from(matches!(case, "spoof" | "malformed_data")), "{case}");
         }
     }
 
@@ -558,9 +594,20 @@ mod tests {
         assert_eq!(shared.last_rx(), 0.0, "nothing authenticated and expected yet");
         assert!(matches!(shared.client_inbound(&server.seal(DATA, &mine).unwrap(), addr(1), 11.0, &mut pending), Out::Tun(p) if p == mine));
         assert_eq!(shared.last_rx(), 11.0);
-        assert!(matches!(shared.client_inbound(&server.seal(PONG, &stamp).unwrap(), addr(1), 10.25, &mut pending), Out::Nothing));
+        let pong = server.seal(PONG, &stamp).unwrap();
+        assert!(matches!(shared.client_inbound(&pong, addr(1), 10.25, &mut pending), Out::Nothing));
         assert_eq!(lock(&shared.probes).rtts_ms, vec![250.0]);
         assert!(pending.is_empty());
+
+        // `test_udp_dead_peer_cleanup[replay|invalid]`: a captured PONG replayed, or tampered, must not
+        // extend the dead-peer deadline, even while its stamp is pending again.
+        pending.insert(stamp.as_slice().try_into().unwrap(), 99.0);
+        assert!(matches!(shared.client_inbound(&pong, addr(1), 20.0, &mut pending), Out::Nothing));
+        let mut tampered = server.seal(PONG, &stamp).unwrap();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(matches!(shared.client_inbound(&tampered, addr(1), 21.0, &mut pending), Out::Nothing));
+        assert_eq!((shared.last_rx(), pending.len()), (10.25, 1));
+        assert_eq!(shared.counters.replay_rejects.load(Relaxed), 1);
     }
 
     #[test]
@@ -648,5 +695,147 @@ mod tests {
         let shared = Shared::new(Role::Server, 1380, None);
         guarded(&shared, || panic!("boom"));
         assert_eq!(shared.error().as_deref(), Some("data-plane worker panicked"));
+    }
+
+    fn v4(socket: &UdpSocket) -> SocketAddrV4 {
+        match socket.local_addr().unwrap() { std::net::SocketAddr::V4(a) => a, _ => unreachable!() }
+    }
+
+    /// Sends `make(i)` into `wire` until `stop`; a full socket buffer just retries.
+    fn pump(wire: UnixDatagram, stop: Arc<AtomicBool>, make: fn(u32) -> Vec<u8>) -> JoinHandle<()> {
+        wire.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let mut i = 0u32;
+            while !stop.load(Relaxed) {
+                if wire.send(&make(i)).is_ok() { i = i.wrapping_add(1); } else { std::thread::yield_now(); }
+            }
+        })
+    }
+
+    fn epoch_keys(epoch: u32) -> ([u8; 32], [u8; 12], [u8; 32], [u8; 12]) {
+        let e = u8::try_from(epoch).unwrap();
+        ([e + 10; 32], [e + 20; 12], [e + 30; 32], [e + 40; 12])
+    }
+
+    /// Every frame either side ever seals is recorded; a (direction, epoch, sequence) seen twice
+    /// would be an AES-GCM nonce reused under one key.
+    #[test]
+    fn rekey_under_load_never_repeats_a_nonce() {
+        let (client_session, server_session) = sessions(0);
+        let (server_udp, client_udp, relay) = (UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap(),
+                                               UdpSocket::bind("127.0.0.1:0").unwrap());
+        let (server_addr, client_addr, relay_addr) = (v4(&server_udp), v4(&client_udp), v4(&relay));
+        let seen = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let duplicates = Arc::new(AtomicU64::new(0));
+        let record = {
+            let (seen, duplicates) = (seen.clone(), duplicates.clone());
+            move |frame: &[u8]| if frame.len() >= HEADER_LEN && !lock(&seen).insert((frame[5], frame[14..26].to_vec())) {
+                duplicates.fetch_add(1, Relaxed);
+            }
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        relay.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let relay_thread = {
+            let (stop, record) = (stop.clone(), record.clone());
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 2048];
+                while !stop.load(Relaxed) {
+                    let Ok((len, std::net::SocketAddr::V4(from))) = relay.recv_from(&mut buffer) else { continue };
+                    record(&buffer[..len]);
+                    let _ = relay.send_to(&buffer[..len], if from == client_addr { server_addr } else { client_addr });
+                }
+            })
+        };
+        let ((server_tun, server_wire), (client_tun, client_wire)) = (UnixDatagram::pair().unwrap(), UnixDatagram::pair().unwrap());
+        let server = Arc::new(Shared::new(Role::Server, 1380, None));
+        server.add(server_session.clone(), &SID, LEASE);
+        let client = Arc::new(Shared::new(Role::Client, 1380, Some(relay_addr)));
+        client.add(client_session.clone(), &SID, LEASE);
+        client_udp.send_to(&client_session.seal(BIND, b"bind").unwrap(), relay_addr).unwrap(); // the relay records it
+        let workers = [spawn(server.clone(), worker(&server_udp, server_tun, None)).unwrap(),
+                       spawn(client.clone(), worker(&client_udp, client_tun, None)).unwrap()];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.last_seen(&SID).is_none() {
+            assert!(Instant::now() < deadline, "BIND never arrived");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let pumps = [pump(client_wire.try_clone().unwrap(), stop.clone(), |i| ipv4(LEASE, [1, 1, 1, 1], &i.to_be_bytes())),
+                     pump(server_wire.try_clone().unwrap(), stop.clone(), |i| ipv4([1, 1, 1, 1], LEASE, &i.to_be_bytes()))];
+        let sealer = {
+            let (stop, session, record) = (stop.clone(), client_session.clone(), record.clone());
+            std::thread::spawn(move || while !stop.load(Relaxed) {
+                if let Ok(frame) = session.seal(PING, &[0; 8]) { record(&frame); }
+            })
+        };
+        for epoch in 1..=5 {
+            std::thread::sleep(Duration::from_millis(30));
+            let (c2s, nc, s2c, ns) = epoch_keys(epoch);
+            client_session.rekey(epoch, &c2s, &nc, &s2c, &ns).unwrap();
+            server_session.rekey(epoch, &s2c, &ns, &c2s, &nc).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        stop.store(true, Relaxed);
+        for handle in pumps.into_iter().chain([sealer, relay_thread]) {
+            handle.join().unwrap();
+        }
+        for shared in [&server, &client] {
+            shared.request_stop();
+        }
+        for handle in workers {
+            handle.join().unwrap();
+        }
+        assert!(server.error().is_none() && client.error().is_none());
+        assert_eq!(duplicates.load(Relaxed), 0, "a nonce was reused");
+        let epochs: std::collections::HashSet<_> = lock(&seen).iter().map(|(direction, rest)| (*direction, rest[..4].to_vec())).collect();
+        assert!(epochs.len() >= 8, "both directions should have carried traffic across rekeys: {epochs:?}");
+        assert!(epochs.contains(&(2, 5u32.to_be_bytes().to_vec())), "the server sent at the final epoch");
+        assert!(server.counters.rx_packets.load(Relaxed) > 0 && client.counters.rx_packets.load(Relaxed) > 0);
+    }
+
+    #[test]
+    fn remove_and_close_under_load_stop_the_session_cleanly() {
+        let (client_session, server_session) = sessions(0);
+        let (server_udp, sink) = (UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap());
+        let (server_tun, server_wire) = UnixDatagram::pair().unwrap();
+        let server = Arc::new(Shared::new(Role::Server, 1380, None));
+        server.add(server_session, &SID, LEASE);
+        sink.send_to(&client_session.seal(BIND, b"bind").unwrap(), v4(&server_udp)).unwrap();
+        let handle = spawn(server.clone(), worker(&server_udp, server_tun, None)).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let downstream = pump(server_wire, stop.clone(), |i| ipv4([1, 1, 1, 1], LEASE, &i.to_be_bytes()));
+        sink.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buffer = [0u8; 2048];
+        for _ in 0..100 {
+            sink.recv(&mut buffer).unwrap();
+        }
+        server.remove(&SID);
+        // Frames already in flight when remove returns may still land; none after one worker cycle.
+        std::thread::sleep(Duration::from_millis(50));
+        sink.set_nonblocking(true).unwrap();
+        while sink.recv(&mut buffer).is_ok() {}
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(sink.recv(&mut buffer).is_err(), "a removed session was still forwarded");
+        assert_eq!(server.last_seen(&SID), None);
+        stop.store(true, Relaxed);
+        downstream.join().unwrap();
+        server.request_stop();
+        handle.join().unwrap();
+        assert!(server.error().is_none());
+
+        // Closing (Python's secure_wipe) under a busy client worker ends it with an error, not a panic.
+        let (client_session, _) = sessions(0);
+        let (client_udp, (client_tun, client_wire)) = (UdpSocket::bind("127.0.0.1:0").unwrap(), UnixDatagram::pair().unwrap());
+        let client = Arc::new(Shared::new(Role::Client, 1380, Some(v4(&sink))));
+        client.add(client_session.clone(), &SID, LEASE);
+        let handle = spawn(client.clone(), worker(&client_udp, client_tun, None)).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let upstream = pump(client_wire, stop.clone(), |i| ipv4(LEASE, [1, 1, 1, 1], &i.to_be_bytes()));
+        std::thread::sleep(Duration::from_millis(20));
+        client_session.close();
+        handle.join().unwrap();
+        stop.store(true, Relaxed);
+        upstream.join().unwrap();
+        assert_eq!(client.error().as_deref(), Some("seal failed: closed"));
+        assert_eq!(client_session.seal(DATA, b"after close"), Err(Error::Closed));
     }
 }

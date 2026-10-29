@@ -548,7 +548,8 @@ def test_genuinely_idle_session_expires_and_cleans_up(connected, caplog, monkeyp
 
 @pytest.mark.parametrize('case', ['ping', 'data', 'replay', 'wrong_session', 'unknown_session',
     'wrong_endpoint', 'malformed_ping', 'bad_tag', 'truncated', 'spoof', 'malformed_data', 'old_epoch', 'control_domain', 'bad_bind'])
-@pytest.mark.data_plane
+# The Python loop's own dispatch; the Rust loop's twin is the cargo parity test of the same 14 cases.
+@pytest.mark.parametrize('data_plane', ['python'])
 def test_only_authorized_current_records_touch_activity(data_plane, identities, case):
     cs, ss = exchange(identities, data_plane=data_plane)
     server = object.__new__(runtime.VPNServer)
@@ -630,7 +631,8 @@ class PongFilter:
         return self.sock.sendto(data,address)
 
 
-@pytest.mark.data_plane
+# Patches the Python loop's socket; Rust mode: test_rust_client_dead_peer_* and the cargo PONG tests.
+@pytest.mark.parametrize('data_plane', ['python'])
 @pytest.mark.parametrize('traffic', ['healthy','blackhole','data','replay','invalid'])
 def test_udp_dead_peer_cleanup(connected, traffic):
     server,client=connected
@@ -692,6 +694,65 @@ def test_rust_worker_io_error_ends_the_session_with_a_logged_error(connected, si
             until(lambda: server.stop_event.is_set())
     assert client.state == 'FAILED' and client.session is None
     assert 'tun write failed' in caplog.text
+
+
+@needs_rust
+@pytest.mark.parametrize('data_plane', ['rust'])
+def test_rust_rekey_and_remove_under_load(connected):
+    import select
+    server, client = connected
+    client.PING_INITIAL_DELAY = 3600
+    client.connect()
+    lease = client.tunnel['client_vpn_ip']
+    stop = threading.Event()
+    def flood() -> None:
+        # Bursts, not a GIL-hogging spin, so the control threads that rekey() needs keep running;
+        # the full-speed race is the cargo test rekey_under_load_never_repeats_a_nonce.
+        packet = ipv4(lease, '1.1.1.1', b'load')
+        while not stop.is_set():
+            for _ in range(32):
+                try: client.tun.inject(packet)
+                except BlockingIOError: break
+            time.sleep(.001)
+    def drain(seconds: float) -> int:
+        count, end = 0, time.monotonic() + seconds
+        while time.monotonic() < end:
+            if select.select([server.tun._sock_remote], [], [], .05)[0]:
+                try:
+                    while True: server.tun.drain(); count += 1
+                except BlockingIOError: pass
+        return count
+    pump = threading.Thread(target=flood)
+    pump.start()
+    try:
+        item = next(iter(server.sessions.by_id.values()))
+        for epoch in (1, 2, 3):
+            client.rekey()
+            until(lambda: item.crypto.epoch == epoch)
+            assert drain(.2) > 0, f'no traffic after rekey to epoch {epoch}'
+        server.sessions.remove(item)
+        drain(.1)  # frames in flight when remove returned
+        assert drain(.3) == 0
+    finally:
+        stop.set(); pump.join()
+    assert client.state == 'CONNECTED' and server._dp.error() is None
+
+
+@needs_rust
+@pytest.mark.parametrize('data_plane', ['rust'])
+def test_rust_inner_packet_rejects_are_logged_at_a_bounded_rate(connected, caplog):
+    server, client = connected
+    client.PING_INITIAL_DELAY = 3600
+    client.connect()
+    with caplog.at_level('WARNING', logger='pqvpn.runtime'):
+        client.tun.inject(ipv4('10.8.0.99', '1.1.1.1', b'spoofed source'))
+        until(lambda: 'rejected 1 spoofed/malformed inner packets' in caplog.text)
+        for _ in range(20):
+            client.tun.inject(ipv4('10.8.0.99', '1.1.1.1', b'flood'))
+        until(lambda: server._dp.stats()['inner_rejects'] == 21)
+        time.sleep(.5)
+    assert caplog.text.count('spoofed/malformed') == 1
+    assert client.state == 'CONNECTED'
 
 
 @needs_rust

@@ -193,7 +193,8 @@ impl PyDataPlane {
         let c = &self.shared.counters;
         let stats = PyDict::new(py);
         for (name, value) in [("rx_packets", &c.rx_packets), ("rx_bytes", &c.rx_bytes), ("tx_packets", &c.tx_packets),
-                              ("tx_bytes", &c.tx_bytes), ("drops", &c.drops), ("replay_rejects", &c.replay_rejects)] {
+                              ("tx_bytes", &c.tx_bytes), ("drops", &c.drops), ("replay_rejects", &c.replay_rejects),
+                              ("inner_rejects", &c.inner_rejects)] {
             stats.set_item(name, value.load(Relaxed))?;
         }
         stats.set_item("last_rx", self.shared.last_rx())?;

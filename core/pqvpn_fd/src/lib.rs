@@ -37,6 +37,9 @@ pub fn check(fd: RawFd, kind: Kind) -> io::Result<Checked> {
     if !is(borrowed, kind)? {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("descriptor is not a {kind:?}")));
     }
+    // O_NONBLOCK lives on the open-file description, which the dup shares with Python's original.
+    // Harmless: the originals are already non-blocking (setblocking(False), O_NONBLOCK TUN), Python's
+    // timeout sockets poll before reading anyway, and once the worker starts Python never reads them.
     let flags = OFlag::from_bits_truncate(fcntl(borrowed, FcntlArg::F_GETFL)?);
     fcntl(borrowed, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
     Ok(Checked(fd))
