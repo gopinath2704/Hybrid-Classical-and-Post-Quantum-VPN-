@@ -10,6 +10,10 @@ yanked = "deny"
 version = 2
 allow = ["MIT", "MIT-0", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "ISC", "BSD-3-Clause", "Unicode-3.0"]
 confidence-threshold = 0.9
+# Our own crates are publish = false and the project has no licence chosen yet; check dependencies only.
+private = { ignore = true }
+# libFuzzer (LLVM, NCSA) is linked only into core/fuzz, never into a shipped build.
+exceptions = [{ allow = ["NCSA"], crate = "libfuzzer-sys" }]
 
 [bans]
 multiple-versions = "warn"
