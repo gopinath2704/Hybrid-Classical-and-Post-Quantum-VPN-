@@ -1,0 +1,31 @@
+# cargo deny check   (run from core/; the fuzz crate is outside the workspace)
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+allow = ["MIT", "MIT-0", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "ISC", "BSD-3-Clause", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+# aws-lc-rs is the one crypto provider; a second one would be a second thing to audit.
+deny = [
+    { crate = "ring", reason = "second crypto provider" },
+    { crate = "openssl", reason = "second crypto provider" },
+    { crate = "openssl-sys", reason = "second crypto provider" },
+    { crate = "boring", reason = "second crypto provider" },
+    { crate = "boring-sys", reason = "second crypto provider" },
+    { crate = "aes-gcm", reason = "second AEAD implementation" },
+    { crate = "chacha20poly1305", reason = "second AEAD implementation" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

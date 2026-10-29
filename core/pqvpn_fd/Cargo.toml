@@ -1,0 +1,10 @@
+[package]
+name = "pqvpn_fd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+libc = "=0.2.191"
+nix = { version = "=0.31.3", features = ["fs", "socket"] }

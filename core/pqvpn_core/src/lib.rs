@@ -1,14 +1,21 @@
 #![forbid(unsafe_code)]
 //! PQ-VPN Rust core. Keys go in; only ciphertext comes back out.
 
+pub mod dataplane;
 pub mod packet;
 pub mod replay;
 pub mod session;
 
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
-use pyo3::exceptions::PyValueError;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+use pyo3::buffer::PyBuffer;
+use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
+use zeroize::Zeroizing;
 
 pub use session::{HEADER_LEN, KEY_LEN};
 
@@ -47,28 +54,165 @@ fn role(name: &str) -> PyResult<session::Role> {
     }
 }
 
-/// One epoch of a session's data channel. Keys go in at construction; there are no getters.
+fn kind(error: session::Error) -> PyErr {
+    PyValueError::new_err(error.as_str())
+}
+
+/// Copies a secret straight from a Python buffer (e.g. a TrafficSecrets bytearray) into wiped-on-drop
+/// memory, with no intermediate bytes object that the caller's wipe() could not reach.
+fn secret<const N: usize>(py: Python<'_>, buffer: &PyBuffer<u8>) -> PyResult<Zeroizing<[u8; N]>> {
+    let mut out = Zeroizing::new([0u8; N]);
+    buffer.copy_to_slice(py, &mut out[..]).map_err(|_| kind(session::Error::InvalidKey))?;
+    Ok(out)
+}
+
+/// A session's data channel. Keys go in at construction and on rekey; there are no getters.
+/// A `DataPlane` shares this same object, so there is only ever one sealer per data key.
 #[pyclass(frozen, name = "DataSession")]
-struct PyDataSession(session::DataSession);
+struct PyDataSession(Arc<session::Session>);
 
 #[pymethods]
 impl PyDataSession {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    fn new(role_name: &str, session_id: &[u8], protocol_version: u8, epoch: u32, send_key: &[u8], send_nonce_base: &[u8],
-           recv_key: &[u8], recv_nonce_base: &[u8]) -> PyResult<Self> {
-        session::DataSession::new(role(role_name)?, session_id, protocol_version, epoch, send_key, send_nonce_base, recv_key, recv_nonce_base)
-            .map(Self)
-            .map_err(|e| PyValueError::new_err(e.as_str()))
+    fn new(py: Python<'_>, role_name: &str, session_id: &[u8], protocol_version: u8, epoch: u32, send_key: PyBuffer<u8>,
+           send_nonce_base: PyBuffer<u8>, recv_key: PyBuffer<u8>, recv_nonce_base: PyBuffer<u8>) -> PyResult<Self> {
+        let (sk, sn) = (secret::<32>(py, &send_key)?, secret::<12>(py, &send_nonce_base)?);
+        let (rk, rn) = (secret::<32>(py, &recv_key)?, secret::<12>(py, &recv_nonce_base)?);
+        session::Session::new(role(role_name)?, session_id, protocol_version, epoch, &sk[..], &sn[..], &rk[..], &rn[..])
+            .map(|s| Self(Arc::new(s)))
+            .map_err(kind)
+    }
+
+    fn rekey(&self, py: Python<'_>, epoch: u32, send_key: PyBuffer<u8>, send_nonce_base: PyBuffer<u8>,
+             recv_key: PyBuffer<u8>, recv_nonce_base: PyBuffer<u8>) -> PyResult<()> {
+        let (sk, sn) = (secret::<32>(py, &send_key)?, secret::<12>(py, &send_nonce_base)?);
+        let (rk, rn) = (secret::<32>(py, &recv_key)?, secret::<12>(py, &recv_nonce_base)?);
+        self.0.rekey(epoch, &sk[..], &sn[..], &rk[..], &rn[..]).map_err(kind)
+    }
+
+    fn close(&self) {
+        self.0.close();
     }
 
     fn seal<'py>(&self, py: Python<'py>, frame_type: u8, payload: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
-        self.0.seal(frame_type, payload).map(|f| PyBytes::new(py, &f)).map_err(|e| PyValueError::new_err(e.as_str()))
+        self.0.seal(frame_type, payload).map(|f| PyBytes::new(py, &f)).map_err(kind)
     }
 
     /// Returns (frame_type, plaintext); raises ValueError(kind) on rejection.
-    fn open<'py>(&self, py: Python<'py>, frame: &[u8]) -> PyResult<(u8, Bound<'py, PyBytes>)> {
-        self.0.open(frame).map(|(t, p)| (t, PyBytes::new(py, &p))).map_err(|e| PyValueError::new_err(e.as_str()))
+    #[pyo3(signature = (frame, expected_type=None))]
+    fn open<'py>(&self, py: Python<'py>, frame: &[u8], expected_type: Option<u8>) -> PyResult<(u8, Bound<'py, PyBytes>)> {
+        self.0.open(frame, expected_type).map(|(t, p)| (t, PyBytes::new(py, &p))).map_err(kind)
+    }
+}
+
+fn ipv4(address: &str) -> PyResult<Ipv4Addr> {
+    address.parse().map_err(|_| PyValueError::new_err("expected an IPv4 address"))
+}
+
+/// The UDP <-> TUN loop for one role on its own thread. On success Rust owns and closes both
+/// descriptors; if construction raises it owns neither. Call `stop()` before Python-side cleanup.
+#[pyclass(frozen, name = "DataPlane")]
+struct PyDataPlane {
+    shared: Arc<dataplane::Shared>,
+    /// The descriptors until `start()` moves them into the worker.
+    idle: Mutex<Option<dataplane::Worker>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[pymethods]
+impl PyDataPlane {
+    #[new]
+    #[pyo3(signature = (role_name, udp_fd, tun_fd, mtu, emulated_tun=false, peer=None, ping=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(role_name: &str, udp_fd: i32, tun_fd: i32, mtu: usize, emulated_tun: bool, peer: Option<(String, u16)>,
+           ping: Option<(f64, f64, f64)>) -> PyResult<Self> {
+        let role = role(role_name)?;
+        let (server, ping) = match (role, peer, ping) {
+            (session::Role::Client, Some((host, port)), Some((initial, interval, timeout))) => {
+                (Some(SocketAddrV4::new(ipv4(&host)?, port)), Some(dataplane::Ping { initial, interval, timeout }))
+            }
+            (session::Role::Server, None, None) => (None, None),
+            _ => return Err(PyValueError::new_err("a client needs peer and ping; a server takes neither")),
+        };
+        // Every check (both descriptors included) passes before either is owned: all or nothing.
+        let udp = pqvpn_fd::check(udp_fd, pqvpn_fd::Kind::Udp).map_err(PyOSError::new_err)?;
+        let tun = pqvpn_fd::check(tun_fd, if emulated_tun { pqvpn_fd::Kind::EmulatedTun } else { pqvpn_fd::Kind::Tun })
+            .map_err(PyOSError::new_err)?;
+        let (udp, tun) = (pqvpn_fd::own(udp), pqvpn_fd::own(tun));
+        Ok(Self {
+            shared: Arc::new(dataplane::Shared::new(role, mtu, server)),
+            idle: Mutex::new(Some(dataplane::Worker { udp, tun, ping })),
+            worker: Mutex::new(None),
+        })
+    }
+
+    fn add_session(&self, session: &Bound<'_, PyDataSession>, session_id: &[u8], lease: &str) -> PyResult<()> {
+        let id = session_id.try_into().map_err(|_| kind(session::Error::InvalidKey))?;
+        self.shared.add(session.get().0.clone(), id, ipv4(lease)?.octets());
+        Ok(())
+    }
+
+    fn remove_session(&self, session_id: &[u8]) {
+        self.shared.remove(session_id);
+    }
+
+    /// Monotonic seconds of the session's last authenticated activity, or None.
+    fn last_seen(&self, session_id: &[u8]) -> Option<f64> {
+        self.shared.last_seen(session_id)
+    }
+
+    fn start(&self) -> PyResult<()> {
+        let worker = self.idle.lock().map_err(|_| PyRuntimeError::new_err("poisoned"))?.take()
+            .ok_or_else(|| PyRuntimeError::new_err("data plane already started or stopped"))?;
+        let handle = dataplane::spawn(self.shared.clone(), worker).map_err(PyOSError::new_err)?;
+        *self.worker.lock().map_err(|_| PyRuntimeError::new_err("poisoned"))? = Some(handle);
+        Ok(())
+    }
+
+    /// Stops and joins the worker (GIL released) and closes the descriptors. Idempotent.
+    fn stop(&self, py: Python<'_>) {
+        self.shared.request_stop();
+        if let Ok(mut idle) = self.idle.lock() {
+            idle.take();
+        }
+        let handle = self.worker.lock().ok().and_then(|mut w| w.take());
+        if let Some(handle) = handle {
+            // `guarded` already recorded any panic; a join error carries nothing more.
+            let _ = py.detach(|| handle.join());
+        }
+    }
+
+    /// The worker's fatal error or panic, once it has stopped by itself.
+    fn error(&self) -> Option<String> {
+        self.shared.error()
+    }
+
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = &self.shared.counters;
+        let stats = PyDict::new(py);
+        for (name, value) in [("rx_packets", &c.rx_packets), ("rx_bytes", &c.rx_bytes), ("tx_packets", &c.tx_packets),
+                              ("tx_bytes", &c.tx_bytes), ("drops", &c.drops), ("replay_rejects", &c.replay_rejects),
+                              ("inner_rejects", &c.inner_rejects)] {
+            stats.set_item(name, value.load(Relaxed))?;
+        }
+        stats.set_item("last_rx", self.shared.last_rx())?;
+        Ok(stats)
+    }
+
+    /// Client keepalive results since the last call: (probes sent, probes lost, RTTs in ms).
+    fn drain_probes(&self) -> (u64, u64, Vec<f64>) {
+        let mut probes = self.shared.probes.lock().unwrap_or_else(|p| p.into_inner());
+        let drained = std::mem::take(&mut *probes);
+        (drained.sent, drained.lost, drained.rtts_ms)
+    }
+}
+
+impl Drop for PyDataPlane {
+    /// Never leave a worker (and its descriptors) running after Python drops the object.
+    fn drop(&mut self) {
+        self.shared.request_stop();
     }
 }
 
@@ -85,7 +229,8 @@ fn inbound_ok(role_name: &str, packet: &[u8], address: [u8; 4], mtu: usize) -> P
 fn pqvpn_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encrypt_frame, m)?)?;
     m.add_function(wrap_pyfunction!(inbound_ok, m)?)?;
-    m.add_class::<PyDataSession>()
+    m.add_class::<PyDataSession>()?;
+    m.add_class::<PyDataPlane>()
 }
 
 #[cfg(test)]
@@ -121,12 +266,12 @@ mod tests {
                 u32::try_from(s["epoch"].as_u64().unwrap()).unwrap(), &unhex(&s["send_key"]), &unhex(&s["send_nonce_base"]),
                 &unhex(&s["recv_key"]), &unhex(&s["recv_nonce_base"])).unwrap();
             for op in s["ops"].as_array().unwrap() {
-                let outcome = match rx.open(&unhex(&op["frame"])) {
-                    Ok((t, p)) => format!("ok {t} {}", p.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+                let outcome = match rx.open(&unhex(&op["frame"]), None) {
+                    Ok((t, p)) => format!("ok {t} {p:?}"),
                     Err(e) => e.as_str().to_string(),
                 };
                 let expected = match op["expect"].as_str().unwrap() {
-                    "ok" => format!("ok {} {}", op["frame_type"], op["plaintext"].as_str().unwrap()),
+                    "ok" => format!("ok {} {:?}", op["frame_type"], unhex(&op["plaintext"])),
                     kind => kind.to_string(),
                 };
                 assert_eq!(outcome, expected, "{} {}", s["name"], op["name"]);
@@ -150,7 +295,7 @@ mod tests {
         let sequences: std::collections::HashSet<_> = frames.iter().map(|f| f[18..26].to_vec()).collect();
         assert_eq!(sequences.len(), 4000);
         frames.sort_by(|a, b| a[18..26].cmp(&b[18..26]));
-        assert!(frames.iter().all(|f| server.open(f).is_ok()));
+        assert!(frames.iter().all(|f| server.open(f, None).is_ok()));
     }
 
     #[test]
@@ -159,7 +304,7 @@ mod tests {
         for _ in 0..200 {
             let frame = client.seal(1, b"once").unwrap();
             let results: Vec<_> = std::thread::scope(|s| {
-                let workers: Vec<_> = (0..4).map(|_| s.spawn(|| server.open(&frame))).collect();
+                let workers: Vec<_> = (0..4).map(|_| s.spawn(|| server.open(&frame, None))).collect();
                 workers.into_iter().map(|w| w.join().unwrap()).collect()
             });
             assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
@@ -174,8 +319,8 @@ mod tests {
         let next_epoch = session::DataSession::new(session::Role::Server, &sid, 0x30, 2, &s2c, &ns, &c2s, &nc).unwrap();
         let other = session::DataSession::new(session::Role::Server, &[8; 32], 0x30, 1, &s2c, &ns, &c2s, &nc).unwrap();
         let frame = client.seal(1, b"old").unwrap();
-        assert_eq!(next_epoch.open(&frame), Err(session::Error::Binding));
-        assert_eq!(other.open(&frame), Err(session::Error::Binding));
+        assert_eq!(next_epoch.open(&frame, None), Err(session::Error::Binding));
+        assert_eq!(other.open(&frame, None), Err(session::Error::Binding));
     }
 
     #[test]

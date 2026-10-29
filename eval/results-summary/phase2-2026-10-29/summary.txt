@@ -1,0 +1,6 @@
+M5 LAN, median of runs: tcp_received_mbps, tunnel_rtt_ms - bare_rtt_ms
+  v2-ed25519 python n=5    633.6 Mbps  0.410 ms
+  v2-ed25519 rust   n=5   3820.9 Mbps  0.177 ms  gate(>=1500 Mbps, <=0.2 ms, 5 runs): PASS
+  v3-kem     python n=5    632.2 Mbps  0.445 ms
+  v3-kem     rust   n=5   3756.9 Mbps  0.213 ms  gate(>=1500 Mbps, <=0.2 ms, 5 runs): FAIL
+PHASE 2 GATES: FAIL

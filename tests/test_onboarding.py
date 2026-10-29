@@ -520,7 +520,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
     # changes: python -m pytest -q tests/test_onboarding.py -k checksum  (the
     # failure message prints the new digest).
     digest = _stable_archive_digest(root, tmp_path)
-    assert digest == "89a6b14475b59f38aefd23e3652fc450e052b7d2bb7857b922a4241578a2b624"
+    assert digest == "85a961afb1f3393c2a82a11ec4613c19806044571a5eb13d2edadc23e03ae1d7"
 
     with tarfile.open(archive, "r:gz") as source:
         names = source.getnames()
@@ -555,7 +555,7 @@ def test_packages_do_not_include_deployment_identity_or_config(tmp_path):
         ".git", "__pycache__", ".pytest_cache", ".venv", "venv",
         "build", "dist", "pkg", "src", "target",
     }
-    rust_crate_src = "pqvpn-3.0.0/core/pqvpn_core/src"
+    rust_crate_srcs = ("pqvpn-3.0.0/core/pqvpn_core/src", "pqvpn-3.0.0/core/pqvpn_fd/src")
     forbidden_suffixes = (
         ".key", ".pem", ".p12", ".pfx", ".crt", ".db",
         ".db-wal", ".db-shm", ".sqlite", ".sqlite3",
@@ -564,8 +564,8 @@ def test_packages_do_not_include_deployment_identity_or_config(tmp_path):
     for name in names:
         path = Path(name)
         parts = {part.lower() for part in path.parts}
-        # The Rust crate's own src/ is source code, not a leaked makepkg srcdir.
-        if name == rust_crate_src or name.startswith(rust_crate_src + "/"):
+        # The Rust crates' own src/ is source code, not a leaked makepkg srcdir.
+        if any(name == src or name.startswith(src + "/") for src in rust_crate_srcs):
             parts.discard("src")
         filename = path.name.lower()
         assert not parts.intersection(forbidden_directories), name

@@ -65,7 +65,7 @@ The FFI boundary, once Phase 2 lands, is deliberately small:
 - `rekey(session_id, keys, epoch)`, `bind_endpoint(session_id, addr)`, `remove_session(session_id)`.
 - `stats()` returns counters for the eval harness; no packets or keys ever cross back into Python.
 
-Build it with maturin as an `abi3` wheel (one build covers Python 3.10 and newer), with the Rust workspace in `core/` and `Cargo.lock` committed.
+Build it with maturin as an `abi3` wheel (one build covers Python 3.11 and newer), with the Rust workspace in `core/` and `Cargo.lock` committed.
 
 ## Crate choices
 
@@ -115,6 +115,32 @@ Decision point after Phase 2 or 3: if the paper deadline is close, freeze there.
 
 All numbers right of "Today" are targets, not measurements. Phase 0 may move the starting point, since batching and resumption landed after the published runs.
 
+### Phase 2 ablation: Python vs Rust data plane
+
+Final run: commit 17d4667 (clean), governor pinned to performance, M5 LAN, median of 5 runs per cell, Python and Rust interleaved on the same commit (`scripts/bench_dataplane.sh`, raw data and `environment.txt` in `eval/results-summary/phase2-2026-10-29/`).
+
+| Suite | Data plane | TCP (Mbps) | Tunnel RTT overhead (ms) |
+| --- | --- | --- | --- |
+| v2-ed25519 | Python | 634 | 0.410 |
+| v2-ed25519 | Rust | 3,821 | 0.177 |
+| v3-kem | Python | 632 | 0.445 |
+| v3-kem | Rust | 3,757 | 0.213 |
+
+Same run, Rust data plane: M1 LAN cold connect 131 ms, warm 9.0 ms (30 each). M7 ClientHello flood at 0, 100 and 1000 per second: all legitimate connects succeed at about 157 ms, with server CPU at 22% (cookies off) and 18% (cookies always) at 1000 per second.
+
+**Moved to Rust** (`data_plane = "rust"`, both roles): the whole per-packet loop, meaning `recvmmsg`/`sendmmsg` and the TUN drain in batches of 64, AES-256-GCM seal and open, the 128-entry replay window, session lookup, endpoint binding, `UDP_BIND`/`ACK`, `PING`/`PONG` keepalive, the inner-packet source and destination checks, and the counters.
+
+**Stayed in Python:** the TCP control channel (CONFIG, rekey, re-handshake and close frames), the KEMTLS handshake, cookies, resumption, the key schedule and rekey derivation, idle, session and dead-peer policy, revocation, the client's first `UDP_BIND` at connect, and TUN, route and DNS setup and teardown. Python derives each epoch's keys; Rust holds the only data-channel sealer.
+
+**RTT overhead.** The loop's own work is about 30 µs per ping round trip. The rest is the host waking idle threads: three wakeups per round trip (client TUN, server UDP, client UDP). Spinning instead of sleeping drops the overhead to about 0.03 ms on the same machine, so the remaining gap is host wake-from-idle latency, not data-plane code. Per-run overhead spans 0.14 to 0.23 ms on both suites, which share one data path, and the suite that misses 0.2 ms flips between runs: the pre-hardening run at 0310a5c measured v2 0.203 / v3-kem 0.155 ms, this one v2 0.177 / v3-kem 0.213 ms. Busy-polling or holding a PM QoS latency request would pass the gate here, but it burns a core on a laptop client and does nothing on a WAN path, so the gate is recorded as missed rather than tuned around.
+
+Phase 2 gates (final bench above):
+
+- [x] Byte-identical interop with the Python backend in both directions (`test_mixed_data_planes_interoperate_end_to_end`, v2 and v3, with rekey)
+- [x] Full suite passes on both backends
+- [x] M5 LAN TCP 1.5 Gbps or more, both suites
+- [ ] Tunnel RTT overhead 0.2 ms or less, both suites. Missed: v3-kem 0.213 ms (v2 0.177 ms); host wake-up latency, see above.
+
 ## Security invariants and tests
 
 The rewrite must not weaken a single property in the security gap analysis. These are the invariants each Rust PR is checked against:
@@ -129,7 +155,7 @@ The rewrite must not weaken a single property in the security gap analysis. Thes
 
 Test strategy, on top of the existing 560 tests and 70-attack pentest suite:
 
-- [ ] Run the whole Python suite against both backends via a `--backend` pytest option.
+- [x] Run the whole Python suite against both backends via a `--backend` pytest option.
 - [ ] Cross-implementation interop: Python client to Rust server and the reverse, for v2, v3-kem and v3-mldsa, including rekey and resumption.
 - [ ] Known-answer vectors exported from the Python code for HKDF output, frame encryption and transcripts, checked in Rust unit tests.
 - [ ] Differential fuzzing with `cargo-fuzz` on frame decryption, the replay window and handshake parsing, comparing Rust against Python where both exist.
@@ -164,6 +190,6 @@ Treat the Python and Rust backends as two configurations of one artifact, not as
 
 - [ ] Phase 0: re-run M1 to M8 on current main with flame graphs, then tag `v3-paper-artifact` (needs root on your machine).
 - [ ] Phase 1: open one PR per quick win, starting with warm connect through `ClientService` and pyroute2.
-- [ ] Phase 2 spike: a `core/` skeleton with maturin, one known-answer test for frame encryption, and a `--backend` pytest option, to prove the build and packaging path before the real port.
+- [x] Phase 2 spike: a `core/` skeleton with maturin, one known-answer test for frame encryption, and a `--backend` pytest option, to prove the build and packaging path before the real port.
 
 Open question: which venue and deadline is the paper aiming for? That decides whether to freeze after Phase 2, Phase 3 or Phase 4.

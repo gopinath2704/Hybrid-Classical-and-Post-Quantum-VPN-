@@ -22,7 +22,7 @@ impl ReplayWindow {
                 let delta = highest - sequence;
                 if delta >= WINDOW {
                     Err(Reject::OutsideWindow)
-                } else if self.bitmap >> delta & 1 == 1 {
+                } else if (self.bitmap >> delta) & 1 == 1 {
                     Err(Reject::Replayed)
                 } else {
                     Ok(())
@@ -34,10 +34,14 @@ impl ReplayWindow {
 
     pub fn commit(&mut self, sequence: u64) {
         match self.highest {
-            Some(highest) if sequence <= highest => self.bitmap |= 1 << (highest - sequence),
+            Some(highest) if sequence <= highest => {
+                // `check` guarantees this; a misuse would otherwise mask the shift silently in release.
+                debug_assert!(highest - sequence < WINDOW, "commit without check");
+                self.bitmap |= 1 << (highest - sequence);
+            }
             Some(highest) => {
                 let shift = sequence - highest;
-                self.bitmap = if shift >= WINDOW { 1 } else { self.bitmap << shift | 1 };
+                self.bitmap = if shift >= WINDOW { 1 } else { (self.bitmap << shift) | 1 };
                 self.highest = Some(sequence);
             }
             None => {

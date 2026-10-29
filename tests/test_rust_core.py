@@ -256,3 +256,83 @@ if __name__ == "__main__":
     VECTORS.parent.mkdir(exist_ok=True)
     VECTORS.write_text(json.dumps(build_vectors(), indent=1) + "\n")
     DECRYPT_VECTORS.write_text(json.dumps(build_decrypt_vectors(), indent=1) + "\n")
+
+
+@pytest.mark.parametrize("client_plane, server_plane", [("python", "rust"), ("rust", "python")])
+@pytest.mark.parametrize("suite", ["v2", "v3-kem", "v3-mldsa"])
+def test_mixed_data_planes_interoperate_across_rekey(core, request, suite, client_plane, server_plane):
+    from test_crypto_protocol import exchange, exchange_mldsa, exchange_v3
+    make, ids = {"v2": (exchange, "identities"), "v3-kem": (exchange_v3, "v3_identities"),
+                 "v3-mldsa": (exchange_mldsa, "mldsa_identities")}[suite]
+    client, server = make(request.getfixturevalue(ids), data_plane=client_plane, server_plane=server_plane)
+    for epoch in (0, 1):
+        assert server.open_data(client.seal_data(b"up"))[1] == b"up"
+        assert client.open_data(server.seal_data(b"down", FrameType.PONG), FrameType.PONG)[1] == b"down"
+        if epoch == 0:
+            old, nonce = client.seal_data(b"stale"), bytes(32)
+            client.activate_epoch(1, client.derive_next_epoch(1, nonce))
+            server.activate_epoch(1, server.derive_next_epoch(1, nonce))
+    with pytest.raises(HandshakeError, match="wrong session, epoch, or direction"):
+        server.open_data(old)
+
+
+def test_rust_mode_python_never_holds_data_ciphers(core, identities):
+    from test_crypto_protocol import exchange
+    client, server = exchange(identities, data_plane="rust")
+    for session in (client, server):
+        assert not hasattr(session, "_data_send_cipher") and not hasattr(session, "_data_recv_cipher")
+        assert all(not any(getattr(session.secrets, name)) for name in
+                   ("data_c2s_key", "data_s2c_key", "data_c2s_nonce_base", "data_s2c_nonce_base"))
+        with pytest.raises(HandshakeError, match="owned by the Rust data plane"):
+            session.encrypt_frame(b"x")
+        with pytest.raises(HandshakeError, match="owned by the Rust data plane"):
+            session.decrypt_frame(b"x" * 64)
+    frame = client.seal_data(b"x")
+    server.secure_wipe()
+    with pytest.raises(HandshakeError, match="session closed"):
+        server.open_data(frame)
+    with pytest.raises(HandshakeError, match="session closed"):
+        server.derive_next_epoch(1, bytes(32))
+
+
+def test_rust_mode_fails_loudly_without_pqvpn_core(identities, monkeypatch):
+    import builtins
+    from test_crypto_protocol import exchange
+    from vpn.config import ServerConfig, validate_server
+    real_import = builtins.__import__
+    def no_core(name, *args, **kwargs):
+        if name == "pqvpn_core":
+            raise ImportError("pqvpn_core hidden by test")
+        return real_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", no_core)
+    with pytest.raises(ImportError, match="hidden"):
+        exchange(identities, data_plane="rust")
+    with pytest.raises(ValueError, match="requires the pqvpn_core module"):
+        validate_server(ServerConfig(data_plane="rust"))
+
+
+def test_data_plane_owns_both_descriptors_or_neither():
+    import os
+    import socket
+    from vpn.network import TUNInterface, TUNMode
+    from vpn.runtime import rust_data_plane
+    pqvpn_core = pytest.importorskip("pqvpn_core")
+    udp, stream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM), socket.socketpair()[0]
+    udp_fd, stream_fd = os.dup(udp.fileno()), os.dup(stream.fileno())
+    with pytest.raises(OSError, match="EmulatedTun"):
+        pqvpn_core.DataPlane("server", udp_fd, stream_fd, 1380, emulated_tun=True)
+    os.close(udp_fd)  # rejected: both are still ours
+    os.close(stream_fd)
+    with TUNInterface(mode=TUNMode.SOCKET_PIPE) as tun:
+        before = set(os.listdir("/proc/self/fd"))
+        with pytest.raises(ValueError, match="role"):
+            rust_data_plane("relay", udp, tun, 1380)
+        with pytest.raises(ValueError, match="peer and ping"):
+            rust_data_plane("client", udp, tun, 1380)
+        assert set(os.listdir("/proc/self/fd")) == before  # rust_data_plane closed its dups
+        dp = rust_data_plane("server", udp, tun, 1380)
+        dp.start()
+        dp.stop()
+        assert set(os.listdir("/proc/self/fd")) == before  # the worker closed the ones it owned
+    udp.close()
+    stream.close()

@@ -1,5 +1,6 @@
 [workspace]
-members = ["pqvpn_core"]
+members = ["pqvpn_core", "pqvpn_fd"]
+exclude = ["fuzz"]
 resolver = "3"
 
 [profile.release]
