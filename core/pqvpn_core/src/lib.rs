@@ -157,6 +157,11 @@ impl PyDataPlane {
         self.shared.remove(session_id);
     }
 
+    /// Inner packets this session sent that were spoofed or malformed, or None if unknown.
+    fn inner_rejects(&self, session_id: &[u8]) -> Option<u64> {
+        self.shared.inner_rejects(session_id)
+    }
+
     /// Monotonic seconds of the session's last authenticated activity, or None.
     fn last_seen(&self, session_id: &[u8]) -> Option<f64> {
         self.shared.last_seen(session_id)

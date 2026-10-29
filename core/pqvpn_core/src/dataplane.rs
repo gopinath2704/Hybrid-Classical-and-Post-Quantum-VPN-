@@ -49,6 +49,8 @@ struct Peer {
     endpoint: Mutex<Option<SocketAddrV4>>,
     /// f64 bits of the last authenticated activity (`ServerSession.touch`); 0 = none.
     last_seen: AtomicU64,
+    /// This session's share of `Counters::inner_rejects`, so the warning can name the client.
+    inner_rejects: AtomicU64,
 }
 
 /// Swapped whole on add/remove, like `SessionManager`'s snapshot dicts, so the loop reads lock-free.
@@ -130,7 +132,8 @@ impl Shared {
     /// The session object is shared with Python's `HandshakeSession`, so its rekeys apply here atomically.
     pub fn add(&self, session: Arc<Session>, session_id: &[u8; 32], lease: [u8; 4]) {
         let id: [u8; 8] = session_id[..8].try_into().unwrap_or_default();
-        let peer = Arc::new(Peer { session, lease, endpoint: Mutex::new(self.server), last_seen: AtomicU64::new(0) });
+        let peer = Arc::new(Peer { session, lease, endpoint: Mutex::new(self.server), last_seen: AtomicU64::new(0),
+                                   inner_rejects: AtomicU64::new(0) });
         self.update(|t| {
             t.by_id.insert(id, peer.clone());
             t.by_ip.insert(lease, peer);
@@ -149,6 +152,10 @@ impl Shared {
     pub fn last_seen(&self, session_id: &[u8]) -> Option<f64> {
         let seen = self.table.load().by_id.get(session_id.get(..8)?)?.last_seen.load(Relaxed);
         (seen != 0).then(|| f64::from_bits(seen))
+    }
+
+    pub fn inner_rejects(&self, session_id: &[u8]) -> Option<u64> {
+        Some(self.table.load().by_id.get(session_id.get(..8)?)?.inner_rejects.load(Relaxed))
     }
 
     pub fn last_rx(&self) -> f64 {
@@ -210,6 +217,7 @@ impl Shared {
             DATA if bound => {
                 if !packet::server_accepts(&payload, peer.lease, self.mtu) {
                     self.counters.inner_rejects.fetch_add(1, Relaxed);
+                    peer.inner_rejects.fetch_add(1, Relaxed);
                     return self.drop_packet();
                 }
                 touch();
@@ -556,8 +564,9 @@ mod tests {
                     assert_eq!(seen, None, "{case}");
                 }
             }
-            let inner = shared.counters.inner_rejects.load(Relaxed);
-            assert_eq!(inner, u64::from(matches!(case, "spoof" | "malformed_data")), "{case}");
+            let rejected = u64::from(matches!(case, "spoof" | "malformed_data"));
+            assert_eq!(shared.counters.inner_rejects.load(Relaxed), rejected, "{case}");
+            assert_eq!(shared.inner_rejects(&SID), Some(rejected), "{case}");
         }
     }
 

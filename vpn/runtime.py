@@ -643,6 +643,7 @@ class VPNServer:
 
     def _watch_data_plane(self) -> None:
         logged, logged_at = 0, float("-inf")
+        per_session: dict[bytes, int] = {}
         while not self.stop_event.wait(0.2):
             error = self._dp.error()
             if error:
@@ -651,8 +652,22 @@ class VPNServer:
                 return
             rejects = self._dp.stats()["inner_rejects"]
             if rejects > logged and time.monotonic() - logged_at >= INNER_REJECT_LOG_INTERVAL:
-                logger.warning("rejected %d spoofed/malformed inner packets", rejects - logged)
+                offenders, per_session = self._inner_reject_offenders(per_session)
+                logger.warning("rejected %d spoofed/malformed inner packets; by client_id: %s",
+                               rejects - logged, offenders or "sessions since removed")
                 logged, logged_at = rejects, time.monotonic()
+
+    def _inner_reject_offenders(self, before: dict[bytes, int], limit: int = 10) -> tuple[str, dict[bytes, int]]:
+        """'client=N, ...' for sessions whose Rust reject count rose, and the new per-session baseline."""
+        rising: list[str] = []
+        now: dict[bytes, int] = {}
+        for item in list(self.sessions._snap_id.values()):
+            session_id = item.crypto.session_id
+            now[session_id] = self._dp.inner_rejects(session_id) or 0
+            if now[session_id] > before.get(session_id, 0):
+                rising.append(f"{item.client_id}={now[session_id] - before.get(session_id, 0)}")
+        more = f" and {len(rising) - limit} more" if len(rising) > limit else ""
+        return ", ".join(rising[:limit]) + more, now
 
     # ponytail: batch size for draining sockets per wakeup; tune up if
     # profiling shows select() round-trips are still the bottleneck

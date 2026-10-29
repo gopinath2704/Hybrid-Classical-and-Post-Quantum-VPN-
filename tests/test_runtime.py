@@ -400,6 +400,7 @@ import pytest
 import vpn.runtime as runtime
 from handshake.kemtls import FrameType
 from vpn.config import ClientConfig, ServerConfig
+from dataclasses import replace
 from vpn.identity import AuthorizedClients, generate_client_identity, generate_server_identity
 from test_crypto_protocol import exchange
 
@@ -740,19 +741,38 @@ def test_rust_rekey_and_remove_under_load(connected):
 
 @needs_rust
 @pytest.mark.parametrize('data_plane', ['rust'])
-def test_rust_inner_packet_rejects_are_logged_at_a_bounded_rate(connected, caplog):
+def test_rust_inner_packet_rejects_are_logged_at_a_bounded_rate(connected, caplog, monkeypatch, tmp_path):
     server, client = connected
-    client.PING_INITIAL_DELAY = 3600
-    client.connect()
-    with caplog.at_level('WARNING', logger='pqvpn.runtime'):
-        client.tun.inject(ipv4('10.8.0.99', '1.1.1.1', b'spoofed source'))
-        until(lambda: 'rejected 1 spoofed/malformed inner packets' in caplog.text)
-        for _ in range(20):
-            client.tun.inject(ipv4('10.8.0.99', '1.1.1.1', b'flood'))
-        until(lambda: server._dp.stats()['inner_rejects'] == 21)
-        time.sleep(.5)
-    assert caplog.text.count('spoofed/malformed') == 1
-    assert client.state == 'CONNECTED'
+    monkeypatch.setattr(runtime, 'INNER_REJECT_LOG_INTERVAL', 1.0)
+    keys = tmp_path/'second'  # its own directory: the resumption ticket is stored next to the key
+    keys.mkdir()
+    generate_client_identity(keys/'client.key', keys/'client.pub')
+    AuthorizedClients(tmp_path/'clients.json').authorize((keys/'client.pub').read_bytes(), 'second')
+    second = runtime.VPNClient(replace(client.cfg, client_identity_private_key=str(keys/'client.key'),
+                                       client_identity_public_key=str(keys/'client.pub'), tun_name='pqidle2'))
+    for vpn in (client, second):
+        vpn.PING_INITIAL_DELAY = 3600
+        vpn.connect()
+    warnings = lambda: [r.getMessage() for r in caplog.records if 'spoofed/malformed' in r.getMessage()]
+    try:
+        with caplog.at_level('WARNING', logger='pqvpn.runtime'):
+            client.tun.inject(ipv4('10.8.0.99', '1.1.1.1', b'spoofed source'))
+            until(lambda: len(warnings()) == 1)
+            assert warnings()[0].endswith('rejected 1 spoofed/malformed inner packets; by client_id: idle-test=1')
+            for vpn, count in ((client, 20), (second, 5)):
+                for _ in range(count):
+                    vpn.tun.inject(ipv4('10.8.0.99', '1.1.1.1', b'flood'))
+            until(lambda: server._dp.stats()['inner_rejects'] == 26)
+            assert len(warnings()) == 1  # still inside the interval
+            until(lambda: len(warnings()) == 2)
+            time.sleep(.5)
+        assert len(warnings()) == 2
+        assert warnings()[1].startswith('rejected 25 spoofed/malformed inner packets; by client_id: ')
+        assert sorted(warnings()[1].split(': ')[1].split(', ')) == ['idle-test=20', 'second=5']
+        assert client.state == second.state == 'CONNECTED'
+    finally:
+        second.disconnect()
+
 
 
 @needs_rust
