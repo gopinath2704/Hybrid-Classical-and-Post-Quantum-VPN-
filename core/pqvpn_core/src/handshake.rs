@@ -1221,13 +1221,28 @@ fn b64_decode(text: &str) -> Option<Zeroizing<Vec<u8>>> {
     Some(out)
 }
 
+fn ticket_json(fingerprint: &str, protocol_version: u8, ticket: &[u8], secret: &[u8; 32]) -> io::Result<Zeroizing<String>> {
+    let fingerprint = serde_json::to_string(fingerprint).map_err(io::Error::other)?;
+    let (ticket, secret) = (b64_encode(ticket), b64_encode(secret));
+    Ok(Zeroizing::new(format!("{{\"fp\": {fingerprint}, \"t\": \"{}\", \"s\": \"{}\", \"v\": {protocol_version}}}",
+                              ticket.as_str(), secret.as_str())))
+}
+
+/// Fuzzing only: whatever `parse_ticket` accepts (for fingerprint "fp", version 3) re-encodes as `save_ticket` would
+/// and parses back to the same ticket and secret.
+#[cfg(fuzzing)]
+pub fn fuzz_parse_ticket(raw: &[u8]) {
+    if let Some((ticket, secret)) = parse_ticket(raw, "fp", 3) {
+        let again = ticket_json("fp", 3, &ticket, &secret).expect("a str always serializes");
+        let (ticket2, secret2) = parse_ticket(again.as_bytes(), "fp", 3).expect("our own format parses");
+        assert_eq!((ticket, *secret), (ticket2, *secret2));
+    }
+}
+
 /// The client's ticket file, `{fp, t, s, v}` as `VPNClient._save_ticket` writes it, written the same way: a temp file
 /// in the same directory (O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600), fsync, rename over, fsync the directory.
 pub fn save_ticket(path: &Path, fingerprint: &str, protocol_version: u8, ticket: &[u8], secret: &[u8; 32]) -> io::Result<()> {
-    let fingerprint = serde_json::to_string(fingerprint).map_err(io::Error::other)?;
-    let (ticket, secret) = (b64_encode(ticket), b64_encode(secret));
-    let contents = Zeroizing::new(format!("{{\"fp\": {fingerprint}, \"t\": \"{}\", \"s\": \"{}\", \"v\": {protocol_version}}}",
-                                          ticket.as_str(), secret.as_str()));
+    let contents = ticket_json(fingerprint, protocol_version, ticket, secret)?;
     let directory = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
