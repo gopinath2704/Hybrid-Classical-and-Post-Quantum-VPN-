@@ -246,11 +246,11 @@ cd /tmp/debbuild/pqvpn-3.0.0 && dpkg-buildpackage --build=binary --no-sign
 ```
 
 On a non-Debian host, run the same build in a `debian:trixie` container after
-installing `build-essential cargo rustc python3-maturin debhelper dh-python
+installing `ca-certificates build-essential cargo rustc python3-maturin debhelper dh-python
 dh-sequence-installsysusers pybuild-plugin-pyproject python3-all python3-build
 python3-cryptography python3-installer python3-setuptools python3-wheel`.
 The Rust core (`core/`, built with maturin) needs network access for `cargo` at
-build time; vendored offline builds are a follow-up.
+build time (hence `ca-certificates`, which `--no-install-recommends` would skip); vendored offline builds are a follow-up.
 
 The build-time check only prints the PQC mode; it does not fail when native liboqs
 is absent (a build without liboqs prints `pqc_mode: unavailable` and succeeds), so

@@ -22,7 +22,8 @@ execute_after_dh_python3:
 execute_after_dh_auto_build:
 	# trixie maturin 1.8 predates setting this; without it pyo3 0.30 links libpython.
 	PYO3_BUILD_EXTENSION_MODULE=1 maturin build --release --locked --compatibility linux -m core/pqvpn_core/Cargo.toml -o debian/core-wheel
-	cargo build --release --locked --manifest-path core/Cargo.toml -p pqvpnd
+	# pqvpnd builds pqvpn_core as a dependency, whose cdylib would link libpython without this too.
+	PYO3_BUILD_EXTENSION_MODULE=1 cargo build --release --locked --manifest-path core/Cargo.toml -p pqvpnd
 
 execute_after_dh_auto_install:
 	python3 -m zipfile -e debian/core-wheel/pqvpn_core-*.whl debian/pqvpn/usr/lib/python3/dist-packages/
