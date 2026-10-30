@@ -440,6 +440,17 @@ class VPNServer:
 
     def _client(self, connection: socket.socket, address: tuple[str, int]) -> None:
         item = None
+        # Counts handshakes in progress for cookie_mode "under_load": decremented exactly once, when
+        # the session is established (CONFIG and ticket sent) or on any earlier exit.
+        in_handshake = True
+
+        def end_handshake() -> None:
+            nonlocal in_handshake
+            if in_handshake:
+                in_handshake = False
+                with self._pending_lock:
+                    self._pending_handshakes = max(0, self._pending_handshakes - 1)
+
         with self._pending_lock:
             self._pending_handshakes += 1
         try:
@@ -494,6 +505,7 @@ class VPNServer:
                     bytes(session.secrets.rekey_secret), session.client_id,
                     session.protocol_version, self.cfg.resumption_ticket_lifetime, vpn_ip)
                 send_message(connection, session.encrypt_control(ticket, FrameType.RESUMPTION_TICKET))
+            end_handshake()
             connection.settimeout(self.cfg.handshake_timeout)
             while not self.stop_event.is_set():
                 with self.sessions.lock:
@@ -544,8 +556,7 @@ class VPNServer:
                     item.crypto.secure_wipe()
             connection.close()
             self.slots.release()
-            with self._pending_lock:
-                self._pending_handshakes = max(0, self._pending_handshakes - 1)
+            end_handshake()
 
     def _cookie_gate(self, connection: socket.socket, address: tuple[str, int], first_msg: bytes) -> bytes:
         """Return the ClientHello wire bytes, issuing a cookie challenge if needed."""
