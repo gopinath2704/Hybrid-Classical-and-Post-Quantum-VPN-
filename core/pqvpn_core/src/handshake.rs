@@ -1100,6 +1100,18 @@ impl TicketKey {
     }
 }
 
+/// Fuzzing only: seals arbitrary plaintext under a key the fuzzer knows, so it reaches the ticket parser behind GCM.
+#[cfg(fuzzing)]
+pub fn fuzz_ticket_plaintext(plaintext: &[u8], now: i64) {
+    let key = TicketKey(LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &[7; 32]).expect("valid key")));
+    let mut sealed = plaintext.to_vec();
+    key.0.seal_in_place_append_tag(Nonce::assume_unique_for_key([0; 12]), Aad::from(RESUMPTION_AAD), &mut sealed).expect("seal");
+    if let Some((secret, client_id, _, assigned_ip)) = key.validate(&[&[0u8; 12][..], &sealed].concat(), now) {
+        assert_eq!(&secret[..], &plaintext[..32]);
+        assert_eq!(plaintext.len(), 45 + client_id.len() + assigned_ip.len());
+    }
+}
+
 /// `ResumptionClientHandshake`.
 pub struct ResumeClient {
     version: u8,
