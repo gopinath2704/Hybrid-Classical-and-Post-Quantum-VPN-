@@ -1,0 +1,6 @@
+system,profile,metric,run,value,unit
+pqvpn-dp-rust-hs-rust,n=50,baseline_rss_kb,0,45568,kB
+pqvpn-dp-rust-hs-rust,n=50,loaded_rss_kb,1,46792,kB
+pqvpn-dp-rust-hs-rust,n=50,connected_clients,2,50,count
+pqvpn-dp-rust-hs-rust,n=50,per_session_kb,3,24.5,kB
+pqvpn-dp-rust-hs-rust,n=50,per_session_bytes,4,25068,B

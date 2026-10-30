@@ -520,7 +520,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
     # changes: python -m pytest -q tests/test_onboarding.py -k checksum  (the
     # failure message prints the new digest).
     digest = _stable_archive_digest(root, tmp_path)
-    assert digest == "4e0a335013e96caec8bacf9fa7104ee8964560af161c61e181a084d671b4d70e"
+    assert digest == "912f0020a52c128b1cd3fa67ecccd5ac35e2d4d4a16e8a70ef8b95034234229e"
 
     with tarfile.open(archive, "r:gz") as source:
         names = source.getnames()
@@ -555,7 +555,7 @@ def test_packages_do_not_include_deployment_identity_or_config(tmp_path):
         ".git", "__pycache__", ".pytest_cache", ".venv", "venv",
         "build", "dist", "pkg", "src", "target",
     }
-    rust_crate_srcs = ("pqvpn-3.0.0/core/pqvpn_core/src", "pqvpn-3.0.0/core/pqvpn_fd/src")
+    rust_crate_srcs = ("pqvpn-3.0.0/core/pqvpn_core/src", "pqvpn-3.0.0/core/pqvpn_fd/src", "pqvpn-3.0.0/core/pqvpnd/src")
     forbidden_suffixes = (
         ".key", ".pem", ".p12", ".pfx", ".crt", ".db",
         ".db-wal", ".db-shm", ".sqlite", ".sqlite3",

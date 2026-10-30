@@ -99,7 +99,7 @@ Phases 0 to 3 give the paper its numbers; Phase 4 and 5 turn the prototype into 
 2. **Phase 1, Python quick wins (1 week).** The four items in Quick wins. Gate: M1 LAN warm 40 ms or less, cold 130 ms or less, all tests green, Tamarin re-verified for the folded bind.
 3. **Phase 2, Rust data plane (2 to 3 weeks).** `core/` workspace, `pqvpn_core` module, one worker thread, `recvmmsg`/`sendmmsg` and TUN drain in batches of 64, AES-256-GCM, 128-entry replay window, lock-free session table. Gate: byte-identical interop with the Python backend in both directions, the full suite passes on both backends, M5 LAN 1.5 Gbps or more, tunnel RTT overhead 0.2 ms or less.
 4. **Phase 3, scale out (2 weeks).** N workers on multi-queue TUN with `SO_REUSEPORT`, UDP GSO/GRO, TUN offload. Gate: M5 LAN 3 Gbps or more, a fixed-rate UDP goodput sweep replacing the `-b 0` flood numbers, M7 still 100% under a 10k/s flood.
-5. **Phase 4, Rust handshake and native daemon (3 to 4 weeks).** Port KEMTLS, cookies, resumption, rekey and the key schedule; ship `pqvpnd` speaking the existing IPC so the GUI is untouched. Gate: Python and Rust produce identical transcripts and secrets on shared test vectors, M1 LAN cold 30 ms or less, M2 0.2 ms or less, M8 64 kB per session or less.
+5. **Phase 4, Rust handshake and native daemon (3 to 4 weeks).** Port KEMTLS, cookies, resumption, rekey and the key schedule; ship `pqvpnd` speaking the existing IPC so the GUI is untouched (scope cut 2026-10-30: Phase 4 ships `pqvpnd connect`, a native one-shot client; the IPC daemon moves to Phase 5, see `docs/phase4-design.md`). Gate: Python and Rust produce identical transcripts and secrets on shared test vectors, M1 LAN cold 30 ms or less, M2 0.2 ms or less, M8 64 kB per session or less.
 6. **Phase 5, hardening and release (1 to 2 weeks).** Fuzzing, `cargo deny`, unsafe review, packaging, full M1 to M8 rerun, tag `v4.0.0`. Gate: 24 hours of fuzzing without a crash, pentest suite re-run clean, Arch and Debian packages build from `git archive HEAD`.
 
 Decision point after Phase 2 or 3: if the paper deadline is close, freeze there. The data plane alone already makes the ablation story, and Phase 4 can follow as v4.
@@ -245,6 +245,32 @@ Phase 3 gates:
 
 All numbers are from veth on one host. EC2's ENA has no UDP segmentation offload, so the gain from GSO/GRO will be smaller there.
 
+### Phase 4 results
+
+Gate run: commit 6822d09 (clean), governor pinned to performance, on AC power, one `sudo PHASE=4 bash scripts/bench_dataplane.sh` run. Raw data and `environment.txt` are in `eval/results-summary/phase4-2026-10-30/`. Each row is named by its server backends, data plane then handshake: `python-python`, `rust-python` or `rust-rust`. The native client is `pqvpnd connect`, a separate binary, not the Python CLI made faster.
+
+| Metric | Python (published) | Phase 4 | Gate |
+| --- | --- | --- | --- |
+| M1 LAN cold, Python CLI (ms) | 127 | 126 (rust-python), 150 (rust-rust) | n/a |
+| M1 LAN cold, native `pqvpnd` (ms) | n/a | 42 (30/30) | 30, **missed** |
+| M1 LAN warm (ms) | 15 | 15 | n/a |
+| M2 handshake CPU, v3-kem, both roles (ms) | 0.391 | 0.205 | 0.2, **missed** |
+| M2 handshake CPU, v2 (ms) | 0.475 | 0.218 | reported |
+| M8 server memory per session, N=50 (kB) | 174 before slice (c) | 56.7 (python-python), 61.6 (rust-python), 24.5 (rust-rust) | 64, met |
+| M5 TCP LAN (Mbps) | 680 / 677 | 6,665 / 6,783 | 3,000, met |
+| M7 connects under a 10k/s flood | 5/5 | 5/5 in all six rows, median 156 ms | met |
+| M6 ping loss across 12 rekeys / rehandshakes | n/a | 0.00% on the Rust data plane; 0.04% / 0.01% on the Python data plane | 0%, met on Rust |
+
+Phase 4 gates:
+
+- [x] Python and Rust produce identical transcripts and secrets on shared vectors: v2, v3-kem, resumption, rekey and rehandshake, replayed through the real state machines.
+- [ ] **M1 LAN cold 30 ms or less: missed at 42 ms.** The native client removes Python startup, but the Rust handshake also costs about 24 ms more cold than the Python one in the same CLI (150 vs 126 ms). That cost has not been profiled yet. Phase 5 profiles it first; any fix is reported as a separate, labelled run.
+- [ ] **M2 0.2 ms or less: missed at 0.205 ms (v3-kem).** The primitive floor is about 0.167 ms. Nothing was trimmed to meet the gate.
+- [x] M8 64 kB per session or less, on every backend. Most of the drop comes from the slice (c) selector thread, which also applies to the default Python path.
+- [x] No regression in M5 or M7. The M6 netns gate is new in this run. On the Python data plane it lost 2 of 5,447 pings across 12 rekeys (0.04%) and 1 across 12 rehandshakes (0.01%). There is no earlier netns M6 baseline, so it is recorded here, not counted as a regression.
+
+Caveat: `environment.txt` says `pqvpnd: MISSING`, because the environment is captured before the build step. The 30 native M1 rows show the binary was built and run. The runner will be fixed in Phase 5.
+
 ## Security invariants and tests
 
 The rewrite must not weaken a single property in the security gap analysis. These are the invariants each Rust PR is checked against:
@@ -289,12 +315,13 @@ Treat the Python and Rust backends as two configurations of one artifact, not as
 | Packaging breaks (Rust toolchain on Arch and in the Debian container, offline build) | High | Medium | Vendored crates, pinned toolchain, abi3 wheel, CI job that builds both packages |
 | Scope creep delays the paper | High | High | Hard decision point after Phase 2 or 3; the Python artifact is frozen first |
 | Multi-core changes packet ordering and hurts TCP | Medium | Medium | Flow-hash workers per session (one session per queue), measure reordering in Phase 3 |
-| Rewritten code drops a past fix (cookie `bid - 1`, rate limiter, revocation kill) | Medium | Medium | Port the regression tests first, then the code |
+| Rewritten code drops a past fix (cookie boot-time window, rate limiter, revocation kill) | Medium | Medium | Port the regression tests first, then the code. The old cookie `bid - 1` window was replaced by a current-plus-previous secret in 30e60fc; its regression test is `test_cookie_no_crash_at_boot_time` |
 
 ## Next steps
 
 - [x] Phase 0: re-run M1 to M8 on current main with flame graphs, then tag `v3-paper-artifact` (needs root on your machine). Baseline b726b42 in `eval/results-summary/phase0-2026-10-28/`; the `v3-paper-artifact` tag already existed and is public, so it was not moved.
 - [x] Phase 1: open one PR per quick win, starting with warm connect through `ClientService` and pyroute2. Merged: #28 warm connect, #29 TCP_NODELAY.
+- [x] Phase 4: Rust handshake behind `handshake = "rust"`, `pqvpnd connect`, the server selector thread. Gate run 6822d09: transcripts, M8, M5 and M7 met; M1 cold (42 ms) and M2 (0.205 ms) missed and reported. The IPC daemon is deferred to Phase 5.
 - [x] Phase 2 spike: a `core/` skeleton with maturin, one known-answer test for frame encryption, and a `--backend` pytest option, to prove the build and packaging path before the real port.
 
 Open question: which venue and deadline is the paper aiming for? That decides whether to freeze after Phase 2, Phase 3 or Phase 4.

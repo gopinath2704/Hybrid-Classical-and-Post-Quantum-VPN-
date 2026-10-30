@@ -1,5 +1,7 @@
 # Not in the core workspace or any release build. Needs nightly and cargo-fuzz:
 #   cargo +nightly fuzz run dispatch -- -max_total_time=60
+# The handshake targets start from tests/vectors/handshake.json (corpus/ is not committed); seed them with:
+#   python3 seed_corpus.py   (from core/fuzz)
 [package]
 name = "pqvpn_core_fuzz"
 version = "0.0.0"
@@ -12,6 +14,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "=0.4.13"
 pqvpn_core = { path = "../pqvpn_core" }
+zeroize = "=1.9.1"
 
 [[bin]]
 name = "dispatch"
@@ -23,6 +26,27 @@ bench = false
 [[bin]]
 name = "open"
 path = "fuzz_targets/open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_decode"
+path = "fuzz_targets/handshake_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_machines"
+path = "fuzz_targets/handshake_machines.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "established"
+path = "fuzz_targets/established.rs"
 test = false
 doc = false
 bench = false

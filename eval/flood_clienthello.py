@@ -191,7 +191,7 @@ def read_server_cpu(pid: int) -> float | None:
         return None
 
 
-def setup_topology(run_dir: str, cookie_mode: str, data_plane: str = "python") -> dict:
+def setup_topology(run_dir: str, cookie_mode: str, data_plane: str = "python", handshake: str = "python") -> dict:
     """Create namespaces, veth pairs, identities, configs.  Returns info dict."""
     tag = os.getpid()
     srv_ns = f"m7srv-{tag}"
@@ -293,6 +293,10 @@ def setup_topology(run_dir: str, cookie_mode: str, data_plane: str = "python") -
         for path in (f"{srv_dir}/server.toml", f"{cli_dir}/client.toml"):
             with open(path, "a") as f:
                 f.write('data_plane = "rust"\n')
+    if handshake == "rust":  # phase 4 slice b; main() checks it needs data_plane = "rust"
+        for path in (f"{srv_dir}/server.toml", f"{cli_dir}/client.toml"):
+            with open(path, "a") as f:
+                f.write('handshake = "rust"\n')
 
     return {
         "srv_ns": srv_ns, "cli_ns": cli_ns, "fld_ns": fld_ns,
@@ -391,7 +395,17 @@ def main():
                         help="CSV output path")
     parser.add_argument("--data-plane", default="python", choices=["python", "rust"],
                         help="per-packet loop on both ends; rust needs pqvpn_core (sudo .venv/bin/python)")
+    parser.add_argument("--handshake", default="python", choices=["python", "rust"],
+                        help="both ends on the Rust handshake (phase 4 slice b); needs --data-plane rust")
     args = parser.parse_args()
+    if args.handshake == "rust":
+        import dataclasses
+        from vpn.config import ServerConfig
+        if args.data_plane != "rust":
+            parser.error("--handshake rust requires --data-plane rust")
+        if "handshake" not in {f.name for f in dataclasses.fields(ServerConfig)}:
+            print("SKIP: handshake=rust backend unavailable (phase 4 slice b not landed)", file=sys.stderr)
+            return
 
     rates = [int(r) for r in args.rates.split(",")]
     run_dir = subprocess.check_output(
@@ -413,7 +427,7 @@ def main():
         print(f"\n--- cookie_mode={cookie_mode} ---")
         mode_dir = os.path.join(run_dir, cookie_mode)
         os.makedirs(mode_dir, exist_ok=True)
-        topo = setup_topology(mode_dir, cookie_mode, args.data_plane)
+        topo = setup_topology(mode_dir, cookie_mode, args.data_plane, args.handshake)
         server_proc = start_server(topo, mode_dir)
 
         try:

@@ -52,6 +52,37 @@ pub fn own(checked: Checked) -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(checked.0) }
 }
 
+/// `struct ifreq` as TUNSETIFF reads it: the name, then the flags at the start of the 24-byte union.
+#[repr(C)]
+#[derive(Default)]
+struct IfReqFlags {
+    name: [u8; libc::IFNAMSIZ],
+    flags: libc::c_short,
+    _rest: [u8; 22],
+}
+
+/// Opens a TUN interface the way `TUNInterface.open` does (IFF_TUN | IFF_NO_PI, non-blocking, close-on-exec),
+/// for `pqvpnd`, which has no Python to hand a descriptor over. Returns the name the kernel assigned.
+pub fn open_tun(name: &str) -> io::Result<(OwnedFd, String)> {
+    if name.is_empty() || name.len() >= libc::IFNAMSIZ || name.bytes().any(|b| b == 0 || b == b'/') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "TUN name must be 1-15 bytes without NUL or '/'"));
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    // std opens with O_CLOEXEC; no unsafe is needed to own the descriptor.
+    let file = std::fs::OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK).open("/dev/net/tun")?;
+    let mut request = IfReqFlags::default();
+    request.name[..name.len()].copy_from_slice(name.as_bytes());
+    request.flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
+    // SAFETY: `file` is an open /dev/net/tun descriptor for the whole call, and `request` is a live,
+    // exclusively borrowed `struct ifreq`-sized buffer (40 bytes) that TUNSETIFF reads and writes back.
+    if unsafe { libc::ioctl(file.as_raw_fd(), libc::TUNSETIFF, &mut request as *mut IfReqFlags) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = request.name.iter().position(|&b| b == 0).unwrap_or(request.name.len());
+    let assigned = String::from_utf8_lossy(&request.name[..len]).into_owned();
+    Ok((OwnedFd::from(file), assigned))
+}
+
 fn is(fd: BorrowedFd<'_>, kind: Kind) -> io::Result<bool> {
     let stat = fstat(fd)?;
     let format = SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT;
@@ -69,6 +100,7 @@ fn is(fd: BorrowedFd<'_>, kind: Kind) -> io::Result<bool> {
 mod tests {
     use super::*;
     use std::net::UdpSocket;
+    use std::os::fd::AsFd;
     use std::os::unix::net::{UnixDatagram, UnixStream};
 
     #[test]
@@ -95,5 +127,28 @@ mod tests {
         assert_eq!(check(-1, Kind::Udp).unwrap_err().raw_os_error(), Some(libc::EBADF));
         // Rejections left every descriptor with its original owner, still open.
         assert!(udp.local_addr().is_ok() && stream.peer_addr().is_ok());
+    }
+
+    #[test]
+    fn ifreq_layout_and_tun_name_checks() {
+        assert_eq!(std::mem::size_of::<IfReqFlags>(), 40, "struct ifreq on 64-bit Linux");
+        for bad in ["", "a-name-of-16-byt", "a\0b", "a/b"] {
+            assert_eq!(open_tun(bad).unwrap_err().kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+    }
+
+    /// Needs CAP_NET_ADMIN, e.g. `unshare -rn cargo test`; without it TUNSETIFF fails and the test only checks that.
+    #[test]
+    fn open_tun_creates_a_check_compatible_interface() {
+        match open_tun("pqfdtest0") {
+            Ok((fd, name)) => {
+                assert_eq!(name, "pqfdtest0");
+                assert!(is(fd.as_fd(), Kind::Tun).unwrap());
+                assert!(OFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFL).unwrap()).contains(OFlag::O_NONBLOCK));
+                let cloexec = fcntl(&fd, FcntlArg::F_GETFD).unwrap();
+                assert!(nix::fcntl::FdFlag::from_bits_truncate(cloexec).contains(nix::fcntl::FdFlag::FD_CLOEXEC));
+            }
+            Err(error) => assert!(matches!(error.raw_os_error(), Some(libc::EPERM | libc::ENOENT | libc::EACCES)), "{error}"),
+        }
     }
 }

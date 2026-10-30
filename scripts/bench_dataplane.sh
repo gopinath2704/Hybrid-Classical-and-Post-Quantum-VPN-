@@ -13,11 +13,24 @@
 # >= 3000 Mbps TCP, a fixed-rate UDP goodput sweep on rust (UDP_RATES, max rate with <1% loss
 # reported) and M7 at 0,1000,10000/s with every legitimate connect succeeding at 10000/s.
 # Output goes to eval/results-summary/phase3-<date>.
+#
+# PHASE=4 gates Phase 4 (docs/phase4-design.md section 3), definitions unchanged from Phases 0-3:
+#   - M1 LAN cold, v2, n=30, per data-plane/handshake backend, plus the pqvpnd native row
+#     (gate: native cold median <= 30 ms, all 30 connected)
+#   - M2 in-process, both roles, n=50, python and rust handshake (gate: v3-kem rust total <= 0.2 ms)
+#   - M8 N=50, v2, cookies off, per backend (gate: <= 64 kB per session, all 50 connected)
+#   - no regression: M5 (rust >= 3000 Mbps TCP), M6 hitless rekey/rehandshake (0% ping loss),
+#     M7 at 0,1000,10000/s (every legitimate connect succeeds at 10000/s)
+# Backends are data_plane/handshake: python/python, rust/python, rust/rust. The pqvpnd binary is
+# built from core/ when that crate exists (slice d); NATIVE=<path> overrides it.
+#
+# DRY_RUN=1 (no sudo needed) prints the plan and the commands without running anything.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PHASE=${PHASE:-2}
-[[ $PHASE == 2 || $PHASE == 3 ]] || { echo "PHASE must be 2 or 3" >&2; exit 1; }
+DRY_RUN=${DRY_RUN:-0}
+[[ $PHASE == 2 || $PHASE == 3 || $PHASE == 4 ]] || { echo "PHASE must be 2, 3 or 4" >&2; exit 1; }
 UDP_RATES=${UDP_RATES:-100M,500M,1G,2G,3G,4G,5G,6G,8G}
 OUT=${1:-$ROOT/eval/results-summary/phase$PHASE-$(date +%F)}
 PY=$ROOT/.venv/bin/python
@@ -25,9 +38,27 @@ RUNS=5
 # Root must not leave root-owned .pyc files in the user's tree.
 export PYTHONDONTWRITEBYTECODE=1
 cd "$ROOT"
-[[ $EUID -eq 0 && -n ${SUDO_USER:-} ]] || { echo "run with sudo from your user account" >&2; exit 1; }
+BACKENDS=("python python" "rust python" "rust rust")  # PHASE=4: data_plane handshake
+NATIVE_GIVEN=${NATIVE:+1}
+NATIVE=${NATIVE:-$ROOT/core/target/release/pqvpnd}
+
+FAILED=()
+run() {
+  local name=$1; shift
+  if (( DRY_RUN )); then printf '=== %s\n   %s\n' "$name" "$*"; return; fi
+  echo "=== $name"; "$@" || { echo "FAILED: $name" >&2; FAILED+=("$name"); }
+}
+
+if (( DRY_RUN )); then
+  echo "DRY RUN: PHASE=$PHASE OUT=$OUT (nothing runs; needs sudo for real)"
+  echo "  pins every CPU governor to performance, restores on exit"
+  echo "  builds pqvpn_core (maturin develop --release)$( (( PHASE == 4 )) && echo " and pqvpnd if core/pqvpnd exists" )"
+  echo "  writes $OUT/environment.txt (commit, kernel, governor, CPU, python, pqc_mode, rustc)"
+fi
+(( DRY_RUN )) || [[ $EUID -eq 0 && -n ${SUDO_USER:-} ]] || { echo "run with sudo from your user account" >&2; exit 1; }
 as_user() { sudo -u "$SUDO_USER" -H env "PATH=$PATH" "$@"; }
 [[ -x $PY ]] || { echo "missing $PY (create the venv first)" >&2; exit 1; }
+if (( ! DRY_RUN )); then
 command -v iperf3 >/dev/null || { echo "iperf3 not found" >&2; exit 1; }
 
 # --- Pin the governor; restore each CPU's own value however the script ends ---
@@ -57,10 +88,17 @@ DIRTY=$(as_user git -C "$ROOT" status --porcelain | wc -l)
   "$PY" -c "from crypto.hybrid_crypto import get_crypto_status as s; print('pqc_mode', s()['pqc_mode'])"
   echo "rustc: $(cd "$ROOT/core" && as_user rustc --version)"
   echo "pqvpn_core: maturin develop --release"
+  if (( PHASE == 4 )); then
+    "$PY" -c "import dataclasses; from vpn.config import ServerConfig
+print('handshake switch:', 'present' if 'handshake' in {f.name for f in dataclasses.fields(ServerConfig)} else 'MISSING (slice b)')"
+    echo "pqvpnd: $([[ -x $NATIVE ]] && echo "$NATIVE" || echo "MISSING (slice d)")"
+  fi
 } | tee "$OUT/environment.txt"
+fi
 
-FAILED=()
-run() { local name=$1; shift; echo "=== $name"; "$@" || { echo "FAILED: $name" >&2; FAILED+=("$name"); }; }
+if (( PHASE == 4 )) && [[ -z $NATIVE_GIVEN && -d $ROOT/core/pqvpnd ]]; then
+  run "build pqvpnd" as_user cargo build --release --manifest-path "$ROOT/core/Cargo.toml" -p pqvpnd
+fi
 
 # --- M5 LAN: python vs rust, interleaved so drift hits both equally ---
 for run in $(seq 1 $RUNS); do
@@ -73,11 +111,36 @@ for run in $(seq 1 $RUNS); do
   done
 done
 
+if (( PHASE < 4 )); then
 # --- M1 cold + warm, and M7, on the rust data plane ---
 run "m1 rust lan" env PYTHON="$PY" bash eval/run_pqvpn_net.sh lan --iterations 30 --data-plane rust \
   --out "$OUT/pqvpn-net-lan-rust.csv"
 M7_RATES=0,100,1000; [[ $PHASE == 3 ]] && M7_RATES=0,1000,10000
 run "m7 rust" "$PY" eval/flood_clienthello.py --rates "$M7_RATES" --data-plane rust --out "$OUT/m7-flood-rust.csv"
+else
+# --- Phase 4: M1, M8, M6 and M7 per backend; M2 per handshake; the native row on rust/rust ---
+for backend in "${BACKENDS[@]}"; do
+  read -r plane handshake <<<"$backend"
+  tag=$plane-$handshake
+  native=(); [[ $tag == rust-rust ]] && native=(--native-client "$NATIVE")
+  run "m1 $tag lan" env PYTHON="$PY" bash eval/run_pqvpn_net.sh lan --iterations 30 --data-plane "$plane" \
+    --handshake "$handshake" "${native[@]}" --out "$OUT/m1-lan-$tag.csv"
+  run "m8 $tag" "$PY" eval/measure_memory.py --clients 50 --data-plane "$plane" --handshake "$handshake" \
+    --out "$OUT/m8-$tag.csv"
+  run "m6 $tag" env PYTHON="$PY" bash eval/run_rehandshake_net.sh --data-plane "$plane" --handshake "$handshake" \
+    --out "$OUT/m6-net-$tag.csv"
+  run "m7 $tag" "$PY" eval/flood_clienthello.py --rates 0,1000,10000 --data-plane "$plane" --handshake "$handshake" \
+    --out "$OUT/m7-flood-$tag.csv"
+done
+for handshake in python rust; do
+  run "m2 $handshake" "$PY" eval/run_pqvpn.py --iterations 50 --suites v2-ed25519,v3-kem,v3-mldsa \
+    --handshake "$handshake" --out "$OUT/m2-$handshake.csv"
+done
+fi
+if (( DRY_RUN )); then
+  echo "then: summary.txt with medians and gates, and a HEAD-unchanged check"
+  exit 0
+fi
 chown -R "$SUDO_USER": "$OUT"
 
 [[ $(as_user git -C "$ROOT" rev-parse HEAD) == "$COMMIT" ]] || { echo "HEAD moved during the run" >&2; exit 1; }
@@ -127,21 +190,82 @@ if phase == 3:
         median = f"{statistics.median(best):.0f} Mbps" if best else "NO DATA"
         print(f"  {protocol:10} max rate with <1% loss, n={len(best)}: {median}"
               f"  gate(reported, 5 runs): {'PASS' if ok else 'FAIL'}")
-    print("M7 ClientHello flood at 10000/s, rust: legitimate connects, offered flood rate")
-    m7 = {}
-    m7_path = f"{out}/m7-flood-rust.csv"
-    for r in csv.DictReader(open(m7_path)) if os.path.exists(m7_path) else []:
-        if r["profile"] == "flood-10000":
-            m7.setdefault(r["system"], {})[r["metric"]] = float(r["value"])
-    for system in ("pqvpn-cookie-off", "pqvpn-cookie-always"):
-        m = m7.get(system, {})
-        ok = (m.get("connects_attempted", 0) > 0 and m["connects_succeeded"] == m["connects_attempted"]
-              and m.get("flood_rate_per_s", 0) >= 9500)
+if phase >= 3:
+    TAGS = ["rust"] if phase == 3 else ["python-python", "rust-python", "rust-rust"]
+    print("M7 ClientHello flood at 10000/s" + (", rust" if phase == 3 else "") + ": legitimate connects, offered flood rate")
+    for tag in TAGS:
+        m7 = {}
+        m7_path = f"{out}/m7-flood-{tag}.csv"
+        for r in csv.DictReader(open(m7_path)) if os.path.exists(m7_path) else []:
+            if r["profile"] == "flood-10000":
+                m7.setdefault(r["system"], {})[r["metric"]] = float(r["value"])
+        for system in ("pqvpn-cookie-off", "pqvpn-cookie-always"):
+            m = m7.get(system, {})
+            ok = (m.get("connects_attempted", 0) > 0 and m["connects_succeeded"] == m["connects_attempted"]
+                  and m.get("flood_rate_per_s", 0) >= 9500)
+            verdict &= ok
+            label = "" if phase == 3 else f"{tag:13} "
+            print(f"  {label}{system:20} {m.get('connects_succeeded', 0):.0f}/{m.get('connects_attempted', 0):.0f}"
+                  f" connects  offered {m.get('flood_rate_per_s', 0):.0f}/s"
+                  f"  delivered {m.get('flood_delivered_per_s', 0):.0f}/s"
+                  f"  median {m.get('median_connect_time_ms', -1):.0f} ms"
+                  f"  gate(all connects, offered >=9500/s): {'PASS' if ok else 'FAIL'}")
+if phase == 4:
+    def rows(path):
+        return list(csv.DictReader(open(path))) if os.path.exists(path) else []
+    def med(values):
+        return statistics.median(values) if values else None
+    print("M1 LAN connect, median ms (cold = new process, no ticket, spawn to first tunnel ping; -1 = no tunnel)")
+    for tag in TAGS:
+        for system in ("pqvpn-net", "pqvpn-net-warm", "pqvpn-net-native"):
+            vals = [float(r["value"]) for r in rows(f"{out}/m1-lan-{tag}.csv") if r["system"] == system]
+            if not vals:
+                continue
+            good = [v for v in vals if v >= 0]
+            gate = ""
+            if system == "pqvpn-net-native":
+                ok = len(good) == len(vals) == 30 and med(good) <= 30
+                verdict &= ok
+                gate = f"  gate(native cold <=30 ms, 30/30): {'PASS' if ok else 'FAIL'}"
+            print(f"  {tag:13} {system:17} n={len(vals)} connected={len(good)} "
+                  f"median {med(good) if good else float('nan'):.1f} ms{gate}")
+    if not any(r["system"] == "pqvpn-net-native" for r in rows(f"{out}/m1-lan-rust-rust.csv")):
+        print("  pqvpn-net-native: NO DATA  gate(native cold <=30 ms): FAIL"); verdict = False
+    print("M2 handshake CPU, both roles in one process: median client + median server cpu ms")
+    for handshake, suffix in (("python", ""), ("rust", "-hs-rust")):
+        data = rows(f"{out}/m2-{handshake}.csv")
+        for suite in ("v2-ed25519", "v3-kem", "v3-mldsa"):
+            cpu = {m: [float(r["value"]) for r in data if r["system"] == f"pqvpn-{suite}{suffix}" and r["metric"] == m]
+                   for m in ("client_cpu_ms", "server_cpu_ms")}
+            if not all(cpu.values()):
+                if handshake == "rust" and suite == "v3-kem":
+                    print(f"  {handshake:6} {suite:10} NO DATA  gate(<=0.2 ms): FAIL"); verdict = False
+                continue
+            total = med(cpu["client_cpu_ms"]) + med(cpu["server_cpu_ms"])
+            gate = ""
+            if handshake == "rust" and suite == "v3-kem":
+                ok = total <= 0.2 and len(cpu["client_cpu_ms"]) == 50
+                verdict &= ok
+                gate = f"  gate(<=0.2 ms, n=50): {'PASS' if ok else 'FAIL'}"
+            print(f"  {handshake:6} {suite:10} client {med(cpu['client_cpu_ms']):.3f} + server "
+                  f"{med(cpu['server_cpu_ms']):.3f} = {total:.3f} ms{gate}")
+    print("M8 server VmRSS per session, N=50, v2, cookies off")
+    for tag in TAGS:
+        m = {r["metric"]: float(r["value"]) for r in rows(f"{out}/m8-{tag}.csv") if r["profile"] == "n=50"}
+        ok = m.get("connected_clients") == 50 and m.get("per_session_kb", 1e9) <= 64
         verdict &= ok
-        print(f"  {system:20} {m.get('connects_succeeded', 0):.0f}/{m.get('connects_attempted', 0):.0f} connects"
-              f"  offered {m.get('flood_rate_per_s', 0):.0f}/s  delivered {m.get('flood_delivered_per_s', 0):.0f}/s"
-              f"  median {m.get('median_connect_time_ms', -1):.0f} ms"
-              f"  gate(all connects, offered >=9500/s): {'PASS' if ok else 'FAIL'}")
+        print(f"  {tag:13} connected {m.get('connected_clients', 0):.0f}/50  "
+              f"{m.get('per_session_kb', float('nan')):.1f} kB  gate(<=64 kB, 50/50): {'PASS' if ok else 'FAIL'}")
+    print("M6 hitless rekey and rehandshake on the netns path: ping loss across epoch switches")
+    for tag in TAGS:
+        m = {(r["system"], r["metric"]): float(r["value"]) for r in rows(f"{out}/m6-net-{tag}.csv")}
+        for kind in ("rekey", "rehandshake"):
+            loss = m.get((f"pqvpn-{kind}", f"{kind}_ping_loss_pct"))
+            switches = m.get((f"pqvpn-{kind}", f"{kind}_epoch_transitions"), 0)
+            ok = loss == 0 and switches > 0
+            verdict &= ok
+            print(f"  {tag:13} {kind:11} loss {loss if loss is not None else float('nan'):.2f}%  "
+                  f"epochs {switches:.0f}  gate(0% loss, >0 epochs): {'PASS' if ok else 'FAIL'}")
 print(f"PHASE {phase} GATES:", "PASS" if verdict else "FAIL")
 PYEOF
 

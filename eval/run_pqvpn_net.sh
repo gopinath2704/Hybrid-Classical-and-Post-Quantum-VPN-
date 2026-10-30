@@ -10,6 +10,12 @@
 #
 # Usage:
 #   sudo eval/run_pqvpn_net.sh <profile> [--iterations N] [--out FILE] [--data-plane python|rust]
+#        [--handshake python|rust] [--native-client PATH]
+#
+# --handshake rust puts both ends on the Rust handshake (phase 4 slice b; needs --data-plane rust).
+# --native-client PATH adds a third row, pqvpn-net-native: the same cold definition (bash clock from
+# spawn, ticket deleted, first tunnel ping, same server, suite and n) with `PATH connect --config
+# client.toml` spawned in place of `python -m vpn.cli client connect` (phase 4 slice d, pqvpnd).
 #
 # --data-plane rust runs both ends on the Rust loop; it needs pqvpn_core, so every Python step
 # then uses $ROOT_DIR/.venv/bin/python (override with PYTHON=...), never sudo's system python.
@@ -22,11 +28,15 @@ shift
 ITERATIONS=30
 OUT=""
 DATA_PLANE=python
+HANDSHAKE=python
+NATIVE=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --iterations) ITERATIONS=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     --data-plane) DATA_PLANE=$2; shift 2 ;;
+    --handshake) HANDSHAKE=$2; shift 2 ;;
+    --native-client) NATIVE=$2; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
 done
@@ -37,6 +47,14 @@ case $DATA_PLANE in
   rust) PY=${PYTHON:-$ROOT_DIR/.venv/bin/python} ;;
   *) echo "unknown data plane: $DATA_PLANE" >&2; exit 1 ;;
 esac
+case $HANDSHAKE in
+  python) ;;
+  rust) [[ $DATA_PLANE == rust ]] || { echo "--handshake rust requires --data-plane rust" >&2; exit 1; } ;;
+  *) echo "unknown handshake: $HANDSHAKE" >&2; exit 1 ;;
+esac
+if [[ -n $NATIVE && ! -x $NATIVE ]]; then
+  echo "native client not executable: $NATIVE" >&2; exit 1
+fi
 RUN_DIR=$(mktemp -d /tmp/pqvpn-net.XXXXXX)
 SERVER_NS=pqnet-srv-$$
 CLIENT_NS=pqnet-cli-$$
@@ -60,6 +78,13 @@ print(f'liboqs_version={v}')
 if '$DATA_PLANE' == 'rust':
     import pqvpn_core
     print('data_plane=rust')
+if '$HANDSHAKE' == 'rust':
+    import dataclasses
+    from vpn.config import ServerConfig
+    if 'handshake' not in {f.name for f in dataclasses.fields(ServerConfig)}:
+        print('FATAL: handshake=rust backend unavailable (phase 4 slice b not landed)', file=sys.stderr)
+        sys.exit(1)
+    print('handshake=rust')
 "
 
 # --- Profile parameters ---
@@ -167,6 +192,10 @@ if [[ $DATA_PLANE == rust ]]; then
   echo 'data_plane = "rust"' >>"$RUN_DIR/server/server.toml"
   echo 'data_plane = "rust"' >>"$RUN_DIR/client/client.toml"
 fi
+if [[ $HANDSHAKE == rust ]]; then
+  echo 'handshake = "rust"' >>"$RUN_DIR/server/server.toml"
+  echo 'handshake = "rust"' >>"$RUN_DIR/client/client.toml"
+fi
 
 # --- Start server ---
 ip netns exec "$SERVER_NS" sysctl -q -w net.ipv4.ip_forward=1
@@ -228,6 +257,26 @@ for i in $(seq 0 $(( ITERATIONS - 1 ))); do
   wait "$CLIENT_PID" 2>/dev/null || true
   sleep 2
 done
+
+# --- Native cold: the same definition, with the pqvpnd binary spawned in place of the Python CLI ---
+if [[ -n $NATIVE ]]; then
+  echo "Running $ITERATIONS native cold connect-time measurements ($NATIVE)..."
+  for i in $(seq 0 $(( ITERATIONS - 1 ))); do
+    START_NS=$(date +%s%N)
+    ip -n "$CLIENT_NS" link del pqbench0 2>/dev/null || true
+    rm -f "$TICKET"
+    ip netns exec "$CLIENT_NS" "$NATIVE" connect --config "$RUN_DIR/client/client.toml" \
+      >"$RUN_DIR/native.log" 2>&1 &
+    CLIENT_PID=$!
+    CONNECTED=0
+    wait_tunnel && CONNECTED=1
+    record pqvpn-net-native "$i" "$START_NS" "$CONNECTED"
+    # SIGTERM: pqvpnd restores routes and closes the TUN, as the Python client does.
+    kill "$CLIENT_PID" 2>/dev/null || true
+    wait "$CLIENT_PID" 2>/dev/null || true
+    sleep 2
+  done
+fi
 
 # --- Warm: CONNECT over the IPC of an already-running client service ---
 # Private mount namespace + tmpfs /run: the production socket path /run/pqvpn/client.sock,
