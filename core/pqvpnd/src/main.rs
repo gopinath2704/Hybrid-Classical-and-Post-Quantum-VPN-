@@ -18,14 +18,15 @@ fn main() -> ExitCode {
     if matches!(args.as_slice(), [_, command] if command == "recover") {
         return recover();
     }
-    let config = match args.as_slice() {
-        [_, command, flag, path] if command == "connect" && flag == "--config" => PathBuf::from(path),
+    let (config, status_json) = match args.as_slice() {
+        [_, command, flag, path] if command == "connect" && flag == "--config" => (PathBuf::from(path), false),
+        [_, command, flag, path, json] if command == "connect" && flag == "--config" && json == "--status-json" => (PathBuf::from(path), true),
         _ => {
-            eprintln!("usage: pqvpnd connect --config CLIENT_TOML | pqvpnd recover");
+            eprintln!("usage: pqvpnd connect --config CLIENT_TOML [--status-json] | pqvpnd recover");
             return ExitCode::from(2);
         }
     };
-    match pqvpnd::connect::connect(&config, &signals) {
+    match pqvpnd::connect::connect(&config, &signals, status_json) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("pqvpnd: {error}");

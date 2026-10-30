@@ -8,6 +8,7 @@ kill switch on a full tunnel: enforced while up and removed on SIGTERM, left blo
 usage: conformance.py PQVPND REPO SERVER_HANDSHAKE SERVER_DATA_PLANE VERSIONS(comma list)
 """
 import ipaddress
+import json
 import os
 import signal
 import socket
@@ -29,6 +30,7 @@ from vpn.identity import (AuthorizedClients, generate_client_identity, generate_
                           generate_server_identity)
 
 SERVER = "192.0.2.1"
+VERSION_UNDER_TEST = 0
 TUN = "pqconf0"
 
 
@@ -131,15 +133,59 @@ def kill_switch(server: runtime.VPNServer, config: Path, client_ip_check, before
     assert kill_switch_rules() is None and uplink_send_allowed(), "recover reopens"
     # The crash's other residue: the server bypass /32 (harmless, documented); clear it for the next check.
     subprocess.run(["ip", "route", "del", f"{SERVER}/32"], capture_output=True)
-    # Lost session (the server goes away): pqvpnd exits with an error and leaves the "connecting" phase blocking.
-    process, _ = start_pqvpnd(config)
-    server.stop()
-    assert process.wait(20) != 0, "a lost session is an error exit"
+    # Lost session (the server goes away): pqvpnd exits with an error and leaves the "connecting" phase blocking;
+    # with --status-json its final line says BLOCKED, and only after the table is in place.
+    seen = status_stream(config, VERSION_UNDER_TEST, server, lambda _, server: server.stop())
+    final = seen[-2]
+    assert final["state"] == "BLOCKED" and final["kill_switch"] and final["error"] and seen[-1] == {"exit": 1}, seen[-3:]
     rules = kill_switch_rules()
     assert rules is not None and "oifname \"lo\"" in rules and TUN not in rules, "narrowed to the connecting phase"
     assert not uplink_send_allowed(), "still blocking after the session was lost"
     recover()
     assert ip("route", "show", "table", "all") == before, "routes restored after the lost session"
+
+
+STATES = {"CONNECTING", "CONNECTED", "DISCONNECTED", "FAILED", "BLOCKED"}
+CONNECTED_FIELDS = {"client_vpn_ip": str, "server_vpn_ip": str, "prefix": int, "endpoint": str, "tun_name": str, "mtu": int,
+                    "suite": str, "ipv6_guard": bool, "dns_managed": bool, "epoch": int, "probes": dict}
+
+
+def status_lines(process: subprocess.Popen):
+    """Each --status-json line, checked against wire spec v1 before it is yielded."""
+    for raw in process.stdout:
+        assert len(raw.encode()) <= 4096 and raw.endswith("\n"), f"line framing: {raw[:80]!r}"
+        line = json.loads(raw)
+        assert line["v"] == 1 and line["state"] in STATES, line
+        assert type(line["error"]) is str and type(line["kill_switch"]) is bool, line
+        if line["state"] == "CONNECTED":
+            for key, kind in CONNECTED_FIELDS.items():
+                assert type(line[key]) is kind, (key, line)
+            for key in ("rekey_in", "rehandshake_in"):
+                assert line[key] is None or line[key] >= 0, (key, line)
+            probes = line["probes"]
+            assert type(probes["sent"]) is int and type(probes["lost"]) is int and len(probes["rtts_ms"]) <= 64, line
+        yield line
+
+
+def status_stream(config: Path, version: int, server: runtime.VPNServer, stop) -> list[dict]:
+    """One --status-json session: CONNECTING, CONNECTED (then an epoch-change line), then `stop` ends it."""
+    process = subprocess.Popen([PQVPND, "connect", "--config", str(config), "--status-json"], stdout=subprocess.PIPE,
+                               stderr=sys.stderr, text=True)
+    lines = status_lines(process)
+    seen = [next(lines), next(lines)]
+    assert [line["state"] for line in seen] == ["CONNECTING", "CONNECTED"], seen
+    assert seen[1]["suite"] == ("v3-kem" if version == 3 else "v2-ed25519") and seen[1]["tun_name"] == TUN, seen[1]
+    for line in lines:
+        seen.append(line)
+        if line["state"] != "CONNECTED" or line["epoch"] > seen[1]["epoch"]:
+            break
+    assert seen[-1]["state"] == "CONNECTED" and seen[-1]["epoch"] > seen[1]["epoch"], "an epoch change is reported"
+    assert any(line["probes"]["sent"] for line in seen[1:]), "keepalive results are reported"
+    stop(process, server)
+    seen.extend(lines)
+    assert process.wait(20) is not None
+    seen.append({"exit": process.returncode})
+    return seen
 
 
 def stop_pqvpnd(process: subprocess.Popen) -> None:
@@ -196,13 +242,20 @@ def run_version(version: int, work: Path) -> None:
         stop_pqvpnd(process)
         until(lambda: not server.sessions.by_id, 5, "server session closed")
         assert ip("route", "show", "table", "all") == before, "every route restored after resume"
+        # 2b. --status-json: the wire spec, ending in exactly one final DISCONNECTED line on SIGTERM.
+        seen = status_stream(config, version, server, lambda process, _: process.send_signal(signal.SIGTERM))
+        finals = [line for line in seen[:-1] if line["state"] != "CONNECTED"][1:]
+        assert [line["state"] for line in finals] == ["DISCONNECTED"] and seen[-1] == {"exit": 0}, seen[-3:]
+        until(lambda: not server.sessions.by_id, 5, "server session closed")
         # 3. Kill switch on a full tunnel (DNS left unmanaged: resolvectl would reach the host's resolved).
         ks_config = work / "client/kill_switch.toml"
         ks_config.write_text(config.read_text().replace("full_tunnel = false\n", "full_tunnel = true\nkill_switch = true\n")
                              + "ping_timeout = 1\ndead_peer_timeout = 3\n")
+        global VERSION_UNDER_TEST
+        VERSION_UNDER_TEST = version
         kill_switch(server, ks_config, lambda client_ip: data_both_ways(server, client_ip, b"kill-switch"), before)
         print(f"ok {label}: cookie, full, data, rekey+rehandshake (epoch {item.crypto.epoch}), SIGTERM, resume, "
-              "kill switch (up, SIGTERM removes, SIGKILL keeps until recover, lost session keeps)", flush=True)
+              "kill switch (up, SIGTERM removes, SIGKILL keeps until recover, lost session keeps), --status-json", flush=True)
     finally:
         runtime.ResumptionServerHandshake.process_hello = real_hello
         server.stop()

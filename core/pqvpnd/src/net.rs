@@ -286,6 +286,10 @@ impl Network {
         Ok(())
     }
 
+    pub fn dns_managed(&self) -> bool {
+        self.dns_resolvectl.is_some()
+    }
+
     fn replace_route(&mut self, destination: &str, route: Vec<String>) -> io::Result<()> {
         let previous = parse_routes(&run_ip(&argv(&["route", "show", "exact", destination]), true)?);
         run_ip(&[argv(&["route", "replace"]), route.clone()].concat(), true)?;
