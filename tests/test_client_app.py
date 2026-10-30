@@ -275,6 +275,121 @@ class TestClientService:
         assert status.dns_managed is False
 
 
+# ─── STATUS golden contract: what the GUI's ClientStatus(**status) accepts ─────
+
+def _hint_matches(value: object, hint: object) -> bool:
+    import types
+    import typing
+    if hint is type(None):
+        return value is None
+    if typing.get_origin(hint) in (typing.Union, types.UnionType):
+        return any(_hint_matches(value, arm) for arm in typing.get_args(hint))
+    if typing.get_origin(hint) is list:
+        (item,) = typing.get_args(hint)
+        return isinstance(value, list) and all(_hint_matches(v, item) for v in value)
+    if hint is dict:
+        return isinstance(value, dict)
+    if hint is float:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if hint is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    return isinstance(value, hint)
+
+
+def assert_status_contract(status: dict) -> ClientStatus:
+    """A STATUS payload exactly as the GUI needs it: ClientStatus(**status) raises on an extra key but silently
+    defaults a missing one, so the key set must equal the dataclass fields, and every value must have its type."""
+    import dataclasses
+    import typing
+    hints = typing.get_type_hints(ClientStatus)
+    assert set(status) == {f.name for f in dataclasses.fields(ClientStatus)}, set(status) ^ set(hints)
+    wrong = {k: v for k, v in status.items() if not _hint_matches(v, hints[k])}
+    assert not wrong, wrong
+    assert status["state"] in {state.value for state in ConnectionState}
+    return ClientStatus(**status)
+
+
+def _ipc_status(service: ClientService) -> dict:
+    service.ALLOWED_UIDS = {os.getuid()}
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        ipc_send(a, {"command": "STATUS"})
+        service._handle_connection(b)
+        return ipc_recv(a, timeout=2.0)["status"]
+    finally:
+        a.close()
+
+
+def _fake_vpn(state: str, quality: bool) -> SimpleNamespace:
+    from vpn.network import NetworkQualityMonitor
+    monitor = NetworkQualityMonitor()
+    if quality:
+        for rtt in (1.2, 1.6):
+            monitor.record_probe_sent()
+            monitor.record_rtt(rtt)
+        monitor.record_probe_sent()
+        monitor.record_loss()
+    return SimpleNamespace(
+        state=state, error="", cfg=SimpleNamespace(kill_switch=True), session=SimpleNamespace(epoch=2),
+        tun=SimpleNamespace(name="pqvpn0", mode=SimpleNamespace(name="NATIVE"), mtu=1380), quality=monitor,
+        network=SimpleNamespace(ipv6=SimpleNamespace(table="pqvpn_client6"), dns_cleanup_registered=True,
+                                kill_switch=True),
+        tunnel={"client_vpn_ip": "10.8.0.2", "server_vpn_ip": "10.8.0.1", "rekey_interval": 120},
+        next_rekey=time.monotonic() + 60, server_ip="192.0.2.10")
+
+
+class TestStatusContract:
+    """Every STATUS the service can send, through the real IPC handler, meets the GUI's contract. The native
+    backend (pqvpnd --status-json) is held to the same contract by the same assertion."""
+
+    @pytest.fixture
+    def explicit(self, tmp_path):
+        config = tmp_path / "client.toml"
+        config.write_text("[client]\nserver_host='vpn.example'\n")
+        return ClientService(str(config))
+
+    def test_setup_required_explicit_and_managed(self, tmp_path):
+        assert assert_status_contract(_ipc_status(ClientService(str(tmp_path / "missing.toml")))).state == "SETUP_REQUIRED"
+        managed = ClientService(None, state_dir=tmp_path / "state")
+        status = assert_status_contract(_ipc_status(managed))
+        assert status.state == "SETUP_REQUIRED" and status.managed_mode and status.identity_ready
+
+    def test_disconnected_and_failed(self, explicit):
+        assert assert_status_contract(_ipc_status(explicit)).state == "DISCONNECTED"
+        explicit._last_failure = "server unreachable"
+        status = assert_status_contract(_ipc_status(explicit))
+        assert (status.state, status.error) == ("FAILED", "server unreachable")
+
+    def test_blocked_by_a_leftover_kill_switch(self, tmp_path, monkeypatch):
+        import app.client as client_module
+        monkeypatch.setattr(client_module, "_kill_switch_present", lambda: True)  # checked at service start
+        config = tmp_path / "client.toml"
+        config.write_text("[client]\nserver_host='vpn.example'\n")
+        status = assert_status_contract(_ipc_status(ClientService(str(config))))
+        assert status.state == "BLOCKED" and status.kill_switch_active
+
+    @pytest.mark.parametrize("state", ["CONNECTING", "CONNECTED", "DISCONNECTING", "BLOCKED"])
+    @pytest.mark.parametrize("quality", [False, True])
+    def test_with_a_session(self, explicit, state, quality):
+        explicit._vpn = _fake_vpn(state, quality)
+        explicit._connected_at = time.monotonic()
+        status = assert_status_contract(_ipc_status(explicit))
+        assert status.state == state
+        if state == "CONNECTED":
+            assert (status.client_vpn_ip, status.epoch, status.tun_mode) == ("10.8.0.2", 2, "NATIVE")
+            assert (status.rtt_ms is not None) == quality and (status.loss_rate is not None) == quality
+
+    def test_contract_rejects_drift(self):
+        from dataclasses import asdict
+        good = asdict(ClientStatus())
+        assert_status_contract(good)
+        for broken in ({**good, "extra": 1}, {k: v for k, v in good.items() if k != "epoch"},
+                       {**good, "epoch": "2"}, {**good, "is_quantum_safe": 1}, {**good, "state": "UP"},
+                       {**good, "split_tunnel": [1]}):
+            with pytest.raises(AssertionError):
+                assert_status_contract(broken)
+
+
 # ─── Malformed IPC request tests ──────────────────────────────────────────
 
 class TestMalformedIPC:
