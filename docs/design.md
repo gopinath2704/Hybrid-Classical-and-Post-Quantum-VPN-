@@ -16,7 +16,7 @@ Every record header is AAD, including its DATA/CONTROL channel. Each channel and
 
 Production never falls back to socket-pipe TUN. Emulation requires `--dev-emulated-tun`. Host changes are transactional on the client; server firewall helpers own isolated nftables tables and do not flush user rules.
 
-Current limitations are tracked in the README: IPv4 routing is implemented; IPv6 forwarding/data-route coverage, optional kill switch, and dynamic PMTU discovery remain future work. Post-compromise security via hybrid re-handshake and stateless DoS-resistance cookies are implemented in v3. The root namespace integration marker requires a privileged Linux runner and is not evidence until executed there.
+Current limitations are tracked in the README: IPv4 routing is implemented; IPv6 forwarding/data-route coverage and dynamic PMTU discovery remain future work. An optional kill switch is implemented (see Kill switch). Post-compromise security via hybrid re-handshake and stateless DoS-resistance cookies are implemented in v3. The root namespace integration marker requires a privileged Linux runner and is not evidence until executed there.
 
 ## Deployment and diagnostics
 
@@ -127,6 +127,20 @@ socket itself is `0666` so any local user can connect and be refused; restrictin
 it to `0660` plus a dedicated group is a tracked follow-up. In the other direction,
 `IPCClient` refuses a service whose peer uid is not 0, so a squatted socket (for
 example the `/tmp` fallback) cannot impersonate the service.
+
+With `client_backend = "native"` the service runs `pqvpnd connect --config <file>
+--status-json` instead of the in-process `VPNClient` and builds the same `ClientStatus`
+from its status stream (wire spec v1): one JSON object per line, at most 4096 bytes,
+each with `v` = 1, `state` (CONNECTING, CONNECTED, DISCONNECTED, FAILED, BLOCKED),
+`error` and `kill_switch`; CONNECTED lines add the tunnel fields, the negotiated
+`suite`, `epoch`, rekey timers and keepalive deltas that feed the same
+`NetworkQualityMonitor`. Lines come every second while connected and on every epoch
+change, and exactly one final line follows all cleanup. The service treats the stream
+as untrusted: an invalid line stops the child and, with a kill switch, keeps traffic
+blocked itself; an exit without a final line is reported as FAILED or, if the table is
+present, BLOCKED. `pqvpnd` is found at a fixed path, never through `PATH`, and the
+status shows `pqc_mode = "native_aws_lc"`, quantum-safe once a hybrid suite is
+negotiated.
 
 ## Unsupported IPv6 and revocation
 
@@ -295,6 +309,13 @@ shared secrets. The new session keys are derived via HKDF mixing the original
   a full handshake
 - The client persists the ticket and secret to a JSON file beside the config;
   fingerprint mismatch between the stored ticket and current server rejects reuse
+- The ticket file is deliberately not encrypted at rest. It sits next to the client
+  identity private key, which has the same protection (owner-only 0600), so anyone
+  able to read the ticket can read the stronger long-term key; sealing the ticket
+  alone adds nothing. Both loaders (Python and Rust) refuse a ticket that is not a
+  regular file owned by the effective uid with mode 0600/0400 (opened `O_NOFOLLOW`,
+  non-blocking so a planted FIFO cannot hang connect), and a ticket the server rejects
+  is deleted, so it cannot outlive a revocation
 
 **Configuration:** `resumption_ticket_lifetime` in `[server]` TOML (seconds,
 0 disables). The server advertises resumption support in the encrypted CONFIG
@@ -429,8 +450,8 @@ starting the Python daemon alone does not install firewall/NAT rules. Existing h
 and provider policy remains an independent boundary.
 
 Client UDP receive deadlines detect a blackholed data path even when TCP is alive.
-Route/DNS restoration on detected failure restores ordinary connectivity; it is
-not a kill switch. Managed full-tunnel DNS fails setup when its resolver manager is
+Without `kill_switch`, route/DNS restoration on detected failure restores ordinary
+connectivity; it is not a kill switch. With it, see Kill switch. Managed full-tunnel DNS fails setup when its resolver manager is
 unavailable; `dns_mode="none"` explicitly accepts DNS leakage risk. Routed IPv6 and
 dynamic authenticated PMTU discovery remain unsupported/incomplete.
 
@@ -440,6 +461,33 @@ private identities, and the service's CAP_NET_ADMIN privilege are trusted. Priva
 keys require mode 0600/0400 and server
 ML-KEM keypairs are tested for consistency. These checks and passing regression/native
 and live tests do not substitute for independent protocol review or production assurance.
+
+## Kill switch
+
+`kill_switch = true` installs one fixed-name nftables table, `inet pqvpn_killswitch`,
+whose output chain drops everything this host sends except loopback, DHCPv4 renewals
+and the server's control TCP port, plus, once the tunnel is up, the server's data UDP
+port and the TUN. Each install is one transaction (`destroy table` + re-add), so a
+replace never opens a gap. The Python client and `pqvpnd` render the same text,
+held byte for byte to `tests/golden/killswitch_*.nft`, and each renderer validates its
+inputs before interpolating them.
+
+It is installed in the "connecting" phase before the handshake and widened to "up"
+after routes and DNS. Only an explicit disconnect (or `recover`) removes it. A lost
+session, a failed reconnect from the blocked state, or a crash leaves it blocking: the
+table outlives the process, so a SIGKILL fails closed. The client then reports
+`BLOCKED`. It requires `full_tunnel = true`, an `ipv6_policy` other than `allow`, and
+an IPv4 address for `server_host`: from the blocked state a hostname could only be
+resolved by letting DNS out.
+
+Documented limits: no LAN access while it is on; no forward chain, so containers or VMs
+forwarded through this host are not covered after a crash; nftables state does not
+survive a reboot, so it fails open at boot until the first connect; after SIGKILL the
+randomly named IPv6 guard table and the server bypass route are left behind until
+removed by hand. `destroy table` needs nftables 1.0.8 and kernel 6.3 or newer.
+
+A full tunnel with managed DNS but no DNS servers (neither configured nor advertised)
+is refused in both clients rather than leaving every lookup on the uplink's resolver.
 
 ## IPv6 leakage and revocation boundaries
 

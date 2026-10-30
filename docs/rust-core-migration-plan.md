@@ -281,6 +281,7 @@ The rewrite must not weaken a single property in the security gap analysis. Thes
 - **Inner-packet validation stays.** Decrypted packets must pass the same source-IP check as `validate_client_packet` before reaching the TUN.
 - **Revocation reaches the core.** `remove_session` and ticket-key rotation take effect in the Rust session table within one revocation-loop tick.
 - **No unsafe outside one module.** `#![forbid(unsafe_code)]` on every crate except the small syscall and ioctl module, which gets a line-by-line review and Miri where it can run.
+  Phase 5 review (2026-10-30): `pqvpn_fd` holds the only four `unsafe` blocks (`fcntl(F_GETFD)`, `BorrowedFd::borrow_raw`, `OwnedFd::from_raw_fd` in `own`, and the `TUNSETIFF` ioctl), each with a SAFETY comment; the `ifreq` layout is a compile-time assert. `own()` stays a safe fn on purpose: its one caller is in `pqvpn_core`, and `forbid(unsafe_code)` cannot be relaxed for one block, so the ownership contract (a fresh `os.dup()` copy nothing else uses) is documented on `check` and `own` rather than in the signature. Miri cannot execute these FFI calls, so it adds no coverage here.
 - **No secrets cross back.** The FFI returns only counters and status; keys are never readable from Python once handed over.
 
 Test strategy, on top of the existing 560 tests and 70-attack pentest suite:
@@ -290,6 +291,7 @@ Test strategy, on top of the existing 560 tests and 70-attack pentest suite:
 - [ ] Known-answer vectors exported from the Python code for HKDF output, frame encryption and transcripts, checked in Rust unit tests.
 - [ ] Differential fuzzing with `cargo-fuzz` on frame decryption, the replay window and handshake parsing, comparing Rust against Python where both exist.
   cargo-fuzz smoke 2026-10-29: dispatch 1.63M runs, open 6.70M runs, 60 s each, no crashes; cargo deny + cargo audit clean.
+  Re-run 2026-10-30: `cargo deny check` advisories, bans, licenses and sources ok (one harmless warning: the `libfuzzer-sys` NCSA exception is unmatched because `core/fuzz` is outside the workspace); `cargo audit` 71 crates against 1,395 advisories, none found.
 - [x] Property tests (`proptest`) for the replay window and sequence handling at the 64-bit edge.
 - [ ] Re-run the Tamarin models only where the protocol changes (the folded `UDP_BIND` in Phase 1); a pure port changes no model.
 
@@ -302,7 +304,8 @@ Treat the Python and Rust backends as two configurations of one artifact, not as
 - **Offline, pinned builds.** Commit `Cargo.lock`, vendor crates with `cargo vendor` into the source tarball, and pin the toolchain in `rust-toolchain.toml`. The package is built from `git archive HEAD`, so the vendored tree is what ships.
 - **Record the environment.** Every run writes rustc version, crate versions, liboqs version, CPU model and flags (AES-NI, AVX2), kernel and governor into its results header.
 - **Same statistics.** 30 runs per cell, median with 95% bootstrap CI, as M1 does today, for every new number.
-- **Packaging chores per release.** After each merge, refresh `packaging/arch/pqvpn-3.0.0.tar.gz`, the PKGBUILD `sha256sums` and the digest pin in `tests/test_onboarding.py`; add `cargo` and `maturin` to the Arch makedepends and the `debian:trixie` build container.
+- **Packaging chores per release.** After each merge, refresh `packaging/arch/pqvpn-3.0.0.tar.gz`, the PKGBUILD `sha256sums` and the digest pin in `tests/test_onboarding.py`; add `cargo` and `maturin` to the Arch makedepends and the `debian:trixie` build container. Both packages also build and install `/usr/bin/pqvpnd`. Refresh the pins as the last commit before a package build: every commit under the tarball allowlist moves them.
+- **MSRV 1.85 has no headroom.** `toml`, `toml_parser` and `zeroize` declare exactly 1.85, the `debian:trixie` rustc. Re-check the trixie build (`cargo +1.85.1 check -p pqvpnd --all-targets`) before bumping any of those pins.
 
 ## Risks and mitigations
 

@@ -336,6 +336,26 @@ Check the switch with
 Roll back with `sudo env PQVPN_DATA_PLANE=python bash scripts/deploy-server.sh`, or by hand:
 `sudo sed -i 's/^data_plane = "rust"/data_plane = "python"/' /etc/pqvpn/server.toml && sudo systemctl restart pqvpn-server`.
 
+### Native client (pqvpnd)
+
+Both packages install `/usr/bin/pqvpnd`, the Rust client: `sudo pqvpnd connect --config
+client.toml` reads the same `[client]` table as the Python client (full or split tunnel,
+IPv6 policy, systemd-resolved DNS, kill switch) and refuses, with a reason, any option
+it does not implement. `client_backend = "native"` in an explicit-TOML config makes the
+client service run it; managed profiles use the Python client. It runs `ip`, `nft` and
+`resolvectl` from fixed system paths only.
+
+### Kill switch
+
+Set `kill_switch = true` with `full_tunnel = true` and an IPv4 address as `server_host`.
+While it is on, nothing leaves the host outside the tunnel, LAN included. After a lost
+session or a crash it keeps blocking until you disconnect in the GUI or run
+`sudo pqvpn client recover` (or `sudo pqvpnd recover`); both are safe to repeat. It is
+not active after a reboot until the first connect. After a SIGKILL, also remove the
+leftover IPv6 guard (`sudo nft list tables ip6`, then `sudo nft delete table ip6
+pqvpn_client6_<id>`). Leak checks: `bash pentesting/attacks/attack33_40_network_leaks.sh`
+(no sudo; it runs in a private namespace) includes a kill-switch case.
+
 ## Native and root namespace gate
 
 Install dev dependencies in a fresh validation environment with the same Python:
@@ -636,8 +656,8 @@ No permanent `/etc/resolv.conf` overwrite is performed.
 
 `dns_mode="none"` explicitly opts out, emits a warning, and accepts unmanaged DNS
 and possible leakage over a more-specific LAN route. It is not a safe default.
-If both configured and advertised DNS lists are empty, no DNS is installed; this
-also requires operator attention before full-tunnel deployment.
+If both configured and advertised DNS lists are empty, a full tunnel with managed
+DNS is refused; in split mode no DNS is installed.
 
 Split tunnel does not automatically install `~.`. Configure
 `dns_routing_domains=["~corp.example"]` for intentional split DNS routing. An empty
