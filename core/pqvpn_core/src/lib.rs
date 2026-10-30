@@ -2,8 +2,10 @@
 //! PQ-VPN Rust core. Keys go in; only ciphertext comes back out.
 
 pub mod dataplane;
+pub mod handshake;
 pub mod packet;
 pub mod replay;
+pub mod schedule;
 pub mod session;
 
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};

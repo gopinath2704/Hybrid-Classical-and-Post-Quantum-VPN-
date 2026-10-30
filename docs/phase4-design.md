@@ -21,17 +21,18 @@ This answers the Phase 4 brief from `docs/rust-core-migration-plan.md` and is re
 **The seam.** A private trait inside `pqvpn_core`, with one production implementation and one test implementation:
 
 ```rust
-pub(crate) trait Draws {
-    fn random32(&mut self, label: Draw) -> [u8; 32];                       // client_random, session_id, server_random, rekey nonce, ticket key
-    fn nonce12(&mut self, label: Draw) -> [u8; 12];                        // ticket nonce
-    fn x25519(&mut self, label: Draw) -> agreement::PrivateKey;            // ephemeral DH keys
-    fn mlkem_keypair(&mut self, label: Draw) -> (kem::DecapsulationKey<..>, Vec<u8>); // client ephemeral (dk, ek bytes)
-    fn encapsulate(&mut self, label: Draw, ek: &EncapsulationKey<..>) -> (Vec<u8>, Zeroizing<[u8; 32]>);
-    fn mldsa_sign(&mut self, label: Draw, key: &PqdsaKeyPair, msg: &[u8]) -> Vec<u8>;
+// As built in slice (a), core/pqvpn_core/src/handshake.rs. Sealed, so no crate linking pqvpn_core can implement it.
+pub trait Draws: sealed::Sealed {
+    fn random(&mut self) -> Result<[u8; 32], Error>;                           // client_random, session_id, server_random, rekey nonce
+    fn x25519(&mut self) -> Result<agreement::PrivateKey, Error>;              // ephemeral DH keys
+    fn mlkem_keypair(&mut self) -> Result<(DecapsulationKey, Vec<u8>), Error>; // (dk, ek bytes)
+    fn encapsulate(&mut self, ek: &[u8; 1184]) -> Result<([u8; 1088], Zeroizing<[u8; 32]>), Error>;
 }
-pub(crate) struct Os;                 // calls aws-lc-rs; zero-sized
-#[cfg(test)] pub(crate) struct Replay; // pops recorded values and asserts each `Draw` label in order
+pub struct Os;                         // calls aws-lc-rs; zero-sized
+#[cfg(test)] pub(crate) struct Replay; // pops one step's recorded draws, checking kind and order, and that all were used
 ```
+
+Slice (a) checks each draw's **kind and order**, not a finer label. v3-mldsa is not ported, so there is no `mldsa_sign`. The ticket key and nonce draws come in slice (b) with tickets.
 
 - The state machines are generic over `D: Draws`. The PyO3 classes and `pqvpnd` name only `Os`, so the shipped `.so` and binary contain only that instantiation.
 - `Replay` is `#[cfg(test)]`, so it exists only in `cargo test` builds of the crate. There is no feature flag, no runtime flag and no Python-visible hook. The vector tests live in `src/` unit-test modules, because integration tests in `tests/` cannot see `cfg(test)` items.
