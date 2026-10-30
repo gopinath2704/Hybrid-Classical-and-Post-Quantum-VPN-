@@ -1142,3 +1142,142 @@ def test_rekey_rejects_revoked_client(tmp_path):
     auth.revoke(fingerprint(b'\x01' * 32))
     with pytest.raises(HandshakeError, match="revoked"):
         server._rekey_server(mock_session, b'\x00' * 36)
+
+
+# --- cookie_mode "under_load" counts handshakes in progress, not established sessions ---
+
+def _counter_server(tmp_path, data_plane, **overrides):
+    fp = generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
+    settings = dict(data_plane=data_plane, listen_host='127.0.0.1', control_port=0, udp_port=0,
+        server_identity_private_key=str(tmp_path/'server.key'), server_identity_public_key=str(tmp_path/'server.pub'),
+        authorized_clients_file=str(tmp_path/'clients.json'), dev_emulated_tun=True, dns_servers=[],
+        idle_timeout=30, rekey_interval=0, connections_per_source=100)
+    settings.update(overrides)
+    AuthorizedClients(tmp_path/'clients.json').authorize(b'\x00' * 32, 'placeholder')
+    server = runtime.VPNServer(ServerConfig(**settings))
+    worker = threading.Thread(target=server.start)
+    worker.start()
+    until(lambda: server._data_thread is not None and server._data_thread.is_alive())
+    server.cfg.udp_port = server.udp.getsockname()[1]
+    return server, worker, fp
+
+
+def _counter_client(server, tmp_path, fp, name, authorized=True):
+    directory = tmp_path / name
+    directory.mkdir(exist_ok=True)
+    if not (directory/'client.key').exists():
+        generate_client_identity(directory/'client.key', directory/'client.pub')
+        if authorized:
+            AuthorizedClients(tmp_path/'clients.json').authorize((directory/'client.pub').read_bytes(), name)
+    client = runtime.VPNClient(ClientConfig(data_plane=server.cfg.data_plane, server_host='127.0.0.1',
+        server_control_port=server.tcp.getsockname()[1], server_identity_public_key=str(tmp_path/'server.pub'),
+        server_identity_fingerprint=fp, client_identity_private_key=str(directory/'client.key'),
+        dev_emulated_tun=True, tun_name=f'pq{name}', full_tunnel=False))
+    client.PING_INITIAL_DELAY, client.PING_INTERVAL = .1, .5
+    return client
+
+
+def _pending(server):
+    with server._pending_lock:
+        return server._pending_handshakes
+
+
+def _count_challenges(monkeypatch):
+    issued = []
+    real = runtime.pack_cookie_challenge
+    def spy(*args, **kwargs):
+        issued.append(True)
+        return real(*args, **kwargs)
+    monkeypatch.setattr(runtime, 'pack_cookie_challenge', spy)
+    return issued
+
+
+def test_under_load_cookie_ignores_established_sessions(data_plane, tmp_path, monkeypatch):
+    issued = _count_challenges(monkeypatch)
+    server, worker, fp = _counter_server(tmp_path, data_plane, cookie_mode='under_load', cookie_threshold=2)
+    clients = []
+    try:
+        for name in ('est1', 'est2', 'est3'):
+            clients.append(_counter_client(server, tmp_path, fp, name))
+            clients[-1].connect()
+            until(lambda: _pending(server) == 0)
+        assert len(server.sessions.by_id) == 3 and issued == []
+    finally:
+        for client in clients: client.disconnect()
+        server.stop(); worker.join(4)
+    assert not worker.is_alive()
+
+
+def test_under_load_cookie_counts_stalled_handshakes(data_plane, tmp_path, monkeypatch):
+    issued = _count_challenges(monkeypatch)
+    server, worker, fp = _counter_server(tmp_path, data_plane, cookie_mode='under_load', cookie_threshold=2)
+    address = ('127.0.0.1', server.tcp.getsockname()[1])
+    stalled = [socket.create_connection(address), socket.create_connection(address)]
+    client = None
+    try:
+        stalled[1].sendall(b'\x00\x00')  # half a length prefix; the other sends nothing
+        until(lambda: _pending(server) == 2)
+        client = _counter_client(server, tmp_path, fp, 'late')
+        client.connect()
+        assert client.state == 'CONNECTED' and issued == [True]
+        for sock in stalled: sock.close()
+        until(lambda: _pending(server) == 0)
+    finally:
+        for sock in stalled: sock.close()
+        if client: client.disconnect()
+        server.stop(); worker.join(4)
+    assert not worker.is_alive()
+
+
+def test_pending_handshake_counter_is_exact_across_exit_paths(data_plane, tmp_path, monkeypatch):
+    from handshake.kemtls import PROTOCOL_VERSION, ResumptionHello, pack_cookie_response
+    resumed = []
+    real_hello = runtime.ResumptionServerHandshake.process_hello
+    def spy(self, wire):
+        out = real_hello(self, wire)
+        resumed.append(True)
+        return out
+    monkeypatch.setattr(runtime.ResumptionServerHandshake, 'process_hello', spy)
+    server, worker, fp = _counter_server(tmp_path, data_plane, cookie_mode='always', handshake_timeout=30)
+    address = ('127.0.0.1', server.tcp.getsockname()[1])
+    # One handshake stays in progress throughout: a double decrement anywhere would show as 0, not 1.
+    held = socket.create_connection(address)
+    clients = []
+    try:
+        until(lambda: _pending(server) == 1)
+        time.sleep(.2)  # let its handler apply the 30 s timeout before shortening it for the rest
+        server.cfg.handshake_timeout = 1
+        ok = _counter_client(server, tmp_path, fp, 'ok')
+        clients.append(ok)
+        ok.connect()                                              # success (with a cookie round trip)
+        until(lambda: _pending(server) == 1)
+        stranger = _counter_client(server, tmp_path, fp, 'stranger', authorized=False)
+        clients.append(stranger)
+        with pytest.raises(Exception):
+            stranger.connect()                                    # authorization failure
+        until(lambda: _pending(server) == 1)
+        silent = socket.create_connection(address)                # handshake_timeout
+        until(lambda: _pending(server) == 2)
+        until(lambda: _pending(server) == 1, 5)
+        silent.close()
+        socket.create_connection(address).close()                # dropped socket
+        bad_cookie = socket.create_connection(address)            # cookie rejection
+        runtime.send_message(bad_cookie, pack_cookie_response(b'\x00' * 32, b'\x00' * 16))
+        bad_ticket = socket.create_connection(address)            # resumption failure
+        runtime.send_message(bad_ticket, ResumptionHello(b'r' * 32, b't' * 80, b'e' * 32, b'p' * 1184).pack(PROTOCOL_VERSION))
+        until(lambda: _pending(server) == 1)
+        bad_cookie.close(); bad_ticket.close()
+        ok.disconnect()
+        again = _counter_client(server, tmp_path, fp, 'ok')
+        clients.append(again)
+        again.connect()                                           # resumption success
+        assert resumed == [True]
+        until(lambda: _pending(server) == 1)
+        held.close()
+        until(lambda: _pending(server) == 0)
+        assert server._pending_handshakes == 0
+    finally:
+        held.close()
+        for client in clients: client.disconnect()
+        server.stop(); worker.join(4)
+    assert not worker.is_alive()
