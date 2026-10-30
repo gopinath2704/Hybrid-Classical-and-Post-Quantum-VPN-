@@ -169,6 +169,8 @@ fn handshake(cfg: &ClientConfig, ids: &Identities, server: SocketAddr) -> Result
             }
             Err(error) => {
                 eprintln!("pqvpnd: resumption failed ({error}), falling back to full handshake");
+                // A ticket the server rejected (e.g. key rotated on revocation) must not linger if the full handshake fails too.
+                let _ = std::fs::remove_file(cfg.ticket_path());
                 control = control_connection(server)?;
             }
         }
