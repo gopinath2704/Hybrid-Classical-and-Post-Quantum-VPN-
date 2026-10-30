@@ -3,10 +3,14 @@
 Covers IPC framing, peer authorization, state transitions, missing
 configuration handling, service serialization, and GUI-headless widget tests.
 """
+import inspect
 import json
 import os
 import socket
 import struct
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -309,15 +313,31 @@ def assert_status_contract(status: dict) -> ClientStatus:
     return ClientStatus(**status)
 
 
-def _ipc_status(service: ClientService) -> dict:
+def _ipc(service: ClientService, command: str, timeout: float = 2.0) -> dict:
+    """One request through the service's real IPC handler, as the GUI sends it."""
     service.ALLOWED_UIDS = {os.getuid()}
     a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        ipc_send(a, {"command": "STATUS"})
+        ipc_send(a, {"command": command})
         service._handle_connection(b)
-        return ipc_recv(a, timeout=2.0)["status"]
+        return ipc_recv(a, timeout=timeout)
     finally:
         a.close()
+
+
+def _ipc_status(service: ClientService) -> dict:
+    return _ipc(service, "STATUS")["status"]
+
+
+def _status_until(service: ClientService, predicate, timeout: float, what: str) -> ClientStatus:
+    """Polls STATUS (each response held to the contract) until `predicate` holds."""
+    deadline = time.monotonic() + timeout
+    while True:
+        status = assert_status_contract(_ipc_status(service))
+        if predicate(status):
+            return status
+        assert time.monotonic() < deadline, f"timed out waiting for {what}; last {status.state}: {status.error!r}"
+        time.sleep(0.05)
 
 
 def _fake_vpn(state: str, quality: bool) -> SimpleNamespace:
@@ -388,6 +408,240 @@ class TestStatusContract:
                        {**good, "split_tunnel": [1]}):
             with pytest.raises(AssertionError):
                 assert_status_contract(broken)
+
+
+# ─── Native backend: ClientService supervising pqvpnd --status-json (wire spec v1) ───
+
+native_only = pytest.mark.skipif("pqvpnd_path" not in inspect.signature(ClientService.__init__).parameters,
+                                 reason="client_backend = 'native' has not landed (T3)")
+NATIVE_CONFIG = ("[client]\nserver_host = '192.0.2.1'\nfull_tunnel = false\ndns_mode = 'none'\ndns_servers = []\n"
+                 "data_plane = 'rust'\nhandshake = 'rust'\nclient_backend = 'native'\n")
+
+
+def _line(state: str, **extra: object) -> dict:
+    return {"v": 1, "state": state, "error": "", "kill_switch": False, **extra}
+
+
+def _up(epoch: int, sent: int = 0, lost: int = 0, rtts: tuple = ()) -> dict:
+    return _line("CONNECTED", client_vpn_ip="10.8.0.2", server_vpn_ip="10.8.0.1", prefix=24, endpoint="192.0.2.1:51820",
+                 tun_name="pqvpn0", mtu=1380, epoch=epoch, rekey_in=30.0, rehandshake_in=None, ipv6_guard=False,
+                 dns_managed=False, suite="v2-ed25519", probes={"sent": sent, "lost": lost, "rtts_ms": list(rtts)})
+
+
+def _stream_pqvpnd(tmp_path: Path, lines: list, then: str = "wait", code: int = 0) -> Path:
+    """A stand-in pqvpnd that prints `lines` (dicts as JSON, strings verbatim), records its argv and pid, then:
+    "wait" for SIGTERM and print one final DISCONNECTED (exit 0), "exit" with `code`, or "kill" itself (no final line)."""
+    path = tmp_path / "fake-pqvpnd"
+    path.write_text(textwrap.dedent(f"""\
+        #!{sys.executable}
+        import json, os, signal, sys, time
+        stop = []
+        signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+        json.dump({{"argv": sys.argv[1:], "pid": os.getpid()}}, open({str(tmp_path / "fake.json")!r}, "w"))
+        for line in {lines!r}:
+            sys.stdout.write((line if isinstance(line, str) else json.dumps(line)) + "\\n")
+            sys.stdout.flush()
+        if {then!r} == "kill":
+            os.kill(os.getpid(), signal.SIGKILL)
+        if {then!r} == "wait":
+            while not stop:
+                time.sleep(0.02)
+            print(json.dumps({{"v": 1, "state": "DISCONNECTED", "error": "", "kill_switch": False}}), flush=True)
+        sys.exit({code})
+    """))
+    path.chmod(0o755)
+    return path
+
+
+def _native_service(tmp_path: Path, pqvpnd: Path, kill_switch: bool = False) -> ClientService:
+    config = tmp_path / "client.toml"
+    config.write_text(NATIVE_CONFIG.replace("full_tunnel = false\n", "full_tunnel = true\nkill_switch = true\n")
+                      if kill_switch else NATIVE_CONFIG)
+    return ClientService(str(config), pqvpnd_path=str(pqvpnd))
+
+
+def _gone(pid: int) -> bool:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split(") ")[1][0] in "ZX"
+    except (FileNotFoundError, IndexError):
+        return True
+
+
+@native_only
+class TestNativeStatusStream:
+    """The service's mapping of each spec v1 line to STATUS, against a fake pqvpnd; every STATUS meets the contract."""
+
+    @pytest.fixture(autouse=True)
+    def nft(self, monkeypatch):
+        """The kill-switch table, recorded instead of touched: `table` is what present() reports."""
+        import vpn.network as network
+        calls = SimpleNamespace(table=False, installed=[], removed=0)
+        monkeypatch.setattr(network.KillSwitch, "present", staticmethod(lambda: calls.table))
+        monkeypatch.setattr(network.KillSwitch, "install", staticmethod(lambda *args: calls.installed.append(args)))
+        monkeypatch.setattr(network.KillSwitch, "remove", staticmethod(lambda: setattr(calls, "removed", calls.removed + 1)))
+        return calls
+
+    def test_connected_stream_maps_to_status_and_disconnects(self, tmp_path):
+        fake = _stream_pqvpnd(tmp_path, [_line("CONNECTING"), _up(0, sent=3, lost=1, rtts=(1.2, 1.6)), _up(1, sent=1, rtts=(1.4,))])
+        service = _native_service(tmp_path, fake)
+        assert "error" not in _ipc(service, "CONNECT", timeout=10)
+        status = _status_until(service, lambda s: s.state == "CONNECTED" and s.epoch == 1, 5, "epoch 1")
+        argv = json.loads((tmp_path / "fake.json").read_text())["argv"]
+        assert argv[:2] == ["connect", "--config"] and argv[-1] == "--status-json" and len(argv) == 4, argv
+        assert (status.client_vpn_ip, status.server_vpn_ip, status.tun_name, status.mtu) == ("10.8.0.2", "10.8.0.1", "pqvpn0", 1380)
+        assert (status.pqc_mode, status.is_quantum_safe) == ("native_aws_lc", True)
+        assert status.connected_endpoint.startswith("192.0.2.1") and status.rekey_countdown is not None
+        # probes are deltas: 4 sent, 1 lost, three RTTs in total, not just the last line's.
+        assert status.loss_rate == pytest.approx(0.25) and status.rtt_ms == pytest.approx(1.4)
+        assert _ipc(service, "DISCONNECT", timeout=10) == {"status": "disconnected"}
+        assert _status_until(service, lambda s: s.state == "DISCONNECTED", 5, "DISCONNECTED").error == ""
+
+    @pytest.mark.parametrize("final, code, state, error", [
+        (_line("FAILED", error="server unreachable"), 1, "FAILED", "server unreachable"),
+        (_line("FAILED", error="unsupported by pqvpnd: dns_routing_domains"), 2, "FAILED", "dns_routing_domains"),
+        (_line("BLOCKED", error="session lost", kill_switch=True), 1, "BLOCKED", "session lost"),
+    ])
+    def test_final_line_sets_the_state(self, tmp_path, nft, final, code, state, error):
+        blocked = state == "BLOCKED"
+        fake = _stream_pqvpnd(tmp_path, [_line("CONNECTING", kill_switch=blocked), _up(0), final], then="exit", code=code)
+        service = _native_service(tmp_path, fake, kill_switch=blocked)
+        _ipc(service, "CONNECT", timeout=10)
+        status = _status_until(service, lambda s: s.state == state, 5, state)
+        assert error in status.error and status.kill_switch_active == blocked
+        if blocked:  # only the user's Disconnect lifts it
+            nft.table = True
+            assert _ipc(service, "DISCONNECT", timeout=10) == {"status": "disconnected"} and nft.removed == 1
+            assert _status_until(service, lambda s: s.state == "DISCONNECTED", 5, "DISCONNECTED")
+
+    @pytest.mark.parametrize("bad", [
+        "not json", json.dumps({**_up(0), "v": 2}), "x" * 5000, json.dumps({k: v for k, v in _up(0).items() if k != "probes"}),
+    ], ids=["not-json", "wrong-version", "oversized", "missing-field"])
+    @pytest.mark.parametrize("kill_switch", [False, True])
+    def test_invalid_stream_fails_closed_and_stops_the_child(self, tmp_path, nft, bad, kill_switch):
+        service = _native_service(tmp_path, _stream_pqvpnd(tmp_path, [_line("CONNECTING"), bad]), kill_switch=kill_switch)
+        _ipc(service, "CONNECT", timeout=10)
+        want = "BLOCKED" if kill_switch else "FAILED"
+        status = _status_until(service, lambda s: s.state == want, 5, want)
+        assert "pqvpnd status stream invalid" in status.error
+        assert [args[0] for args in nft.installed] == (["connecting"] if kill_switch else [])
+        pid = json.loads((tmp_path / "fake.json").read_text())["pid"]
+        deadline = time.monotonic() + 5
+        while not _gone(pid):
+            assert time.monotonic() < deadline, "the service stops a pqvpnd whose stream it cannot trust"
+            time.sleep(0.05)
+
+    @pytest.mark.parametrize("table", [False, True])
+    def test_exit_without_a_final_line(self, tmp_path, nft, table):
+        service = _native_service(tmp_path, _stream_pqvpnd(tmp_path, [_line("CONNECTING"), _up(0)], then="kill"),
+                                  kill_switch=table)
+        nft.table = table  # a crash leaves the table behind only when the kill switch was on
+        _ipc(service, "CONNECT", timeout=10)
+        want = "BLOCKED" if table else "FAILED"
+        status = _status_until(service, lambda s: s.state == want, 5, want)
+        assert "pqvpnd exited unexpectedly (signal 9)" in status.error and status.kill_switch_active == table
+
+
+PQVPND_BUILD = Path(__file__).resolve().parents[1] / "core/target/release/pqvpnd"
+NETNS_SERVER, NETNS_TUN = "192.0.2.1", "pqt4"
+
+
+def _netns_interop(version: int, work: Path) -> None:
+    """Inside `unshare -rn`: ClientService(native) with the real pqvpnd against the real Python server."""
+    import vpn.runtime as runtime
+    from vpn.config import ServerConfig
+    from vpn.identity import (AuthorizedClients, generate_client_identity, generate_client_identity_kem,
+                              generate_server_identity)
+
+    def ip(*args: str) -> str:
+        return subprocess.run(["ip", *args], check=True, capture_output=True, text=True).stdout
+
+    def kill_switch_rules() -> str | None:
+        result = subprocess.run(["nft", "list", "table", "inet", "pqvpn_killswitch"], capture_output=True, text=True)
+        return result.stdout if result.returncode == 0 else None
+
+    (work / "client").mkdir()
+    fp = generate_server_identity(work / "server.key", work / "server.pub")
+    (generate_client_identity_kem if version == 3 else generate_client_identity)(work / "client/client.key", work / "client/client.pub")
+    AuthorizedClients(work / "clients.json").authorize((work / "client/client.pub").read_bytes(), "t4")
+    server = runtime.VPNServer(ServerConfig(listen_host=NETNS_SERVER, control_port=0, udp_port=0, protocol_version=version,
+        server_identity_private_key=str(work / "server.key"), server_identity_public_key=str(work / "server.pub"),
+        authorized_clients_file=str(work / "clients.json"), dev_emulated_tun=True, dns_servers=[], rekey_interval=2,
+        idle_timeout=60, data_plane="rust", handshake="rust"))
+    worker = threading.Thread(target=server.start, daemon=True)
+    worker.start()
+    deadline = time.monotonic() + 10
+    while server.tcp is None or server.udp is None:
+        assert time.monotonic() < deadline, "server start"
+        time.sleep(0.05)
+    server.cfg.udp_port = server.udp.getsockname()[1]
+    config = work / "client/client.toml"
+    config.write_text(f'[client]\nserver_host = "{NETNS_SERVER}"\nserver_control_port = {server.tcp.getsockname()[1]}\n'
+                      f'server_identity_fingerprint = "{fp}"\nserver_identity_public_key = "../server.pub"\n'
+                      f'client_identity_private_key = "client.key"\nclient_identity_public_key = "client.pub"\n'
+                      f'protocol_version = {version}\nfull_tunnel = false\ndns_mode = "none"\ndns_servers = []\n'
+                      f'tun_name = "{NETNS_TUN}"\ndata_plane = "rust"\nhandshake = "rust"\nping_interval = 0.5\nclient_backend = "native"\n')
+    before = ip("route", "show", "table", "all")
+    try:
+        # Split tunnel: connect, rekey, probes, disconnect, all seen only through STATUS.
+        service = ClientService(str(config), pqvpnd_path=str(PQVPND_BUILD))
+        assert "error" not in _ipc(service, "CONNECT", timeout=30)
+        up = _status_until(service, lambda s: s.state == "CONNECTED", 15, "CONNECTED")
+        assert up.client_vpn_ip.startswith("10.8.0.") and up.server_vpn_ip == "10.8.0.1" and up.tun_name == NETNS_TUN
+        assert (up.pqc_mode, up.is_quantum_safe, up.kill_switch_active) == ("native_aws_lc", True, False)
+        _status_until(service, lambda s: s.epoch is not None and s.epoch > up.epoch, 15, "a rekey")
+        _status_until(service, lambda s: s.rtt_ms is not None, 10, "probe RTTs")
+        assert len(server.sessions.by_id) == 1
+        assert _ipc(service, "DISCONNECT", timeout=15) == {"status": "disconnected"}
+        _status_until(service, lambda s: s.state == "DISCONNECTED", 10, "DISCONNECTED")
+        _wait(lambda: not server.sessions.by_id, 5, "server session closed")
+        assert ip("route", "show", "table", "all") == before, "routes restored"
+        assert subprocess.run(["ip", "link", "show", "dev", NETNS_TUN], capture_output=True).returncode != 0, "TUN gone"
+        # Kill switch on a full tunnel (DNS unmanaged): installed while up, removed by DISCONNECT (SIGTERM).
+        ks = work / "client/kill_switch.toml"
+        ks.write_text(config.read_text().replace("full_tunnel = false\n", "full_tunnel = true\nkill_switch = true\n"))
+        service = ClientService(str(ks), pqvpnd_path=str(PQVPND_BUILD))
+        assert "error" not in _ipc(service, "CONNECT", timeout=30)
+        assert _status_until(service, lambda s: s.state == "CONNECTED", 15, "CONNECTED with kill switch").kill_switch_active
+        assert f'oifname "{NETNS_TUN}" accept' in (kill_switch_rules() or ""), "kill switch up"
+        assert _ipc(service, "DISCONNECT", timeout=15) == {"status": "disconnected"}
+        status = _status_until(service, lambda s: s.state == "DISCONNECTED", 10, "DISCONNECTED")
+        assert not status.kill_switch_active and kill_switch_rules() is None, "kill switch removed"
+        assert ip("route", "show", "table", "all") == before, "routes restored with the kill switch"
+    finally:
+        server.stop()
+        worker.join(5)
+
+
+def _wait(predicate, timeout: float, what: str) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.05)
+
+
+@native_only
+class TestNativeInterop:
+    def test_against_python_server_in_netns(self, tmp_path):
+        """Re-runs itself under `unshare -rn`, where it is root over a throwaway network namespace."""
+        if os.environ.get("PQVPN_T4_NETNS") != "1":
+            if not PQVPND_BUILD.exists():
+                pytest.skip("build pqvpnd first: cargo build --release --locked -p pqvpnd (in core/)")
+            if subprocess.run(["unshare", "-rn", "true"], capture_output=True).returncode:
+                pytest.skip("user namespaces unavailable")
+            node = f"{Path(__file__).resolve()}::TestNativeInterop::test_against_python_server_in_netns"
+            run = subprocess.run(["unshare", "-rn", sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", node],
+                                 env={**os.environ, "PQVPN_T4_NETNS": "1"}, capture_output=True, text=True, timeout=300)
+            assert run.returncode == 0 and "1 passed" in run.stdout, run.stdout[-6000:] + run.stderr[-2000:]
+            return
+        from crypto.hybrid_crypto import get_crypto_status
+        assert os.geteuid() == 0 and get_crypto_status()["pqc_mode"] == "native_liboqs", "inner run needs netns + liboqs"
+        subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
+        for args in (["link", "add", "pqt4up", "type", "dummy"], ["addr", "add", f"{NETNS_SERVER}/24", "dev", "pqt4up"],
+                     ["link", "set", "pqt4up", "up"]):
+            subprocess.run(["ip", *args], check=True)
+        for version in (2, 3):
+            (tmp_path / f"v{version}").mkdir()
+            _netns_interop(version, tmp_path / f"v{version}")
 
 
 # ─── Malformed IPC request tests ──────────────────────────────────────────
@@ -2143,3 +2397,45 @@ def test_login_window_shows_sign_out_message(qapp):
     finally:
         login.close()
         qapp.processEvents()
+
+
+# ─── Native backend (client_backend = "native"): pqvpnd --status-json supervised by the service ──────────
+
+FAKE_CONNECTED = {"v": 1, "state": "CONNECTED", "error": "", "kill_switch": False, "client_vpn_ip": "10.8.0.2",
+                  "server_vpn_ip": "10.8.0.1", "prefix": 24, "endpoint": "192.0.2.1:51820", "tun_name": "pqvpn0",
+                  "mtu": 1380, "suite": "v3-kem", "ipv6_guard": True, "dns_managed": True, "epoch": 1,
+                  "rekey_in": 30.0, "rehandshake_in": None, "probes": {"sent": 2, "lost": 0, "rtts_ms": [1.5, 2.5]}}
+
+
+class TestNativeBackend:
+    def test_status_lines_are_untrusted_until_they_parse(self):
+        from app.client import parse_status_line
+        assert parse_status_line(json.dumps(FAKE_CONNECTED) + "\n")["suite"] == "v3-kem"
+        for broken in ("{}", "not json", json.dumps({**FAKE_CONNECTED, "v": 2}), json.dumps({**FAKE_CONNECTED, "epoch": "1"}),
+                       json.dumps({**FAKE_CONNECTED, "rekey_in": -1}),
+                       json.dumps({**FAKE_CONNECTED, "probes": {"sent": 1, "lost": 0, "rtts_ms": [1.0] * 65}}),
+                       json.dumps({**FAKE_CONNECTED, "state": "UP"}), json.dumps(FAKE_CONNECTED) + " " * 4096):
+            with pytest.raises(ValueError):
+                parse_status_line(broken + "\n")
+        with pytest.raises(ValueError):
+            parse_status_line(json.dumps(FAKE_CONNECTED))  # no newline: a truncated line
+
+    def test_rendered_config_is_one_pqvpnd_and_the_python_loader_both_accept(self, tmp_path):
+        import subprocess
+        import tomllib
+        from app.client import client_toml
+        from vpn.config import ClientConfig, load_client_config
+        cfg = ClientConfig(server_host="192.0.2.1", server_identity_fingerprint="ab" * 32, client_backend="native",
+                           client_identity_private_key="relative/client.key", dns_servers=["10.8.0.1"])
+        text = client_toml(cfg)
+        values = tomllib.loads(text)["client"]
+        assert values["data_plane"] == values["handshake"] == "rust" and "ipv6_policy" not in values
+        assert Path(values["client_identity_private_key"]).is_absolute()
+        (tmp_path / "client.toml").write_text(text)
+        assert load_client_config(tmp_path / "client.toml").client_backend == "native"
+        binary = Path(__file__).parents[1] / "core/target/debug/pqvpnd"
+        if binary.exists():
+            # Exit 2 is a config refusal; 1 means the config passed and the (absent) identity files failed.
+            run = subprocess.run([str(binary), "connect", "--config", str(tmp_path / "client.toml"), "--status-json"],
+                                 capture_output=True, text=True, timeout=30)
+            assert run.returncode == 1 and "identity" in run.stdout.splitlines()[-1], (run.returncode, run.stdout, run.stderr)
