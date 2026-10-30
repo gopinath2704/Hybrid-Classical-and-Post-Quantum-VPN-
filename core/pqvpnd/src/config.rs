@@ -59,6 +59,16 @@ pub struct ClientConfig {
     pub ping_timeout: f64,
     pub dead_peer_timeout: f64,
     pub expected_vpn_subnet: (Ipv4Addr, u8),
+    pub ipv6_policy: Ipv6Policy,
+}
+
+/// `ipv6_policy`, as `IPv6Guard` applies it: leave IPv6 alone, drop all of it but loopback, or refuse to connect
+/// while any usable IPv6 exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ipv6Policy {
+    Allow,
+    Block,
+    Fail,
 }
 
 #[derive(Debug, PartialEq)]
@@ -144,12 +154,13 @@ pub fn parse(text: &str, base: &Path) -> Result<ClientConfig, ConfigError> {
     if raw.dns_routing_domains.as_ref().is_some_and(|list| !list.is_empty()) {
         return Err(unsupported("dns_routing_domains"));
     }
-    match raw.ipv6_policy.as_deref() {
-        // Python's effective policy in split mode is "allow": unrelated IPv6 is left alone.
-        None | Some("allow") => {}
-        Some(policy @ ("block" | "fail")) => return Err(unsupported(format!("ipv6_policy = \"{policy}\" (no IPv6 guard yet)"))),
+    // `effective_policy`: unset means "allow" in split mode, the only mode so far.
+    let ipv6_policy = match raw.ipv6_policy.as_deref() {
+        None | Some("allow") => Ipv6Policy::Allow,
+        Some("block") => Ipv6Policy::Block,
+        Some("fail") => Ipv6Policy::Fail,
         Some(_) => return Err(invalid("ipv6_policy must be block, fail or allow")),
-    }
+    };
     // Unused with dns_mode = "none", exactly as in Python, but still validated.
     for address in raw.dns_servers.iter().flatten() {
         address.parse::<IpAddr>().map_err(|_| invalid(format!("dns_servers: {address:?} is not an IP address")))?;
@@ -212,6 +223,7 @@ pub fn parse(text: &str, base: &Path) -> Result<ClientConfig, ConfigError> {
         ping_timeout,
         dead_peer_timeout,
         expected_vpn_subnet,
+        ipv6_policy,
     })
 }
 
@@ -294,8 +306,6 @@ handshake = "rust"
             (format!("{BENCH}kill_switch = true"), "kill_switch"),
             (format!("{BENCH}split_tunnel = [\"203.0.113.0/24\"]"), "split_tunnel"),
             (format!("{BENCH}dns_routing_domains = [\"corp\"]"), "dns_routing_domains"),
-            (format!("{BENCH}ipv6_policy = \"block\""), "ipv6_policy"),
-            (format!("{BENCH}ipv6_policy = \"fail\""), "ipv6_policy"),
             (format!("{BENCH}dev_emulated_tun = true"), "dev_emulated_tun"),
             (format!("{BENCH}experimental_suite = \"v3-mldsa\""), "v3-mldsa"),
             (BENCH.replace("data_plane = \"rust\"", "data_plane = \"python\""), "data_plane"),
@@ -313,6 +323,10 @@ handshake = "rust"
             with(extra).unwrap_or_else(|e| panic!("{extra}: {e}"));
         }
         parse(&BENCH.replace("dns_servers = []", "dns_servers = [\"1.1.1.1\", \"::1\"]"), Path::new("/")).unwrap();
+        for (extra, policy) in [("", Ipv6Policy::Allow), ("ipv6_policy = \"allow\"", Ipv6Policy::Allow),
+                                ("ipv6_policy = \"block\"", Ipv6Policy::Block), ("ipv6_policy = \"fail\"", Ipv6Policy::Fail)] {
+            assert_eq!(with(extra).unwrap().ipv6_policy, policy, "{extra:?}");
+        }
     }
 
     #[test]

@@ -242,6 +242,8 @@ enum Pending {
 /// The whole client: returns Ok when stopped by a signal, Err when the session fails or ends.
 pub fn connect(config_path: &Path, stop_signals: &SigSet) -> Result<(), ConnectError> {
     let cfg = config::load(config_path).map_err(ConnectError::Config)?;
+    // `ipv6_preflight` first, as in `VPNClient.connect`: refuse before touching anything.
+    crate::net::ipv6_preflight(cfg.ipv6_policy).map_err(net("IPv6 preflight"))?;
     let ids = identity::load(&cfg).map_err(ConnectError::Identity)?;
     let server_ip = resolve_ipv4(&cfg.server_host, cfg.server_control_port)?;
     let (mut control, mut established) = handshake(&cfg, &ids, SocketAddr::from((server_ip, cfg.server_control_port)))?;
@@ -260,7 +262,7 @@ pub fn connect(config_path: &Path, stop_signals: &SigSet) -> Result<(), ConnectE
     control.set_read_timeout(Some(SESSION_TIMEOUT)).map_err(net("control timeout"))?;
     control.set_write_timeout(Some(SESSION_TIMEOUT)).map_err(net("control timeout"))?;
 
-    let network = Network::up(&cfg.tun_name, tunnel.client_ip, tunnel.prefix, tunnel.mtu, server_ip).map_err(net("network setup"))?;
+    let network = Network::up(&cfg.tun_name, tunnel.client_ip, tunnel.prefix, tunnel.mtu, server_ip, cfg.ipv6_policy).map_err(net("network setup"))?;
     let server_udp = SocketAddrV4::new(server_ip, tunnel.udp_port);
     let udp = udp_bind(&established, server_udp)?;
     let tun: OwnedFd = network.tun.as_ref().expect("up() opened it").try_clone().map_err(net("TUN dup"))?;
