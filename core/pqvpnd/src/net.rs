@@ -296,7 +296,9 @@ impl Network {
     /// Best effort and idempotent: undo routes newest first, then close the TUN (which removes its address).
     pub fn restore(&mut self) {
         if let Some(program) = self.dns_resolvectl.take() {
-            let _ = run_checked(&program, &["revert", &self.tun_name]);
+            if let Err(error) = run_checked(&program, &["revert", &self.tun_name]) {
+                eprintln!("pqvpnd: DNS revert failed for {}: {error}", self.tun_name);
+            }
         }
         while let Some(undo) = self.undo.pop() {
             for command in undo.commands() {

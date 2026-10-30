@@ -20,7 +20,7 @@ use pqvpn_core::session::Role;
 
 use crate::config::{self, ClientConfig};
 use crate::identity::{self, Identities};
-use crate::net::Network;
+use crate::net::{self, Network};
 
 /// `socket.create_connection(..., timeout=10)`, which also bounds every handshake read.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -249,9 +249,44 @@ pub fn connect(config_path: &Path, stop_signals: &SigSet) -> Result<(), ConnectE
     let cfg = config::load(config_path).map_err(ConnectError::Config)?;
     // `ipv6_preflight` first, as in `VPNClient.connect`: refuse before touching anything.
     crate::net::ipv6_preflight(cfg.ipv6_policy).map_err(net("IPv6 preflight"))?;
-    let ids = identity::load(&cfg).map_err(ConnectError::Identity)?;
+    if !cfg.kill_switch {
+        return session(&cfg, stop_signals, &mut false);
+    }
+    // Block everything but the handshake before it starts; config checked server_host is an IPv4 literal.
+    let server: Ipv4Addr = cfg.server_host.parse().expect("validated");
+    let preexisting = net::killswitch_present().map_err(net("kill switch"))?;
+    net::killswitch_install(server, cfg.server_control_port, None).map_err(net("kill switch"))?;
+    let mut up = false;
+    let result = session(&cfg, stop_signals, &mut up);
+    // `_settle_kill_switch`, after the network is restored: a stop signal (the user's disconnect) or a fresh connect
+    // that never came up removes it; a lost session, or a failed reconnect from the blocked state, keeps blocking.
+    let settled = if result.is_err() && (up || preexisting) {
+        net::killswitch_install(server, cfg.server_control_port, None)
+            .inspect(|()| eprintln!("pqvpnd: kill switch is blocking all traffic; run `pqvpnd recover` to restore it"))
+    } else {
+        net::killswitch_remove()
+    };
+    if let Err(error) = settled {
+        eprintln!("pqvpnd: kill switch update failed ({error}); run `pqvpnd recover` to remove it");
+    }
+    result
+}
+
+/// `dns = cfg.dns_servers or tunnel["dns"]`, refusing a full tunnel whose managed DNS would configure nothing
+/// and so send every lookup to the uplink's resolver.
+pub fn dns_servers<'a>(cfg: &'a ClientConfig, tunnel: &'a Tunnel) -> Result<&'a [String], ConnectError> {
+    let dns = if cfg.dns_servers.is_empty() { &tunnel.dns } else { &cfg.dns_servers };
+    if cfg.full_tunnel && cfg.manage_dns && dns.is_empty() {
+        return Err(ConnectError::Network("full tunnel with managed DNS but no DNS servers".into()));
+    }
+    Ok(dns)
+}
+
+/// Handshake to teardown; `up` records whether the tunnel (and with it the kill switch's "up" phase) was reached.
+fn session(cfg: &ClientConfig, stop_signals: &SigSet, up: &mut bool) -> Result<(), ConnectError> {
+    let ids = identity::load(cfg).map_err(ConnectError::Identity)?;
     let server_ip = resolve_ipv4(&cfg.server_host, cfg.server_control_port)?;
-    let (mut control, mut established) = handshake(&cfg, &ids, SocketAddr::from((server_ip, cfg.server_control_port)))?;
+    let (mut control, mut established) = handshake(cfg, &ids, SocketAddr::from((server_ip, cfg.server_control_port)))?;
 
     let (_, payload) = established.open_control(&recv_message(&mut control).map_err(net("CONFIG"))?, Some(CONFIG)).map_err(protocol)?;
     let tunnel = parse_tunnel(&payload, cfg.expected_vpn_subnet)?;
@@ -267,9 +302,13 @@ pub fn connect(config_path: &Path, stop_signals: &SigSet) -> Result<(), ConnectE
     control.set_read_timeout(Some(SESSION_TIMEOUT)).map_err(net("control timeout"))?;
     control.set_write_timeout(Some(SESSION_TIMEOUT)).map_err(net("control timeout"))?;
 
+    let dns = dns_servers(cfg, &tunnel)?;
     let mut network = Network::up(&cfg.tun_name, tunnel.client_ip, tunnel.prefix, tunnel.mtu, server_ip, cfg.ipv6_policy, &cfg.routes()).map_err(net("network setup"))?;
-    let dns = if cfg.dns_servers.is_empty() { &tunnel.dns } else { &cfg.dns_servers };
-    network.dns(cfg.manage_dns, dns, &cfg.dns_domains(), crate::net::resolvectl_binary).map_err(net("DNS setup"))?;
+    network.dns(cfg.manage_dns, dns, &cfg.dns_domains(), net::resolvectl_binary).map_err(net("DNS setup"))?;
+    if cfg.kill_switch {
+        net::killswitch_install(server_ip, cfg.server_control_port, Some((&network.tun_name, tunnel.udp_port))).map_err(net("kill switch"))?;
+        *up = true;
+    }
     let server_udp = SocketAddrV4::new(server_ip, tunnel.udp_port);
     let udp = udp_bind(&established, server_udp)?;
     let tun: OwnedFd = network.tun.as_ref().expect("up() opened it").try_clone().map_err(net("TUN dup"))?;
@@ -281,7 +320,7 @@ pub fn connect(config_path: &Path, stop_signals: &SigSet) -> Result<(), ConnectE
     println!("connected {} via {server_udp} epoch {}", tunnel.client_ip, established.epoch());
     let _ = io::stdout().flush();
 
-    let result = control_loop(&cfg, &tunnel, &mut control, &mut established, &running.shared, stop_signals);
+    let result = control_loop(cfg, &tunnel, &mut control, &mut established, &running.shared, stop_signals);
     running.stop_data_plane();
     if result.is_ok() {
         // `disconnect()`: tell the server, best effort, after the data plane is down.
@@ -406,6 +445,18 @@ mod tests {
             assert!(error.contains(needle), "{to}: {error}");
         }
         assert!(config("not json").is_err());
+    }
+
+    #[test]
+    fn full_tunnel_with_managed_dns_needs_servers() {
+        let cfg = |extra: &str| config::parse(&format!("[client]\nserver_identity_fingerprint = \"{}\"\n{extra}", "a".repeat(64)), Path::new("/")).unwrap();
+        let (none, some) = (config(GOOD).unwrap(), config(&GOOD.replace("\"dns\": []", "\"dns\": [\"10.8.0.1\"]")).unwrap());
+        let error = dns_servers(&cfg(""), &none).unwrap_err().to_string();
+        assert!(error.contains("no DNS servers"), "{error}");
+        assert_eq!(dns_servers(&cfg(""), &some).unwrap(), ["10.8.0.1"], "the server's list");
+        assert_eq!(dns_servers(&cfg("dns_servers = [\"9.9.9.9\"]"), &some).unwrap(), ["9.9.9.9"], "the client's list wins");
+        assert!(dns_servers(&cfg("dns_mode = \"none\""), &none).unwrap().is_empty(), "explicitly unmanaged");
+        assert!(dns_servers(&cfg("full_tunnel = false"), &none).unwrap().is_empty(), "split tunnel leaves other DNS alone");
     }
 
     #[test]

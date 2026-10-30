@@ -1,7 +1,9 @@
 """pqvpnd against the real Python VPNServer, in a throwaway network namespace (run by tests/conformance.rs
 under `unshare -rn`). Per protocol version: a full handshake with cookie_mode = "always", data both ways
 through the native TUN, automatic rekey and rehandshake, a clean SIGTERM teardown (routes identical, TUN
-gone, server session closed), then a second connect that must resume from the ticket pqvpnd saved.
+gone, server session closed), then a second connect that must resume from the ticket pqvpnd saved. Then the
+kill switch on a full tunnel: enforced while up and removed on SIGTERM, left blocking after SIGKILL until
+`pqvpnd recover`, and narrowed to the "connecting" phase (still blocking) when the server goes away.
 
 usage: conformance.py PQVPND REPO SERVER_HANDSHAKE SERVER_DATA_PLANE VERSIONS(comma list)
 """
@@ -88,6 +90,58 @@ def start_pqvpnd(config: Path) -> tuple[subprocess.Popen, str]:
     return process, line.split()[1]
 
 
+def uplink_send_allowed() -> bool:
+    """A datagram to a neighbour on the uplink, which bypasses the full tunnel: EPERM when the kill switch drops it."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(b"leak?", ("192.0.2.53", 53))
+        return True
+    except PermissionError:
+        return False
+    finally:
+        sock.close()
+
+
+def kill_switch_rules() -> str | None:
+    result = subprocess.run(["nft", "list", "table", "inet", "pqvpn_killswitch"], capture_output=True, text=True)
+    return result.stdout if result.returncode == 0 else None
+
+
+def recover() -> None:
+    out = subprocess.run([PQVPND, "recover"], check=True, capture_output=True, text=True).stdout
+    assert out == "kill switch removed; traffic is no longer blocked\n", out
+
+
+def kill_switch(server: runtime.VPNServer, config: Path, client_ip_check, before: str) -> None:
+    # Enforced while up: the TUN and data UDP are allowed, the uplink is not; SIGTERM (the user's disconnect) removes it.
+    process, client_ip = start_pqvpnd(config)
+    assert f'oifname "{TUN}" accept' in (kill_switch_rules() or ""), "up phase installed"
+    assert not uplink_send_allowed(), "uplink blocked while connected"
+    client_ip_check(client_ip)
+    stop_pqvpnd(process)
+    assert kill_switch_rules() is None and uplink_send_allowed(), "removed on a clean disconnect"
+    assert ip("route", "show", "table", "all") == before, "routes restored with the kill switch"
+    # SIGKILL: no cleanup runs, the table outlives the process and keeps blocking until recover.
+    process, _ = start_pqvpnd(config)
+    process.kill()
+    process.wait(10)
+    until(lambda: subprocess.run(["ip", "link", "show", "dev", TUN], capture_output=True).returncode != 0, 5, "TUN gone")
+    assert kill_switch_rules() is not None and not uplink_send_allowed(), "fail closed after SIGKILL"
+    recover()
+    assert kill_switch_rules() is None and uplink_send_allowed(), "recover reopens"
+    # The crash's other residue: the server bypass /32 (harmless, documented); clear it for the next check.
+    subprocess.run(["ip", "route", "del", f"{SERVER}/32"], capture_output=True)
+    # Lost session (the server goes away): pqvpnd exits with an error and leaves the "connecting" phase blocking.
+    process, _ = start_pqvpnd(config)
+    server.stop()
+    assert process.wait(20) != 0, "a lost session is an error exit"
+    rules = kill_switch_rules()
+    assert rules is not None and "oifname \"lo\"" in rules and TUN not in rules, "narrowed to the connecting phase"
+    assert not uplink_send_allowed(), "still blocking after the session was lost"
+    recover()
+    assert ip("route", "show", "table", "all") == before, "routes restored after the lost session"
+
+
 def stop_pqvpnd(process: subprocess.Popen) -> None:
     process.send_signal(signal.SIGTERM)
     assert process.wait(10) == 0, "clean exit on SIGTERM"
@@ -142,7 +196,13 @@ def run_version(version: int, work: Path) -> None:
         stop_pqvpnd(process)
         until(lambda: not server.sessions.by_id, 5, "server session closed")
         assert ip("route", "show", "table", "all") == before, "every route restored after resume"
-        print(f"ok {label}: cookie, full, data, rekey+rehandshake (epoch {item.crypto.epoch}), SIGTERM, resume", flush=True)
+        # 3. Kill switch on a full tunnel (DNS left unmanaged: resolvectl would reach the host's resolved).
+        ks_config = work / "client/kill_switch.toml"
+        ks_config.write_text(config.read_text().replace("full_tunnel = false\n", "full_tunnel = true\nkill_switch = true\n")
+                             + "ping_timeout = 1\ndead_peer_timeout = 3\n")
+        kill_switch(server, ks_config, lambda client_ip: data_both_ways(server, client_ip, b"kill-switch"), before)
+        print(f"ok {label}: cookie, full, data, rekey+rehandshake (epoch {item.crypto.epoch}), SIGTERM, resume, "
+              "kill switch (up, SIGTERM removes, SIGKILL keeps until recover, lost session keeps)", flush=True)
     finally:
         runtime.ResumptionServerHandshake.process_hello = real_hello
         server.stop()

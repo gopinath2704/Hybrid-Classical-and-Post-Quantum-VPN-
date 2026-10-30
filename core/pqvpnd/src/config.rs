@@ -68,6 +68,7 @@ pub struct ClientConfig {
     /// Validated IP addresses; empty means the server's CONFIG `dns` list, as in Python.
     pub dns_servers: Vec<String>,
     pub dns_routing_domains: Vec<String>,
+    pub kill_switch: bool,
 }
 
 /// `ipv6_policy`, as `IPv6Guard` applies it: leave IPv6 alone, drop all of it but loopback, or refuse to connect
@@ -144,9 +145,6 @@ pub fn parse(text: &str, base: &Path) -> Result<ClientConfig, ConfigError> {
         Some("none") => false,
         Some(_) => return Err(invalid("dns_mode must be systemd-resolved or none")),
     };
-    if raw.kill_switch == Some(true) {
-        return Err(unsupported("kill_switch = true"));
-    }
     if raw.dev_emulated_tun == Some(true) {
         return Err(unsupported("dev_emulated_tun = true (pqvpnd always opens a native TUN)"));
     }
@@ -210,6 +208,20 @@ pub fn parse(text: &str, base: &Path) -> Result<ClientConfig, ConfigError> {
     if server_host.is_empty() {
         return Err(invalid("server_host must be nonempty"));
     }
+    // validate_client's kill-switch rules: everything outside a full tunnel is blocked, IPv6 included, and from the
+    // blocked state a hostname cannot be resolved without letting DNS leak.
+    let kill_switch = raw.kill_switch.unwrap_or(false);
+    if kill_switch {
+        if !full_tunnel {
+            return Err(invalid("kill_switch requires full_tunnel = true"));
+        }
+        if raw.ipv6_policy.as_deref() == Some("allow") {
+            return Err(invalid("kill_switch requires ipv6_policy block or fail"));
+        }
+        if server_host.parse::<Ipv4Addr>().is_err() {
+            return Err(invalid("kill_switch requires server_host to be an IPv4 address"));
+        }
+    }
     // Omitted paths use the standard file name next to the TOML, relative paths resolve against it.
     let file = |value: Option<String>, default: &str| {
         let value = PathBuf::from(value.unwrap_or_else(|| default.into()));
@@ -235,6 +247,7 @@ pub fn parse(text: &str, base: &Path) -> Result<ClientConfig, ConfigError> {
         manage_dns,
         dns_servers,
         dns_routing_domains,
+        kill_switch,
     })
 }
 
@@ -327,7 +340,6 @@ handshake = "rust"
     #[test]
     fn refuses_every_option_it_cannot_honour() {
         let cases = [
-            (format!("{BENCH}kill_switch = true"), "kill_switch"),
             (format!("{BENCH}dev_emulated_tun = true"), "dev_emulated_tun"),
             (format!("{BENCH}experimental_suite = \"v3-mldsa\""), "v3-mldsa"),
             (BENCH.replace("data_plane = \"rust\"", "data_plane = \"python\""), "data_plane"),
@@ -349,6 +361,25 @@ handshake = "rust"
                                 ("ipv6_policy = \"block\"", Ipv6Policy::Block), ("ipv6_policy = \"fail\"", Ipv6Policy::Fail)] {
             assert_eq!(with(extra).unwrap().ipv6_policy, policy, "{extra:?}");
         }
+    }
+
+    #[test]
+    fn kill_switch_needs_a_full_tunnel_blocked_ipv6_and_an_ip_server() {
+        let full = BENCH.replace("full_tunnel = false\n", "kill_switch = true\n");
+        let cfg = parse(&full, Path::new("/")).unwrap();
+        assert!(cfg.kill_switch && cfg.full_tunnel && cfg.ipv6_policy == Ipv6Policy::Block);
+        for (text, needle) in [
+            (format!("{BENCH}kill_switch = true"), "full_tunnel"),
+            (format!("{full}ipv6_policy = \"allow\""), "ipv6_policy"),
+            (full.replace("192.0.2.1", "vpn.example.com"), "IPv4"),
+            (full.replace("192.0.2.1", "2001:db8::1"), "IPv4"),
+        ] {
+            match parse(&text, Path::new("/")) {
+                Err(ConfigError::Invalid(message)) => assert!(message.contains(needle), "{needle}: {message}"),
+                other => panic!("{needle}: expected Invalid, got {other:?}"),
+            }
+        }
+        parse(&format!("{full}ipv6_policy = \"fail\""), Path::new("/")).unwrap();
     }
 
     #[test]
