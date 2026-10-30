@@ -1,5 +1,5 @@
 [workspace]
-members = ["pqvpn_core", "pqvpn_fd"]
+members = ["pqvpn_core", "pqvpn_fd", "pqvpnd"]
 exclude = ["fuzz"]
 resolver = "3"
 
