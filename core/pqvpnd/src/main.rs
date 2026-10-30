@@ -15,10 +15,13 @@ fn main() -> ExitCode {
         }
     };
     let args: Vec<String> = std::env::args().collect();
+    if matches!(args.as_slice(), [_, command] if command == "recover") {
+        return recover();
+    }
     let config = match args.as_slice() {
         [_, command, flag, path] if command == "connect" && flag == "--config" => PathBuf::from(path),
         _ => {
-            eprintln!("usage: pqvpnd connect --config CLIENT_TOML");
+            eprintln!("usage: pqvpnd connect --config CLIENT_TOML | pqvpnd recover");
             return ExitCode::from(2);
         }
     };
@@ -27,6 +30,21 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("pqvpnd: {error}");
             ExitCode::from(if matches!(error, ConnectError::Config(_)) { 2 } else { 1 })
+        }
+    }
+}
+
+/// `pqvpn client recover`: remove the kill switch a crash or a lost session left blocking traffic.
+fn recover() -> ExitCode {
+    let was_present = pqvpnd::net::killswitch_present().unwrap_or(false);
+    match pqvpnd::net::killswitch_remove() {
+        Ok(()) => {
+            println!("{}", if was_present { "kill switch removed; traffic is no longer blocked" } else { "no kill switch was active" });
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("pqvpnd: kill switch not removed: {error}");
+            ExitCode::FAILURE
         }
     }
 }

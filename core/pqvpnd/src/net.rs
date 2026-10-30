@@ -85,6 +85,43 @@ pub fn ipv6_connectivity(routes: &str, addresses: &str) -> io::Result<Vec<String
     Ok(found)
 }
 
+pub const KILL_SWITCH_TABLE: &str = "pqvpn_killswitch";
+
+/// `killswitch_rules`: the whole table in one transaction (destroy and re-add commit together, so a replace has
+/// no gap). `up = None` is the "connecting" phase: loopback, DHCP and the server's control TCP only; `Some((tun,
+/// udp_port))` adds the server's data UDP and the TUN. Held to tests/golden/killswitch_*.nft, like the Python side.
+pub fn killswitch_rules(server: Ipv4Addr, control_port: u16, up: Option<(&str, u16)>) -> String {
+    let t = format!("inet {KILL_SWITCH_TABLE}");
+    let mut rules = vec![
+        format!("destroy table {t}"),
+        format!("add table {t}"),
+        format!("add chain {t} output {{ type filter hook output priority filter; policy drop; }}"),
+        format!("add rule {t} output oifname \"lo\" accept"),
+        format!("add rule {t} output udp sport 68 udp dport 67 accept"),
+        format!("add rule {t} output ip daddr {server} tcp dport {control_port} accept"),
+    ];
+    if let Some((tun, udp_port)) = up {
+        rules.push(format!("add rule {t} output ip daddr {server} udp dport {udp_port} accept"));
+        rules.push(format!("add rule {t} output oifname \"{tun}\" accept"));
+    }
+    rules.push(format!("add rule {t} output counter"));
+    rules.join("\n") + "\n"
+}
+
+/// The table outlives this process on purpose: a crash leaves traffic blocked. Only disconnect or recover removes it.
+pub fn killswitch_install(server: Ipv4Addr, control_port: u16, up: Option<(&str, u16)>) -> io::Result<()> {
+    run_nft(&["-f", "-"], Some(&killswitch_rules(server, control_port, up)))
+}
+
+pub fn killswitch_present() -> io::Result<bool> {
+    Ok(Command::new(binary(NFT_CANDIDATES, "nft(8)")?).args(["list", "table", "inet", KILL_SWITCH_TABLE])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status()?.success())
+}
+
+pub fn killswitch_remove() -> io::Result<()> {
+    run_nft(&["destroy", "table", "inet", KILL_SWITCH_TABLE], None)
+}
+
 /// `preflight`: with policy "fail", refuse while any usable IPv6 exists.
 pub fn ipv6_preflight(policy: Ipv6Policy) -> io::Result<()> {
     if policy != Ipv6Policy::Fail {
@@ -241,6 +278,13 @@ mod tests {
     #[test]
     fn workspace_keeps_panic_unwind() {
         assert!(!include_str!("../../Cargo.toml").contains("panic"), "core/Cargo.toml must not set a panic strategy");
+    }
+
+    #[test]
+    fn killswitch_rules_match_the_python_golden_files() {
+        let server = Ipv4Addr::new(192, 0, 2, 1);
+        assert_eq!(killswitch_rules(server, 51820, None), include_str!("../../../tests/golden/killswitch_connecting.nft"));
+        assert_eq!(killswitch_rules(server, 51820, Some(("pqvpn0", 51821))), include_str!("../../../tests/golden/killswitch_up.nft"));
     }
 
     #[test]

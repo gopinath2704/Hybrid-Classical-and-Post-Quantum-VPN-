@@ -4,14 +4,15 @@
 //! Without user namespaces it prints SKIP and passes.
 
 use std::io::{BufRead, BufReader};
-use std::net::Ipv4Addr;
+use std::io::ErrorKind;
+use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use pqvpnd::config::Ipv6Policy;
-use pqvpnd::net::{Network, ipv6_preflight, run_ip};
+use pqvpnd::net::{Network, ipv6_preflight, killswitch_install, killswitch_present, run_ip};
 
 const CHILD: &str = "PQVPND_NETNS_CHILD";
 
@@ -27,6 +28,72 @@ fn nft_tables() -> String {
     let output = Command::new("nft").args(["list", "tables"]).output().expect("nft");
     assert!(output.status.success(), "nft list tables: {}", String::from_utf8_lossy(&output.stderr));
     String::from_utf8(output.stdout).unwrap()
+}
+
+/// Whether the host may send to `to`: a packet the kill switch drops fails the send with EPERM at once.
+fn udp_allowed(from: &str, to: &str) -> bool {
+    let socket = UdpSocket::bind(from).unwrap();
+    match socket.send_to(b"probe", to) {
+        Ok(_) => true,
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => false,
+        Err(error) => panic!("send {from} -> {to}: {error}"),
+    }
+}
+
+/// Packets that fell through to the kill switch's final counter, i.e. were dropped.
+fn kill_switch_drops() -> u64 {
+    let output = Command::new("nft").args(["list", "chain", "inet", "pqvpn_killswitch", "output"]).output().expect("nft");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let after = text.split("counter packets ").nth(1).unwrap_or_else(|| panic!("no counter in {text}"));
+    after.split_whitespace().next().unwrap().parse().unwrap()
+}
+
+/// TCP does not fail fast on a dropped SYN, so judge it by the drop counter: unchanged means it went out.
+fn tcp_allowed(to: &str) -> bool {
+    let before = kill_switch_drops();
+    let _ = TcpStream::connect_timeout(&to.parse::<SocketAddr>().unwrap(), Duration::from_millis(200));
+    kill_switch_drops() == before
+}
+
+/// The K2 allow set, both phases, on a dummy uplink (server 192.0.2.1) and a dummy standing in for the TUN.
+fn kill_switch_allow_set() {
+    ip("link set lo up"); // a fresh namespace starts with loopback down
+    ip("link add pqks0 type dummy");
+    ip("addr add 10.8.0.2/24 dev pqks0");
+    ip("link set pqks0 up");
+    ip("-6 addr add 2001:db8::2/64 dev pqup0 nodad");
+    let server = Ipv4Addr::new(192, 0, 2, 1);
+    let open = |phase: &str| {
+        assert!(udp_allowed("127.0.0.1:0", "127.0.0.1:9"), "{phase}: loopback");
+        assert!(udp_allowed("0.0.0.0:68", "192.0.2.1:67"), "{phase}: DHCP");
+        assert!(tcp_allowed("192.0.2.1:51820"), "{phase}: server control TCP");
+    };
+    killswitch_install(server, 51820, None).unwrap();
+    assert!(killswitch_present().unwrap());
+    open("connecting");
+    for (to, what) in [("192.0.2.53:53", "DNS on the uplink"), ("192.0.2.1:51821", "data UDP before up"), ("10.8.0.1:53", "TUN before up")] {
+        assert!(!udp_allowed("0.0.0.0:0", to), "connecting: {what} must be blocked");
+    }
+    // Replaced in place by the "up" phase, one transaction.
+    killswitch_install(server, 51820, Some(("pqks0", 51821))).unwrap();
+    open("up");
+    assert!(udp_allowed("0.0.0.0:0", "192.0.2.1:51821"), "up: server data UDP");
+    assert!(udp_allowed("0.0.0.0:0", "10.8.0.1:53"), "up: anything via the TUN, DNS included");
+    assert!(!udp_allowed("0.0.0.0:0", "192.0.2.53:53"), "up: DNS on the uplink must be blocked");
+    assert!(!udp_allowed("0.0.0.0:0", "192.0.2.1:51822"), "up: other server ports blocked");
+    assert!(!tcp_allowed("192.0.2.1:22"), "up: server TCP other than control blocked");
+    assert!(!udp_allowed("[::]:0", "[2001:db8::1]:53"), "up: IPv6 blocked");
+    let recover = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_pqvpnd")).arg("recover").output().unwrap();
+        assert!(output.status.success(), "recover: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(recover(), "kill switch removed; traffic is no longer blocked\n");
+    assert_eq!(recover(), "no kill switch was active\n", "idempotent");
+    assert!(!killswitch_present().unwrap());
+    assert!(udp_allowed("0.0.0.0:0", "192.0.2.53:53") && udp_allowed("[::]:0", "[2001:db8::1]:53"), "open again after remove");
+    ip("-6 addr del 2001:db8::2/64 dev pqup0");
+    ip("link del pqks0");
 }
 
 /// ipv6_policy = "fail" refuses while usable IPv6 exists, and a setup failure after the guard is up removes it.
@@ -53,6 +120,7 @@ fn child() {
     ip("link set pqup0 up");
     ip("route add 192.0.2.1/32 dev pqup0 metric 77");
     ipv6_refusals();
+    kill_switch_allow_set();
     let before = routes();
 
     let network = Network::up("pqtest0", Ipv4Addr::new(10, 8, 0, 2), 24, 1380, Ipv4Addr::new(192, 0, 2, 1), Ipv6Policy::Block).unwrap();
@@ -106,5 +174,5 @@ fn main() {
     let status = process.wait().unwrap();
     assert!(status.success(), "child failed: {status}");
     assert_eq!(last.as_deref(), Some("restored after SIGTERM"));
-    println!("netns: ipv6 fail/block refusals and rollback, TUN up, bypass route, guard, SIGTERM cleanup restored everything: ok");
+    println!("netns: kill switch allow set, ipv6 fail/block refusals and rollback, TUN up, bypass route, guard, SIGTERM cleanup restored everything: ok");
 }
