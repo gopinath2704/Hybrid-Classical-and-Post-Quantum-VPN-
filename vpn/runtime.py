@@ -11,6 +11,7 @@ import select
 import selectors
 import shlex
 import socket
+import stat
 import struct
 import subprocess
 import threading
@@ -1004,8 +1005,14 @@ class VPNClient:
     def _load_ticket(self, fingerprint: str) -> tuple[bytes, bytes] | None:
         import base64
         try:
-            fd = os.open(self._ticket_path(), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            # O_NONBLOCK: a FIFO planted at the path must not hang connect; it fails the S_ISREG check instead.
+            fd = os.open(self._ticket_path(), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
             with os.fdopen(fd, encoding="utf-8") as f:
+                # Same rule as identity.read_private, plus ownership: only a ticket this user wrote is trusted.
+                info = os.fstat(f.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                        or stat.S_IMODE(info.st_mode) not in (0o400, 0o600)):
+                    return None
                 data = json.load(f)
             if data.get("fp") != fingerprint or data.get("v") != self.cfg.protocol_version:
                 return None
@@ -1053,6 +1060,11 @@ class VPNClient:
                     logger.info("session resumed via 1-RTT ticket")
                 except (HandshakeError, OSError) as exc:
                     logger.info("resumption failed (%s), falling back to full handshake", exc)
+                    # A rejected ticket (e.g. key rotated on revocation) must not linger if the full handshake fails too.
+                    try:
+                        self._ticket_path().unlink(missing_ok=True)
+                    except OSError:
+                        pass
                     self.control.close()
                     self.control = set_nodelay(socket.create_connection(
                         (self.server_ip, self.cfg.server_control_port), timeout=10))

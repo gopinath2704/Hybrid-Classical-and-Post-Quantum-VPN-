@@ -1091,6 +1091,7 @@ def test_signed_out_client_cannot_resume_before_revocation_sweep(data_plane, tmp
         with pytest.raises(Exception):
             c2.connect()
         assert c2.state != 'CONNECTED'
+        assert not c2._ticket_path().exists(), 'the rejected ticket must be deleted, not kept until expiry'
     finally:
         server.stop()
         worker.join(4)
@@ -1395,6 +1396,23 @@ def test_ticket_load_refuses_symlink(tmp_path):
     client._ticket_path().rename(elsewhere)
     client._ticket_path().symlink_to(elsewhere)
     assert client._load_ticket('aa'*32) is None
+
+
+def test_ticket_load_refuses_unsafe_file(tmp_path, monkeypatch):
+    client = runtime.VPNClient(ClientConfig(server_identity_fingerprint='aa'*32,
+        client_identity_private_key=str(tmp_path/'client.key'), client_identity_public_key=str(tmp_path/'client.pub')))
+    client._save_ticket(b'ticket', b's'*32, 'aa'*32)
+    path = client._ticket_path()
+    path.chmod(0o640)
+    assert client._load_ticket('aa'*32) is None
+    path.chmod(0o600)
+    monkeypatch.setattr(runtime.os, 'geteuid', lambda: os.getuid() + 1)
+    assert client._load_ticket('aa'*32) is None
+    monkeypatch.undo()
+    assert client._load_ticket('aa'*32) == (b'ticket', b's'*32)
+    path.unlink()
+    os.mkfifo(path, 0o600)
+    assert client._load_ticket('aa'*32) is None  # returns at once, no hang on a FIFO
 
 
 def test_ticket_save_failure_leaves_no_temp_file(tmp_path, monkeypatch):
