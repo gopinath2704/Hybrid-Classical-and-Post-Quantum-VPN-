@@ -470,6 +470,17 @@ class VPNServer:
     def _client(self, connection: socket.socket, address: tuple[str, int]) -> None:
         item = None
         handed_off = False
+        # Counts handshakes in progress for cookie_mode "under_load": decremented exactly once, when
+        # the session is established (CONFIG and ticket sent) or on any earlier exit.
+        in_handshake = True
+
+        def end_handshake() -> None:
+            nonlocal in_handshake
+            if in_handshake:
+                in_handshake = False
+                with self._pending_lock:
+                    self._pending_handshakes = max(0, self._pending_handshakes - 1)
+
         with self._pending_lock:
             self._pending_handshakes += 1
         try:
@@ -524,12 +535,14 @@ class VPNServer:
             if resumption_enabled:
                 ticket = session.issue_ticket(self._ticket_key, self.cfg.resumption_ticket_lifetime, vpn_ip)
                 send_message(connection, session.encrypt_control(ticket, FrameType.RESUMPTION_TICKET))
+            end_handshake()
             # From here the selector thread owns the socket and the session; this thread exits.
             connection.setblocking(False)
             handed_off = self._hand_off(item, connection, address)
         except Exception as exc:
             self._log_control_failure(exc, address[0])
         finally:
+            end_handshake()
             if not handed_off:
                 self._end_session(item, connection)
 
@@ -558,10 +571,6 @@ class VPNServer:
         finally:
             connection.close()
             self.slots.release()
-            # ponytail: counts live connections, not just handshakes, as before slice (c); cookie_mode
-            # "under_load" reads it, so keeping the decrement at session end keeps cookie/M7 behaviour.
-            with self._pending_lock:
-                self._pending_handshakes = max(0, self._pending_handshakes - 1)
 
     def _hand_off(self, item: ServerSession, connection: socket.socket, address: tuple[str, int]) -> bool:
         with self._handoff_lock:
