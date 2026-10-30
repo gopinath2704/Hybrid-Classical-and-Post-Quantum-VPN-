@@ -112,6 +112,35 @@ fn ipv6_refusals() {
     assert_eq!(routes(), before);
 }
 
+/// A stand-in for resolvectl that logs its argv (and fails on `fail_on`): the real one would talk to the HOST's
+/// systemd-resolved over D-Bus, where this namespace's TUN index could name a host link.
+fn stub_resolvectl(name: &str, fail_on: &str) -> (&'static str, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("netns-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (script, log) = (dir.join("resolvectl"), dir.join("log"));
+    let _ = std::fs::remove_file(&log);
+    std::fs::write(&script, format!("#!/bin/sh\necho \"$*\" >> '{}'\n[ \"$1\" != '{fail_on}' ]\n", log.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (Box::leak(script.to_string_lossy().into_owned().into_boxed_str()), log)
+}
+
+fn log_of(log: &std::path::Path) -> String {
+    std::fs::read_to_string(log).unwrap_or_default()
+}
+
+/// DNS: nothing is run when unmanaged or without servers; a failing `domain` still reverts the link on rollback.
+fn dns_rollback() {
+    let (stub, log) = stub_resolvectl("fail", "domain");
+    let mut network = Network::up("pqfail0", Ipv4Addr::new(10, 8, 0, 2), 24, 1380, Ipv4Addr::new(192, 0, 2, 1), Ipv6Policy::Allow, &[]).unwrap();
+    network.dns(false, &["10.8.0.1".into()], &["~.".into()], || Ok(stub)).unwrap();
+    network.dns(true, &[], &["~.".into()], || Ok(stub)).unwrap();
+    assert_eq!(log_of(&log), "", "unmanaged or no servers: resolvectl never runs");
+    assert!(network.dns(true, &["10.8.0.1".into()], &["~.".into()], || Ok(stub)).is_err());
+    drop(network);
+    assert_eq!(log_of(&log), "dns pqfail0 10.8.0.1\ndomain pqfail0 ~.\nrevert pqfail0\n", "registered before the first command");
+}
+
 /// A split route the kernel rejects after one went in: the first is undone and the route it replaced comes back.
 fn split_route_rollback() {
     ip("route add 10.99.0.0/16 via 192.0.2.254 dev pqup0");
@@ -132,12 +161,13 @@ fn child() {
     ipv6_refusals();
     kill_switch_allow_set();
     split_route_rollback();
+    dns_rollback();
     // A route the full tunnel replaces, so the restore has to put it back exactly.
     ip("route add 128.0.0.0/1 via 192.0.2.254 dev pqup0");
     let before = routes();
 
     let full = ["0.0.0.0/1".to_owned(), "128.0.0.0/1".to_owned()];
-    let network = Network::up("pqtest0", Ipv4Addr::new(10, 8, 0, 2), 24, 1380, Ipv4Addr::new(192, 0, 2, 1), Ipv6Policy::Block, &full).unwrap();
+    let mut network = Network::up("pqtest0", Ipv4Addr::new(10, 8, 0, 2), 24, 1380, Ipv4Addr::new(192, 0, 2, 1), Ipv6Policy::Block, &full).unwrap();
     for half in full {
         assert!(ip(&format!("route show exact {half}")).trim().ends_with("dev pqtest0 scope link"), "{half} via the TUN");
     }
@@ -148,11 +178,15 @@ fn child() {
     assert_eq!(std::fs::read_to_string("/proc/sys/net/ipv6/conf/pqtest0/disable_ipv6").unwrap().trim(), "1", "no IPv6 on the TUN");
     assert!(ip("route show exact 192.0.2.1/32").contains("dev pqup0"), "bypass route");
     assert_ne!(routes(), before, "routes changed while up");
+    let (stub, log) = stub_resolvectl("main", "none");
+    network.dns(true, &["10.8.0.1".into(), "10.8.0.53".into()], &["~.".into()], || Ok(stub)).unwrap();
+    assert_eq!(log_of(&log), "dns pqtest0 10.8.0.1 10.8.0.53\ndomain pqtest0 ~.\n");
     println!("ready");
 
     let signal = pqvpnd::wait_for_stop(&signals).unwrap();
     drop(network);
     assert_eq!(routes(), before, "every route restored after {signal:?}");
+    assert!(log_of(&log).ends_with("domain pqtest0 ~.\nrevert pqtest0\n"), "DNS reverted after {signal:?}");
     assert!(!nft_tables().contains("pqvpn_client6_"), "IPv6 guard removed after {signal:?}");
     assert!(run_ip(&["link".into(), "show".into(), "dev".into(), "pqtest0".into()], true).is_err(), "TUN closed and gone");
     println!("restored after {signal:?}");
@@ -191,5 +225,5 @@ fn main() {
     let status = process.wait().unwrap();
     assert!(status.success(), "child failed: {status}");
     assert_eq!(last.as_deref(), Some("restored after SIGTERM"));
-    println!("netns: kill switch allow set, ipv6 fail/block refusals and rollback, split rollback, full-tunnel routes, TUN up, bypass route, guard, SIGTERM cleanup restored everything: ok");
+    println!("netns: kill switch allow set, ipv6 fail/block refusals and rollback, split rollback, DNS rollback, full-tunnel routes and DNS, TUN up, bypass route, guard, SIGTERM cleanup restored everything: ok");
 }

@@ -13,6 +13,23 @@ use crate::config::Ipv6Policy;
 /// `ip` from a fixed location: pqvpnd runs as root, so it never resolves commands through PATH.
 const IP_CANDIDATES: [&str; 4] = ["/usr/bin/ip", "/usr/sbin/ip", "/bin/ip", "/sbin/ip"];
 
+const RESOLVECTL_CANDIDATES: [&str; 4] = ["/usr/bin/resolvectl", "/usr/sbin/resolvectl", "/bin/resolvectl", "/sbin/resolvectl"];
+
+/// `resolvectl` from a fixed location, with Python's message when it is missing.
+pub fn resolvectl_binary() -> io::Result<&'static str> {
+    binary(RESOLVECTL_CANDIDATES, "resolvectl").map_err(|_| io::Error::new(io::ErrorKind::NotFound,
+        "configured VPN DNS requires resolvectl; use dns_mode=none only to explicitly accept unmanaged DNS"))
+}
+
+/// Runs `program ARGS` (argv, no shell); a non-zero exit is an error carrying its stderr.
+fn run_checked(program: &str, args: &[&str]) -> io::Result<()> {
+    let output = Command::new(program).args(args).stdin(Stdio::null()).output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!("{program} {}: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim())));
+    }
+    Ok(())
+}
+
 const NFT_CANDIDATES: [&str; 4] = ["/usr/bin/nft", "/usr/sbin/nft", "/bin/nft", "/sbin/nft"];
 
 fn binary(candidates: [&'static str; 4], name: &str) -> io::Result<&'static str> {
@@ -204,6 +221,8 @@ pub struct Network {
     undo: Vec<RouteUndo>,
     /// The `ip6` guard table we created, removed last.
     pub ipv6_table: Option<String>,
+    /// The resolvectl that configured the TUN link's DNS, so restore can revert it first.
+    dns_resolvectl: Option<String>,
 }
 
 impl Network {
@@ -213,7 +232,7 @@ impl Network {
     pub fn up(tun_name: &str, address: Ipv4Addr, prefix: u8, mtu: u16, server: Ipv4Addr, ipv6: Ipv6Policy, routes: &[String])
               -> io::Result<Self> {
         let (fd, name) = pqvpn_fd::open_tun(tun_name)?;
-        let mut network = Network { tun: Some(fd), tun_name: name, undo: Vec::new(), ipv6_table: None };
+        let mut network = Network { tun: Some(fd), tun_name: name, undo: Vec::new(), ipv6_table: None, dns_resolvectl: None };
         // No IPv6 on the tunnel (pqvpnd refuses IPv6 policies), and no link-local chatter the server would drop.
         // Before link up; a kernel without IPv6 has no such file.
         match std::fs::write(format!("/proc/sys/net/ipv6/conf/{}/disable_ipv6", network.tun_name), "1") {
@@ -245,6 +264,28 @@ impl Network {
         Ok(network)
     }
 
+    /// The DNS step of `ClientNetwork.apply`: the TUN link's servers and routing domains through systemd-resolved.
+    /// `resolvectl` is a parameter so the netns test can pass a stub: the real one would reach the host's resolved
+    /// over D-Bus. Cleanup is registered before the first command, so a failure in either still reverts the link.
+    pub fn dns(&mut self, manage: bool, servers: &[String], domains: &[String], resolvectl: impl FnOnce() -> io::Result<&'static str>)
+               -> io::Result<()> {
+        if !manage {
+            eprintln!("pqvpnd: DNS is explicitly unmanaged (dns_mode=none); DNS may bypass the VPN");
+            return Ok(());
+        }
+        if servers.is_empty() {
+            return Ok(());
+        }
+        let program = resolvectl()?;
+        self.dns_resolvectl = Some(program.to_owned());
+        let tun = self.tun_name.clone();
+        run_checked(program, &[["dns", tun.as_str()].as_slice(), &servers.iter().map(String::as_str).collect::<Vec<_>>()].concat())?;
+        if !domains.is_empty() {
+            run_checked(program, &[["domain", tun.as_str()].as_slice(), &domains.iter().map(String::as_str).collect::<Vec<_>>()].concat())?;
+        }
+        Ok(())
+    }
+
     fn replace_route(&mut self, destination: &str, route: Vec<String>) -> io::Result<()> {
         let previous = parse_routes(&run_ip(&argv(&["route", "show", "exact", destination]), true)?);
         run_ip(&[argv(&["route", "replace"]), route.clone()].concat(), true)?;
@@ -254,6 +295,9 @@ impl Network {
 
     /// Best effort and idempotent: undo routes newest first, then close the TUN (which removes its address).
     pub fn restore(&mut self) {
+        if let Some(program) = self.dns_resolvectl.take() {
+            let _ = run_checked(&program, &["revert", &self.tun_name]);
+        }
         while let Some(undo) = self.undo.pop() {
             for command in undo.commands() {
                 let _ = run_ip(&command, false);

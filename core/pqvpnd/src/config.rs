@@ -63,6 +63,11 @@ pub struct ClientConfig {
     pub full_tunnel: bool,
     /// Validated IPv4 networks, as written; ignored in a full tunnel, as in Python.
     pub split_tunnel: Vec<String>,
+    /// `dns_mode = "systemd-resolved"` (the default) rather than `"none"`.
+    pub manage_dns: bool,
+    /// Validated IP addresses; empty means the server's CONFIG `dns` list, as in Python.
+    pub dns_servers: Vec<String>,
+    pub dns_routing_domains: Vec<String>,
 }
 
 /// `ipv6_policy`, as `IPv6Guard` applies it: leave IPv6 alone, drop all of it but loopback, or refuse to connect
@@ -133,15 +138,12 @@ pub fn parse(text: &str, base: &Path) -> Result<ClientConfig, ConfigError> {
         Some(_) => return Err(invalid("experimental_suite must be one of v2-ed25519, v3-kem, v3-mldsa or empty")),
     }
 
-    // Python defaults to systemd-resolved DNS; pqvpnd does not manage DNS yet, so that must be turned off explicitly.
     let full_tunnel = raw.full_tunnel.unwrap_or(true);
-    match raw.dns_mode.as_deref() {
-        Some("none") => {}
-        None | Some("systemd-resolved") => {
-            return Err(unsupported("dns_mode = \"systemd-resolved\" (the default): set dns_mode = \"none\"; DNS management comes later"));
-        }
+    let manage_dns = match raw.dns_mode.as_deref() {
+        None | Some("systemd-resolved") => true,
+        Some("none") => false,
         Some(_) => return Err(invalid("dns_mode must be systemd-resolved or none")),
-    }
+    };
     if raw.kill_switch == Some(true) {
         return Err(unsupported("kill_switch = true"));
     }
@@ -152,8 +154,9 @@ pub fn parse(text: &str, base: &Path) -> Result<ClientConfig, ConfigError> {
     for route in &split_tunnel {
         ipv4_network(route).ok_or_else(|| invalid(format!("split_tunnel: {route:?} is not an IPv4 network")))?;
     }
-    if raw.dns_routing_domains.as_ref().is_some_and(|list| !list.is_empty()) {
-        return Err(unsupported("dns_routing_domains"));
+    let dns_routing_domains = raw.dns_routing_domains.unwrap_or_default();
+    if !dns_routing_domains.iter().all(|domain| routing_domain_ok(domain)) {
+        return Err(invalid("invalid DNS routing domain"));
     }
     // `effective_policy`: unset means "block" in a full tunnel and "allow" in split mode.
     let ipv6_policy = match raw.ipv6_policy.as_deref() {
@@ -164,7 +167,8 @@ pub fn parse(text: &str, base: &Path) -> Result<ClientConfig, ConfigError> {
         Some(_) => return Err(invalid("ipv6_policy must be block, fail or allow")),
     };
     // Unused with dns_mode = "none", exactly as in Python, but still validated.
-    for address in raw.dns_servers.iter().flatten() {
+    let dns_servers = raw.dns_servers.unwrap_or_default();
+    for address in &dns_servers {
         address.parse::<IpAddr>().map_err(|_| invalid(format!("dns_servers: {address:?} is not an IP address")))?;
     }
 
@@ -228,6 +232,9 @@ pub fn parse(text: &str, base: &Path) -> Result<ClientConfig, ConfigError> {
         ipv6_policy,
         full_tunnel,
         split_tunnel,
+        manage_dns,
+        dns_servers,
+        dns_routing_domains,
     })
 }
 
@@ -238,9 +245,21 @@ impl ClientConfig {
         if self.full_tunnel { vec!["0.0.0.0/1".into(), "128.0.0.0/1".into()] } else { self.split_tunnel.clone() }
     }
 
+    /// The resolved routing domains for the TUN link: every name (`~.`) in a full tunnel, else the configured ones.
+    pub fn dns_domains(&self) -> Vec<String> {
+        if self.full_tunnel { vec!["~.".into()] } else { self.dns_routing_domains.clone() }
+    }
+
     pub fn ticket_path(&self) -> PathBuf {
         self.client_identity_private_key.parent().unwrap_or(Path::new(".")).join(".pqvpn_ticket.json")
     }
+}
+
+/// `validate_client`'s routing-domain pattern: `~?[a-zA-Z0-9][a-zA-Z0-9.-]*` or `~.`.
+fn routing_domain_ok(domain: &str) -> bool {
+    let name = domain.strip_prefix('~').unwrap_or(domain);
+    domain == "~." || name.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
 }
 
 /// `interface_name`: `[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,14}`.
@@ -308,10 +327,7 @@ handshake = "rust"
     #[test]
     fn refuses_every_option_it_cannot_honour() {
         let cases = [
-            (BENCH.replace("dns_mode = \"none\"", ""), "dns_mode"),
-            (BENCH.replace("dns_mode = \"none\"", "dns_mode = \"systemd-resolved\""), "dns_mode"),
             (format!("{BENCH}kill_switch = true"), "kill_switch"),
-            (format!("{BENCH}dns_routing_domains = [\"corp\"]"), "dns_routing_domains"),
             (format!("{BENCH}dev_emulated_tun = true"), "dev_emulated_tun"),
             (format!("{BENCH}experimental_suite = \"v3-mldsa\""), "v3-mldsa"),
             (BENCH.replace("data_plane = \"rust\"", "data_plane = \"python\""), "data_plane"),
@@ -333,6 +349,17 @@ handshake = "rust"
                                 ("ipv6_policy = \"block\"", Ipv6Policy::Block), ("ipv6_policy = \"fail\"", Ipv6Policy::Fail)] {
             assert_eq!(with(extra).unwrap().ipv6_policy, policy, "{extra:?}");
         }
+    }
+
+    #[test]
+    fn dns_follows_python() {
+        let cfg = parse(&BENCH.replace("dns_mode = \"none\"\n", "").replace("dns_servers = []", "dns_servers = [\"10.8.0.1\"]")
+            .replace("full_tunnel = false", "full_tunnel = false\ndns_routing_domains = [\"corp.example\", \"~lan\", \"~.\"]"), Path::new("/")).unwrap();
+        assert!(cfg.manage_dns, "systemd-resolved is the default");
+        assert_eq!(cfg.dns_servers, ["10.8.0.1"]);
+        assert_eq!(cfg.dns_domains(), ["corp.example", "~lan", "~."], "split: the configured routing domains");
+        let full = parse(&BENCH.replace("full_tunnel = false", ""), Path::new("/")).unwrap();
+        assert_eq!((full.manage_dns, full.dns_domains()), (false, vec!["~.".to_owned()]), "full tunnel routes every name");
     }
 
     #[test]
@@ -366,6 +393,10 @@ handshake = "rust"
             format!("{BENCH}ipv6_policy = \"sometimes\""),
             format!("{BENCH}split_tunnel = [\"203.0.113.1/24\"]"),
             format!("{BENCH}split_tunnel = [\"::/0\"]"),
+            format!("{BENCH}dns_routing_domains = [\"-corp\"]"),
+            format!("{BENCH}dns_routing_domains = [\"corp;rm\"]"),
+            format!("{BENCH}dns_routing_domains = [\"~\"]"),
+            format!("{BENCH}dns_mode = \"dnsmasq\""),
             BENCH.replace("dns_servers = []", "dns_servers = [\"not-an-ip\"]"),
             BENCH.replace("ABCDEF", "XYZ"),
             BENCH.replace("server_identity_fingerprint = \"ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789\"", ""),
@@ -376,8 +407,8 @@ handshake = "rust"
         for text in invalid_cases {
             assert!(matches!(parse(&text, Path::new("/")), Err(ConfigError::Invalid(_) | ConfigError::Read(_))), "{text}");
         }
-        // A missing [client] gets Python's defaults, which then fail closed (full tunnel, no fingerprint).
-        assert!(matches!(parse("", Path::new("/")), Err(ConfigError::Unsupported(_))));
+        // A missing [client] gets Python's defaults, which then fail closed on the missing fingerprint.
+        assert!(matches!(parse("", Path::new("/")), Err(ConfigError::Invalid(message)) if message.contains("fingerprint")));
     }
 
     #[test]

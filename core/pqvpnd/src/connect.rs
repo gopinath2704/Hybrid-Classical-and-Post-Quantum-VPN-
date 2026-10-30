@@ -120,6 +120,8 @@ pub struct Tunnel {
     pub rekey_interval: u64,
     pub rehandshake_interval: u64,
     pub resumption: bool,
+    /// The server's DNS servers, used when `dns_servers` is empty.
+    pub dns: Vec<String>,
 }
 
 /// Parses CONFIG and applies the checks `connect` makes (advertised subnet, UDP port), plus type and range
@@ -142,6 +144,9 @@ pub fn parse_tunnel(payload: &[u8], expected_subnet: (Ipv4Addr, u8)) -> Result<T
         rehandshake_interval: config.get("rehandshake_interval").map_or(Some(0), serde_json::Value::as_u64)
             .ok_or_else(|| bad("rehandshake_interval"))?,
         resumption: config.get("resumption").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        dns: config.get("dns").and_then(serde_json::Value::as_array).and_then(|list| {
+            list.iter().map(|v| v.as_str().filter(|s| s.parse::<IpAddr>().is_ok()).map(str::to_owned)).collect()
+        }).ok_or_else(|| bad("dns"))?,
     };
     let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
     let advertised = (Ipv4Addr::from(u32::from(tunnel.server_vpn_ip) & mask), prefix);
@@ -262,7 +267,9 @@ pub fn connect(config_path: &Path, stop_signals: &SigSet) -> Result<(), ConnectE
     control.set_read_timeout(Some(SESSION_TIMEOUT)).map_err(net("control timeout"))?;
     control.set_write_timeout(Some(SESSION_TIMEOUT)).map_err(net("control timeout"))?;
 
-    let network = Network::up(&cfg.tun_name, tunnel.client_ip, tunnel.prefix, tunnel.mtu, server_ip, cfg.ipv6_policy, &cfg.routes()).map_err(net("network setup"))?;
+    let mut network = Network::up(&cfg.tun_name, tunnel.client_ip, tunnel.prefix, tunnel.mtu, server_ip, cfg.ipv6_policy, &cfg.routes()).map_err(net("network setup"))?;
+    let dns = if cfg.dns_servers.is_empty() { &tunnel.dns } else { &cfg.dns_servers };
+    network.dns(cfg.manage_dns, dns, &cfg.dns_domains(), crate::net::resolvectl_binary).map_err(net("DNS setup"))?;
     let server_udp = SocketAddrV4::new(server_ip, tunnel.udp_port);
     let udp = udp_bind(&established, server_udp)?;
     let tun: OwnedFd = network.tun.as_ref().expect("up() opened it").try_clone().map_err(net("TUN dup"))?;
@@ -376,7 +383,9 @@ mod tests {
     fn parses_the_servers_config() {
         let tunnel = config(GOOD).unwrap();
         assert_eq!(tunnel, Tunnel { client_ip: Ipv4Addr::new(10, 8, 0, 2), server_vpn_ip: Ipv4Addr::new(10, 8, 0, 1), prefix: 24,
-                                    udp_port: 51820, mtu: 1380, rekey_interval: 3600, rehandshake_interval: 0, resumption: true });
+                                    udp_port: 51820, mtu: 1380, rekey_interval: 3600, rehandshake_interval: 0, resumption: true,
+                                    dns: vec![] });
+        assert_eq!(config(&GOOD.replace("\"dns\": []", "\"dns\": [\"10.8.0.1\", \"::1\"]")).unwrap().dns, ["10.8.0.1", "::1"]);
     }
 
     #[test]
@@ -390,6 +399,8 @@ mod tests {
             ("\"client_vpn_ip\": \"10.8.0.2\"", "\"client_vpn_ip\": \"::1\"", "client_vpn_ip"),
             ("\"rekey_interval\": 3600", "\"rekey_interval\": -1", "rekey_interval"),
             ("\"prefix\": 24", "\"prefix\": \"24\"", "prefix"),
+            ("\"dns\": []", "\"dns\": [\"--set-everything\"]", "dns"),
+            ("\"dns\": [], ", "", "dns"),
         ] {
             let error = config(&GOOD.replace(from, to)).unwrap_err().to_string();
             assert!(error.contains(needle), "{to}: {error}");
