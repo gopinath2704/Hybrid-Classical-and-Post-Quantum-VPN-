@@ -58,6 +58,8 @@ class ConnectionState(enum.Enum):
     DISCONNECTING = "DISCONNECTING"
     FAILED = "FAILED"
     SETUP_REQUIRED = "SETUP_REQUIRED"
+    # The kill switch is holding all traffic after a lost session or a crash; Disconnect releases it.
+    BLOCKED = "BLOCKED"
 
 
 @dataclass
@@ -202,6 +204,7 @@ class ClientService:
         self._identity_fingerprint: str | None = None
         self._connected_profile_id: str | None = None
         self._connected_profile_name: str | None = None
+        self._kill_switch_stale = _kill_switch_present()
         if self.managed_mode:
             self._ensure_identity_startup()
         self._validate_config()
@@ -616,6 +619,17 @@ class ClientService:
             crypto = {"pqc_mode": "unavailable", "is_quantum_safe": False}
 
         vpn = self._vpn
+        if vpn is None and self._kill_switch_stale:
+            status = ClientStatus(
+                state=ConnectionState.BLOCKED.value,
+                error="A kill switch left by an earlier session is blocking all traffic; disconnect to restore the network",
+                kill_switch_active=True,
+                pqc_mode=crypto.get("pqc_mode"),
+                is_quantum_safe=crypto.get("is_quantum_safe", False),
+                **base,
+            )
+            self._observe_state(status)
+            return status
         if vpn is None:
             status = ClientStatus(
                 state=(ConnectionState.FAILED.value if self._last_failure
@@ -659,7 +673,8 @@ class ClientService:
                 if network else False
             ),
             dns_managed=getattr(network, "dns_cleanup_registered", False) if network else False,
-            kill_switch_active=bool(getattr(network, "kill_switch", False)) if network else False,
+            kill_switch_active=(bool(getattr(getattr(vpn, "cfg", None), "kill_switch", False))
+                                and getattr(vpn, "state", "") in ("CONNECTED", "BLOCKED")),
             rekey_interval=(int(tunnel.get("rekey_interval", 0)) or None),
             **base,
         )
@@ -724,11 +739,13 @@ class ClientService:
             self._config = cfg
             self._vpn = VPNClient(cfg)
             info = self._vpn.connect()
+            self._kill_switch_stale = False
             self._connected_at = time.monotonic()
             self._record_event("info", "Secure tunnel connected")
             return {"status": "connected", "info": info}
         except Exception as exc:
-            self._vpn = None
+            if getattr(self._vpn, "state", "") != ConnectionState.BLOCKED.value:
+                self._vpn = None  # a still-blocking client stays, so its status shows and Disconnect can release it
             self._connected_at = None
             raw_error = sanitize_error(exc)
             if self.managed_mode and any(
@@ -753,6 +770,12 @@ class ClientService:
             return {"error": "operation in progress"}
         try:
             self._record_event("info", "Disconnect requested")
+            if self._vpn is None and self._kill_switch_stale:
+                from vpn.network import KillSwitch
+                KillSwitch.remove()
+                self._kill_switch_stale = False
+                self._record_event("info", "Kill switch removed; network restored")
+                return {"status": "disconnected"}
             if self._vpn is None:
                 return {"error": "not connected"}
             self._vpn.disconnect()
@@ -769,6 +792,15 @@ class ClientService:
             return {"error": error}
         finally:
             self._lock.release()
+
+
+def _kill_switch_present() -> bool:
+    """A kill switch table outliving its session (crash or service restart) is reported, never silently kept or dropped."""
+    try:
+        from vpn.network import KillSwitch
+        return KillSwitch.present()
+    except Exception:
+        return False
 
 
 class IPCClient:

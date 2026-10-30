@@ -146,6 +146,41 @@ class TestClientService:
         result = service._do_disconnect()
         assert "error" in result
 
+    def test_kill_switch_left_by_an_earlier_session_is_reported_and_released(self, tmp_path, monkeypatch):
+        import app.client as client_module
+        import vpn.network as network
+        config = tmp_path / "client.toml"
+        config.write_text("[client]\nserver_host='vpn.example'\n")
+        monkeypatch.setattr(client_module, "_kill_switch_present", lambda: True)
+        removed = []
+        monkeypatch.setattr(network.KillSwitch, "remove", staticmethod(lambda: removed.append(True)))
+        service = ClientService(str(config))
+        status = service._get_status()
+        assert status.state == ConnectionState.BLOCKED.value and status.kill_switch_active
+        assert service._do_disconnect() == {"status": "disconnected"} and removed == [True]
+        assert service._get_status().state == ConnectionState.DISCONNECTED.value
+
+    def test_failed_connect_that_leaves_traffic_blocked_keeps_the_client(self, tmp_path, monkeypatch):
+        import vpn.runtime as runtime
+        config = tmp_path / "client.toml"
+        config.write_text("[client]\nserver_host='vpn.example'\n")
+        class Blocked:
+            def __init__(self, cfg):
+                self.cfg, self.state, self.error = SimpleNamespace(kill_switch=True), "CONNECTING", ""
+                self.disconnected = False
+            def connect(self):
+                self.state, self.error = "BLOCKED", "server unreachable"
+                raise OSError("server unreachable")
+            def disconnect(self):
+                self.disconnected, self.state = True, "DISCONNECTED"
+        monkeypatch.setattr(runtime, "VPNClient", Blocked)
+        service = ClientService(str(config))
+        assert "error" in service._do_connect()
+        vpn = service._vpn
+        status = service._get_status()
+        assert status.state == ConnectionState.BLOCKED.value and status.kill_switch_active
+        assert service._do_disconnect() == {"status": "disconnected"} and vpn.disconnected
+
     def test_concurrent_operations_serialized(self, tmp_path):
         """Two concurrent connect attempts do not both succeed."""
         config = tmp_path / "client.toml"
@@ -1526,6 +1561,7 @@ class TestAccountAwareHome:
 # ─── GUI improvements: tray, live stats, stepper, logs, theme, a11y ─────────
 
 from app.ui.components import sparkline_points, step_states  # noqa: E402
+from app.ui.pages.settings import KILL_SWITCH_NOTE  # noqa: E402
 from app.ui.pages.home import explain_failure  # noqa: E402
 from app.ui.pages.logs import format_entries, redact_secrets  # noqa: E402
 from app.ui.pages.servers import (  # noqa: E402
@@ -1739,10 +1775,17 @@ class TestGUIImprovements:
         assert gui.settings.value("auto_connect", type=bool) is True
         assert gui.power_btn.reduce_motion
         gui._render(ClientStatus(state="CONNECTED", kill_switch_active=True))
-        assert "NOT ENFORCED" in gui.kill_switch_chip.text()
-        assert "not enforced" in gui.settings_kill_switch.status_label.text()
+        assert gui.kill_switch_chip.text() == "KILL SWITCH · ON"
+        assert gui.settings_kill_switch.status_label.text() == "Enforced"
         gui._render(ClientStatus(state="CONNECTED", kill_switch_active=False))
         assert gui.kill_switch_chip.text() == "KILL SWITCH · NOT ARMED"
+        gui._render(ClientStatus(state="BLOCKED", error="authenticated UDP dead-peer timeout", kill_switch_active=True))
+        assert gui.kill_switch_chip.text() == "KILL SWITCH · BLOCKING"
+        assert gui.settings_kill_switch.status_label.text() == "Blocking all traffic"
+        assert gui.action_btn.text() == "Disconnect to restore network"
+        for widget in (gui.kill_switch_chip, gui.settings_kill_switch.status_label, gui.action_btn):
+            assert "not enforced" not in widget.text().lower()
+        assert "not install" not in KILL_SWITCH_NOTE and "until you disconnect" in KILL_SWITCH_NOTE
 
     def test_auto_connect_runs_once_at_startup(self, gui):
         gui.prefs["auto_connect"] = True

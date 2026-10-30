@@ -84,6 +84,7 @@ _STATE_TOKENS = {
     "DISCONNECTING": "amber",
     "FAILED": "red",
     "SETUP_REQUIRED": "amber",
+    "BLOCKED": "red",
 }
 STATE_COLORS = {state: COLORS[token] for state, token in _STATE_TOKENS.items()}
 

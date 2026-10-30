@@ -306,7 +306,7 @@ class MainWindow(QMainWindow):
         self._tray.setIcon(state_icon(STATE_COLORS.get(state, COLORS["muted"])))
         self._tray.setToolTip(f"PQ-VPN · {state.replace('_', ' ')}")
         self._tray_toggle_action.setText(
-            "Disconnect" if state == ConnectionState.CONNECTED.value else "Connect")
+            "Disconnect" if state in {ConnectionState.CONNECTED.value, ConnectionState.BLOCKED.value} else "Connect")
         self._tray_toggle_action.setEnabled(self._home.action_btn.isEnabled())
         self._tray_show_action.setText("Hide window" if self.isVisible() else "Show window")
 
@@ -374,7 +374,7 @@ class MainWindow(QMainWindow):
                                    ConnectionState.DISCONNECTING.value,
                                    ConnectionState.SETUP_REQUIRED.value}:
             return
-        action = "disconnect" if state == ConnectionState.CONNECTED.value else "connect"
+        action = "disconnect" if state in {ConnectionState.CONNECTED.value, ConnectionState.BLOCKED.value} else "connect"
         if action == "connect" and self._vpn_locked():
             self._add_gui_event("warning", "Connect refused: signed out. Sign in to use the VPN.")
             self._home.render_failure("Signed out. Sign in to use the VPN.", False)
@@ -547,6 +547,7 @@ class MainWindow(QMainWindow):
             ConnectionState.DISCONNECTING.value: "Restoring network…",
             ConnectionState.FAILED.value: "The connection could not be completed",
             ConnectionState.SETUP_REQUIRED.value: "Client configuration is required",
+            ConnectionState.BLOCKED.value: "Kill switch is blocking all traffic",
         }
         subtitle = messages[state]
         dns_exposed = connected and status.dns_mode == "none"
@@ -560,7 +561,7 @@ class MainWindow(QMainWindow):
         error = sanitize_error(status.error) if status.error else ""
         if state == ConnectionState.SETUP_REQUIRED.value:
             error = error or f"Configuration required: {status.config_path or DEFAULT_CONFIG}"
-        self._home.render_failure(error, state == ConnectionState.FAILED.value)
+        self._home.render_failure(error, state in {ConnectionState.FAILED.value, ConnectionState.BLOCKED.value})
 
         server_display = (status.connected_profile_name if connected else status.active_profile_name)
         server_display = server_display or status.server_host or "—"
@@ -667,8 +668,12 @@ class MainWindow(QMainWindow):
             ipv6_ok = status.ipv6_guard_active
             ipv6_text = "Active" if ipv6_ok else "Inactive"
             ipv6_color = COLORS["green"] if ipv6_ok else COLORS["secondary"]
-            ks_text = "Flag on · not enforced" if status.kill_switch_active else "Not armed"
-            ks_color = COLORS["amber"] if status.kill_switch_active else COLORS["secondary"]
+            ks_text = "Enforced" if status.kill_switch_active else "Not armed"
+            ks_color = COLORS["green"] if status.kill_switch_active else COLORS["secondary"]
+        elif status.state == ConnectionState.BLOCKED.value:
+            dns_text, ipv6_text = "Blocked", "Blocked"
+            dns_color = ipv6_color = COLORS["red"]
+            ks_text, ks_color = "Blocking all traffic · Disconnect to restore", COLORS["red"]
         else:
             dns_text = f"Configured: {status.dns_mode}" if status.dns_mode else "Idle"
             dns_color = COLORS["secondary"]
@@ -676,10 +681,11 @@ class MainWindow(QMainWindow):
             ipv6_color = COLORS["secondary"]
             ks_text = "Idle"
             ks_color = COLORS["secondary"]
-        flagged = connected and status.kill_switch_active
+        blocking = status.state == ConnectionState.BLOCKED.value
+        armed = connected and status.kill_switch_active
         h.kill_switch_chip.setText(
-            "KILL SWITCH · FLAG ON, NOT ENFORCED" if flagged else "KILL SWITCH · NOT ARMED")
-        h.kill_switch_chip.setStyleSheet(badge_style(COLORS["amber" if flagged else "muted"]))
+            "KILL SWITCH · BLOCKING" if blocking else "KILL SWITCH · ON" if armed else "KILL SWITCH · NOT ARMED")
+        h.kill_switch_chip.setStyleSheet(badge_style(COLORS["red" if blocking else "green" if armed else "muted"]))
         h.kill_switch_chip.setToolTip(KILL_SWITCH_NOTE)
         for lbl, text, color in (
             (h.home_dns_value, dns_text, dns_color),
@@ -702,6 +708,7 @@ class MainWindow(QMainWindow):
             "PROTECTED" if state == ConnectionState.CONNECTED.value else
             "WORKING" if state in {ConnectionState.CONNECTING.value,
                                    ConnectionState.DISCONNECTING.value} else
+            "BLOCKING" if state == ConnectionState.BLOCKED.value else
             "ATTENTION" if state in {ConnectionState.FAILED.value,
                                      ConnectionState.SETUP_REQUIRED.value} else "OFFLINE"
         )
@@ -730,12 +737,15 @@ class MainWindow(QMainWindow):
             text, (background, foreground, border) = "Disconnecting…", warn
         elif state == ConnectionState.FAILED.value:
             text, (background, foreground, border) = "Retry", danger
+        elif state == ConnectionState.BLOCKED.value:
+            text, (background, foreground, border) = "Disconnect to restore network", danger
         elif state == ConnectionState.SETUP_REQUIRED.value:
             text, (background, foreground, border) = "Setup required", warn
         else:
             text = "Connect"
             background, foreground, border = COLORS["green"], COLORS["on_accent"], COLORS["green"]
-        locked = state != ConnectionState.CONNECTED.value and self._vpn_locked()
+        # Releasing a blocking kill switch is a disconnect, which is never gated on sign-in.
+        locked = state not in {ConnectionState.CONNECTED.value, ConnectionState.BLOCKED.value} and self._vpn_locked()
         if locked:
             text = "Sign in to connect"
         h.action_btn.setText(text)

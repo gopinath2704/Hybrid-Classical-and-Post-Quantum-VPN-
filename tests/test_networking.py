@@ -628,7 +628,9 @@ def test_cli_connect_never_lifts_a_kill_switch_the_session_left_blocking(monkeyp
     import threading
     calls = []
     class Client:
-        def __init__(self, cfg): self.stop_event, self.state, self.error = threading.Event(), 'CONNECTED', ''
+        def __init__(self, cfg):
+            self.stop_event, self.state, self.error = threading.Event(), 'CONNECTED', ''
+            self._cleanup_done = SimpleNamespace(wait=lambda timeout: calls.append('waited'))
         def connect(self):
             if ending != 'stopped':
                 self.state, self.error = ending, 'authenticated UDP dead-peer timeout'
@@ -643,4 +645,4 @@ def test_cli_connect_never_lifts_a_kill_switch_the_session_left_blocking(monkeyp
     else:
         with pytest.raises(SystemExit, match='recover' if ending == 'BLOCKED' else 'dead-peer'):
             doctor.main(['client', 'connect'])
-    assert calls == (['disconnect'] if disconnects else [])
+    assert calls == (['disconnect'] if disconnects else ['waited']), 'wait for its own cleanup, never disconnect again'
