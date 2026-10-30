@@ -50,7 +50,7 @@ def kernel(monkeypatch):
 
 
 def test_full_tunnel_blocks_ipv6_including_existing_flows_and_forwarding(kernel):
-    net = runtime.ClientNetwork(NativeTun(), '8.8.8.8', True, [], [])
+    net = runtime.ClientNetwork(NativeTun(), '8.8.8.8', True, [], [], dns_mode='none')
     net.apply()
     rules = kernel.tables[net.ipv6.table]
     assert 'create table ip6 ' in rules
@@ -68,7 +68,7 @@ def test_full_tunnel_blocks_ipv6_including_existing_flows_and_forwarding(kernel)
 @pytest.mark.parametrize('full,policy,blocked', [(True,None,True),(False,None,False),
     (False,'block',True),(True,'allow',False)])
 def test_policy_defaults_and_explicit_split_block(kernel, full, policy, blocked, caplog):
-    net = runtime.ClientNetwork(NativeTun(), '8.8.8.8', full, [], [], ipv6_policy=policy)
+    net = runtime.ClientNetwork(NativeTun(), '8.8.8.8', full, [], [], dns_mode='none', ipv6_policy=policy)
     net.apply()
     assert bool(net.ipv6.table) == blocked
     if policy == 'allow': assert 'NOT protected by PQVPN' in caplog.text
@@ -78,14 +78,14 @@ def test_policy_defaults_and_explicit_split_block(kernel, full, policy, blocked,
 
 def test_failed_atomic_block_does_not_touch_routes_or_unrelated_tables(kernel):
     kernel.fail_create = True
-    net = runtime.ClientNetwork(NativeTun(), '8.8.8.8', True, [], [])
+    net = runtime.ClientNetwork(NativeTun(), '8.8.8.8', True, [], [], dns_mode='none')
     with pytest.raises(subprocess.CalledProcessError): net.apply()
     assert not kernel.routes and net.ipv6.table is None
     assert kernel.tables == {'unrelated':'original policy'}
 
 
 def test_guard_removed_even_if_dns_undo_raises(kernel, monkeypatch):
-    net = runtime.ClientNetwork(NativeTun(), '8.8.8.8', True, [], [])
+    net = runtime.ClientNetwork(NativeTun(), '8.8.8.8', True, [], [], dns_mode='none')
     net.apply()
     monkeypatch.setattr(net, '_restore_ipv4_dns', Mock(side_effect=OSError('resolver vanished')))
     with pytest.raises(OSError): net.restore()
@@ -132,7 +132,7 @@ def test_fail_policy_rejects_before_tun_or_routing(kernel, monkeypatch):
 
 def test_fail_policy_with_no_ipv6_does_not_install_guard(kernel, monkeypatch):
     monkeypatch.setattr(ipv6,'connectivity',lambda:[])
-    net=runtime.ClientNetwork(NativeTun(),'8.8.8.8',True,[],[],ipv6_policy='fail')
+    net=runtime.ClientNetwork(NativeTun(),'8.8.8.8',True,[],[],dns_mode='none',ipv6_policy='fail')
     net.apply();assert not kernel.calls
     net.restore()
 
@@ -141,6 +141,7 @@ def test_fail_policy_with_no_ipv6_does_not_install_guard(kernel, monkeypatch):
 def test_actual_client_cleanup_removes_guard(connected, kernel, monkeypatch, ending):
     server,client=connected
     client.cfg.full_tunnel=True
+    client.cfg.dns_mode='none'
     client.cfg.dead_peer_timeout=1
     network_class=runtime.ClientNetwork
     def network(tun,*args):
@@ -329,7 +330,7 @@ def test_exact_previous_route_restoration(monkeypatch):
         if args[:3]==("route","show","exact"):return SimpleNamespace(stdout="")
         return SimpleNamespace(stdout="")
     monkeypatch.setattr(runtime,"run_ip",ip);monkeypatch.setattr(runtime.subprocess,"run",lambda *a,**k:SimpleNamespace(returncode=1))
-    network=runtime.ClientNetwork(Tun(),"8.8.8.8",True,[],[]);network.apply();network.restore()
+    network=runtime.ClientNetwork(Tun(),"8.8.8.8",True,[],[],dns_mode="none");network.apply();network.restore()
     assert ("route","replace","8.8.8.8","via","192.0.2.254","dev","eth9","metric","77") in calls
 
 def test_route_apply_failure_rolls_back(monkeypatch):
@@ -341,7 +342,7 @@ def test_route_apply_failure_rolls_back(monkeypatch):
         if args[:3]==("route","replace","0.0.0.0/1"):raise subprocess.CalledProcessError(2,args)
         return SimpleNamespace(stdout="")
     monkeypatch.setattr(runtime,"run_ip",ip);monkeypatch.setattr(runtime.subprocess,"run",lambda *a,**k:SimpleNamespace(returncode=1))
-    with pytest.raises(subprocess.CalledProcessError):runtime.ClientNetwork(Tun(),"8.8.8.8",True,[],[]).apply()
+    with pytest.raises(subprocess.CalledProcessError):runtime.ClientNetwork(Tun(),"8.8.8.8",True,[],[],dns_mode="none").apply()
     assert any(call[:3]==("route","del","8.8.8.8/32") for call in calls)
 
 def test_partial_dns_failure_always_reverts(monkeypatch):
@@ -545,3 +546,101 @@ def test_client_recover_removes_the_kill_switch(monkeypatch, capsys):
     doctor.main(['client', 'recover'])
     assert calls == [['nft', 'list', 'table', 'inet', 'pqvpn_killswitch'], ['nft', 'destroy', 'table', 'inet', 'pqvpn_killswitch']]
     assert 'kill switch removed' in capsys.readouterr().out
+
+
+def test_full_tunnel_with_managed_dns_but_no_servers_fails_closed(kernel):
+    with pytest.raises(RuntimeError, match='no DNS servers'):
+        runtime.ClientNetwork(NativeTun(), '8.8.8.8', True, [], []).apply()
+    assert not kernel.calls and not kernel.routes, 'refused before any change'
+    # Split tunnel leaves other DNS alone by design, and dns_mode = "none" is the explicit opt-out.
+    runtime.ClientNetwork(NativeTun(), '8.8.8.8', False, [], []).apply()
+    runtime.ClientNetwork(NativeTun(), '8.8.8.8', True, [], [], dns_mode='none').apply()
+
+
+@pytest.mark.parametrize('args', [
+    ('up', '192.0.2.1; flush ruleset', 51820, 'pqvpn0', 51821),
+    ('up', '192.0.2.1', 51820, 'pqvpn0" accept\nflush ruleset #', 51821),
+    ('up', '192.0.2.1', 51820, 'pqvpn0', 0),
+    ('connecting', '192.0.2.1', True),
+    ('connecting', 'vpn.example.com', 51820),
+])
+def test_killswitch_renderer_refuses_injection_looking_input(args):
+    with pytest.raises(ValueError):
+        ipv6.killswitch_rules(*args)
+
+
+class RecordingKillSwitch:
+    calls: list = []
+    preexisting = False
+    @classmethod
+    def install(cls, *args): cls.calls.append(('install',) + args)
+    @classmethod
+    def present(cls): cls.calls.append(('present',)); return cls.preexisting
+    @classmethod
+    def remove(cls): cls.calls.append(('remove',))
+
+
+@pytest.fixture
+def kill_switch(connected, monkeypatch):
+    server, client = connected
+    monkeypatch.setattr(RecordingKillSwitch, 'calls', [])
+    monkeypatch.setattr(RecordingKillSwitch, 'preexisting', False)
+    monkeypatch.setattr(runtime, 'KillSwitch', RecordingKillSwitch)
+    client.cfg.kill_switch = True
+    return server, client, RecordingKillSwitch
+
+
+def test_kill_switch_lifecycle_connect_then_user_disconnect_removes_it(kill_switch):
+    server, client, ks = kill_switch
+    host, port = client.cfg.server_host, client.cfg.server_control_port
+    client.connect()
+    assert ks.calls == [('present',), ('install', 'connecting', host, port),
+                        ('install', 'up', host, port, client.cfg.tun_name, server.cfg.udp_port)]
+    client.disconnect()
+    assert ks.calls[-1] == ('remove',) and client.state == 'DISCONNECTED'
+
+
+def test_kill_switch_stays_blocking_after_a_lost_session_until_disconnect(kill_switch):
+    server, client, ks = kill_switch
+    client.connect()
+    client._fail('authenticated UDP dead-peer timeout')
+    assert ks.calls[-1] == ('install', 'connecting', client.cfg.server_host, client.cfg.server_control_port)
+    assert client.state == 'BLOCKED' and 'dead-peer' in client.error
+    client.disconnect()
+    assert ks.calls[-1] == ('remove',) and client.state == 'DISCONNECTED'
+
+
+@pytest.mark.parametrize('preexisting', [False, True])
+def test_kill_switch_failed_connect_returns_to_the_previous_state(kill_switch, preexisting):
+    server, client, ks = kill_switch
+    ks.preexisting = preexisting
+    closed = socket.socket(); closed.bind(('127.0.0.1', 0)); client.cfg.server_control_port = closed.getsockname()[1]; closed.close()
+    with pytest.raises(OSError): client.connect()
+    connecting = ('install', 'connecting', client.cfg.server_host, client.cfg.server_control_port)
+    if preexisting:
+        assert ks.calls == [('present',), connecting, connecting] and client.state == 'BLOCKED'
+    else:
+        assert ks.calls == [('present',), connecting, ('remove',)] and client.state == 'DISCONNECTED'
+
+
+@pytest.mark.parametrize('ending,disconnects', [('BLOCKED', False), ('FAILED', False), ('stopped', True)])
+def test_cli_connect_never_lifts_a_kill_switch_the_session_left_blocking(monkeypatch, ending, disconnects):
+    import threading
+    calls = []
+    class Client:
+        def __init__(self, cfg): self.stop_event, self.state, self.error = threading.Event(), 'CONNECTED', ''
+        def connect(self):
+            if ending != 'stopped':
+                self.state, self.error = ending, 'authenticated UDP dead-peer timeout'
+            self.stop_event.set()
+            return {'client_vpn_ip': '10.8.0.2', 'udp_port': 51820}
+        def disconnect(self): calls.append('disconnect')
+    monkeypatch.setattr(doctor, 'VPNClient', Client)
+    monkeypatch.setattr(doctor, 'load_client_config', lambda path: ClientConfig())
+    monkeypatch.setattr(doctor, 'get_crypto_status', lambda: {'is_quantum_safe': True})
+    if ending == 'stopped':
+        doctor.main(['client', 'connect'])
+    else:
+        with pytest.raises(SystemExit, match='recover' if ending == 'BLOCKED' else 'dead-peer'):
+            doctor.main(['client', 'connect'])
+    assert calls == (['disconnect'] if disconnects else [])

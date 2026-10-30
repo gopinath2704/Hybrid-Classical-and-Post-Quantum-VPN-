@@ -247,6 +247,13 @@ def killswitch_rules(phase: str, server: str, control_port: int, tun: str = '', 
     """
     if phase not in ('connecting', 'up'):
         raise ValueError('kill switch phase must be connecting or up')
+    # Everything below is interpolated into nft text: validate here too, not only in validate_client.
+    ipaddress.IPv4Address(server)
+    ports = (control_port, udp_port) if phase == 'up' else (control_port,)
+    if not all(type(port) is int and 1 <= port <= 65535 for port in ports):
+        raise ValueError('kill switch ports must be integers in [1, 65535]')
+    if phase == 'up':
+        interface_name(tun)
     t = f'inet {KILL_SWITCH_TABLE}'
     rules = [f'destroy table {t}', f'add table {t}',
              f'add chain {t} output {{ type filter hook output priority filter; policy drop; }}',
