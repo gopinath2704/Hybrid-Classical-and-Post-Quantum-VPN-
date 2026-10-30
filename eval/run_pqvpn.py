@@ -5,11 +5,16 @@ Outputs one CSV row per (suite x metric x run) to stdout or a file using the
 unified schema: system,profile,metric,run,value,unit
 
     python eval/run_pqvpn.py --iterations 50 --out results/eval/raw/pqvpn.csv
+
+M2 is the client_cpu_ms + server_cpu_ms rows: process_time around each role's steps, both roles in
+this one process. --handshake rust runs the same metric with both roles on the Rust handshake
+(phase 4 slice b; it implies data_plane="rust"); its rows are labelled pqvpn-<suite>-hs-rust.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import io
 import os
 import sys
@@ -31,6 +36,14 @@ from handshake.kemtls import (
 )
 
 CSV_COLUMNS = ["system", "profile", "metric", "run", "value", "unit"]
+# Extra endpoint kwargs; empty is the published Python-handshake path. Set from --handshake.
+_BACKEND: dict[str, str] = {}
+_SUFFIX = ""
+
+
+def handshake_backend_available() -> bool:
+    """True once the handshake classes accept handshake="rust" (phase 4 slice b)."""
+    return "handshake" in inspect.signature(KEMTLSClient.__init__).parameters
 
 
 def require_native_pqc():
@@ -76,15 +89,15 @@ def _make_mldsa_identities():
 
 
 def _make_v2_endpoints(sk, pk, cpriv, cpub):
-    c = KEMTLSClient(pk, fingerprint(pk), cpriv)
-    s = KEMTLSServer(sk, pk, lambda k: {"client_id": "eval"} if k == cpub else None)
+    c = KEMTLSClient(pk, fingerprint(pk), cpriv, **_BACKEND)
+    s = KEMTLSServer(sk, pk, lambda k: {"client_id": "eval"} if k == cpub else None, **_BACKEND)
     return c, s
 
 
 def _make_v3_endpoints(sk, pk, csk, cpk):
     cfp = fingerprint(cpk)
-    c = KEMTLSClientV3(pk, fingerprint(pk), csk, cpk)
-    s = KEMTLSServerV3(sk, pk, lambda h: (cpk, {"client_id": "eval"}) if h == cfp else None)
+    c = KEMTLSClientV3(pk, fingerprint(pk), csk, cpk, **_BACKEND)
+    s = KEMTLSServerV3(sk, pk, lambda h: (cpk, {"client_id": "eval"}) if h == cfp else None, **_BACKEND)
     return c, s
 
 
@@ -166,8 +179,10 @@ def measure_encrypt_throughput(session: HandshakeSession, packet_size: int = 140
     count = 0
     t0 = time.perf_counter()
     deadline = t0 + duration_s
+    # The Python data plane keeps its published path; a Rust data plane owns the data channel.
+    seal = session.encrypt_frame if session.data_plane == "python" else session.seal_data
     while time.perf_counter() < deadline:
-        session.encrypt_frame(packet)
+        seal(packet)
         count += 1
     elapsed = time.perf_counter() - t0
     return {
@@ -221,7 +236,7 @@ def evaluate_suite(suite: str, iterations: int = 50, warmup: int = 5):
             ("total_wire_bytes", r["total_wire_bytes"], "bytes"),
         ]:
             rows.append({
-                "system": f"pqvpn-{suite}",
+                "system": f"pqvpn-{suite}{_SUFFIX}",
                 "profile": "in-process",
                 "metric": metric,
                 "run": i,
@@ -231,7 +246,7 @@ def evaluate_suite(suite: str, iterations: int = 50, warmup: int = 5):
 
     hs_sec = measure_handshakes_per_sec(suite)
     rows.append({
-        "system": f"pqvpn-{suite}",
+        "system": f"pqvpn-{suite}{_SUFFIX}",
         "profile": "in-process",
         "metric": "handshakes_per_sec",
         "run": 0,
@@ -247,7 +262,7 @@ def evaluate_suite(suite: str, iterations: int = 50, warmup: int = 5):
     cs = c.process_server_finished(sf)
     tp = measure_encrypt_throughput(cs)
     rows.append({
-        "system": f"pqvpn-{suite}",
+        "system": f"pqvpn-{suite}{_SUFFIX}",
         "profile": "in-process",
         "metric": "encrypt_pps",
         "run": 0,
@@ -255,7 +270,7 @@ def evaluate_suite(suite: str, iterations: int = 50, warmup: int = 5):
         "unit": "pps",
     })
     rows.append({
-        "system": f"pqvpn-{suite}",
+        "system": f"pqvpn-{suite}{_SUFFIX}",
         "profile": "in-process",
         "metric": "encrypt_mbps",
         "run": 0,
@@ -266,7 +281,7 @@ def evaluate_suite(suite: str, iterations: int = 50, warmup: int = 5):
     mem = measure_memory_per_session(suite)
     if mem >= 0:
         rows.append({
-            "system": f"pqvpn-{suite}",
+            "system": f"pqvpn-{suite}{_SUFFIX}",
             "profile": "in-process",
             "metric": "memory_bytes_per_session",
             "run": 0,
@@ -282,16 +297,27 @@ def main():
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--suites", type=str, default="v2-ed25519,v3-kem,v3-mldsa")
     parser.add_argument("--out", type=str, default=None)
+    parser.add_argument("--handshake", choices=("python", "rust"), default="python",
+                        help="rust: both roles on the Rust handshake (and Rust data plane)")
     args = parser.parse_args()
+    suites = [s.strip() for s in args.suites.split(",")]
+    if args.handshake == "rust":
+        if not handshake_backend_available():
+            print("SKIP: handshake=rust backend unavailable (phase 4 slice b not landed)", file=sys.stderr)
+            return
+        global _SUFFIX
+        _BACKEND.update(handshake="rust", data_plane="rust")
+        _SUFFIX = "-hs-rust"
+        if "v3-mldsa" in suites:
+            print("  v3-mldsa skipped: not ported to the Rust handshake (phase 4 decision 4)")
+            suites.remove("v3-mldsa")
 
     status = require_native_pqc()
     pqc_mode = status["pqc_mode"]
     liboqs_ver = _liboqs_version()
 
-    suites = [s.strip() for s in args.suites.split(",")]
-
     print(f"PQVPN Evaluation — {args.iterations} iterations")
-    print(f"  Suites: {', '.join(suites)}")
+    print(f"  Suites: {', '.join(suites)}  handshake: {args.handshake}")
     print(f"  pqc_mode: {pqc_mode}")
     print(f"  liboqs_version: {liboqs_ver}")
     print()

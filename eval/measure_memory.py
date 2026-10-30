@@ -15,11 +15,23 @@ Outputs unified CSV: system,profile,metric,run,value,unit
 Usage:
     sudo env PATH="$PATH" python eval/measure_memory.py \
         --clients 1,10,50 --out results/m8/raw/memory.csv
+
+The gate path is the one above: v2, cookies off, N=50, (loaded - baseline) / connected.
+--data-plane / --handshake run the same definition on another backend (rows: pqvpn-dp-<x>-hs-<y>).
+
+--dev is an unprivileged probe for development, NOT the gate: the server runs in its own process on
+127.0.0.1 with an emulated TUN and the clients run in this process (profile dev-n=<N>[-concurrent]).
+It tracks the gate closely for a staggered run but cannot replace it (no netns, no real TUN).
+    python eval/measure_memory.py --dev --clients 50 [--concurrent]
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
+import json
+import tempfile
+import threading
 import os
 import subprocess
 import sys
@@ -32,6 +44,8 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 CSV_COLUMNS = ["system", "profile", "metric", "run", "value", "unit"]
+# TOML lines appended to every server and client config; empty is the published python/python path.
+BACKEND_LINES: list[str] = []
 
 
 def read_vmrss_kb(pid: int) -> int | None:
@@ -150,6 +164,10 @@ def setup_topology(run_dir: str, n_clients: int) -> dict:
             rate_limit_window = 1.0
             cookie_mode = "off"
         """))
+
+    for path in [f"{srv_dir}/server.toml"] + [c["config"] for c in clients]:
+        with open(path, "a") as f:
+            f.writelines(line + "\n" for line in BACKEND_LINES)
 
     return {
         "srv_ns": srv_ns, "srv_dir": srv_dir,
@@ -272,6 +290,97 @@ def run_measurement(n_clients: int, run_dir: str) -> dict:
         cleanup(topo, client_procs, server_proc)
 
 
+_DEV_SERVER = """
+import json, sys, threading, time
+sys.path.insert(0, sys.argv[1])
+import vpn.runtime as runtime
+from vpn.config import ServerConfig
+d, n, backend = sys.argv[2], int(sys.argv[3]), json.loads(sys.argv[4])
+s = runtime.VPNServer(ServerConfig(listen_host="127.0.0.1", control_port=0, udp_port=0, protocol_version=2,
+    server_identity_private_key=d + "/server.key", server_identity_public_key=d + "/server.pub",
+    authorized_clients_file=d + "/clients.json", dev_emulated_tun=True, dns_servers=[], cookie_mode="off",
+    max_clients=max(n + 10, 64), connections_per_source=10000, rate_limit_window=1.0, rekey_interval=86400,
+    **backend))
+threading.Thread(target=s.start, daemon=True).start()
+while s.tcp is None or s.udp is None:
+    time.sleep(0.01)
+s.cfg.udp_port = s.udp.getsockname()[1]
+print(json.dumps({"tcp": s.tcp.getsockname()[1]}), flush=True)
+sys.stdin.read()
+"""
+
+
+def run_dev_measurement(n_clients: int, run_dir: str, backend: dict[str, str], concurrent: bool) -> dict:
+    """Unprivileged probe: same arithmetic as the gate, server in its own process, emulated TUN."""
+    from vpn.config import ClientConfig
+    from vpn.identity import AuthorizedClients, generate_client_identity, generate_server_identity
+    import vpn.runtime as runtime
+
+    d = tempfile.mkdtemp(prefix=f"dev-n{n_clients}-", dir=run_dir)
+    fp = generate_server_identity(Path(d, "server.key"), Path(d, "server.pub"))
+    auth = AuthorizedClients(Path(d, "clients.json"))
+    for i in range(n_clients):  # one directory each: the resumption ticket lives next to the key
+        Path(d, f"c{i}").mkdir()
+        generate_client_identity(Path(d, f"c{i}", "client.key"), Path(d, f"c{i}", "client.pub"))
+        auth.authorize(Path(d, f"c{i}", "client.pub").read_bytes(), f"bench-{i}")
+    print(f"\n--- dev N={n_clients} {'concurrent' if concurrent else 'staggered 0.3 s'} ---", flush=True)
+    server = subprocess.Popen([sys.executable, "-c", _DEV_SERVER, str(_ROOT), d, str(n_clients), json.dumps(backend)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, cwd=str(_ROOT))
+    clients: list = []
+    try:
+        port = json.loads(next(line for line in server.stdout if line.startswith("{")))["tcp"]
+        time.sleep(2)
+        baseline_rss = read_vmrss_kb(server.pid)
+
+        def connect(i: int) -> None:
+            client = runtime.VPNClient(ClientConfig(server_host="127.0.0.1", server_control_port=port,
+                server_identity_public_key=f"{d}/server.pub", server_identity_fingerprint=fp,
+                client_identity_private_key=f"{d}/c{i}/client.key", dev_emulated_tun=True,
+                tun_name=f"pqm8d{i}", full_tunnel=False, dns_servers=[], **backend))
+            try:
+                client.connect()
+                clients.append(client)
+            except Exception as exc:
+                print(f"\n  WARNING: client {i} failed to connect: {exc}", flush=True)
+
+        if concurrent:
+            threads = [threading.Thread(target=connect, args=(i,)) for i in range(n_clients)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        else:
+            for i in range(n_clients):
+                connect(i)
+                time.sleep(0.3)
+        time.sleep(2)
+        loaded_rss = read_vmrss_kb(server.pid)
+        connected = len(clients)
+        per_session = (loaded_rss - baseline_rss) / connected if connected and baseline_rss and loaded_rss else None
+        print(f"  {connected}/{n_clients} connected, VmRSS {baseline_rss} -> {loaded_rss} kB, "
+              f"per session {per_session if per_session is None else round(per_session, 1)} kB", flush=True)
+        return {"n_clients": n_clients, "connected": connected, "baseline_rss_kb": baseline_rss,
+                "loaded_rss_kb": loaded_rss, "per_session_kb": per_session}
+    finally:
+        for client in clients:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+        server.stdin.close()
+        try:
+            server.wait(10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait()
+
+
+def handshake_backend_available() -> bool:
+    """True once ServerConfig has the phase 4 slice (b) handshake switch."""
+    from vpn.config import ServerConfig
+    return "handshake" in {f.name for f in dataclasses.fields(ServerConfig)}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="M8: Memory per session — networked measurement")
@@ -279,13 +388,31 @@ def main():
                         help="Comma-separated client counts to test")
     parser.add_argument("--out", default="",
                         help="CSV output path")
+    parser.add_argument("--data-plane", choices=("python", "rust"), default="python")
+    parser.add_argument("--handshake", choices=("python", "rust"), default="python",
+                        help="rust needs --data-plane rust (phase 4 slice b)")
+    parser.add_argument("--dev", action="store_true",
+                        help="unprivileged probe (server process, emulated TUN); not the gate path")
+    parser.add_argument("--concurrent", action="store_true",
+                        help="with --dev: start every client at once instead of 0.3 s apart")
     args = parser.parse_args()
+    if args.concurrent and not args.dev:
+        parser.error("--concurrent only applies to --dev (the gate path staggers clients 0.3 s apart)")
+    if args.handshake == "rust":
+        if args.data_plane != "rust":
+            parser.error("--handshake rust requires --data-plane rust")
+        if not handshake_backend_available():
+            print("SKIP: handshake=rust backend unavailable (phase 4 slice b not landed)", file=sys.stderr)
+            return
+    backend = {key: value for key, value in (("data_plane", args.data_plane), ("handshake", args.handshake))
+               if value != "python"}
+    BACKEND_LINES.extend(f'{key} = "{value}"' for key, value in backend.items())
+    system = "pqvpn" if not backend else f"pqvpn-dp-{args.data_plane}-hs-{args.handshake}"
 
     counts = [int(c) for c in args.clients.split(",")]
-    run_dir = subprocess.check_output(
-        ["mktemp", "-d", "/tmp/pqvpn-m8.XXXXXX"]).decode().strip()
+    run_dir = tempfile.mkdtemp(prefix="pqvpn-m8.")
 
-    print("=== M8 Memory per Session (Networked) ===")
+    print("=== M8 Memory per Session", "(dev probe, NOT the gate path) ===" if args.dev else "(Networked) ===")
     print(f"Client counts: {counts}")
 
     csv_path = args.out or os.path.join(run_dir, "memory.csv")
@@ -296,26 +423,31 @@ def main():
 
     run_idx = 0
     for n in counts:
-        result = run_measurement(n, run_dir)
+        if args.dev:
+            result = run_dev_measurement(n, run_dir, backend, args.concurrent)
+            profile = f"dev-n={n}" + ("-concurrent" if args.concurrent else "")
+        else:
+            result = run_measurement(n, run_dir)
+            profile = f"n={n}"
 
-        writer.writerow(["pqvpn", f"n={n}", "baseline_rss_kb", run_idx,
+        writer.writerow([system, profile, "baseline_rss_kb", run_idx,
                          result["baseline_rss_kb"], "kB"])
         run_idx += 1
 
-        writer.writerow(["pqvpn", f"n={n}", "loaded_rss_kb", run_idx,
+        writer.writerow([system, profile, "loaded_rss_kb", run_idx,
                          result["loaded_rss_kb"], "kB"])
         run_idx += 1
 
-        writer.writerow(["pqvpn", f"n={n}", "connected_clients", run_idx,
+        writer.writerow([system, profile, "connected_clients", run_idx,
                          result["connected"], "count"])
         run_idx += 1
 
         if result["per_session_kb"] is not None:
-            writer.writerow(["pqvpn", f"n={n}", "per_session_kb", run_idx,
+            writer.writerow([system, profile, "per_session_kb", run_idx,
                              f"{result['per_session_kb']:.1f}", "kB"])
             run_idx += 1
 
-            writer.writerow(["pqvpn", f"n={n}", "per_session_bytes", run_idx,
+            writer.writerow([system, profile, "per_session_bytes", run_idx,
                              f"{result['per_session_kb'] * 1024:.0f}", "B"])
             run_idx += 1
 

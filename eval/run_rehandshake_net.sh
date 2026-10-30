@@ -9,21 +9,53 @@
 #   - wire bytes for each control exchange (via tcpdump)
 #
 # Usage:
-#   sudo eval/run_rehandshake_net.sh [--iterations N] [--out FILE]
+#   sudo eval/run_rehandshake_net.sh [--iterations N] [--out FILE] [--data-plane python|rust]
+#        [--handshake python|rust]
+#
+# --data-plane rust / --handshake rust run both ends on that backend (the handshake switch is phase 4
+# slice b and needs --data-plane rust); every Python step then uses .venv/bin/python (or PYTHON=...).
 set -euo pipefail
 
 ITERATIONS=10
 OUT=""
+DATA_PLANE=python
+HANDSHAKE=python
 while [[ $# -gt 0 ]]; do
   case $1 in
     --iterations) ITERATIONS=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
+    --data-plane) DATA_PLANE=$2; shift 2 ;;
+    --handshake) HANDSHAKE=$2; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
 done
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 source "$ROOT_DIR/eval/netem_profiles.sh"
+case $DATA_PLANE in
+  python) PY=${PYTHON:-python} ;;
+  rust) PY=${PYTHON:-$ROOT_DIR/.venv/bin/python} ;;
+  *) echo "unknown data plane: $DATA_PLANE" >&2; exit 1 ;;
+esac
+case $HANDSHAKE in
+  python) ;;
+  rust) [[ $DATA_PLANE == rust ]] || { echo "--handshake rust requires --data-plane rust" >&2; exit 1; }
+        "$PY" -c "
+import dataclasses, sys; sys.path.insert(0, '$ROOT_DIR')
+from vpn.config import ServerConfig
+sys.exit('handshake' not in {f.name for f in dataclasses.fields(ServerConfig)})" ||
+          { echo "FATAL: handshake=rust backend unavailable (phase 4 slice b not landed)" >&2; exit 1; } ;;
+  *) echo "unknown handshake: $HANDSHAKE" >&2; exit 1 ;;
+esac
+# Appends the backend keys to both configs; nothing for the default python/python path.
+append_backend() {
+  local key value
+  for key in data_plane handshake; do
+    [[ $key == data_plane ]] && value=$DATA_PLANE || value=$HANDSHAKE
+    [[ $value == python ]] && continue
+    echo "$key = \"$value\"" | tee -a "$RUN_DIR/server/server.toml" >>"$RUN_DIR/client/client.toml"
+  done
+}
 
 CSV_FILE="${OUT:-/dev/stdout}"
 if [[ "$CSV_FILE" != "/dev/stdout" ]]; then
@@ -68,13 +100,13 @@ mkdir -p "$RUN_DIR/server" "$RUN_DIR/client"
 cd "$ROOT_DIR"
 
 echo "  Generating identities..." >&2
-python -m vpn.cli identity generate \
+"$PY" -m vpn.cli identity generate \
   --private "$RUN_DIR/server/server.key" --public "$RUN_DIR/server/server.pub" || {
     echo "ERROR: server identity generation failed" >&2; exit 1; }
-python -m vpn.cli client-key generate \
+"$PY" -m vpn.cli client-key generate \
   --private "$RUN_DIR/client/client.key" --public "$RUN_DIR/client/client.pub" || {
     echo "ERROR: client key generation failed" >&2; exit 1; }
-python -m vpn.cli client authorize \
+"$PY" -m vpn.cli client authorize \
   "$(base64 -w0 "$RUN_DIR/client/client.pub")" \
   --database "$RUN_DIR/server/authorized.json" --client-id bench-client || {
     echo "ERROR: client authorization failed" >&2; exit 1; }
@@ -113,12 +145,13 @@ dns_mode = "none"
 dns_servers = []
 tun_name = "pqbench0"
 EOF
+append_backend
 
 ip netns exec "$SERVER_NS" sysctl -q -w net.ipv4.ip_forward=1
 
 # Start server
 ip netns exec "$SERVER_NS" \
-  python -m vpn.cli server --config "$RUN_DIR/server/server.toml" \
+  "$PY" -m vpn.cli server --config "$RUN_DIR/server/server.toml" \
   >"$RUN_DIR/server.log" 2>&1 &
 PIDS+=("$!")
 sleep 2
@@ -139,7 +172,7 @@ sleep 0.5
 # Start client
 ip -n "$CLIENT_NS" link del pqbench0 2>/dev/null || true
 ip netns exec "$CLIENT_NS" \
-  python -m vpn.cli client connect --config "$RUN_DIR/client/client.toml" \
+  "$PY" -m vpn.cli client connect --config "$RUN_DIR/client/client.toml" \
   >"$RUN_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 PIDS+=("$CLIENT_PID")
@@ -249,13 +282,13 @@ mkdir -p "$RUN_DIR/server" "$RUN_DIR/client"
 cd "$ROOT_DIR"
 
 echo "  Generating identities..." >&2
-python -m vpn.cli identity generate \
+"$PY" -m vpn.cli identity generate \
   --private "$RUN_DIR/server/server.key" --public "$RUN_DIR/server/server.pub" || {
     echo "ERROR: server identity generation failed" >&2; exit 1; }
-python -m vpn.cli client-key generate \
+"$PY" -m vpn.cli client-key generate \
   --private "$RUN_DIR/client/client.key" --public "$RUN_DIR/client/client.pub" || {
     echo "ERROR: client key generation failed" >&2; exit 1; }
-python -m vpn.cli client authorize \
+"$PY" -m vpn.cli client authorize \
   "$(base64 -w0 "$RUN_DIR/client/client.pub")" \
   --database "$RUN_DIR/server/authorized.json" --client-id bench-client || {
     echo "ERROR: client authorization failed" >&2; exit 1; }
@@ -294,12 +327,13 @@ dns_mode = "none"
 dns_servers = []
 tun_name = "pqbench0"
 EOF
+append_backend
 
 ip netns exec "$SERVER_NS" sysctl -q -w net.ipv4.ip_forward=1
 
 # Start server
 ip netns exec "$SERVER_NS" \
-  python -m vpn.cli server --config "$RUN_DIR/server/server.toml" \
+  "$PY" -m vpn.cli server --config "$RUN_DIR/server/server.toml" \
   >"$RUN_DIR/server.log" 2>&1 &
 PIDS+=("$!")
 sleep 2
@@ -320,7 +354,7 @@ sleep 0.5
 # Start client
 ip -n "$CLIENT_NS" link del pqbench0 2>/dev/null || true
 ip netns exec "$CLIENT_NS" \
-  python -m vpn.cli client connect --config "$RUN_DIR/client/client.toml" \
+  "$PY" -m vpn.cli client connect --config "$RUN_DIR/client/client.toml" \
   >"$RUN_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 PIDS+=("$CLIENT_PID")
