@@ -18,6 +18,7 @@ import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 APP_VERSION = "2.0.0"
 MAX_IPC_MESSAGE = 16384
@@ -174,7 +175,10 @@ class ClientService:
 
     ALLOWED_UIDS: set[int] = set()  # non-root uids allowed on the IPC socket
 
-    def __init__(self, config_path: str | None = None, state_dir: Path | None = None) -> None:
+    def __init__(self, config_path: str | None = None, state_dir: Path | None = None,
+                 pqvpnd_path: str = "/usr/bin/pqvpnd") -> None:
+        # A fixed path, never PATH or the environment: this service runs as root.
+        self.pqvpnd_path = pqvpnd_path
         self.managed_mode = config_path is None
         self.ALLOWED_UIDS = parse_allowed_uids(os.environ.get("PQVPN_ALLOWED_UIDS", ""))
         self.config_path = config_path
@@ -617,6 +621,9 @@ class ClientService:
             crypto = get_crypto_status()
         except Exception:
             crypto = {"pqc_mode": "unavailable", "is_quantum_safe": False}
+        if isinstance(self._vpn, NativeClient):
+            # pqvpnd's own aws-lc ML-KEM-768, not this process's liboqs; quantum-safe once a hybrid suite is negotiated.
+            crypto = {"pqc_mode": "native_aws_lc", "is_quantum_safe": self._vpn.suite in HYBRID_SUITES}
 
         vpn = self._vpn
         if vpn is None and self._kill_switch_stale:
@@ -673,7 +680,8 @@ class ClientService:
                 if network else False
             ),
             dns_managed=getattr(network, "dns_cleanup_registered", False) if network else False,
-            kill_switch_active=(bool(getattr(getattr(vpn, "cfg", None), "kill_switch", False))
+            kill_switch_active=(vpn.kill_switch_active if isinstance(vpn, NativeClient) else
+                                bool(getattr(getattr(vpn, "cfg", None), "kill_switch", False))
                                 and getattr(vpn, "state", "") in ("CONNECTED", "BLOCKED")),
             rekey_interval=(int(tunnel.get("rekey_interval", 0)) or None),
             **base,
@@ -737,7 +745,7 @@ class ClientService:
                 self._connected_profile_id = None
                 self._connected_profile_name = None
             self._config = cfg
-            self._vpn = VPNClient(cfg)
+            self._vpn = NativeClient(cfg, self.pqvpnd_path) if cfg.client_backend == "native" else VPNClient(cfg)
             info = self._vpn.connect()
             self._kill_switch_stale = False
             self._connected_at = time.monotonic()
@@ -792,6 +800,188 @@ class ClientService:
             return {"error": error}
         finally:
             self._lock.release()
+
+
+# Both suites put X25519 and ML-KEM-768 into every session key (the hybrid-only invariant).
+HYBRID_SUITES = frozenset({"v2-ed25519", "v3-kem"})
+_STATUS_STATES = frozenset({"CONNECTING", "CONNECTED", "DISCONNECTED", "FAILED", "BLOCKED"})
+_STATUS_CONNECTED = {"client_vpn_ip": str, "server_vpn_ip": str, "prefix": int, "endpoint": str, "tun_name": str,
+                     "mtu": int, "suite": str, "ipv6_guard": bool, "dns_managed": bool, "epoch": int, "probes": dict}
+_CONFIG_PATHS = ("server_identity_public_key", "client_identity_private_key", "client_identity_public_key")
+
+
+def parse_status_line(raw: str) -> dict:
+    """One pqvpnd --status-json line (wire spec v1), or ValueError: the stream is untrusted until it parses."""
+    if len(raw.encode()) > 4096 or not raw.endswith("\n"):
+        raise ValueError("status line framing")
+    line = json.loads(raw)
+    if not (isinstance(line, dict) and line.get("v") == 1 and line.get("state") in _STATUS_STATES
+            and type(line.get("error")) is str and type(line.get("kill_switch")) is bool):
+        raise ValueError("status line header")
+    if line["state"] == "CONNECTED":
+        probes = line.get("probes")
+        rtts = probes.get("rtts_ms") if isinstance(probes, dict) else None
+        if (any(type(line.get(key)) is not kind for key, kind in _STATUS_CONNECTED.items())
+                or any(line.get(key) is not None and (type(line[key]) not in (int, float) or line[key] < 0)
+                       for key in ("rekey_in", "rehandshake_in"))
+                or type(probes.get("sent")) is not int or type(probes.get("lost")) is not int
+                or not isinstance(rtts, list) or len(rtts) > 64
+                or any(type(rtt) not in (int, float) for rtt in rtts)):
+            raise ValueError("status line CONNECTED fields")
+    return line
+
+
+def client_toml(cfg: object) -> str:
+    """The [client] table pqvpnd reads: every set field, paths absolute (VPNClient resolves them from its cwd)."""
+    from dataclasses import fields
+    lines = ["[client]"]
+    for item in fields(cfg):
+        value = getattr(cfg, item.name)
+        if value is None:
+            continue
+        if item.name in _CONFIG_PATHS:
+            value = str(Path(value).absolute())
+        if item.name in ("data_plane", "handshake"):
+            value = "rust"  # pqvpnd is both by construction
+        lines.append(f"{item.name} = {json.dumps(value)}")  # JSON scalars, strings and string lists are valid TOML
+    return "\n".join(lines) + "\n"
+
+
+class NativeClient:
+    """client_backend = "native": supervises `pqvpnd connect --status-json` and exposes the attributes
+    `ClientService._get_status` reads from a VPNClient, so both backends meet one STATUS contract."""
+    STOP_TIMEOUT = 12.0
+    CONNECT_TIMEOUT = 60.0
+
+    def __init__(self, cfg: object, pqvpnd_path: str) -> None:
+        from vpn.network import NetworkQualityMonitor
+        self.cfg, self.pqvpnd_path = cfg, pqvpnd_path
+        self.state, self.error = "DISCONNECTED", ""
+        self.session = self.tun = self.network = self.next_rekey = self.server_ip = self.suite = None
+        self.tunnel: dict = {}
+        # What pqvpnd reports for its table (spec v1 "kill_switch"), or what this service did on its behalf.
+        self.kill_switch_active = False
+        self.quality = NetworkQualityMonitor()
+        self._process: object | None = None
+        self._config_path: str | None = None
+        self._final = threading.Event()
+        self._connected = threading.Event()
+        self._invalid = False
+
+    def connect(self) -> dict:
+        import subprocess
+        import tempfile
+        # mkstemp is O_EXCL and 0600 wherever it lands; the file holds paths and a fingerprint, no secrets.
+        directory = _RUNTIME_DIR if os.access(_RUNTIME_DIR, os.W_OK) else None
+        fd, self._config_path = tempfile.mkstemp(prefix="pqvpnd-", suffix=".toml", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(client_toml(self.cfg))
+        self.state = "CONNECTING"
+        self._process = subprocess.Popen([self.pqvpnd_path, "connect", "--config", self._config_path, "--status-json"],
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, encoding="utf-8")
+        threading.Thread(target=self._read, daemon=True, name="pqvpnd-status").start()
+        deadline = time.monotonic() + self.CONNECT_TIMEOUT
+        while not self._connected.wait(0.05):
+            if self._final.is_set():
+                raise RuntimeError(self.error or "pqvpnd exited before connecting")
+            if time.monotonic() > deadline:
+                self.disconnect()
+                raise RuntimeError("pqvpnd did not connect in time")
+        return self.tunnel
+
+    def _read(self) -> None:
+        try:
+            while raw := self._process.stdout.readline(4097):
+                self._apply(parse_status_line(raw))
+        except (ValueError, UnicodeDecodeError) as exc:
+            logger.error("pqvpnd status stream invalid: %s", exc)
+            self._fail_closed()
+        finally:
+            self._exited()
+
+    def _apply(self, line: dict) -> None:
+        state = line["state"]
+        self.kill_switch_active = line["kill_switch"]
+        if state == "CONNECTED":
+            self.tunnel = {key: line[key] for key in ("client_vpn_ip", "server_vpn_ip", "prefix", "mtu")}
+            self.tunnel.update(rekey_interval=0, udp_port=int(line["endpoint"].rsplit(":", 1)[1]))
+            self.server_ip, self.suite = line["endpoint"].rsplit(":", 1)[0], line["suite"]
+            self.session = SimpleNamespace(epoch=line["epoch"])
+            self.tun = SimpleNamespace(name=line["tun_name"], mode=SimpleNamespace(name="NATIVE"), mtu=line["mtu"])
+            self.network = SimpleNamespace(ipv6=SimpleNamespace(table="pqvpnd" if line["ipv6_guard"] else None),
+                                           dns_cleanup_registered=line["dns_managed"])
+            self.next_rekey = time.monotonic() + line["rekey_in"] if line["rekey_in"] is not None else None
+            probes = line["probes"]
+            for _ in range(probes["sent"]):
+                self.quality.record_probe_sent()
+            for _ in range(probes["lost"]):
+                self.quality.record_loss()
+            for rtt in probes["rtts_ms"]:
+                self.quality.record_rtt(rtt)
+            self.state = state
+            self._connected.set()
+        elif state == "CONNECTING":
+            self.state = state
+        else:
+            self._finish(state, line["error"])
+
+    def _finish(self, state: str, error: str) -> None:
+        self.session = self.tun = self.network = self.next_rekey = None
+        self.state, self.error = state, error
+        self._final.set()
+
+    def _fail_closed(self) -> None:
+        """An unreadable child: stop it cleanly, then keep traffic blocked ourselves if a kill switch is configured."""
+        self._invalid = True
+        self._stop_child()
+        if getattr(self.cfg, "kill_switch", False):
+            from vpn.network import KillSwitch
+            try:
+                KillSwitch.install("connecting", self.cfg.server_host, self.cfg.server_control_port)
+            except Exception:
+                logger.exception("kill switch reinstall failed after an invalid pqvpnd stream")
+            self.kill_switch_active = True
+            self._finish("BLOCKED", "pqvpnd status stream invalid")
+        else:
+            self._finish("FAILED", "pqvpnd status stream invalid")
+
+    def _exited(self) -> None:
+        code = self._process.wait()
+        if self._config_path:
+            Path(self._config_path).unlink(missing_ok=True)
+        if not self._final.is_set():  # EOF without a final line: a crash or SIGKILL
+            from vpn.network import KillSwitch
+            how = f"signal {-code}" if code < 0 else f"code {code}"
+            blocked = getattr(self.cfg, "kill_switch", False) and KillSwitch.present()
+            self.kill_switch_active = blocked
+            self._finish("BLOCKED" if blocked else "FAILED", f"pqvpnd exited unexpectedly ({how})")
+
+    def _stop_child(self) -> bool:
+        """SIGTERM (pqvpnd's own clean teardown), SIGKILL after STOP_TIMEOUT; True if it stopped in time."""
+        import subprocess
+        if self._process is None or self._process.poll() is not None:
+            return True
+        self._process.send_signal(signal.SIGTERM)
+        try:
+            self._process.wait(self.STOP_TIMEOUT)
+            return True
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            self._process.wait()
+            return False
+
+    def disconnect(self) -> None:
+        """The user's disconnect: the one action that lifts a kill switch, whatever state the child left."""
+        stopped = self._stop_child()
+        self._final.wait(self.STOP_TIMEOUT)
+        if getattr(self.cfg, "kill_switch", False) and (not stopped or self.state == "BLOCKED"):
+            from vpn.network import KillSwitch
+            KillSwitch.remove()
+            self.kill_switch_active = False
+        if stopped:
+            self._finish("DISCONNECTED", "")
+        else:
+            self._finish("FAILED", "pqvpnd did not stop in time; network state may need `pqvpnd recover`")
 
 
 def _kill_switch_present() -> bool:

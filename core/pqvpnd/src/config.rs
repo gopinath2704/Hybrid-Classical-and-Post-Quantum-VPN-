@@ -35,6 +35,8 @@ struct RawClient {
     expected_vpn_subnet: Option<String>,
     ipv6_policy: Option<String>,
     experimental_suite: Option<String>,
+    /// Which program the client service runs; pqvpnd itself is the "native" one either way.
+    client_backend: Option<String>,
 }
 
 /// Like Python, other top-level tables (a `[server]` in a shared file) are not read.
@@ -129,6 +131,9 @@ pub fn parse(text: &str, base: &Path) -> Result<ClientConfig, ConfigError> {
             Some("python") => return Err(unsupported(format!("{name} = \"python\" (pqvpnd is the Rust {name}; use the Python client)"))),
             Some(_) => return Err(invalid(format!("{name} must be python or rust"))),
         }
+    }
+    if !matches!(raw.client_backend.as_deref(), None | Some("python" | "native")) {
+        return Err(invalid("client_backend must be python or native"));
     }
     match raw.experimental_suite.as_deref() {
         None | Some("") => {}
@@ -352,7 +357,7 @@ handshake = "rust"
             }
         }
         // Explicitly harmless values of those options are fine.
-        for extra in ["kill_switch = false", "split_tunnel = []", "dns_routing_domains = []", "ipv6_policy = \"allow\"",
+        for extra in ["client_backend = \"native\"", "client_backend = \"python\"", "kill_switch = false", "split_tunnel = []", "dns_routing_domains = []", "ipv6_policy = \"allow\"",
                       "dev_emulated_tun = false", "experimental_suite = \"\""] {
             with(extra).unwrap_or_else(|e| panic!("{extra}: {e}"));
         }
@@ -428,6 +433,7 @@ handshake = "rust"
             format!("{BENCH}dns_routing_domains = [\"corp;rm\"]"),
             format!("{BENCH}dns_routing_domains = [\"~\"]"),
             format!("{BENCH}dns_mode = \"dnsmasq\""),
+            format!("{BENCH}client_backend = \"go\""),
             BENCH.replace("dns_servers = []", "dns_servers = [\"not-an-ip\"]"),
             BENCH.replace("ABCDEF", "XYZ"),
             BENCH.replace("server_identity_fingerprint = \"ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789\"", ""),
