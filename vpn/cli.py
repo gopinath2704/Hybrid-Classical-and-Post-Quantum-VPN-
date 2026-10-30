@@ -570,7 +570,14 @@ def main(argv: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        service.disconnect()
+        # A session that ended itself is cleaning up on its own thread: wait for that (exiting first would kill it
+        # mid-restore) rather than disconnect again, which would lift a kill switch it left blocking.
+        if getattr(service, "state", "") in ("FAILED", "BLOCKED"):
+            service._cleanup_done.wait(timeout=12)
+        else:
+            service.disconnect()
+    if getattr(service, "state", "") == "BLOCKED":
+        raise SystemExit(f"{service.error}; kill switch is blocking all traffic, run `pqvpn client recover` to restore it")
     if getattr(service, "state", "") == "FAILED":
         raise SystemExit(service.error)
 
