@@ -22,8 +22,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
+import pytest
+
 import handshake.kemtls as kemtls
-from crypto.hybrid_crypto import ECCProvider, PQCProvider
+from crypto.hybrid_crypto import _OQS_AVAILABLE, ECCProvider, PQCProvider
 from handshake.kemtls import (PROTOCOL_VERSION, PROTOCOL_VERSION_V3, ClientHello, ClientHelloV3, ClientKeyExchange,
                               ClientKeyExchangeV3, FrameType, HandshakeError, KEMTLSClient, KEMTLSClientV3,
                               KEMTLSServer, KEMTLSServerV3, ResumptionAccept, ResumptionClientHandshake, ResumptionHello,
@@ -330,6 +332,8 @@ def build(recorded: dict | None = None) -> dict:
             "kem_kat": _kem_kat(runs, ids), "primitive_rejections": _primitive_rejections(ids)}
 
 
+@pytest.mark.native_pqc
+@pytest.mark.skipif(not _OQS_AVAILABLE, reason="native liboqs ML-KEM-768 unavailable")
 def test_handshake_vectors_replay_through_python():
     # Everything is deterministic given the recorded draws, including liboqs's implicit-rejection secret.
     recorded = json.loads(VECTORS.read_text())
