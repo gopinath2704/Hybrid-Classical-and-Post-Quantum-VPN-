@@ -15,7 +15,7 @@ install=pqvpn.install
 options=('!lto')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel' 'cargo' 'maturin')
 source=("${pkgname}-${pkgver}.tar.gz")
-sha256sums=('cb71d2d922c4c32b99762f66e8aed3140092b64a7ce353ca04e10cc1cd9e21c3')
+sha256sums=('fba3855229070b984503555128274b20e06d7b3d867fecc5dea7b0188318822f')
 
 prepare() {
   cd "${srcdir}/${pkgname}-${pkgver}"
