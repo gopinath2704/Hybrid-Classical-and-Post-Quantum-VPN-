@@ -10,6 +10,7 @@ import socket
 import stat
 import subprocess
 import tarfile
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -475,7 +476,7 @@ def _make_arch_source_archive(root: Path, archive: Path) -> None:
     included = (
         "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
         "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
-        "packaging/common", "config/account-api.toml", "scripts", "core",
+        "packaging/common", "config/account-api.toml", "scripts", "core", ".cargo",
     )
     subprocess.run(
         [
@@ -500,7 +501,7 @@ def _stable_archive_digest(root: Path, tmp: Path) -> str:
     included = (
         "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
         "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
-        "packaging/common", "config/account-api.toml", "scripts", "core",
+        "packaging/common", "config/account-api.toml", "scripts", "core", ".cargo",
     )
     manifest = subprocess.run(
         ["git", "ls-tree", "-r", "HEAD^{tree}", "--", *included],
@@ -534,6 +535,17 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
         "client_identity_private.key", "server_identity_private.key",
     }
     assert not any(forbidden_parts.intersection(Path(name).parts) for name in names)
+
+
+def test_aws_lc_is_built_without_jitter_entropy(tmp_path):
+    """Every cargo/maturin build (dev, bench, Arch, Debian, fuzz) runs from the root and ships the same .cargo config."""
+    root = Path(__file__).parents[1]
+    config = tomllib.loads((root / ".cargo/config.toml").read_text())
+    assert config["env"]["AWS_LC_SYS_NO_JITTER_ENTROPY"] == "1"
+    archive = tmp_path / "pqvpn-3.0.0.tar.gz"
+    _make_arch_source_archive(root, archive)
+    with tarfile.open(archive, "r:gz") as source:
+        assert "pqvpn-3.0.0/.cargo/config.toml" in source.getnames()
 
 
 def test_packages_do_not_include_deployment_identity_or_config(tmp_path):

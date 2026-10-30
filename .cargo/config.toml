@@ -1,0 +1,6 @@
+# At the repo root so every build finds it: cargo reads config from the working directory up, not from --manifest-path,
+# and the PKGBUILD, debian/rules, maturin and the bench runner all build from the root.
+[env]
+# Seed aws-lc's DRBG from getrandom (+ RDRAND) instead of CPU Jitter Entropy, whose first-use ~27 ms dominated native
+# cold connect (Phase 5 design notes). Same OS source the Python path uses; loses aws-lc's second independent source.
+AWS_LC_SYS_NO_JITTER_ENTROPY = "1"
