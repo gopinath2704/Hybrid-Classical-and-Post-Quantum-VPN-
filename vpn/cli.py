@@ -301,6 +301,9 @@ def _parser() -> argparse.ArgumentParser:
     revoke.add_argument("fingerprint")
     revoke.add_argument("--database", default="config/authorized_clients.json")
 
+    client_actions.add_parser(
+        "recover", description="Remove the kill switch left blocking traffic after a crash or lost session (root)")
+
     connect = client_actions.add_parser("connect")
     connect.add_argument("--config", default="config/client.toml")
     connect.add_argument("--server-host", help="validated deployment override for the configured server host")
@@ -515,6 +518,15 @@ def main(argv: list[str] | None = None) -> None:
             _account_command(args)
         except (AccountError, ValueError, OSError) as exc:
             raise SystemExit(f"account error: {exc}") from None
+        return
+    if args.command == "client" and args.action == "recover":
+        from vpn.network import KillSwitch
+        was_present = KillSwitch.present()
+        try:
+            KillSwitch.remove()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise SystemExit(f"kill switch not removed: {getattr(exc, 'stderr', '') or exc}") from None
+        print("kill switch removed; traffic is no longer blocked" if was_present else "no kill switch was active")
         return
     if args.command == "client" and args.action == "revoke":
         if not AuthorizedClients(Path(args.database)).revoke(args.fingerprint):

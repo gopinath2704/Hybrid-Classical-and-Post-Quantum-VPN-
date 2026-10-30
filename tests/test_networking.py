@@ -492,3 +492,56 @@ def test_interface_name_rejects_option_shapes(bad):
 def test_interface_name_accepts_linux_names(good):
     from vpn.config import interface_name
     interface_name(good)
+
+
+# --- Kill switch (K2): one fixed-name table, rules held to the golden files pqvpnd also matches ---
+
+GOLDEN = Path(__file__).parent / 'golden'
+
+
+def test_killswitch_rules_match_golden():
+    assert ipv6.killswitch_rules('connecting', '192.0.2.1', 51820) == (GOLDEN / 'killswitch_connecting.nft').read_text()
+    assert ipv6.killswitch_rules('up', '192.0.2.1', 51820, 'pqvpn0', 51821) == (GOLDEN / 'killswitch_up.nft').read_text()
+    with pytest.raises(ValueError, match='phase'): ipv6.killswitch_rules('down', '192.0.2.1', 51820)
+
+
+def test_killswitch_install_present_remove_commands(monkeypatch):
+    calls = []
+    def run(args, **kwargs):
+        calls.append((args, kwargs.get('input')))
+        return SimpleNamespace(returncode=1 if args[1] == 'list' else 0, stdout='')
+    monkeypatch.setattr(ipv6.subprocess, 'run', run)
+    ipv6.KillSwitch.install('up', '192.0.2.1', 51820, 'pqvpn0', 51821)
+    assert not ipv6.KillSwitch.present()
+    ipv6.KillSwitch.remove()
+    assert calls == [(['nft', '-f', '-'], (GOLDEN / 'killswitch_up.nft').read_text()),
+                     (['nft', 'list', 'table', 'inet', 'pqvpn_killswitch'], None),
+                     (['nft', 'destroy', 'table', 'inet', 'pqvpn_killswitch'], None)]
+
+
+@pytest.mark.parametrize('overrides,error', [
+    (dict(full_tunnel=False), 'full_tunnel'),
+    (dict(ipv6_policy='allow'), 'ipv6_policy'),
+    (dict(server_host='vpn.example.com'), 'IPv4 address'),
+    (dict(server_host='2001:db8::1'), 'IPv4 address'),
+])
+def test_killswitch_config_contradictions_rejected(overrides, error):
+    with pytest.raises(ValueError, match=error):
+        validate_client(ClientConfig(kill_switch=True, **overrides))
+
+
+def test_killswitch_config_accepted_with_full_tunnel_and_ip_server():
+    for policy in (None, 'block', 'fail'):
+        validate_client(ClientConfig(kill_switch=True, server_host='52.62.237.95', ipv6_policy=policy))
+    validate_client(ClientConfig(kill_switch=False, full_tunnel=False, server_host='vpn.example.com', ipv6_policy='allow'))
+
+
+def test_client_recover_removes_the_kill_switch(monkeypatch, capsys):
+    calls = []
+    def run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout='')
+    monkeypatch.setattr(ipv6.subprocess, 'run', run)
+    doctor.main(['client', 'recover'])
+    assert calls == [['nft', 'list', 'table', 'inet', 'pqvpn_killswitch'], ['nft', 'destroy', 'table', 'inet', 'pqvpn_killswitch']]
+    assert 'kill switch removed' in capsys.readouterr().out

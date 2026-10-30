@@ -233,3 +233,48 @@ class IPv6Guard:
                 logger.exception('IPv6 cleanup failed; owned table remains: ip6 %s', self.table)
                 raise
             self.table = None
+
+
+KILL_SWITCH_TABLE = 'pqvpn_killswitch'
+
+
+def killswitch_rules(phase: str, server: str, control_port: int, tun: str = '', udp_port: int = 0) -> str:
+    """The whole kill-switch table as one transaction: destroy and re-add commit together, so a replace has no gap.
+
+    "connecting" lets only loopback, DHCP and the server's control TCP out; "up" adds the server's data UDP and the
+    TUN. Everything else this host sends, IPv6 included, is dropped. Must match tests/golden/killswitch_*.nft, which
+    pqvpnd's renderer is held to as well.
+    """
+    if phase not in ('connecting', 'up'):
+        raise ValueError('kill switch phase must be connecting or up')
+    t = f'inet {KILL_SWITCH_TABLE}'
+    rules = [f'destroy table {t}', f'add table {t}',
+             f'add chain {t} output {{ type filter hook output priority filter; policy drop; }}',
+             f'add rule {t} output oifname "lo" accept',
+             f'add rule {t} output udp sport 68 udp dport 67 accept',
+             f'add rule {t} output ip daddr {server} tcp dport {control_port} accept']
+    if phase == 'up':
+        rules += [f'add rule {t} output ip daddr {server} udp dport {udp_port} accept',
+                  f'add rule {t} output oifname "{tun}" accept']
+    rules.append(f'add rule {t} output counter')
+    return '\n'.join(rules) + '\n'
+
+
+class KillSwitch:
+    """The fixed-name table outlives this process on purpose: a crash leaves traffic blocked (fail closed).
+
+    Only an explicit disconnect or recover removes it.
+    """
+    @staticmethod
+    def install(phase: str, server: str, control_port: int, tun: str = '', udp_port: int = 0) -> None:
+        subprocess.run(['nft', '-f', '-'], input=killswitch_rules(phase, server, control_port, tun, udp_port),
+                       text=True, capture_output=True, check=True)
+
+    @staticmethod
+    def present() -> bool:
+        return subprocess.run(['nft', 'list', 'table', 'inet', KILL_SWITCH_TABLE],
+                              capture_output=True, text=True).returncode == 0
+
+    @staticmethod
+    def remove() -> None:
+        subprocess.run(['nft', 'destroy', 'table', 'inet', KILL_SWITCH_TABLE], capture_output=True, text=True, check=True)
