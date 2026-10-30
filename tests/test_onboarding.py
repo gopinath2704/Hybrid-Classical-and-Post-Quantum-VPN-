@@ -463,6 +463,8 @@ def test_packaging_foundation_has_safe_launcher_and_managed_service():
     assert '"cryptography==50.0.1"' in debian_dependency_patch
     assert '"liboqs-python==0.16.0"' in debian_dependency_patch
     assert "get_crypto_status" in debian_rules
+    for rules in (arch, debian_rules):
+        assert "-p pqvpnd" in rules and "core/target/release/pqvpnd" in rules and "/usr/bin/pqvpnd" in rules
     installer = (root / "scripts/install-client.sh").read_text()
     assert "Environment=PQVPN_ALLOWED_UIDS=%s" in installer and '"$SUDO_UID"' in installer
     assert "install=pqvpn.install" in arch
