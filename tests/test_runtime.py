@@ -1142,3 +1142,170 @@ def test_rekey_rejects_revoked_client(tmp_path):
     auth.revoke(fingerprint(b'\x01' * 32))
     with pytest.raises(HandshakeError, match="revoked"):
         server._rekey_server(mock_session, b'\x00' * 36)
+
+
+# --- Slice (c): handshake threads exit; one selector thread serves established sessions ---
+
+def _handshake_threads_exited(server):
+    return all(not thread.is_alive() for thread in server._client_threads)
+
+
+def _second_client(server, tmp_path, name):
+    from vpn.identity import AuthorizedClients, generate_client_identity
+    from vpn.identity import fingerprint as fp_of
+    directory = tmp_path / name
+    directory.mkdir()
+    generate_client_identity(directory/'client.key', directory/'client.pub')
+    AuthorizedClients(tmp_path/'clients.json').authorize((directory/'client.pub').read_bytes(), name)
+    client = runtime.VPNClient(ClientConfig(server_host='127.0.0.1', server_control_port=server.tcp.getsockname()[1],
+        server_identity_public_key=str(tmp_path/'server.pub'), server_identity_fingerprint=fp_of((tmp_path/'server.pub').read_bytes()),
+        client_identity_private_key=str(directory/'client.key'), dev_emulated_tun=True, tun_name=f'pq{name}', full_tunnel=False,
+        data_plane=server.cfg.data_plane))
+    client.PING_INITIAL_DELAY = 3600
+    return client
+
+
+def test_session_survives_handshake_thread_exit(connected):
+    server, client = connected
+    client.connect()
+    until(lambda: _handshake_threads_exited(server))
+    item = next(iter(server.sessions.by_id.values()))
+    assert server._selector_thread.is_alive() and item.control in server._selector_socks
+    client.rekey()
+    until(lambda: item.crypto.epoch == 1)
+    assert client.state == 'CONNECTED' and server.sessions.by_id.get(item.crypto.session_id[:8]) is item
+
+
+def test_revocation_ends_selector_held_session(connected, tmp_path):
+    from vpn.identity import fingerprint
+    server, client = connected
+    client.connect()
+    until(lambda: _handshake_threads_exited(server))
+    item = next(iter(server.sessions.by_id.values()))
+    keys = item.crypto.secrets
+    assert AuthorizedClients(tmp_path/'clients.json').revoke(fingerprint((tmp_path/'client.pub').read_bytes()))
+    server._check_revocations()
+    until(lambda: not server.sessions.by_id and server.slots._value == server.cfg.max_clients)
+    assert item.client_id not in server.pool._leases and item.control.fileno() == -1
+    assert all(not any(value) for value in vars(keys).values() if isinstance(value, bytearray))
+    until(lambda: client._cleanup_done.is_set(), 5)
+    assert client.state == 'FAILED'
+
+
+def test_idle_timeout_ends_selector_held_session(connected, caplog):
+    server, client = connected
+    client.PING_INITIAL_DELAY = 3600
+    with caplog.at_level('INFO', logger='pqvpn.runtime'):
+        client.connect()
+        until(lambda: _handshake_threads_exited(server))
+        until(lambda: not server.sessions.by_id, 6)
+    assert 'session expired reason=idle timeout' in caplog.text
+    until(lambda: server.slots._value == server.cfg.max_clients and not server._selector_socks)
+
+
+def test_max_clients_slot_held_until_session_ends(connected, tmp_path):
+    server, client = connected
+    server.slots = threading.BoundedSemaphore(1)
+    client.connect()
+    until(lambda: _handshake_threads_exited(server))
+    second = _second_client(server, tmp_path, 'slot2')
+    try:
+        with pytest.raises(Exception):
+            second.connect()
+        client.disconnect()
+        until(lambda: server.slots._value == 1)
+        second.connect()
+        assert second.state == 'CONNECTED'
+    finally:
+        second.disconnect()
+
+
+def test_stalled_client_does_not_block_other_sessions(connected, tmp_path, caplog):
+    server, client = connected
+    client.connect()
+    staller = _second_client(server, tmp_path, 'stall')
+    staller.PING_INITIAL_DELAY, staller.PING_INTERVAL = .1, .3  # keep it out of the idle sweep
+    try:
+        staller.connect()
+        until(lambda: len(server.sessions.by_id) == 2 and _handshake_threads_exited(server))
+        server.cfg.handshake_timeout = 1
+        with caplog.at_level('INFO', logger='pqvpn.runtime'):
+            staller.control.sendall(b'\x00\x00')  # half a length prefix, then silence
+            start = time.monotonic()
+            client.rekey()
+            assert time.monotonic() - start < 2 and client.session.epoch == 1
+            until(lambda: len(server.sessions.by_id) == 1, 5)
+        assert 'client timeout source=127.0.0.1' in caplog.text and 'idle timeout' not in caplog.text
+        assert client.state == 'CONNECTED'
+    finally:
+        staller.disconnect()
+
+
+def test_failed_control_send_drops_only_that_session(connected, monkeypatch):
+    server, client = connected
+    client.connect()
+    until(lambda: _handshake_threads_exited(server))
+    def full_send_buffer(self, item, payload):
+        raise BlockingIOError(11, 'send buffer full')
+    monkeypatch.setattr(runtime.VPNServer, '_rekey_server', full_send_buffer)
+    with pytest.raises(Exception):
+        client.rekey()
+    until(lambda: not server.sessions.by_id and server.slots._value == server.cfg.max_clients)
+    assert server._selector_thread.is_alive() and not server.stop_event.is_set()
+
+
+def test_one_session_cleanup_failure_keeps_selector_running(connected, tmp_path, caplog):
+    server, client = connected
+    client.connect()
+    other = _second_client(server, tmp_path, 'broken')
+    try:
+        other.connect()
+        until(lambda: len(server.sessions.by_id) == 2 and _handshake_threads_exited(server))
+        broken = next(item for item in server.sessions.by_id.values() if item.client_id == 'broken')
+        def failing_wipe():
+            raise RuntimeError('injected cleanup failure')
+        broken.crypto.secure_wipe = failing_wipe
+        with caplog.at_level('ERROR', logger='pqvpn.runtime'):
+            other.disconnect()
+            # The slot is released (finally) just before the failure is logged; wait for both.
+            until(lambda: len(server.sessions.by_id) == 1 and server.slots._value == server.cfg.max_clients - 1
+                  and 'control session cleanup failed' in caplog.text)
+        assert server._selector_thread.is_alive() and not server.stop_event.is_set()
+        client.rekey()
+        assert client.session.epoch == 1 and client.state == 'CONNECTED'
+    finally:
+        other.disconnect()
+
+
+def test_ticket_save_replaces_symlink_without_following(tmp_path):
+    client = runtime.VPNClient(ClientConfig(server_identity_fingerprint='aa'*32,
+        client_identity_private_key=str(tmp_path/'client.key'), client_identity_public_key=str(tmp_path/'client.pub')))
+    victim = tmp_path/'victim'
+    victim.write_text('keep')
+    client._ticket_path().symlink_to(victim)
+    client._save_ticket(b'ticket', b's'*32, 'aa'*32)
+    path = client._ticket_path()
+    assert victim.read_text() == 'keep' and not path.is_symlink()
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert client._load_ticket('aa'*32) == (b'ticket', b's'*32)
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ['.pqvpn_ticket.json', 'victim']
+
+
+def test_ticket_load_refuses_symlink(tmp_path):
+    client = runtime.VPNClient(ClientConfig(server_identity_fingerprint='aa'*32,
+        client_identity_private_key=str(tmp_path/'client.key'), client_identity_public_key=str(tmp_path/'client.pub')))
+    client._save_ticket(b'ticket', b's'*32, 'aa'*32)
+    elsewhere = tmp_path/'elsewhere.json'
+    client._ticket_path().rename(elsewhere)
+    client._ticket_path().symlink_to(elsewhere)
+    assert client._load_ticket('aa'*32) is None
+
+
+def test_ticket_save_failure_leaves_no_temp_file(tmp_path, monkeypatch):
+    client = runtime.VPNClient(ClientConfig(server_identity_fingerprint='aa'*32,
+        client_identity_private_key=str(tmp_path/'client.key'), client_identity_public_key=str(tmp_path/'client.pub')))
+    def broken_fsync(fd):
+        raise OSError(5, 'injected fsync failure')
+    monkeypatch.setattr(runtime.os, 'fsync', broken_fsync)
+    client._save_ticket(b'ticket', b's'*32, 'aa'*32)
+    assert list(tmp_path.iterdir()) == []

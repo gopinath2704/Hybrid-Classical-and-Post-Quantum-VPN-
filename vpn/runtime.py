@@ -10,6 +10,7 @@ import logging
 import os
 import queue
 import select
+import selectors
 import shlex
 import socket
 import struct
@@ -257,6 +258,16 @@ class ServerSession:
         self.last_seen = time.monotonic()
 
 
+@dataclass
+class _ControlConn:
+    """An established session's control socket, owned by the selector thread after hand-off."""
+    item: ServerSession
+    sock: socket.socket
+    source: str
+    rx: bytearray = field(default_factory=bytearray)
+    stalled_since: float = 0.0
+
+
 # Data-plane wire versions the server will route; the per-session
 # HandshakeSession re-validates the exact version in decrypt_frame.
 _DATA_PROTOCOL_VERSIONS = frozenset(
@@ -384,6 +395,14 @@ class VPNServer:
         self._pending_lock = threading.Lock()
         self._revocation_thread = None
         self._last_auth_snapshot: set[str] | None = None
+        # Established sessions are served by one selector thread; handshake threads exit at hand-off,
+        # so a session no longer pins a thread's stack (M8). The max_clients slot is held until session end.
+        self._selector_thread = None
+        self._selector_open = False
+        self._selector_socks: set[socket.socket] = set()
+        self._handoffs: queue.SimpleQueue = queue.SimpleQueue()
+        self._handoff_lock = threading.Lock()
+        self._wake_r = self._wake_w = -1
 
     def start(self) -> None:
         try:
@@ -407,6 +426,10 @@ class VPNServer:
             self._data_thread.start()
             self._revocation_thread = threading.Thread(target=self._revocation_loop, daemon=True, name="pqvpn-revoke")
             self._revocation_thread.start()
+            self._wake_r, self._wake_w = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+            self._selector_open = True
+            self._selector_thread = threading.Thread(target=self._serve_control, daemon=True, name="pqvpn-control")
+            self._selector_thread.start()
             while not self.stop_event.is_set():
                 try:
                     connection, address = listener.accept()
@@ -425,7 +448,7 @@ class VPNServer:
                     connection.close()
                     continue
                 thread = threading.Thread(target=self._client, args=(connection, address), daemon=True)
-                self._client_threads.append(thread)
+                self._client_threads = [item for item in self._client_threads if item.is_alive()] + [thread]
                 thread.start()
         finally:
             self._close_listeners()
@@ -440,6 +463,7 @@ class VPNServer:
 
     def _client(self, connection: socket.socket, address: tuple[str, int]) -> None:
         item = None
+        handed_off = False
         with self._pending_lock:
             self._pending_handshakes += 1
         try:
@@ -494,58 +518,199 @@ class VPNServer:
                     bytes(session.secrets.rekey_secret), session.client_id,
                     session.protocol_version, self.cfg.resumption_ticket_lifetime, vpn_ip)
                 send_message(connection, session.encrypt_control(ticket, FrameType.RESUMPTION_TICKET))
-            connection.settimeout(self.cfg.handshake_timeout)
-            while not self.stop_event.is_set():
-                with self.sessions.lock:
-                    now = time.monotonic()
-                    reason = ("idle timeout" if now - self._last_activity(item) > self.cfg.idle_timeout else
-                              "session timeout" if now - item.created > self.cfg.session_timeout else None)
-                    if reason:
-                        self.sessions.remove(item)
-                        logger.info("session expired reason=%s client_id=%s vpn_ip=%s",
-                                    reason, item.client_id, item.vpn_ip)
-                        break
-                if not select.select([connection], [], [], 1)[0]:
-                    continue
-                frame = recv_message(connection)
-                frame_type, payload = session.decrypt_control(frame)
-                if frame_type == FrameType.CLOSE:
-                    break
-                if frame_type == FrameType.REKEY_REQUEST:
-                    with self.sessions.lock:
-                        self._rekey_server(item, payload)
-                        item.touch()
-                elif frame_type == FrameType.REHANDSHAKE_REQUEST:
-                    with self.sessions.lock:
-                        self._rehandshake_server(item, payload)
-                        item.touch()
-                elif frame_type not in {FrameType.ERROR}:
-                    raise HandshakeError("unexpected control message")
-                else:
-                    with self.sessions.lock:
-                        item.touch()
-        except socket.timeout:
-            logger.info("client timeout source=%s", address[0])
-        except HandshakeError as exc:
-            level = logging.INFO if "unauthorized" in str(exc) else logging.WARNING
-            logger.log(level, "protocol/authentication rejection source=%s reason=%s", address[0], exc)
-        except PQCUnavailableError as exc:
-            logger.error("PQC failure source=%s reason=%s", address[0], exc)
-        except OSError as exc:
-            logger.info("client network closure source=%s reason=%s", address[0], exc)
-        except Exception:
-            logger.exception("unexpected client handler failure source=%s", address[0])
+            # From here the selector thread owns the socket and the session; this thread exits.
+            connection.setblocking(False)
+            handed_off = self._hand_off(item, connection, address)
+        except Exception as exc:
+            self._log_control_failure(exc, address[0])
         finally:
+            if not handed_off:
+                self._end_session(item, connection)
+
+    @staticmethod
+    def _log_control_failure(exc: Exception, source: str) -> None:
+        if isinstance(exc, socket.timeout):
+            logger.info("client timeout source=%s", source)
+        elif isinstance(exc, HandshakeError):
+            level = logging.INFO if "unauthorized" in str(exc) else logging.WARNING
+            logger.log(level, "protocol/authentication rejection source=%s reason=%s", source, exc)
+        elif isinstance(exc, PQCUnavailableError):
+            logger.error("PQC failure source=%s reason=%s", source, exc)
+        elif isinstance(exc, OSError):
+            logger.info("client network closure source=%s reason=%s", source, exc)
+        else:
+            logger.error("unexpected client handler failure source=%s", source, exc_info=exc)
+
+    def _end_session(self, item: ServerSession | None, connection: socket.socket) -> None:
+        try:
             if item:
                 with self.sessions.lock:
                     self.sessions.remove(item)
                     item.endpoint = None
                     self.pool.release(item.client_id)
                     item.crypto.secure_wipe()
+        finally:
             connection.close()
             self.slots.release()
+            # ponytail: counts live connections, not just handshakes, as before slice (c); cookie_mode
+            # "under_load" reads it, so keeping the decrement at session end keeps cookie/M7 behaviour.
             with self._pending_lock:
                 self._pending_handshakes = max(0, self._pending_handshakes - 1)
+
+    def _hand_off(self, item: ServerSession, connection: socket.socket, address: tuple[str, int]) -> bool:
+        with self._handoff_lock:
+            if not self._selector_open:
+                return False
+            self._handoffs.put(_ControlConn(item, connection, address[0]))
+            self._poke()
+        return True
+
+    def _poke(self) -> None:
+        """Wake the selector; caller holds _handoff_lock and has checked _selector_open."""
+        try:
+            os.write(self._wake_w, b"\0")
+        except BlockingIOError:
+            pass
+
+    def _serve_control(self) -> None:
+        selector = selectors.DefaultSelector()
+        selector.register(self._wake_r, selectors.EVENT_READ)
+        last_sweep = 0.0
+        try:
+            while not self.stop_event.is_set():
+                for key, _ in selector.select(1):
+                    if key.data is None:
+                        try:
+                            while os.read(self._wake_r, 4096):
+                                pass
+                        except BlockingIOError:
+                            pass
+                    else:
+                        self._control_readable(selector, key.data)
+                self._adopt_handoffs(selector)
+                now = time.monotonic()
+                if now - last_sweep >= 1:
+                    last_sweep = now
+                    self._sweep_sessions(selector, now)
+        except Exception:
+            logger.exception("control selector failed; stopping server")
+            self.stop()
+        finally:
+            with self._handoff_lock:
+                self._selector_open = False
+                os.close(self._wake_r)
+                os.close(self._wake_w)
+            for key in list(selector.get_map().values()):
+                if key.data is not None:
+                    self._drop_control(selector, key.data)
+            self._adopt_handoffs(None)
+            selector.close()
+
+    def _adopt_handoffs(self, selector: selectors.BaseSelector | None) -> None:
+        while True:
+            try:
+                conn = self._handoffs.get_nowait()
+            except queue.Empty:
+                return
+            # Closed while queued (revocation) or shutting down: end it here, never register a dead fd.
+            if selector is None or conn.sock.fileno() == -1:
+                self._drop_control(None, conn)
+                continue
+            try:
+                stale = selector.get_map().get(conn.sock.fileno())
+                if stale is not None:  # its socket was closed elsewhere and the fd number reused
+                    self._drop_control(selector, stale.data)
+                selector.register(conn.sock, selectors.EVENT_READ, conn)
+                self._selector_socks.add(conn.sock)
+            except (ValueError, KeyError, OSError):  # closed between the check and register
+                self._drop_control(selector, conn)
+
+    def _drop_control(self, selector: selectors.BaseSelector | None, conn: _ControlConn) -> None:
+        """End one session; never raises, so one session's failure cannot take the selector down."""
+        if selector is not None:
+            try:
+                selector.unregister(conn.sock)
+            except (KeyError, ValueError):
+                pass
+        self._selector_socks.discard(conn.sock)
+        try:
+            self._end_session(conn.item, conn.sock)
+        except Exception:
+            logger.exception("control session cleanup failed source=%s", conn.source)
+
+    def _control_readable(self, selector: selectors.BaseSelector, conn: _ControlConn) -> None:
+        """Read what is available without blocking, so one slow client cannot stall the others."""
+        try:
+            try:
+                data = conn.sock.recv(65536)
+            except BlockingIOError:
+                return
+            if not data:
+                raise HandshakeError("control connection closed")
+            conn.rx += data
+            while len(conn.rx) >= 4:
+                size = struct.unpack("!I", conn.rx[:4])[0]
+                if size <= 0 or size > MAX_CONTROL_MESSAGE:
+                    raise HandshakeError("invalid control message length")
+                if len(conn.rx) < 4 + size:
+                    break
+                frame = bytes(conn.rx[4:4 + size])
+                del conn.rx[:4 + size]
+                if not self._dispatch_control(conn.item, frame):
+                    self._drop_control(selector, conn)
+                    return
+            conn.stalled_since = time.monotonic()
+        except Exception as exc:  # includes a failed non-blocking send: the stream is unusable
+            self._log_control_failure(exc, conn.source)
+            self._drop_control(selector, conn)
+
+    def _dispatch_control(self, item: ServerSession, frame: bytes) -> bool:
+        """Today's control dispatch for one frame; False when the client closed the session."""
+        frame_type, payload = item.crypto.decrypt_control(frame)
+        if frame_type == FrameType.CLOSE:
+            return False
+        if frame_type == FrameType.REKEY_REQUEST:
+            with self.sessions.lock:
+                self._rekey_server(item, payload)
+                item.touch()
+        elif frame_type == FrameType.REHANDSHAKE_REQUEST:
+            with self.sessions.lock:
+                self._rehandshake_server(item, payload)
+                item.touch()
+        elif frame_type not in {FrameType.ERROR}:
+            raise HandshakeError("unexpected control message")
+        else:
+            with self.sessions.lock:
+                item.touch()
+        return True
+
+    def _sweep_sessions(self, selector: selectors.BaseSelector, now: float) -> None:
+        for key in list(selector.get_map().values()):
+            conn = key.data
+            if conn is None:
+                continue
+            if conn.sock.fileno() == -1:
+                self._drop_control(selector, conn)
+                continue
+            item = conn.item
+            try:
+                with self.sessions.lock:
+                    reason = ("idle timeout" if now - self._last_activity(item) > self.cfg.idle_timeout else
+                              "session timeout" if now - item.created > self.cfg.session_timeout else None)
+                    if reason:
+                        self.sessions.remove(item)
+                        logger.info("session expired reason=%s client_id=%s vpn_ip=%s",
+                                    reason, item.client_id, item.vpn_ip)
+            except Exception:
+                logger.exception("session sweep failed source=%s", conn.source)
+                self._drop_control(selector, conn)
+                continue
+            if reason:
+                self._drop_control(selector, conn)
+            elif conn.rx and now - conn.stalled_since > self.cfg.handshake_timeout:
+                # A partial frame with no progress: the socket timeout the per-session thread used to give.
+                logger.info("client timeout source=%s", conn.source)
+                self._drop_control(selector, conn)
 
     def _cookie_gate(self, connection: socket.socket, address: tuple[str, int], first_msg: bytes) -> bytes:
         """Return the ClientHello wire bytes, issuing a cookie challenge if needed."""
@@ -628,9 +793,16 @@ class VPNServer:
             if item.client_id not in enabled:
                 logger.info("terminating revoked client session client_id=%s", item.client_id)
                 try:
-                    item.control.close()
+                    # The selector sees the shutdown as EOF and ends the session itself; closing a socket
+                    # it holds would silently drop it from epoll and free the fd number for reuse.
+                    item.control.shutdown(socket.SHUT_RDWR)
                 except Exception:
                     pass
+                if item.control not in self._selector_socks:
+                    try:
+                        item.control.close()
+                    except Exception:
+                        pass
 
     def _revocation_loop(self) -> None:
         while not self.stop_event.wait(30):
@@ -754,6 +926,11 @@ class VPNServer:
             self._data_thread.join(timeout=3)
         if self._revocation_thread and self._revocation_thread is not threading.current_thread():
             self._revocation_thread.join(timeout=3)
+        with self._handoff_lock:
+            if self._selector_open:
+                self._poke()
+        if self._selector_thread and self._selector_thread is not threading.current_thread():
+            self._selector_thread.join(timeout=3)
         for thread in list(self._client_threads):
             if thread is not threading.current_thread():
                 thread.join(timeout=3)
@@ -806,18 +983,39 @@ class VPNClient:
         import base64
         data = {"fp": fingerprint, "t": base64.b64encode(ticket).decode(),
                 "s": base64.b64encode(secret).decode(), "v": self.cfg.protocol_version}
+        path = self._ticket_path()
+        # Same directory, so os.replace stays on one filesystem; O_EXCL|O_NOFOLLOW never follows a planted link.
+        tmp = path.parent / f".pqvpn_ticket.{os.urandom(8).hex()}.tmp"
+        created = False
         try:
-            path = str(self._ticket_path())
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            created = True
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            created = False
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         except OSError:
             logger.debug("could not persist resumption ticket")
+        finally:
+            if created:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
     def _load_ticket(self, fingerprint: str) -> tuple[bytes, bytes] | None:
         import base64
         try:
-            data = json.loads(self._ticket_path().read_text(encoding="utf-8"))
+            fd = os.open(self._ticket_path(), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            with os.fdopen(fd, encoding="utf-8") as f:
+                data = json.load(f)
             if data.get("fp") != fingerprint or data.get("v") != self.cfg.protocol_version:
                 return None
             return base64.b64decode(data["t"]), base64.b64decode(data["s"])
