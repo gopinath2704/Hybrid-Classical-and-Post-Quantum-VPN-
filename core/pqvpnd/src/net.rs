@@ -207,9 +207,11 @@ pub struct Network {
 }
 
 impl Network {
-    /// Opens the TUN, configures it, and routes the server's address around it. Any failure undoes the
-    /// partial work before returning (the drop of `network`).
-    pub fn up(tun_name: &str, address: Ipv4Addr, prefix: u8, mtu: u16, server: Ipv4Addr, ipv6: Ipv6Policy) -> io::Result<Self> {
+    /// Opens the TUN, configures it, applies the IPv6 policy, routes the server's address around the TUN and then
+    /// `routes` through it (`ClientNetwork.apply` order). Any failure undoes the partial work before returning (the
+    /// drop of `network`).
+    pub fn up(tun_name: &str, address: Ipv4Addr, prefix: u8, mtu: u16, server: Ipv4Addr, ipv6: Ipv6Policy, routes: &[String])
+              -> io::Result<Self> {
         let (fd, name) = pqvpn_fd::open_tun(tun_name)?;
         let mut network = Network { tun: Some(fd), tun_name: name, undo: Vec::new(), ipv6_table: None };
         // No IPv6 on the tunnel (pqvpnd refuses IPv6 policies), and no link-local chatter the server would drop.
@@ -237,6 +239,9 @@ impl Network {
             .ok_or_else(|| io::Error::other(format!("cannot parse `ip route get {server}`: {route:?}")))?;
         let destination = format!("{server}/32");
         network.replace_route(&destination, bypass_args(server, via.as_deref(), &dev))?;
+        for cidr in routes {
+            network.replace_route(cidr, vec![cidr.clone(), "dev".into(), network.tun_name.clone()])?;
+        }
         Ok(network)
     }
 

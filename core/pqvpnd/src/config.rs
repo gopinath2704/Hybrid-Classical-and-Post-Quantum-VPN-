@@ -60,6 +60,9 @@ pub struct ClientConfig {
     pub dead_peer_timeout: f64,
     pub expected_vpn_subnet: (Ipv4Addr, u8),
     pub ipv6_policy: Ipv6Policy,
+    pub full_tunnel: bool,
+    /// Validated IPv4 networks, as written; ignored in a full tunnel, as in Python.
+    pub split_tunnel: Vec<String>,
 }
 
 /// `ipv6_policy`, as `IPv6Guard` applies it: leave IPv6 alone, drop all of it but loopback, or refuse to connect
@@ -130,11 +133,8 @@ pub fn parse(text: &str, base: &Path) -> Result<ClientConfig, ConfigError> {
         Some(_) => return Err(invalid("experimental_suite must be one of v2-ed25519, v3-kem, v3-mldsa or empty")),
     }
 
-    // Python defaults to a full tunnel with systemd-resolved DNS; pqvpnd only does split mode without DNS
-    // changes so far, so both must be stated explicitly rather than defaulted into something it cannot do.
-    if raw.full_tunnel != Some(false) {
-        return Err(unsupported("full_tunnel = true (the default): set full_tunnel = false; full-tunnel routing comes later"));
-    }
+    // Python defaults to systemd-resolved DNS; pqvpnd does not manage DNS yet, so that must be turned off explicitly.
+    let full_tunnel = raw.full_tunnel.unwrap_or(true);
     match raw.dns_mode.as_deref() {
         Some("none") => {}
         None | Some("systemd-resolved") => {
@@ -148,14 +148,16 @@ pub fn parse(text: &str, base: &Path) -> Result<ClientConfig, ConfigError> {
     if raw.dev_emulated_tun == Some(true) {
         return Err(unsupported("dev_emulated_tun = true (pqvpnd always opens a native TUN)"));
     }
-    if raw.split_tunnel.as_ref().is_some_and(|list| !list.is_empty()) {
-        return Err(unsupported("split_tunnel routes (only the VPN subnet is routed so far)"));
+    let split_tunnel = raw.split_tunnel.unwrap_or_default();
+    for route in &split_tunnel {
+        ipv4_network(route).ok_or_else(|| invalid(format!("split_tunnel: {route:?} is not an IPv4 network")))?;
     }
     if raw.dns_routing_domains.as_ref().is_some_and(|list| !list.is_empty()) {
         return Err(unsupported("dns_routing_domains"));
     }
-    // `effective_policy`: unset means "allow" in split mode, the only mode so far.
+    // `effective_policy`: unset means "block" in a full tunnel and "allow" in split mode.
     let ipv6_policy = match raw.ipv6_policy.as_deref() {
+        None if full_tunnel => Ipv6Policy::Block,
         None | Some("allow") => Ipv6Policy::Allow,
         Some("block") => Ipv6Policy::Block,
         Some("fail") => Ipv6Policy::Fail,
@@ -224,11 +226,18 @@ pub fn parse(text: &str, base: &Path) -> Result<ClientConfig, ConfigError> {
         dead_peer_timeout,
         expected_vpn_subnet,
         ipv6_policy,
+        full_tunnel,
+        split_tunnel,
     })
 }
 
 impl ClientConfig {
     /// `VPNClient._ticket_path`: next to the client private key, shared with the Python client.
+    /// What `ClientNetwork.apply` routes through the TUN: both halves of IPv4 in a full tunnel, else the split list.
+    pub fn routes(&self) -> Vec<String> {
+        if self.full_tunnel { vec!["0.0.0.0/1".into(), "128.0.0.0/1".into()] } else { self.split_tunnel.clone() }
+    }
+
     pub fn ticket_path(&self) -> PathBuf {
         self.client_identity_private_key.parent().unwrap_or(Path::new(".")).join(".pqvpn_ticket.json")
     }
@@ -299,12 +308,9 @@ handshake = "rust"
     #[test]
     fn refuses_every_option_it_cannot_honour() {
         let cases = [
-            (BENCH.replace("full_tunnel = false", ""), "full_tunnel"),
-            (BENCH.replace("full_tunnel = false", "full_tunnel = true"), "full_tunnel"),
             (BENCH.replace("dns_mode = \"none\"", ""), "dns_mode"),
             (BENCH.replace("dns_mode = \"none\"", "dns_mode = \"systemd-resolved\""), "dns_mode"),
             (format!("{BENCH}kill_switch = true"), "kill_switch"),
-            (format!("{BENCH}split_tunnel = [\"203.0.113.0/24\"]"), "split_tunnel"),
             (format!("{BENCH}dns_routing_domains = [\"corp\"]"), "dns_routing_domains"),
             (format!("{BENCH}dev_emulated_tun = true"), "dev_emulated_tun"),
             (format!("{BENCH}experimental_suite = \"v3-mldsa\""), "v3-mldsa"),
@@ -330,6 +336,19 @@ handshake = "rust"
     }
 
     #[test]
+    fn routes_follow_full_and_split_tunnel_like_python() {
+        let split = with("split_tunnel = [\"203.0.113.0/24\", \"198.51.100.7\"]").unwrap();
+        assert_eq!(split.routes(), ["203.0.113.0/24", "198.51.100.7"]);
+        assert_eq!(split.ipv6_policy, Ipv6Policy::Allow);
+        // Full tunnel is the default; the split list is then ignored and IPv6 defaults to block.
+        let full = parse(&BENCH.replace("full_tunnel = false", "split_tunnel = [\"203.0.113.0/24\"]"), Path::new("/")).unwrap();
+        assert_eq!(full.routes(), ["0.0.0.0/1", "128.0.0.0/1"]);
+        assert_eq!(full.ipv6_policy, Ipv6Policy::Block);
+        let explicit = parse(&BENCH.replace("full_tunnel = false", "full_tunnel = true\nipv6_policy = \"allow\""), Path::new("/")).unwrap();
+        assert_eq!((explicit.full_tunnel, explicit.ipv6_policy), (true, Ipv6Policy::Allow));
+    }
+
+    #[test]
     fn rejects_what_python_rejects() {
         let invalid_cases = [
             format!("{BENCH}tun_name2 = 1"),                      // unknown field
@@ -345,6 +364,8 @@ handshake = "rust"
             format!("{BENCH}ping_interval = 0.01"),
             format!("{BENCH}dead_peer_timeout = 4"),
             format!("{BENCH}ipv6_policy = \"sometimes\""),
+            format!("{BENCH}split_tunnel = [\"203.0.113.1/24\"]"),
+            format!("{BENCH}split_tunnel = [\"::/0\"]"),
             BENCH.replace("dns_servers = []", "dns_servers = [\"not-an-ip\"]"),
             BENCH.replace("ABCDEF", "XYZ"),
             BENCH.replace("server_identity_fingerprint = \"ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789\"", ""),

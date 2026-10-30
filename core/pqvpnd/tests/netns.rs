@@ -102,14 +102,24 @@ fn ipv6_refusals() {
     ip("-6 addr add 2001:db8::2/64 dev pqup0 nodad");
     let error = ipv6_preflight(Ipv6Policy::Fail).unwrap_err();
     assert!(error.to_string().contains("ipv6_policy=fail"), "{error}");
-    assert!(Network::up("pqfail0", Ipv4Addr::new(10, 8, 0, 2), 24, 1380, Ipv4Addr::new(192, 0, 2, 1), Ipv6Policy::Fail).is_err());
+    assert!(Network::up("pqfail0", Ipv4Addr::new(10, 8, 0, 2), 24, 1380, Ipv4Addr::new(192, 0, 2, 1), Ipv6Policy::Fail, &[]).is_err());
     assert!(run_ip(&["link".into(), "show".into(), "dev".into(), "pqfail0".into()], true).is_err(), "refused before leaving a TUN");
     ip("-6 addr del 2001:db8::2/64 dev pqup0");
     // No route to this server, so the bypass step fails after the guard went in: everything must be undone.
     let before = routes();
-    assert!(Network::up("pqfail0", Ipv4Addr::new(10, 8, 0, 2), 24, 1380, Ipv4Addr::new(198, 51, 100, 1), Ipv6Policy::Block).is_err());
+    assert!(Network::up("pqfail0", Ipv4Addr::new(10, 8, 0, 2), 24, 1380, Ipv4Addr::new(198, 51, 100, 1), Ipv6Policy::Block, &[]).is_err());
     assert!(!nft_tables().contains("pqvpn_client6_"), "guard removed after a failed setup");
     assert_eq!(routes(), before);
+}
+
+/// A split route the kernel rejects after one went in: the first is undone and the route it replaced comes back.
+fn split_route_rollback() {
+    ip("route add 10.99.0.0/16 via 192.0.2.254 dev pqup0");
+    let before = routes();
+    let split = ["10.99.0.0/16".to_owned(), "10.98.0.0/33".to_owned()];
+    assert!(Network::up("pqfail0", Ipv4Addr::new(10, 8, 0, 2), 24, 1380, Ipv4Addr::new(192, 0, 2, 1), Ipv6Policy::Allow, &split).is_err());
+    assert_eq!(routes(), before, "partial split routes rolled back exactly");
+    ip("route del 10.99.0.0/16 via 192.0.2.254 dev pqup0");
 }
 
 fn child() {
@@ -121,9 +131,16 @@ fn child() {
     ip("route add 192.0.2.1/32 dev pqup0 metric 77");
     ipv6_refusals();
     kill_switch_allow_set();
+    split_route_rollback();
+    // A route the full tunnel replaces, so the restore has to put it back exactly.
+    ip("route add 128.0.0.0/1 via 192.0.2.254 dev pqup0");
     let before = routes();
 
-    let network = Network::up("pqtest0", Ipv4Addr::new(10, 8, 0, 2), 24, 1380, Ipv4Addr::new(192, 0, 2, 1), Ipv6Policy::Block).unwrap();
+    let full = ["0.0.0.0/1".to_owned(), "128.0.0.0/1".to_owned()];
+    let network = Network::up("pqtest0", Ipv4Addr::new(10, 8, 0, 2), 24, 1380, Ipv4Addr::new(192, 0, 2, 1), Ipv6Policy::Block, &full).unwrap();
+    for half in full {
+        assert!(ip(&format!("route show exact {half}")).trim().ends_with("dev pqtest0 scope link"), "{half} via the TUN");
+    }
     let table = network.ipv6_table.clone().expect("block installs the guard");
     assert!(nft_tables().contains(&format!("table ip6 {table}")), "IPv6 guard present while up");
     assert!(ip("-o addr show dev pqtest0").contains("10.8.0.2/24"), "TUN address");
@@ -174,5 +191,5 @@ fn main() {
     let status = process.wait().unwrap();
     assert!(status.success(), "child failed: {status}");
     assert_eq!(last.as_deref(), Some("restored after SIGTERM"));
-    println!("netns: kill switch allow set, ipv6 fail/block refusals and rollback, TUN up, bypass route, guard, SIGTERM cleanup restored everything: ok");
+    println!("netns: kill switch allow set, ipv6 fail/block refusals and rollback, split rollback, full-tunnel routes, TUN up, bypass route, guard, SIGTERM cleanup restored everything: ok");
 }

@@ -262,7 +262,7 @@ pub fn connect(config_path: &Path, stop_signals: &SigSet) -> Result<(), ConnectE
     control.set_read_timeout(Some(SESSION_TIMEOUT)).map_err(net("control timeout"))?;
     control.set_write_timeout(Some(SESSION_TIMEOUT)).map_err(net("control timeout"))?;
 
-    let network = Network::up(&cfg.tun_name, tunnel.client_ip, tunnel.prefix, tunnel.mtu, server_ip, cfg.ipv6_policy).map_err(net("network setup"))?;
+    let network = Network::up(&cfg.tun_name, tunnel.client_ip, tunnel.prefix, tunnel.mtu, server_ip, cfg.ipv6_policy, &cfg.routes()).map_err(net("network setup"))?;
     let server_udp = SocketAddrV4::new(server_ip, tunnel.udp_port);
     let udp = udp_bind(&established, server_udp)?;
     let tun: OwnedFd = network.tun.as_ref().expect("up() opened it").try_clone().map_err(net("TUN dup"))?;
