@@ -1,0 +1,11 @@
+system,profile,metric,run,value,unit
+pqvpn-rekey,lan,rekey_ping_loss_pct,0,0.036704,percent
+pqvpn-rekey,lan,rekey_ping_total,0,5447,packets
+pqvpn-rekey,lan,rekey_epoch_transitions,0,12,count
+pqvpn-rekey,lan,rekey_control_packets,0,49,packets
+pqvpn-rekey,lan,rekey_control_bytes,0,6254,bytes
+pqvpn-rehandshake,lan,rehandshake_ping_loss_pct,0,0.0114626,percent
+pqvpn-rehandshake,lan,rehandshake_ping_total,0,8723,packets
+pqvpn-rehandshake,lan,rehandshake_epoch_transitions,0,12,count
+pqvpn-rehandshake,lan,rehandshake_control_packets,0,49,packets
+pqvpn-rehandshake,lan,rehandshake_control_bytes,0,33906,bytes
