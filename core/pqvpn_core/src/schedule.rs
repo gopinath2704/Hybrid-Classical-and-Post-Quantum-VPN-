@@ -22,7 +22,6 @@ type Key = Zeroizing<[u8; 32]>;
 type NonceBase = Zeroizing<[u8; 12]>;
 
 /// The 12 secrets of one epoch, in `_SECRET_SPECS` order. No `Debug`, no getters outside the crate.
-#[cfg_attr(not(test), allow(dead_code, reason = "read by the session state machines in slice (b); tests read them now"))]
 pub struct Secrets {
     pub(crate) client_finished: Key,
     pub(crate) server_finished: Key,
@@ -80,9 +79,9 @@ fn derive_key(ikm: &[u8], salt: &[u8], info: &[u8]) -> Key {
     out
 }
 
-/// `_derive_secrets(seed, context)`.
-fn secrets(seed: &[u8], context: &[u8]) -> Secrets {
-    Secrets {
+/// `_derive_secrets(seed, context)`, boxed so moving an epoch's secrets never copies them.
+fn secrets(seed: &[u8], context: &[u8]) -> Box<Secrets> {
+    Box::new(Secrets {
         client_finished: expand(seed, b"client finished", context),
         server_finished: expand(seed, b"server finished", context),
         data_c2s_key: expand(seed, b"data c2s key", context),
@@ -95,7 +94,7 @@ fn secrets(seed: &[u8], context: &[u8]) -> Secrets {
         control_s2c_nonce: expand(seed, b"control s2c nonce", context),
         rekey: expand(seed, b"rekey", context),
         control_confirm: expand(seed, b"control confirm", context),
-    }
+    })
 }
 
 /// The handshake inputs every suite shares.
@@ -118,14 +117,14 @@ impl Randoms<'_> {
 }
 
 /// `derive_schedule` (v2): ikm = x25519 ‖ ephemeral ML-KEM ‖ server-identity ML-KEM.
-pub fn v2(r: &Randoms<'_>, x25519: &[u8; 32], k_eph: &[u8; 32], k_identity: &[u8; 32]) -> Secrets {
+pub fn v2(r: &Randoms<'_>, x25519: &[u8; 32], k_eph: &[u8; 32], k_identity: &[u8; 32]) -> Box<Secrets> {
     let ikm = Zeroizing::new([&x25519[..], k_eph, k_identity].concat());
     let master = derive_key(&ikm, &r.salt(b"pqvpn extract"), b"pqvpn master secret");
     secrets(&master[..], &r.context(PROTOCOL_NAME, VERSION_V2))
 }
 
 /// `derive_schedule_v3`: k_s is the client→server-identity encapsulation, k_c the server→client-static one.
-pub fn v3(r: &Randoms<'_>, x25519: &[u8; 32], k_eph: &[u8; 32], k_s: &[u8; 32], k_c: &[u8; 32]) -> Secrets {
+pub fn v3(r: &Randoms<'_>, x25519: &[u8; 32], k_eph: &[u8; 32], k_s: &[u8; 32], k_c: &[u8; 32]) -> Box<Secrets> {
     let handshake = derive_key(&Zeroizing::new([&x25519[..], k_eph].concat()), &r.salt(b"pqvpn extract"), b"pqvpn v3 handshake secret");
     let auth_salt = Zeroizing::new(sha256(&[&handshake[..], r.transcript_hash]));
     let ikm = Zeroizing::new([&handshake[..], k_s, k_c].concat());
@@ -134,14 +133,14 @@ pub fn v3(r: &Randoms<'_>, x25519: &[u8; 32], k_eph: &[u8; 32], k_s: &[u8; 32], 
 }
 
 /// `derive_schedule_resume`. Its context always carries 0x30, even when a v2 session resumes.
-pub fn resume(r: &Randoms<'_>, resumption_secret: &[u8; 32], x25519: &[u8; 32], kem: &[u8; 32]) -> Secrets {
+pub fn resume(r: &Randoms<'_>, resumption_secret: &[u8; 32], x25519: &[u8; 32], kem: &[u8; 32]) -> Box<Secrets> {
     let ikm = Zeroizing::new([&resumption_secret[..], x25519, kem].concat());
     let master = derive_key(&ikm, &r.salt(b"pqvpn resume"), b"pqvpn resume master secret");
     secrets(&master[..], &r.context(RESUMPTION_PROTOCOL, VERSION_V3))
 }
 
 /// `derive_next_epoch`: the symmetric rekey. The caller checks `epoch == current + 1`.
-pub fn next_epoch(rekey_secret: &[u8; 32], session_id: &[u8; 32], epoch: u32, nonce: &[u8; 32]) -> Secrets {
+pub fn next_epoch(rekey_secret: &[u8; 32], session_id: &[u8; 32], epoch: u32, nonce: &[u8; 32]) -> Box<Secrets> {
     let context = [&session_id[..], &epoch.to_be_bytes(), nonce].concat();
     let seed: Key = expand(rekey_secret, b"epoch", &context);
     secrets(&seed[..], &context)
@@ -149,7 +148,7 @@ pub fn next_epoch(rekey_secret: &[u8; 32], session_id: &[u8; 32], epoch: u32, no
 
 /// `derive_rehandshake_epoch`. The seed is plain SHA-256, not HKDF. The caller checks the epoch.
 pub fn rehandshake_epoch(rekey_secret: &[u8; 32], session_id: &[u8; 32], epoch: u32, dh: &[u8; 32], kem: &[u8; 32],
-                         transcript: &[u8]) -> Option<Secrets> {
+                         transcript: &[u8]) -> Option<Box<Secrets>> {
     if transcript.is_empty() {
         return None;
     }

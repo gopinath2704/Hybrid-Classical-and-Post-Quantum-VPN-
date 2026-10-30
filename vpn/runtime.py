@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import enum
-import hashlib
-import hmac
 import ipaddress
 import json
 import logging
@@ -27,7 +25,7 @@ from handshake.kemtls import (Channel, DATA_HEADER_FORMAT, DATA_HEADER_SIZE, DAT
     KEMTLSClientV3, KEMTLSServerV3, PROTOCOL_VERSION_V3, PROTOCOL_VERSION_V3_MLDSA, HEADER_SIZE, HEADER_FORMAT,
     MessageType, CookieProtector, pack_cookie_challenge, unpack_cookie_challenge,
     pack_cookie_response, unpack_cookie_response,
-    ResumptionTicketKey, ResumptionClientHandshake, ResumptionServerHandshake)
+    ResumptionTicketKey, ResumptionClientHandshake, ResumptionServerHandshake, _core)
 from vpn.config import ClientConfig, ServerConfig, validate_server, validate_client
 from vpn.network import NetworkQualityMonitor, TUNInterface, TUNMode
 from vpn.identity import AuthorizedClients, load_client_kem_private, load_client_private, validate_server_identity
@@ -382,15 +380,20 @@ class VPNServer:
         self.tun = self.udp = self.tcp = None
         self.slots = threading.BoundedSemaphore(config.max_clients)
         self.rate_limiter = SourceRateLimiter(config.connections_per_source, config.rate_limit_window)
-        self.identity_secret, self.identity_public = validate_server_identity(
-            Path(config.server_identity_private_key), Path(config.server_identity_public_key))
+        if config.handshake == "rust":
+            # pqvpn_core reads and checks the private key itself; Python never holds it.
+            self.identity_public = Path(config.server_identity_public_key).read_bytes()
+            self.identity_secret = _core().Identity.kem_file(config.server_identity_private_key, self.identity_public)
+        else:
+            self.identity_secret, self.identity_public = validate_server_identity(
+                Path(config.server_identity_private_key), Path(config.server_identity_public_key))
         records = self.auth._load(required=True, subnet=config.vpn_subnet, server_ip=config.server_vpn_ip)
         self.pool.reserved = {item['assigned_ip']: item['client_id'] for item in records['clients'] if item.get('assigned_ip')}
         self._data_thread = None
         self._dp = None
         self._client_threads: list[threading.Thread] = []
         self._cookie = CookieProtector() if config.cookie_mode != "off" else None
-        self._ticket_key = ResumptionTicketKey() if config.resumption_ticket_lifetime > 0 else None
+        self._ticket_key = self._new_ticket_key() if config.resumption_ticket_lifetime > 0 else None
         self._pending_handshakes = 0
         self._pending_lock = threading.Lock()
         self._revocation_thread = None
@@ -453,6 +456,9 @@ class VPNServer:
         finally:
             self._close_listeners()
 
+    def _new_ticket_key(self) -> object:
+        return _core().TicketKey() if self.cfg.handshake == "rust" else ResumptionTicketKey()
+
     def _needs_cookie(self) -> bool:
         if self._cookie is None:
             return False
@@ -481,11 +487,13 @@ class VPNServer:
                 resume = ResumptionServerHandshake(
                     self._ticket_key,
                     PROTOCOL_VERSION_V3 if self.cfg.protocol_version == 3 else PROTOCOL_VERSION,
-                    data_plane=self.cfg.data_plane)
+                    data_plane=self.cfg.data_plane, handshake=self.cfg.handshake)
                 accept_wire, session = resume.process_hello(first_msg)
                 # Tickets outlive authorization; re-check so a revoked or signed-out
                 # client cannot resume before the revocation loop rotates the ticket key.
+                # The crypto is done, but nothing is sent, leased or registered before this check.
                 if not self.auth.is_client_authorized(session.client_id):
+                    session.secure_wipe()
                     raise HandshakeError("unauthorized: client authorization revoked")
                 send_message(connection, accept_wire)
                 assigned_ip_hint = resume.assigned_ip or None
@@ -493,10 +501,10 @@ class VPNServer:
                 client_hello_wire = self._cookie_gate(connection, address, first_msg)
                 if self.cfg.protocol_version == 3:
                     handshake = KEMTLSServerV3(self.identity_secret, self.identity_public, self.auth.find_by_fingerprint,
-                                               data_plane=self.cfg.data_plane)
+                                               data_plane=self.cfg.data_plane, handshake=self.cfg.handshake)
                 else:
                     handshake = KEMTLSServer(self.identity_secret, self.identity_public, self.auth.find,
-                                             data_plane=self.cfg.data_plane)
+                                             data_plane=self.cfg.data_plane, handshake=self.cfg.handshake)
                 send_message(connection, handshake.process_client_hello(client_hello_wire))
                 finished, session = handshake.process_client_key_exchange(recv_message(connection))
                 send_message(connection, finished)
@@ -514,9 +522,7 @@ class VPNServer:
             send_message(connection, session.encrypt_control(config, FrameType.CONFIG))
             # Issue resumption ticket for next connect
             if resumption_enabled:
-                ticket = self._ticket_key.issue(
-                    bytes(session.secrets.rekey_secret), session.client_id,
-                    session.protocol_version, self.cfg.resumption_ticket_lifetime, vpn_ip)
+                ticket = session.issue_ticket(self._ticket_key, self.cfg.resumption_ticket_lifetime, vpn_ip)
                 send_message(connection, session.encrypt_control(ticket, FrameType.RESUMPTION_TICKET))
             # From here the selector thread owns the socket and the session; this thread exits.
             connection.setblocking(False)
@@ -741,39 +747,15 @@ class VPNServer:
     def _rekey_server(self, item: ServerSession, payload: bytes) -> None:
         if not self.auth.is_client_authorized(item.client_id):
             raise HandshakeError("client authorization revoked")
-        if len(payload) != 36:
-            raise HandshakeError("invalid rekey request")
-        epoch, nonce = struct.unpack("!I", payload[:4])[0], payload[4:]
-        next_keys = item.crypto.derive_next_epoch(epoch, nonce)
-        confirmation = hmac.new(bytes(item.crypto.secrets.control_confirm_key),
-                                b"rekey response" + payload, hashlib.sha256).digest()
-        send_message(item.control, item.crypto.encrypt_control(payload[:4] + confirmation, FrameType.REKEY_RESPONSE))
-        item.crypto.activate_epoch(epoch, next_keys)
-        logger.info("rekey complete epoch=%d client_id=%s", epoch, item.client_id)
+        # Derives, confirms under the old key, seals under the old keys, then activates: all inside the session.
+        send_message(item.control, item.crypto.respond_rekey(payload))
+        logger.info("rekey complete epoch=%d client_id=%s", item.crypto.epoch, item.client_id)
 
     def _rehandshake_server(self, item: ServerSession, payload: bytes) -> None:
         if not self.auth.is_client_authorized(item.client_id):
             raise HandshakeError("client authorization revoked")
-        from crypto.hybrid_crypto import HybridKEM
-        expected_len = 4 + 32 + 1184
-        if len(payload) != expected_len:
-            raise HandshakeError("invalid rehandshake request")
-        epoch = struct.unpack("!I", payload[:4])[0]
-        client_dh_pub = payload[4:36]
-        client_kem_pub = payload[36:]
-        hybrid = HybridKEM("ML-KEM-768")
-        server_dh_private, server_dh_public = hybrid.ecc.generate_keypair()
-        dh_ss = hybrid.ecc.derive_shared_secret(server_dh_private, client_dh_pub)
-        ct, k_mlkem = hybrid.pqc.encapsulate(client_kem_pub)
-        response_body = struct.pack("!I", epoch) + server_dh_public + ct
-        transcript = payload + response_body
-        next_keys = item.crypto.derive_rehandshake_epoch(epoch, dh_ss, k_mlkem, transcript)
-        confirmation = hmac.new(bytes(next_keys.control_confirm_key),
-                                b"rehandshake confirm" + transcript, hashlib.sha256).digest()
-        response = response_body + confirmation
-        send_message(item.control, item.crypto.encrypt_control(response, FrameType.REHANDSHAKE_RESPONSE))
-        item.crypto.activate_epoch(epoch, next_keys)
-        logger.info("rehandshake complete epoch=%d client_id=%s", epoch, item.client_id)
+        send_message(item.control, item.crypto.respond_rehandshake(payload))
+        logger.info("rehandshake complete epoch=%d client_id=%s", item.crypto.epoch, item.client_id)
 
     def _enabled_client_ids(self) -> set[str]:
         try:
@@ -787,7 +769,7 @@ class VPNServer:
         old = self._last_auth_snapshot
         self._last_auth_snapshot = enabled
         if old is not None and old - enabled and self._ticket_key is not None:
-            self._ticket_key = ResumptionTicketKey()
+            self._ticket_key = self._new_ticket_key()
             logger.info("resumption ticket key rotated due to client revocation")
         for item in list(self.sessions._snap_id.values()):
             if item.client_id not in enabled:
@@ -1042,13 +1024,20 @@ class VPNClient:
             self.control = set_nodelay(socket.create_connection((self.server_ip, self.cfg.server_control_port), timeout=10))
             # Try 1-RTT resumption first, fall back to full handshake
             resumed = False
-            saved = self._load_ticket(self.cfg.server_identity_fingerprint)
-            if saved is not None:
-                ticket, resume_secret = saved
+            version = PROTOCOL_VERSION_V3 if self.cfg.protocol_version == 3 else PROTOCOL_VERSION
+            rust = self.cfg.handshake == "rust"
+            if rust:
+                resume = ResumptionClientHandshake.from_ticket_file(
+                    self._ticket_path(), self.cfg.server_identity_fingerprint, self.cfg.protocol_version, version)
+                ticket = None
+            else:
+                saved = self._load_ticket(self.cfg.server_identity_fingerprint)
+                resume = ticket = None
+                if saved is not None:
+                    ticket, resume_secret = saved
+                    resume = ResumptionClientHandshake(resume_secret, version, data_plane=self.cfg.data_plane)
+            if resume is not None:
                 try:
-                    resume = ResumptionClientHandshake(resume_secret,
-                        PROTOCOL_VERSION_V3 if self.cfg.protocol_version == 3 else PROTOCOL_VERSION,
-                        data_plane=self.cfg.data_plane)
                     send_message(self.control, resume.initiate(ticket))
                     self.session = resume.process_accept(recv_message(self.control))
                     resumed = True
@@ -1059,15 +1048,18 @@ class VPNClient:
                     self.control = set_nodelay(socket.create_connection(
                         (self.server_ip, self.cfg.server_control_port), timeout=10))
             if not resumed:
+                private_path = self.cfg.client_identity_private_key
                 if self.cfg.protocol_version == 3:
-                    client_secret = load_client_kem_private(Path(self.cfg.client_identity_private_key))
                     client_public = Path(self.cfg.client_identity_public_key).read_bytes()
-                    handshake = KEMTLSClientV3(identity, self.cfg.server_identity_fingerprint,
-                                               client_secret, client_public, data_plane=self.cfg.data_plane)
+                    # In rust mode pqvpn_core reads the private key itself; Python never holds it.
+                    client_secret = (_core().Identity.kem_file(private_path, client_public) if rust
+                                     else load_client_kem_private(Path(private_path)))
+                    handshake = KEMTLSClientV3(identity, self.cfg.server_identity_fingerprint, client_secret, client_public,
+                                               data_plane=self.cfg.data_plane, handshake=self.cfg.handshake)
                 else:
-                    private = load_client_private(Path(self.cfg.client_identity_private_key))
+                    private = _core().Identity.ed25519_file(private_path) if rust else load_client_private(Path(private_path))
                     handshake = KEMTLSClient(identity, self.cfg.server_identity_fingerprint, private,
-                                             data_plane=self.cfg.data_plane)
+                                             data_plane=self.cfg.data_plane, handshake=self.cfg.handshake)
                 client_hello_wire = handshake.initiate_handshake()
                 send_message(self.control, client_hello_wire)
                 server_reply = recv_message(self.control)
@@ -1087,7 +1079,11 @@ class VPNClient:
                 try:
                     frame = recv_message(self.control)
                     kind, ticket_data = self.session.decrypt_control(frame)
-                    if kind == FrameType.RESUMPTION_TICKET:
+                    if kind == FrameType.RESUMPTION_TICKET and rust:
+                        # pqvpn_core writes the file (same format and write discipline) with the secret it holds.
+                        self.session.save_ticket(self._ticket_path(), self.cfg.server_identity_fingerprint,
+                                                 self.cfg.protocol_version, ticket_data)
+                    elif kind == FrameType.RESUMPTION_TICKET:
                         self._save_ticket(ticket_data, bytes(self.session.secrets.rekey_secret),
                                           self.cfg.server_identity_fingerprint)
                 except (HandshakeError, OSError):
@@ -1285,38 +1281,33 @@ class VPNClient:
     def rekey(self) -> None:
         if not self._rekey_lock.acquire(blocking=False):
             raise HandshakeError("rekey already in progress")
-        pending = None
-        failed = False
+        begun = failed = False
         try:
             if self.rekey_state != RekeyState.IDLE:
                 raise HandshakeError("rekey already in progress")
             self.rekey_state = RekeyState.REQUESTED
-            epoch, nonce = self.session.epoch + 1, os.urandom(32)
-            payload = struct.pack("!I", epoch) + nonce
-            pending = self.session.derive_next_epoch(epoch, nonce)
+            # The session derives and holds the next epoch; its secrets never surface here.
+            request = self.session.begin_rekey()
+            begun = True
             self.rekey_state = RekeyState.WAITING_CONFIRMATION
             with self._control_write_lock:
-                send_message(self.control, self.session.encrypt_control(payload, FrameType.REKEY_REQUEST))
+                send_message(self.control, request)
             if self._control_thread is None:  # synchronous protocol harness
                 _, response = self.session.decrypt_control(recv_message(self.control), FrameType.REKEY_RESPONSE)
             else:
                 response = self._responses.get(timeout=10)
                 if response is None or self.stop_event.is_set():
                     raise HandshakeError("session closed during rekey")
-            expected = hmac.new(bytes(self.session.secrets.control_confirm_key),
-                                b"rekey response" + payload, hashlib.sha256).digest()
-            if response[:4] != payload[:4] or not hmac.compare_digest(response[4:], expected):
-                raise HandshakeError("invalid rekey confirmation")
             self.rekey_state = RekeyState.ACTIVATING
-            self.session.activate_epoch(epoch, pending)
-            logger.info("rekey complete epoch=%d", epoch)
-            pending = None
+            begun = False
+            self.session.finish_rekey(response)
+            logger.info("rekey complete epoch=%d", self.session.epoch)
         except Exception:
             failed = True
             raise
         finally:
-            if pending:
-                pending.wipe()
+            if begun:
+                self.session.abort_epoch_change()
             self._epoch_ready.set()
             self.rekey_state = RekeyState.IDLE
             self._rekey_lock.release()
@@ -1325,24 +1316,18 @@ class VPNClient:
 
     def rehandshake(self) -> None:
         """PCS re-handshake: fresh X25519 + ML-KEM ephemeral material."""
-        from crypto.hybrid_crypto import HybridKEM
         if not self._rekey_lock.acquire(blocking=False):
             raise HandshakeError("rekey/rehandshake already in progress")
-        pending = None
-        failed = False
+        begun = failed = False
         try:
             if self.rekey_state != RekeyState.IDLE:
                 raise HandshakeError("rekey/rehandshake already in progress")
             self.rekey_state = RekeyState.REQUESTED
-            epoch = self.session.epoch + 1
-            hybrid = HybridKEM("ML-KEM-768")
-            dh_private, dh_public = hybrid.ecc.generate_keypair()
-            kem_secret, kem_public = hybrid.pqc.generate_keypair()
-            payload = struct.pack("!I", epoch) + dh_public + kem_public
+            request = self.session.begin_rehandshake()
+            begun = True
             self.rekey_state = RekeyState.WAITING_CONFIRMATION
             with self._control_write_lock:
-                send_message(self.control, self.session.encrypt_control(
-                    payload, FrameType.REHANDSHAKE_REQUEST))
+                send_message(self.control, request)
             if self._control_thread is None:
                 _, response = self.session.decrypt_control(
                     recv_message(self.control), FrameType.REHANDSHAKE_RESPONSE)
@@ -1350,34 +1335,16 @@ class VPNClient:
                 response = self._responses.get(timeout=15)
                 if response is None or self.stop_event.is_set():
                     raise HandshakeError("session closed during rehandshake")
-            expected_len = 4 + 32 + 1088 + 32
-            if len(response) != expected_len:
-                raise HandshakeError("invalid rehandshake response length")
-            resp_epoch = struct.unpack("!I", response[:4])[0]
-            if resp_epoch != epoch:
-                raise HandshakeError("rehandshake epoch mismatch")
-            response_body = response[:4 + 32 + 1088]
-            server_confirm = response[4 + 32 + 1088:]
-            server_dh_public = response[4:36]
-            ct = response[36:36 + 1088]
-            dh_ss = hybrid.ecc.derive_shared_secret(dh_private, server_dh_public)
-            k_mlkem = hybrid.pqc.decapsulate(kem_secret, ct)
-            transcript = payload + response_body
-            pending = self.session.derive_rehandshake_epoch(epoch, dh_ss, k_mlkem, transcript)
-            expected_confirm = hmac.new(bytes(pending.control_confirm_key),
-                                        b"rehandshake confirm" + transcript, hashlib.sha256).digest()
-            if not hmac.compare_digest(server_confirm, expected_confirm):
-                raise HandshakeError("rehandshake key confirmation failed")
             self.rekey_state = RekeyState.ACTIVATING
-            self.session.activate_epoch(epoch, pending)
-            logger.info("rehandshake complete epoch=%d", epoch)
-            pending = None
+            begun = False
+            self.session.finish_rehandshake(response)
+            logger.info("rehandshake complete epoch=%d", self.session.epoch)
         except Exception:
             failed = True
             raise
         finally:
-            if pending:
-                pending.wipe()
+            if begun:
+                self.session.abort_epoch_change()
             self._epoch_ready.set()
             self.rekey_state = RekeyState.IDLE
             self._rekey_lock.release()

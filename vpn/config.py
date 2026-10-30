@@ -30,6 +30,7 @@ class ServerConfig:
     service_user:str="pqvpn"
     experimental_suite:str=""
     data_plane:str="python"
+    handshake:str="python"
 @dataclass
 class ClientConfig:
     server_host:str="127.0.0.1"; server_control_port:int=51820
@@ -38,6 +39,7 @@ class ClientConfig:
     client_identity_public_key:str="config/client_identity_public.key"
     protocol_version:int=2
     data_plane:str="python"
+    handshake:str="python"
     full_tunnel:bool=True
     split_tunnel:list[str]=field(default_factory=list); dns_servers:list[str]=field(default_factory=list); kill_switch:bool=False
     tun_name:str="pqvpn0"; dev_emulated_tun:bool=False
@@ -112,6 +114,7 @@ def validate_server(cfg: ServerConfig, *, test_ports=False) -> None:
     if not isinstance(cfg.listen_host, str) or not cfg.listen_host: raise ValueError('listen_host must be nonempty')
     if cfg.protocol_version not in (2, 3): raise ValueError('protocol_version must be 2 or 3')
     data_plane(cfg.data_plane)
+    handshake_backend(cfg)
     if cfg.cookie_mode not in ('off', 'under_load', 'always'): raise ValueError('cookie_mode must be off, under_load, or always')
     number(cfg.cookie_threshold, 'cookie_threshold', 1, integer=True)
     number(cfg.resumption_ticket_lifetime, 'resumption_ticket_lifetime', 0, 604800, True)
@@ -126,6 +129,14 @@ def data_plane(value: object) -> None:
             importlib.import_module('pqvpn_core')
         except ImportError as exc:
             raise ValueError('data_plane = "rust" requires the pqvpn_core module (build core/ with maturin)') from exc
+
+
+def handshake_backend(cfg: ServerConfig | ClientConfig) -> None:
+    if cfg.handshake not in ('python', 'rust'): raise ValueError('handshake must be python or rust')
+    if cfg.handshake == 'rust':
+        # The Rust session owns the data keys, so they never come back up to a Python data plane.
+        if cfg.data_plane != 'rust': raise ValueError('handshake = "rust" requires data_plane = "rust"')
+        if cfg.experimental_suite == 'v3-mldsa': raise ValueError('handshake = "rust" does not support v3-mldsa')
 
 
 def validate_client(cfg: ClientConfig) -> None:
@@ -150,5 +161,6 @@ def validate_client(cfg: ClientConfig) -> None:
         if type(getattr(cfg, name)) is not bool: raise ValueError(f'{name} must be boolean')
     if cfg.protocol_version not in (2, 3): raise ValueError('protocol_version must be 2 or 3')
     data_plane(cfg.data_plane)
+    handshake_backend(cfg)
     if cfg.experimental_suite and cfg.experimental_suite not in _VALID_SUITES:
         raise ValueError(f'experimental_suite must be one of {sorted(_VALID_SUITES)} or empty')

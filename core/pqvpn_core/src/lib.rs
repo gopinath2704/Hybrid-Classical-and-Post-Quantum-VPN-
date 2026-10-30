@@ -223,6 +223,269 @@ impl Drop for PyDataPlane {
     }
 }
 
+fn handshake_error(error: handshake::Error) -> PyErr {
+    PyValueError::new_err(error.message())
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn suite(version: u8) -> PyResult<handshake::Suite> {
+    handshake::Suite::from_version(version).map_err(handshake_error)
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// A long-term identity; the secret goes in once and never comes back out.
+#[pyclass(frozen, name = "Identity")]
+struct PyIdentity(Arc<handshake::Identity>);
+
+fn read_private(path: &str) -> PyResult<zeroize::Zeroizing<Vec<u8>>> {
+    handshake::read_private(std::path::Path::new(path)).map_err(|e| match e.kind() {
+        std::io::ErrorKind::InvalidData => PyValueError::new_err(e.to_string()),
+        _ => PyOSError::new_err(e.to_string()),
+    })
+}
+
+#[pymethods]
+impl PyIdentity {
+    /// The v2 client: a 32-byte Ed25519 seed.
+    #[staticmethod]
+    fn ed25519(seed: &[u8]) -> PyResult<Self> {
+        Ok(Self(Arc::new(handshake::Identity::ed25519(seed).map_err(handshake_error)?)))
+    }
+
+    /// An ML-KEM-768 identity (server, or v3 client); the keypair must be consistent.
+    #[staticmethod]
+    fn kem(secret: &[u8], public: &[u8]) -> PyResult<Self> {
+        Ok(Self(Arc::new(handshake::Identity::kem(secret, public).map_err(handshake_error)?)))
+    }
+
+    /// Reads the private key itself (no symlinks, regular file, mode 0600 or 0400), so Python never holds it.
+    #[staticmethod]
+    fn ed25519_file(path: &str) -> PyResult<Self> {
+        Self::ed25519(&read_private(path)?)
+    }
+
+    #[staticmethod]
+    fn kem_file(path: &str, public: &[u8]) -> PyResult<Self> {
+        Self::kem(&read_private(path)?, public)
+    }
+}
+
+/// An established session: control channel, epoch changes, tickets, and the data channel the data plane shares.
+#[pyclass(frozen, name = "Session")]
+struct PySession {
+    inner: Mutex<Option<handshake::Established>>,
+    data: Arc<session::Session>,
+    session_id: [u8; 32],
+    role: &'static str,
+    version: u8,
+}
+
+impl PySession {
+    fn wrap(established: handshake::Established) -> Self {
+        Self {
+            data: established.data(),
+            session_id: *established.session_id(),
+            role: if established.role() == session::Role::Client { "client" } else { "server" },
+            version: established.version(),
+            inner: Mutex::new(Some(established)),
+        }
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&mut handshake::Established) -> Result<T, handshake::Error>) -> PyResult<T> {
+        let mut inner = lock(&self.inner);
+        let established = inner.as_mut().ok_or_else(|| kind(session::Error::Closed))?;
+        f(established).map_err(handshake_error)
+    }
+}
+
+#[pymethods]
+impl PySession {
+    #[getter]
+    fn session_id<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.session_id)
+    }
+
+    #[getter]
+    fn role(&self) -> &'static str {
+        self.role
+    }
+
+    #[getter]
+    fn protocol_version(&self) -> u8 {
+        self.version
+    }
+
+    #[getter]
+    fn epoch(&self) -> PyResult<u32> {
+        self.with(|s| Ok(s.epoch()))
+    }
+
+    /// The data channel, for `DataPlane.add_session` and `seal`/`open`; the same object the data plane holds.
+    fn data(&self) -> PyDataSession {
+        PyDataSession(self.data.clone())
+    }
+
+    fn seal_control<'py>(&self, py: Python<'py>, frame_type: u8, payload: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+        self.with(|s| s.seal_control(frame_type, payload)).map(|f| PyBytes::new(py, &f))
+    }
+
+    #[pyo3(signature = (frame, expected_type=None))]
+    fn open_control<'py>(&self, py: Python<'py>, frame: &[u8], expected_type: Option<u8>) -> PyResult<(u8, Bound<'py, PyBytes>)> {
+        self.with(|s| s.open_control(frame, expected_type)).map(|(t, p)| (t, PyBytes::new(py, &p)))
+    }
+
+    fn begin_rekey<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        self.with(|s| s.begin_rekey(&mut handshake::Os)).map(|f| PyBytes::new(py, &f))
+    }
+
+    fn finish_rekey(&self, response: &[u8]) -> PyResult<()> {
+        self.with(|s| s.finish_rekey(response))
+    }
+
+    fn respond_rekey<'py>(&self, py: Python<'py>, request: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+        self.with(|s| s.respond_rekey(request)).map(|f| PyBytes::new(py, &f))
+    }
+
+    fn begin_rehandshake<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        self.with(|s| s.begin_rehandshake(&mut handshake::Os)).map(|f| PyBytes::new(py, &f))
+    }
+
+    fn finish_rehandshake(&self, response: &[u8]) -> PyResult<()> {
+        self.with(|s| s.finish_rehandshake(response))
+    }
+
+    fn respond_rehandshake<'py>(&self, py: Python<'py>, request: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+        self.with(|s| s.respond_rehandshake(&mut handshake::Os, request)).map(|f| PyBytes::new(py, &f))
+    }
+
+    fn abort_epoch_change(&self) {
+        if let Some(s) = lock(&self.inner).as_mut() {
+            s.abort_epoch_change();
+        }
+    }
+
+    fn issue_ticket<'py>(&self, py: Python<'py>, key: &PyTicketKey, client_id: &str, lifetime: i64,
+                         assigned_ip: &str) -> PyResult<Bound<'py, PyBytes>> {
+        self.with(|s| s.issue_ticket(&mut handshake::Os, &key.0, client_id, lifetime, assigned_ip, unix_now()))
+            .map(|t| PyBytes::new(py, &t))
+    }
+
+    /// Writes the client's ticket file with the resumption secret; raises OSError on failure.
+    fn save_ticket(&self, path: &str, fingerprint: &str, protocol_version: u8, ticket: &[u8]) -> PyResult<()> {
+        let inner = lock(&self.inner);
+        let established = inner.as_ref().ok_or_else(|| kind(session::Error::Closed))?;
+        established.save_ticket(std::path::Path::new(path), fingerprint, protocol_version, ticket)
+            .map_err(|e| PyOSError::new_err(e.to_string()))
+    }
+
+    /// Wipes every secret now and closes the data channel for the data plane too. Idempotent.
+    fn close(&self) {
+        self.data.close();
+        lock(&self.inner).take();
+    }
+}
+
+#[pyclass(frozen, name = "TicketKey")]
+struct PyTicketKey(handshake::TicketKey);
+
+#[pymethods]
+impl PyTicketKey {
+    #[new]
+    fn new() -> PyResult<Self> {
+        Ok(Self(handshake::TicketKey::new(&mut handshake::Os).map_err(handshake_error)?))
+    }
+}
+
+#[pyclass(frozen, name = "ClientHandshake")]
+struct PyClientHandshake(Mutex<handshake::ClientHandshake>);
+
+#[pymethods]
+impl PyClientHandshake {
+    #[new]
+    fn new(version: u8, server_public: &[u8], fingerprint: &str, identity: &PyIdentity) -> PyResult<Self> {
+        let machine = handshake::ClientHandshake::new(suite(version)?, server_public, fingerprint, identity.0.clone());
+        Ok(Self(Mutex::new(machine.map_err(handshake_error)?)))
+    }
+
+    fn hello<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        lock(&self.0).hello(&mut handshake::Os).map(|w| PyBytes::new(py, &w)).map_err(handshake_error)
+    }
+
+    fn on_server_hello<'py>(&self, py: Python<'py>, wire: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+        lock(&self.0).on_server_hello(&mut handshake::Os, wire).map(|w| PyBytes::new(py, &w)).map_err(handshake_error)
+    }
+
+    fn on_server_finished(&self, wire: &[u8]) -> PyResult<PySession> {
+        lock(&self.0).on_server_finished(wire).map(PySession::wrap).map_err(handshake_error)
+    }
+}
+
+#[pyclass(frozen, name = "ServerHandshake")]
+struct PyServerHandshake(Mutex<handshake::ServerHandshake>);
+
+#[pymethods]
+impl PyServerHandshake {
+    #[new]
+    fn new(version: u8, identity: &PyIdentity) -> PyResult<Self> {
+        Ok(Self(Mutex::new(handshake::ServerHandshake::new(suite(version)?, identity.0.clone()).map_err(handshake_error)?)))
+    }
+
+    /// What the caller authorizes: the Ed25519 public key (v2) or the identity hash (v3).
+    fn client_identity<'py>(&self, py: Python<'py>, wire: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+        lock(&self.0).client_identity(wire).map(|id| PyBytes::new(py, &id)).map_err(handshake_error)
+    }
+
+    #[pyo3(signature = (client_kem_public=None))]
+    fn respond<'py>(&self, py: Python<'py>, client_kem_public: Option<&[u8]>) -> PyResult<Bound<'py, PyBytes>> {
+        lock(&self.0).respond(&mut handshake::Os, client_kem_public).map(|w| PyBytes::new(py, &w)).map_err(handshake_error)
+    }
+
+    fn on_key_exchange<'py>(&self, py: Python<'py>, wire: &[u8]) -> PyResult<(Bound<'py, PyBytes>, PySession)> {
+        let (finished, established) = lock(&self.0).on_key_exchange(wire).map_err(handshake_error)?;
+        Ok((PyBytes::new(py, &finished), PySession::wrap(established)))
+    }
+}
+
+#[pyclass(frozen, name = "ResumeClient")]
+struct PyResumeClient(Mutex<handshake::ResumeClient>);
+
+#[pymethods]
+impl PyResumeClient {
+    #[new]
+    fn new(version: u8, secret: &[u8], ticket: &[u8]) -> PyResult<Self> {
+        let secret = zeroize::Zeroizing::new(secret.try_into().map_err(|_| handshake_error(handshake::Error::Ticket))?);
+        Ok(Self(Mutex::new(handshake::ResumeClient::new(version, secret, ticket.to_vec()))))
+    }
+
+    /// From the ticket file, or None if there is no usable ticket for this server and protocol version.
+    #[staticmethod]
+    fn load(path: &str, fingerprint: &str, protocol_version: u8, version: u8) -> Option<Self> {
+        handshake::ResumeClient::load(std::path::Path::new(path), fingerprint, protocol_version, version).map(|c| Self(Mutex::new(c)))
+    }
+
+    fn hello<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        lock(&self.0).hello(&mut handshake::Os).map(|w| PyBytes::new(py, &w)).map_err(handshake_error)
+    }
+
+    fn on_accept(&self, wire: &[u8]) -> PyResult<PySession> {
+        lock(&self.0).on_accept(wire).map(PySession::wrap).map_err(handshake_error)
+    }
+}
+
+/// (accept, session, client_id, assigned_ip). The caller re-checks authorization before sending the accept.
+#[pyfunction]
+fn resume_server<'py>(py: Python<'py>, key: &PyTicketKey, wire: &[u8], version: u8) -> PyResult<(Bound<'py, PyBytes>, PySession, String, String)> {
+    let (accept, established, client_id, assigned_ip) =
+        handshake::resume_server(&mut handshake::Os, &key.0, wire, version, unix_now()).map_err(handshake_error)?;
+    Ok((PyBytes::new(py, &accept), PySession::wrap(established), client_id, assigned_ip))
+}
+
 /// Inner-packet check after decryption: server checks the source lease, client its destination.
 #[pyfunction]
 fn inbound_ok(role_name: &str, packet: &[u8], address: [u8; 4], mtu: usize) -> PyResult<bool> {
@@ -236,6 +499,13 @@ fn inbound_ok(role_name: &str, packet: &[u8], address: [u8; 4], mtu: usize) -> P
 fn pqvpn_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encrypt_frame, m)?)?;
     m.add_function(wrap_pyfunction!(inbound_ok, m)?)?;
+    m.add_function(wrap_pyfunction!(resume_server, m)?)?;
+    m.add_class::<PyIdentity>()?;
+    m.add_class::<PySession>()?;
+    m.add_class::<PyTicketKey>()?;
+    m.add_class::<PyClientHandshake>()?;
+    m.add_class::<PyServerHandshake>()?;
+    m.add_class::<PyResumeClient>()?;
     m.add_class::<PyDataSession>()?;
     m.add_class::<PyDataPlane>()
 }

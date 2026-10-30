@@ -447,15 +447,17 @@ def test_control_connection_disables_nagle_at_both_ends(connected):
         assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
 
 
-@pytest.mark.parametrize('server_plane, client_plane', [('rust', 'python'), ('python', 'rust')])
+@pytest.mark.parametrize('server_plane, client_plane, server_hs, client_hs', [
+    ('rust', 'python', 'python', 'python'), ('python', 'rust', 'python', 'python'),
+    ('rust', 'rust', 'rust', 'python'), ('rust', 'rust', 'python', 'rust'), ('rust', 'rust', 'rust', 'rust')])
 @pytest.mark.parametrize('version', [2, 3])
-def test_mixed_data_planes_interoperate_end_to_end(tmp_path, version, server_plane, client_plane):
+def test_mixed_data_planes_interoperate_end_to_end(tmp_path, caplog, version, server_plane, client_plane, server_hs, client_hs):
     pytest.importorskip('pqvpn_core')
     from vpn.identity import generate_client_identity_kem
     fp = generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
     (generate_client_identity_kem if version == 3 else generate_client_identity)(tmp_path/'client.key', tmp_path/'client.pub')
     AuthorizedClients(tmp_path/'clients.json').authorize((tmp_path/'client.pub').read_bytes(), 'mixed')
-    server = runtime.VPNServer(ServerConfig(data_plane=server_plane, protocol_version=version, listen_host='127.0.0.1',
+    server = runtime.VPNServer(ServerConfig(data_plane=server_plane, handshake=server_hs, protocol_version=version, listen_host='127.0.0.1',
         control_port=0, udp_port=0, server_identity_private_key=str(tmp_path/'server.key'),
         server_identity_public_key=str(tmp_path/'server.pub'), authorized_clients_file=str(tmp_path/'clients.json'),
         dev_emulated_tun=True, tun_name='pqmix0', dns_servers=[], rekey_interval=0))
@@ -465,7 +467,7 @@ def test_mixed_data_planes_interoperate_end_to_end(tmp_path, version, server_pla
     try:
         until(lambda: server._data_thread is not None and server._data_thread.is_alive())
         server.cfg.udp_port = server.udp.getsockname()[1]
-        client = runtime.VPNClient(ClientConfig(data_plane=client_plane, protocol_version=version, server_host='127.0.0.1',
+        client = runtime.VPNClient(ClientConfig(data_plane=client_plane, handshake=client_hs, protocol_version=version, server_host='127.0.0.1',
             server_control_port=server.tcp.getsockname()[1], server_identity_public_key=str(tmp_path/'server.pub'),
             server_identity_fingerprint=fp, client_identity_private_key=str(tmp_path/'client.key'),
             client_identity_public_key=str(tmp_path/'client.pub'), dev_emulated_tun=True, tun_name='pqmix1', full_tunnel=False))
@@ -475,7 +477,7 @@ def test_mixed_data_planes_interoperate_end_to_end(tmp_path, version, server_pla
         pong = Mock(wraps=client.quality.record_rtt)
         client.quality.record_rtt = pong
         import select
-        for epoch in (0, 1):
+        for epoch in (0, 1, 2):
             up, down = ipv4(lease, '1.1.1.1', b'up%d' % epoch), ipv4('1.1.1.1', lease, b'down%d' % epoch)
             client.tun.inject(up)
             assert select.select([server.tun._sock_remote], [], [], 2)[0] and server.tun.drain() == up
@@ -487,6 +489,21 @@ def test_mixed_data_planes_interoperate_end_to_end(tmp_path, version, server_pla
                 client.rekey()
                 item = next(iter(server.sessions.by_id.values()))
                 until(lambda: client.session.epoch == 1 and item.crypto.epoch == 1)
+            if epoch == 1:
+                client.rehandshake()
+                until(lambda: client.session.epoch == 2 and item.crypto.epoch == 2)
+        # Rust-handshake sessions expose no secrets to Python on either side.
+        for session, hs in ((client.session, client_hs), (item.crypto, server_hs)):
+            assert hasattr(session, 'secrets') == (hs == 'python')
+        # Reconnect from the ticket file: a 1-RTT resumption across the same backend pairing.
+        client.disconnect()
+        until(lambda: not server.sessions.by_id)
+        caplog.set_level('INFO', logger=runtime.logger.name)
+        client.connect()
+        assert 'session resumed via 1-RTT ticket' in caplog.text
+        up = ipv4(client.tunnel['client_vpn_ip'], '1.1.1.1', b'resumed')
+        client.tun.inject(up)
+        assert select.select([server.tun._sock_remote], [], [], 2)[0] and server.tun.drain() == up
     finally:
         if client: client.disconnect()
         server.stop()
@@ -1078,6 +1095,85 @@ def test_signed_out_client_cannot_resume_before_revocation_sweep(data_plane, tmp
         server.stop()
         worker.join(4)
         assert not worker.is_alive()
+
+@pytest.mark.parametrize('handshake', ['python', 'rust'])
+def test_revoked_client_completing_resumption_crypto_gets_nothing(tmp_path, handshake):
+    """A valid ticket lets a revoked client finish the resumption crypto, but authorization is re-checked before the
+    accept is sent: no lease, no session (so no data-plane session), no CONFIG, and the connection is closed."""
+    from vpn.identity import generate_server_identity, generate_client_identity_kem, AuthorizedClients, fingerprint
+    from handshake.kemtls import PROTOCOL_VERSION_V3, ResumptionClientHandshake
+    if handshake == 'rust':
+        pytest.importorskip('pqvpn_core')
+    plane = handshake
+    fp = generate_server_identity(tmp_path/'server.key', tmp_path/'server.pub', allow_mock=True)
+    generate_client_identity_kem(tmp_path/'client.key', tmp_path/'client.pub')
+    auth = AuthorizedClients(tmp_path/'clients.json')
+    auth.authorize((tmp_path/'client.pub').read_bytes(), 'alice-1')
+    server = runtime.VPNServer(ServerConfig(data_plane=plane, handshake=handshake, listen_host='127.0.0.1', control_port=0,
+        udp_port=0, server_identity_private_key=str(tmp_path/'server.key'), server_identity_public_key=str(tmp_path/'server.pub'),
+        authorized_clients_file=str(tmp_path/'clients.json'), dev_emulated_tun=True, tun_name='pqaz0', dns_servers=[],
+        protocol_version=3, resumption_ticket_lifetime=86400, rekey_interval=0))
+    worker = threading.Thread(target=server.start)
+    worker.start()
+    try:
+        until(lambda: server._data_thread is not None and server._data_thread.is_alive())
+        server.cfg.udp_port = server.udp.getsockname()[1]
+        client = runtime.VPNClient(ClientConfig(data_plane=plane, handshake=handshake, server_host='127.0.0.1',
+            server_control_port=server.tcp.getsockname()[1], server_identity_public_key=str(tmp_path/'server.pub'),
+            server_identity_fingerprint=fp, client_identity_private_key=str(tmp_path/'client.key'),
+            client_identity_public_key=str(tmp_path/'client.pub'), protocol_version=3, dev_emulated_tun=True,
+            tun_name='pqaz1', full_tunnel=False))
+        client.connect()
+        client.disconnect()
+        until(lambda: not server.sessions.by_id and 'alice-1' not in server.pool._leases)
+        assert auth.suspend(fingerprint((tmp_path/'client.pub').read_bytes()))
+        added = Mock(wraps=server.sessions.add)
+        server.sessions.add = added
+        if handshake == 'rust':
+            resume = ResumptionClientHandshake.from_ticket_file(client._ticket_path(), fp, 3, PROTOCOL_VERSION_V3)
+            hello = resume.initiate()
+        else:
+            ticket, secret = client._load_ticket(fp)
+            hello = ResumptionClientHandshake(secret, PROTOCOL_VERSION_V3).initiate(ticket)
+        with socket.create_connection(('127.0.0.1', server.tcp.getsockname()[1]), timeout=3) as raw:
+            runtime.send_message(raw, hello)
+            with pytest.raises((runtime.HandshakeError, OSError)):
+                runtime.recv_message(raw)  # neither an accept nor a CONFIG: the server closes the connection
+        assert not added.called and not server.sessions.by_id and 'alice-1' not in server.pool._leases
+    finally:
+        server.stop()
+        worker.join(4)
+        assert not worker.is_alive()
+
+
+@pytest.mark.parametrize('writer', ['python', 'rust'])
+def test_ticket_file_is_shared_by_python_and_rust(tmp_path, writer):
+    """The same {fp, t, s, v} file either backend writes, the other reads; mismatched server or version reads as none."""
+    core = pytest.importorskip('pqvpn_core')
+    client = runtime.VPNClient(ClientConfig(client_identity_private_key=str(tmp_path/'client.key')))
+    path, ticket, secret = client._ticket_path(), b'opaque ticket', bytes(range(32))
+    if writer == 'python':
+        client._save_ticket(ticket, secret, 'ab' * 32)
+        hello = core.ResumeClient.load(str(path), 'ab' * 32, 2, 0x20).hello()
+        assert hello[40:40 + len(ticket)] == ticket  # 6-byte header, client_random(32), ticket_len(2), ticket
+        assert core.ResumeClient.load(str(path), 'cd' * 32, 2, 0x20) is None
+        assert core.ResumeClient.load(str(path), 'ab' * 32, 3, 0x30) is None
+    else:
+        # A real Rust client session writes with the secret only it holds; Python checks what it can see.
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from crypto.hybrid_crypto import PQCProvider
+        from handshake.kemtls import KEMTLSClient, KEMTLSServer
+        from vpn.identity import fingerprint
+        server_sk, server_pk = PQCProvider().generate_keypair()
+        c = KEMTLSClient(server_pk, fingerprint(server_pk), Ed25519PrivateKey.generate(), data_plane='rust', handshake='rust')
+        s = KEMTLSServer(server_sk, server_pk, lambda _: {'client_id': 'x'}, data_plane='rust', handshake='rust')
+        finished, _ = s.process_client_key_exchange(c.process_server_hello(s.process_client_hello(c.initiate_handshake())))
+        c.process_server_finished(finished).save_ticket(path, 'ab' * 32, 2, ticket)
+        assert oct(path.stat().st_mode & 0o777) == '0o600'
+        loaded = client._load_ticket('ab' * 32)
+        assert loaded is not None and loaded[0] == ticket and len(loaded[1]) == 32
+        assert client._load_ticket('cd' * 32) is None
+
 
 def test_revoked_client_session_terminated(tmp_path):
     from vpn.identity import AuthorizedClients, fingerprint, generate_server_identity

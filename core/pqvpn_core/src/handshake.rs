@@ -2,10 +2,19 @@
 //! and resumption. v3-mldsa (0x31) is not ported: `Suite::from_version` refuses it. No I/O and no state machine yet.
 //! Every random draw goes through `Draws`, whose only non-test implementation is `Os`.
 
-use aws_lc_rs::{agreement, digest, kem, rand, signature};
+use std::fs::OpenOptions;
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
+use std::sync::Arc;
+
+use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+use aws_lc_rs::{agreement, constant_time, digest, kem, rand, signature};
+use nix::libc;
 use zeroize::Zeroizing;
 
-use crate::schedule::PROTOCOL_NAME;
+use crate::schedule::{self, CLIENT_FINISHED, PROTOCOL_NAME, RESUME_FINISHED, Randoms, SERVER_FINISHED, Secrets};
+use crate::session::{self, ControlChannel, Role};
 
 const MAGIC: [u8; 2] = [0x48, 0x56];
 pub const HEADER_LEN: usize = 6;
@@ -105,6 +114,39 @@ pub enum Error {
     MldsaUnsupported,
     PeerKey,
     Crypto,
+    State(&'static str),
+    SessionIdMismatch,
+    Substitution,
+    Fingerprint,
+    Identity,
+    Unauthorized,
+    StoreKey,
+    ClientHash,
+    ClientProof,
+    ClientFinished,
+    ServerFinished,
+    Ticket,
+    TicketVersion,
+    ResumeFinished,
+    Busy,
+    NoPending,
+    Role,
+    RekeyRequest,
+    RekeyEpoch,
+    RekeyConfirm,
+    RehandshakeRequest,
+    RehandshakeEpoch,
+    RehandshakeLength,
+    RehandshakeMismatch,
+    RehandshakeConfirm,
+    /// A record-layer rejection; `message` gives its kind, which Python maps through `_RUST_REJECTIONS`.
+    Record(session::Error),
+}
+
+impl From<session::Error> for Error {
+    fn from(error: session::Error) -> Self {
+        Error::Record(error)
+    }
 }
 
 impl Error {
@@ -128,6 +170,32 @@ impl Error {
             Error::MldsaUnsupported => "v3-mldsa is not supported by the Rust handshake".into(),
             Error::PeerKey => "invalid peer key material".into(),
             Error::Crypto => "internal cryptographic failure".into(),
+            Error::State(message) => message.into(),
+            Error::SessionIdMismatch => "Session ID mismatch".into(),
+            Error::Substitution => "server identity substitution detected".into(),
+            Error::Fingerprint => "server identity fingerprint mismatch".into(),
+            Error::Identity => "invalid ML-KEM-768 or Ed25519 identity key".into(),
+            Error::Unauthorized => "unauthorized client".into(),
+            Error::StoreKey => "invalid client ML-KEM public key in store".into(),
+            Error::ClientHash => "client identity hash mismatch".into(),
+            Error::ClientProof => "client identity proof failed".into(),
+            Error::ClientFinished => "Client Finished MAC verification failed".into(),
+            Error::ServerFinished => "Server Finished MAC verification failed".into(),
+            Error::Ticket => "invalid or expired resumption ticket".into(),
+            Error::TicketVersion => "resumption ticket protocol version mismatch".into(),
+            Error::ResumeFinished => "resumption finished MAC failed".into(),
+            Error::Busy => "rekey/rehandshake already in progress".into(),
+            Error::NoPending => "no rekey or rehandshake in progress".into(),
+            Error::Role => "operation not valid for this session role".into(),
+            Error::RekeyRequest => "invalid rekey request".into(),
+            Error::RekeyEpoch => "invalid rekey epoch or nonce".into(),
+            Error::RekeyConfirm => "invalid rekey confirmation".into(),
+            Error::RehandshakeRequest => "invalid rehandshake request".into(),
+            Error::RehandshakeEpoch => "invalid rehandshake epoch".into(),
+            Error::RehandshakeLength => "invalid rehandshake response length".into(),
+            Error::RehandshakeMismatch => "rehandshake epoch mismatch".into(),
+            Error::RehandshakeConfirm => "rehandshake key confirmation failed".into(),
+            Error::Record(error) => error.as_str().into(),
         }
     }
 }
@@ -449,7 +517,13 @@ mod sealed {
 /// can replay Python's recorded draws. Sealed: only `Os` (and the `cfg(test)` `Replay`) implement it, so no crate
 /// linking pqvpn_core can inject randomness or KEM outputs.
 pub trait Draws: sealed::Sealed {
-    fn random(&mut self) -> Result<[u8; 32], Error>;
+    /// `os.urandom(len(out))`.
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), Error>;
+    fn random(&mut self) -> Result<[u8; 32], Error> {
+        let mut out = [0u8; 32];
+        self.fill(&mut out)?;
+        Ok(out)
+    }
     fn x25519(&mut self) -> Result<agreement::PrivateKey, Error>;
     /// The key and its encapsulation key: aws-lc cannot derive the latter from an imported secret key.
     fn mlkem_keypair(&mut self) -> Result<(DecapsulationKey, Vec<u8>), Error>;
@@ -462,10 +536,8 @@ pub struct Os;
 impl sealed::Sealed for Os {}
 
 impl Draws for Os {
-    fn random(&mut self) -> Result<[u8; 32], Error> {
-        let mut out = [0u8; 32];
-        rand::fill(&mut out).map_err(|_| Error::Crypto)?;
-        Ok(out)
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), Error> {
+        rand::fill(out).map_err(|_| Error::Crypto)
     }
 
     fn x25519(&mut self) -> Result<agreement::PrivateKey, Error> {
@@ -483,6 +555,708 @@ impl Draws for Os {
         let (ct, shared) = key.encapsulate().map_err(|_| Error::PeerKey)?;
         Ok((ct.as_ref().try_into().map_err(|_| Error::Crypto)?, Zeroizing::new(shared.as_ref().try_into().map_err(|_| Error::Crypto)?)))
     }
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    constant_time::verify_slices_are_equal(a, b).is_ok()
+}
+
+const RESUMPTION_AAD: &[u8] = b"PQVPN-RESUME";
+const PRIVATE_FILE_MODES: [u32; 2] = [0o600, 0o400];
+/// The ticket file is under 1 KB; anything far larger is not ours.
+const MAX_TICKET_FILE: u64 = 64 * 1024;
+
+/// `read_private`: no symlinks, a regular file, mode 0600 or 0400, checked on the inode that is read.
+pub fn read_private(path: &Path) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || !PRIVATE_FILE_MODES.contains(&(meta.permissions().mode() & 0o7777)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "private identity must be a regular file with mode 0600 (or 0400)"));
+    }
+    let mut out = Zeroizing::new(Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0)));
+    file.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// A long-term identity, loaded once and shared by every handshake that uses it.
+pub enum Identity {
+    /// The v2 client: a 32-byte Ed25519 seed, as `load_client_private` reads it.
+    Ed25519 { seed: Zeroizing<[u8; 32]>, public: [u8; 32] },
+    /// A server identity or a v3 client static key, liboqs / FIPS 203 format.
+    Kem { key: DecapsulationKey, public: Box<[u8; EK_LEN]> },
+}
+
+impl Identity {
+    pub fn ed25519(seed: &[u8]) -> Result<Self, Error> {
+        let seed: Zeroizing<[u8; 32]> = Zeroizing::new(seed.try_into().map_err(|_| Error::Identity)?);
+        let public = ed25519_public(&seed)?;
+        Ok(Identity::Ed25519 { seed, public })
+    }
+
+    /// Like `validate_server_identity`: the secret must decapsulate what its public key encapsulates.
+    pub fn kem(secret: &[u8], public: &[u8]) -> Result<Self, Error> {
+        let public: Box<[u8; EK_LEN]> = Box::new(public.try_into().map_err(|_| Error::Identity)?);
+        if secret.len() != 2400 {
+            return Err(Error::Identity);
+        }
+        let key = mlkem_secret(secret).map_err(|_| Error::Identity)?;
+        let (ct, expected) = Os.encapsulate(&public).map_err(|_| Error::Identity)?;
+        if !ct_eq(&decapsulate(&key, &ct)?[..], &expected[..]) {
+            return Err(Error::Identity);
+        }
+        Ok(Identity::Kem { key, public })
+    }
+
+    fn kem_parts(&self) -> Result<(&DecapsulationKey, &[u8; EK_LEN]), Error> {
+        match self {
+            Identity::Kem { key, public } => Ok((key, public)),
+            Identity::Ed25519 { .. } => Err(Error::Identity),
+        }
+    }
+}
+
+/// One session after its handshake: all 12 secrets of the current epoch, the control channel, and the data channel
+/// that the data plane shares. Nothing secret is readable from outside the crate.
+pub struct Established {
+    role: Role,
+    version: u8,
+    session_id: [u8; 32],
+    epoch: u32,
+    secrets: Box<Secrets>,
+    control: ControlChannel,
+    data: Arc<session::Session>,
+    pending: Option<Pending>,
+}
+
+/// A client's epoch change between its request and the server's confirmation.
+enum Pending {
+    Rekey { epoch: u32, request: Vec<u8>, next: Box<Secrets> },
+    Rehandshake { epoch: u32, request: Vec<u8>, x25519: agreement::PrivateKey, key: DecapsulationKey },
+}
+
+type Directional<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a [u8]);
+
+fn data_keys(role: Role, s: &Secrets) -> Directional<'_> {
+    let (c2s, s2c) = ((&s.data_c2s_key[..], &s.data_c2s_nonce[..]), (&s.data_s2c_key[..], &s.data_s2c_nonce[..]));
+    let ((sk, sn), (rk, rn)) = if role == Role::Client { (c2s, s2c) } else { (s2c, c2s) };
+    (sk, sn, rk, rn)
+}
+
+fn control_channel(role: Role, s: &Secrets, sid: &[u8; 32], version: u8, epoch: u32) -> Result<ControlChannel, Error> {
+    let (c2s, s2c) = ((&s.control_c2s_key[..], &s.control_c2s_nonce[..]), (&s.control_s2c_key[..], &s.control_s2c_nonce[..]));
+    let ((sk, sn), (rk, rn)) = if role == Role::Client { (c2s, s2c) } else { (s2c, c2s) };
+    Ok(ControlChannel::new(role, sid, version, epoch, sk, sn, rk, rn)?)
+}
+
+const REKEY_REQUEST: u8 = 8;
+const REKEY_RESPONSE: u8 = 9;
+const REHANDSHAKE_REQUEST: u8 = 11;
+const REHANDSHAKE_RESPONSE: u8 = 12;
+const REHANDSHAKE_REQUEST_LEN: usize = 4 + 32 + EK_LEN;
+const REHANDSHAKE_BODY_LEN: usize = 4 + 32 + CT_LEN;
+
+impl Established {
+    fn new(role: Role, version: u8, session_id: [u8; 32], secrets: Box<Secrets>) -> Result<Self, Error> {
+        let (sk, sn, rk, rn) = data_keys(role, &secrets);
+        let data = Arc::new(session::Session::new(role, &session_id, version, 0, sk, sn, rk, rn)?);
+        let control = control_channel(role, &secrets, &session_id, version, 0)?;
+        Ok(Self { role, version, session_id, epoch: 0, secrets, control, data, pending: None })
+    }
+
+    pub fn role(&self) -> Role {
+        self.role
+    }
+
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
+    pub fn session_id(&self) -> &[u8; 32] {
+        &self.session_id
+    }
+
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// The data channel, shared with the data plane: one sealer per data key.
+    pub fn data(&self) -> Arc<session::Session> {
+        self.data.clone()
+    }
+
+    pub fn seal_control(&self, frame_type: u8, payload: &[u8]) -> Result<Vec<u8>, Error> {
+        Ok(self.control.seal(frame_type, payload)?)
+    }
+
+    pub fn open_control(&self, frame: &[u8], expected: Option<u8>) -> Result<(u8, Vec<u8>), Error> {
+        Ok(self.control.open(frame, expected)?)
+    }
+
+    /// `activate_epoch`: data and control switch together; the old epoch's secrets are wiped on drop.
+    fn activate(&mut self, epoch: u32, secrets: Box<Secrets>) -> Result<(), Error> {
+        let (sk, sn, rk, rn) = data_keys(self.role, &secrets);
+        self.data.rekey(epoch, sk, sn, rk, rn)?;
+        self.control = control_channel(self.role, &secrets, &self.session_id, self.version, epoch)?;
+        self.secrets = secrets;
+        self.epoch = epoch;
+        Ok(())
+    }
+
+    fn next_epoch(&self) -> Result<u32, Error> {
+        self.epoch.checked_add(1).ok_or(Error::Record(session::Error::Epoch))
+    }
+
+    fn client(&self) -> Result<(), Error> {
+        if self.role != Role::Client {
+            return Err(Error::Role);
+        }
+        if self.pending.is_some() {
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+
+    /// Client: the sealed REKEY_REQUEST (epoch ‖ nonce). The next epoch is derived now and held until confirmed.
+    pub fn begin_rekey<D: Draws>(&mut self, d: &mut D) -> Result<Vec<u8>, Error> {
+        self.client()?;
+        let epoch = self.next_epoch()?;
+        let nonce = d.random()?;
+        let request = [&epoch.to_be_bytes()[..], &nonce].concat();
+        let next = schedule::next_epoch(&self.secrets.rekey, &self.session_id, epoch, &nonce);
+        let frame = self.seal_control(REKEY_REQUEST, &request)?;
+        self.pending = Some(Pending::Rekey { epoch, request, next });
+        Ok(frame)
+    }
+
+    /// Client: checks the REKEY_RESPONSE plaintext against the **old** confirm key, then activates.
+    pub fn finish_rekey(&mut self, response: &[u8]) -> Result<(), Error> {
+        let Some(Pending::Rekey { epoch, request, next }) = self.pending.take() else { return Err(Error::NoPending) };
+        if response.len() < 4 || response[..4] != request[..4]
+            || !schedule::verify_rekey_confirmation(&self.secrets.control_confirm, &request, &response[4..]) {
+            return Err(Error::RekeyConfirm);
+        }
+        self.activate(epoch, next)
+    }
+
+    /// Server: derives the next epoch, seals the confirmation under the old keys, then activates.
+    pub fn respond_rekey(&mut self, request: &[u8]) -> Result<Vec<u8>, Error> {
+        if self.role != Role::Server {
+            return Err(Error::Role);
+        }
+        if request.len() != 36 {
+            return Err(Error::RekeyRequest);
+        }
+        let epoch = u32::from_be_bytes(request[..4].try_into().map_err(|_| Error::RekeyRequest)?);
+        if Some(epoch) != self.epoch.checked_add(1) {
+            return Err(Error::RekeyEpoch);
+        }
+        let next = schedule::next_epoch(&self.secrets.rekey, &self.session_id, epoch, request[4..].try_into().map_err(|_| Error::RekeyRequest)?);
+        let confirmation = schedule::rekey_confirmation(&self.secrets.control_confirm, request);
+        let frame = self.seal_control(REKEY_RESPONSE, &[&request[..4], &confirmation].concat())?;
+        self.activate(epoch, next)?;
+        Ok(frame)
+    }
+
+    /// Client: the sealed REHANDSHAKE_REQUEST (epoch ‖ X25519 ‖ ML-KEM key), fresh ephemeral keys held until the reply.
+    pub fn begin_rehandshake<D: Draws>(&mut self, d: &mut D) -> Result<Vec<u8>, Error> {
+        self.client()?;
+        let epoch = self.next_epoch()?;
+        let x25519 = d.x25519()?;
+        let (key, ek) = d.mlkem_keypair()?;
+        let request = [&epoch.to_be_bytes()[..], &x25519_public(&x25519)?, &ek].concat();
+        let frame = self.seal_control(REHANDSHAKE_REQUEST, &request)?;
+        self.pending = Some(Pending::Rehandshake { epoch, request, x25519, key });
+        Ok(frame)
+    }
+
+    /// Client: checks the REHANDSHAKE_RESPONSE plaintext against the **new** confirm key, then activates.
+    pub fn finish_rehandshake(&mut self, response: &[u8]) -> Result<(), Error> {
+        let Some(Pending::Rehandshake { epoch, request, x25519: x, key }) = self.pending.take() else { return Err(Error::NoPending) };
+        if response.len() != REHANDSHAKE_BODY_LEN + 32 {
+            return Err(Error::RehandshakeLength);
+        }
+        let (body, confirmation) = response.split_at(REHANDSHAKE_BODY_LEN);
+        if body[..4] != epoch.to_be_bytes() {
+            return Err(Error::RehandshakeMismatch);
+        }
+        let dh = x25519(&x, body[4..36].try_into().map_err(|_| Error::RehandshakeLength)?)?;
+        let kem = decapsulate(&key, body[36..].try_into().map_err(|_| Error::RehandshakeLength)?)?;
+        let transcript = [&request[..], body].concat();
+        let next = schedule::rehandshake_epoch(&self.secrets.rekey, &self.session_id, epoch, &dh, &kem, &transcript)
+            .ok_or(Error::RehandshakeRequest)?;
+        if !schedule::verify_rehandshake_confirmation(&next.control_confirm, &transcript, confirmation) {
+            return Err(Error::RehandshakeConfirm);
+        }
+        self.activate(epoch, next)
+    }
+
+    /// Server: fresh X25519 and an encapsulation to the client's new key; sealed under the old keys, then activates.
+    pub fn respond_rehandshake<D: Draws>(&mut self, d: &mut D, request: &[u8]) -> Result<Vec<u8>, Error> {
+        if self.role != Role::Server {
+            return Err(Error::Role);
+        }
+        if request.len() != REHANDSHAKE_REQUEST_LEN {
+            return Err(Error::RehandshakeRequest);
+        }
+        let epoch = u32::from_be_bytes(request[..4].try_into().map_err(|_| Error::RehandshakeRequest)?);
+        let x = d.x25519()?;
+        let dh = x25519(&x, request[4..36].try_into().map_err(|_| Error::RehandshakeRequest)?)?;
+        let (ct, kem) = d.encapsulate(request[36..].try_into().map_err(|_| Error::RehandshakeRequest)?)?;
+        if Some(epoch) != self.epoch.checked_add(1) {
+            return Err(Error::RehandshakeEpoch);
+        }
+        let body = [&epoch.to_be_bytes()[..], &x25519_public(&x)?, &ct].concat();
+        let transcript = [request, &body].concat();
+        let next = schedule::rehandshake_epoch(&self.secrets.rekey, &self.session_id, epoch, &dh, &kem, &transcript)
+            .ok_or(Error::RehandshakeRequest)?;
+        let confirmation = schedule::rehandshake_confirmation(&next.control_confirm, &transcript);
+        let frame = self.seal_control(REHANDSHAKE_RESPONSE, &[&body[..], &confirmation].concat())?;
+        self.activate(epoch, next)?;
+        Ok(frame)
+    }
+
+    /// Drops a client's half-finished rekey or rehandshake; its secrets are wiped on drop.
+    pub fn abort_epoch_change(&mut self) {
+        self.pending = None;
+    }
+
+    /// Server: a resumption ticket carrying this epoch's rekey_secret (issued right after CONFIG, at epoch 0).
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_ticket<D: Draws>(&self, d: &mut D, key: &TicketKey, client_id: &str, lifetime: i64, assigned_ip: &str,
+                                  now: i64) -> Result<Vec<u8>, Error> {
+        if self.role != Role::Server {
+            return Err(Error::Role);
+        }
+        key.issue(d, &self.secrets.rekey, client_id, self.version, lifetime, assigned_ip, now)
+    }
+
+    /// Client: writes the ticket file with this epoch's rekey_secret, as `VPNClient._save_ticket` does.
+    pub fn save_ticket(&self, path: &Path, fingerprint: &str, protocol_version: u8, ticket: &[u8]) -> io::Result<()> {
+        if self.role != Role::Client {
+            return Err(io::Error::other(Error::Role.message()));
+        }
+        save_ticket(path, fingerprint, protocol_version, ticket, &self.secrets.rekey)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn secrets(&self) -> &Secrets {
+        &self.secrets
+    }
+}
+
+/// `KEMTLSClient` / `KEMTLSClientV3`.
+pub struct ClientHandshake {
+    suite: Suite,
+    server_public: Box<[u8; EK_LEN]>,
+    server_id: [u8; 32],
+    identity: Arc<Identity>,
+    client_identity: [u8; 32],
+    state: ClientState,
+}
+
+enum ClientState {
+    Idle,
+    HelloSent { x25519: agreement::PrivateKey, key: DecapsulationKey, client_random: [u8; 32], session_id: [u8; 32], hello: Vec<u8> },
+    KeySent { secrets: Box<Secrets>, transcript: Transcript, session_id: [u8; 32] },
+    Done,
+}
+
+impl ClientHandshake {
+    pub fn new(suite: Suite, server_public: &[u8], fingerprint_hex: &str, identity: Arc<Identity>) -> Result<Self, Error> {
+        let server_public: Box<[u8; EK_LEN]> = Box::new(server_public.try_into().map_err(|_| Error::Fingerprint)?);
+        let server_id = fingerprint(&server_public[..]);
+        if !ct_eq(hex(&server_id).as_bytes(), fingerprint_hex.to_ascii_lowercase().as_bytes()) {
+            return Err(Error::Fingerprint);
+        }
+        let client_identity = match (suite, &*identity) {
+            (Suite::V2, Identity::Ed25519 { public, .. }) => *public,
+            (Suite::V3, Identity::Kem { public, .. }) => fingerprint(&public[..]),
+            _ => return Err(Error::Identity),
+        };
+        Ok(Self { suite, server_public, server_id, identity, client_identity, state: ClientState::Idle })
+    }
+
+    pub fn hello<D: Draws>(&mut self, d: &mut D) -> Result<Vec<u8>, Error> {
+        if !matches!(self.state, ClientState::Idle) {
+            return Err(Error::State("Cannot initiate handshake"));
+        }
+        let x25519 = d.x25519()?;
+        let (key, ek) = d.mlkem_keypair()?;
+        let (client_random, session_id) = (d.random()?, d.random()?);
+        let hello = ClientHello { client_random: &client_random, session_id: &session_id, x25519: &x25519_public(&x25519)?,
+                                  mlkem_ek: ek[..].try_into().map_err(|_| Error::Crypto)?, client_identity: &self.client_identity }
+            .pack(self.suite)?;
+        self.state = ClientState::HelloSent { x25519, key, client_random, session_id, hello: hello.clone() };
+        Ok(hello)
+    }
+
+    /// Returns the ClientKeyExchange. Any failure leaves the handshake unusable.
+    pub fn on_server_hello<D: Draws>(&mut self, d: &mut D, wire: &[u8]) -> Result<Vec<u8>, Error> {
+        let ClientState::HelloSent { x25519: x, key, client_random, session_id, hello } = std::mem::replace(&mut self.state, ClientState::Done)
+        else { return Err(Error::State("Cannot process ServerHello")) };
+        let reply = ServerHello::parse(self.suite, wire)?;
+        if reply.session_id != &session_id {
+            return Err(Error::SessionIdMismatch);
+        }
+        if !ct_eq(reply.identity_id, &self.server_id) {
+            return Err(Error::Substitution);
+        }
+        let mut transcript = Transcript::default();
+        transcript.update(&hello);
+        transcript.update(wire);
+        let ecc = x25519(&x, reply.x25519)?;
+        let k_eph = decapsulate(&key, reply.eph_ct)?;
+        let k_c = match reply.client_ct {
+            Some(ct) => Some(decapsulate(self.identity.kem_parts()?.0, ct)?),
+            None => None,
+        };
+        let (ct, k_s) = d.encapsulate(&self.server_public)?;
+        let digest = transcript.digest();
+        let r = Randoms { client_random: &client_random, server_random: reply.server_random, session_id: &session_id, transcript_hash: &digest };
+        let (secrets, signature) = match (&*self.identity, k_c) {
+            (Identity::Ed25519 { seed, .. }, None) => (schedule::v2(&r, &ecc, &k_eph, &k_s), Some(ed25519_sign(seed, &client_proof(&digest, &ct))?)),
+            (Identity::Kem { .. }, Some(k_c)) => (schedule::v3(&r, &ecc, &k_eph, &k_s, &k_c), None),
+            _ => return Err(Error::Identity),
+        };
+        let partial = [&ct[..], signature.as_ref().map_or(&[][..], |s| &s[..])].concat();
+        let finished = schedule::finished(&secrets.client_finished, CLIENT_FINISHED, &schedule::hash(&[&digest, &partial]));
+        let exchange = KeyExchange { ct: &ct, signature: signature.as_ref(), finished: &finished }.pack(self.suite)?;
+        transcript.update(&exchange);
+        self.state = ClientState::KeySent { secrets, transcript, session_id };
+        Ok(exchange)
+    }
+
+    pub fn on_server_finished(&mut self, wire: &[u8]) -> Result<Established, Error> {
+        let ClientState::KeySent { secrets, transcript, session_id } = std::mem::replace(&mut self.state, ClientState::Done)
+        else { return Err(Error::State("Cannot process ServerFinished")) };
+        let finished = parse_server_finished(self.suite, wire)?;
+        if !schedule::verify_finished(&secrets.server_finished, SERVER_FINISHED, &transcript.digest(), finished) {
+            return Err(Error::ServerFinished);
+        }
+        Established::new(Role::Client, self.suite.version(), session_id, secrets)
+    }
+}
+
+/// `KEMTLSServer` / `KEMTLSServerV3`. Authorization stays with the caller, between `client_identity` and `respond`.
+pub struct ServerHandshake {
+    suite: Suite,
+    identity: Arc<Identity>,
+    identity_id: [u8; 32],
+    state: ServerState,
+}
+
+enum ServerState {
+    Idle,
+    HelloReceived { hello: Vec<u8> },
+    HelloSent(Box<ServerKeys>),
+    Done,
+}
+
+/// What the server holds between its ServerHello and the client's key exchange.
+struct ServerKeys {
+    transcript: Transcript,
+    client_random: [u8; 32],
+    server_random: [u8; 32],
+    session_id: [u8; 32],
+    client_identity: [u8; 32],
+    ecc: Zeroizing<[u8; 32]>,
+    k_eph: Zeroizing<[u8; 32]>,
+    k_c: Option<Zeroizing<[u8; 32]>>,
+}
+
+impl ServerHandshake {
+    pub fn new(suite: Suite, identity: Arc<Identity>) -> Result<Self, Error> {
+        let identity_id = fingerprint(&identity.kem_parts()?.1[..]);
+        Ok(Self { suite, identity, identity_id, state: ServerState::Idle })
+    }
+
+    /// Parses the ClientHello and returns what the caller authorizes: the Ed25519 public key (v2) or identity hash (v3).
+    pub fn client_identity(&mut self, wire: &[u8]) -> Result<[u8; 32], Error> {
+        if !matches!(self.state, ServerState::Idle) {
+            return Err(Error::State("Cannot process ClientHello"));
+        }
+        self.state = ServerState::Done;
+        let identity = *ClientHello::parse(self.suite, wire)?.client_identity;
+        self.state = ServerState::HelloReceived { hello: wire.to_vec() };
+        Ok(identity)
+    }
+
+    /// Call only after authorization passed. v3 passes the client's stored ML-KEM public key; v2 passes None.
+    pub fn respond<D: Draws>(&mut self, d: &mut D, client_kem_public: Option<&[u8]>) -> Result<Vec<u8>, Error> {
+        let ServerState::HelloReceived { hello } = std::mem::replace(&mut self.state, ServerState::Done)
+        else { return Err(Error::State("Cannot process ClientHello")) };
+        let parsed = ClientHello::parse(self.suite, &hello)?;
+        let client_public: Option<&[u8; EK_LEN]> = match (self.suite, client_kem_public) {
+            (Suite::V2, None) => None,
+            (Suite::V3, Some(public)) => {
+                let public: &[u8; EK_LEN] = public.try_into().map_err(|_| Error::StoreKey)?;
+                if !ct_eq(&fingerprint(public), parsed.client_identity) {
+                    return Err(Error::ClientHash);
+                }
+                Some(public)
+            }
+            _ => return Err(Error::Unauthorized),
+        };
+        let x = d.x25519()?;
+        let server_random = d.random()?;
+        let ecc = x25519(&x, parsed.x25519)?;
+        let (eph_ct, k_eph) = d.encapsulate(parsed.mlkem_ek)?;
+        let client_static = client_public.map(|public| d.encapsulate(public)).transpose()?;
+        let reply = ServerHello { server_random: &server_random, session_id: parsed.session_id, x25519: &x25519_public(&x)?, eph_ct: &eph_ct,
+                                  identity_id: &self.identity_id, client_ct: client_static.as_ref().map(|(ct, _)| ct) }.pack(self.suite)?;
+        let mut transcript = Transcript::default();
+        transcript.update(&hello);
+        transcript.update(&reply);
+        self.state = ServerState::HelloSent(Box::new(ServerKeys {
+            transcript,
+            client_random: *parsed.client_random,
+            server_random,
+            session_id: *parsed.session_id,
+            client_identity: *parsed.client_identity,
+            ecc,
+            k_eph,
+            k_c: client_static.map(|(_, k)| k),
+        }));
+        Ok(reply)
+    }
+
+    /// Returns (ServerFinished, the established session).
+    pub fn on_key_exchange(&mut self, wire: &[u8]) -> Result<(Vec<u8>, Established), Error> {
+        let ServerState::HelloSent(keys) = std::mem::replace(&mut self.state, ServerState::Done)
+        else { return Err(Error::State("Cannot process ClientKeyExchange")) };
+        let ServerKeys { mut transcript, client_random, server_random, session_id, client_identity, ecc, k_eph, k_c } = *keys;
+        let exchange = KeyExchange::parse(self.suite, wire)?;
+        let digest = transcript.digest();
+        let k_s = decapsulate(self.identity.kem_parts()?.0, exchange.ct)?;
+        let r = Randoms { client_random: &client_random, server_random: &server_random, session_id: &session_id, transcript_hash: &digest };
+        let secrets = match &k_c {
+            None => schedule::v2(&r, &ecc, &k_eph, &k_s),
+            Some(k_c) => schedule::v3(&r, &ecc, &k_eph, &k_s, k_c),
+        };
+        if let Some(signature) = exchange.signature {
+            if !ed25519_verify(&client_identity, &client_proof(&digest, exchange.ct), signature) {
+                return Err(Error::ClientProof);
+            }
+        }
+        let partial = [&exchange.ct[..], exchange.signature.map_or(&[][..], |s| &s[..])].concat();
+        if !schedule::verify_finished(&secrets.client_finished, CLIENT_FINISHED, &schedule::hash(&[&digest, &partial]), exchange.finished) {
+            return Err(Error::ClientFinished);
+        }
+        transcript.update(wire);
+        let finished = pack_server_finished(self.suite, &schedule::finished(&secrets.server_finished, SERVER_FINISHED, &transcript.digest()))?;
+        Ok((finished, Established::new(Role::Server, self.suite.version(), session_id, secrets)?))
+    }
+}
+
+/// `ResumptionTicketKey`: AES-256-GCM over the resumption secret and the client's identity, held in memory only.
+pub struct TicketKey(LessSafeKey);
+
+impl TicketKey {
+    pub fn new<D: Draws>(d: &mut D) -> Result<Self, Error> {
+        let mut key = Zeroizing::new([0u8; 32]);
+        d.fill(&mut key[..])?;
+        Ok(Self(LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key[..]).map_err(|_| Error::Crypto)?)))
+    }
+
+    /// nonce12 ‖ GCM(secret ‖ !BqHH(version, expiry, len cid, len ip) ‖ cid ‖ ip), AAD "PQVPN-RESUME".
+    #[allow(clippy::too_many_arguments)]
+    fn issue<D: Draws>(&self, d: &mut D, secret: &[u8; 32], client_id: &str, version: u8, lifetime: i64, assigned_ip: &str,
+                       now: i64) -> Result<Vec<u8>, Error> {
+        let (cid, aip) = (client_id.as_bytes(), assigned_ip.as_bytes());
+        let mut plaintext = Zeroizing::new(Vec::with_capacity(45 + cid.len() + aip.len()));
+        plaintext.extend_from_slice(secret);
+        plaintext.push(version);
+        plaintext.extend_from_slice(&now.checked_add(lifetime).ok_or(Error::Crypto)?.to_be_bytes());
+        plaintext.extend_from_slice(&u16::try_from(cid.len()).map_err(|_| Error::Crypto)?.to_be_bytes());
+        plaintext.extend_from_slice(&u16::try_from(aip.len()).map_err(|_| Error::Crypto)?.to_be_bytes());
+        plaintext.extend_from_slice(cid);
+        plaintext.extend_from_slice(aip);
+        let mut nonce = [0u8; 12];
+        d.fill(&mut nonce)?;
+        let mut sealed = plaintext.to_vec();
+        self.0.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(RESUMPTION_AAD), &mut sealed)
+            .map_err(|_| Error::Crypto)?;
+        Ok([&nonce[..], &sealed].concat())
+    }
+
+    /// `validate`: (secret, client_id, protocol_version, assigned_ip), or None for anything not ours or expired.
+    fn validate(&self, ticket: &[u8], now: i64) -> Option<(Zeroizing<[u8; 32]>, String, u8, String)> {
+        if ticket.len() < 12 + 16 + 32 + 13 {
+            return None;
+        }
+        let (nonce, sealed) = ticket.split_at(12);
+        let mut buffer = Zeroizing::new(sealed.to_vec());
+        let plaintext = self.0.open_in_place(Nonce::try_assume_unique_for_key(nonce).ok()?, Aad::from(RESUMPTION_AAD), &mut buffer).ok()?;
+        let (secret, rest) = plaintext.split_first_chunk::<32>()?;
+        let (header, rest) = rest.split_first_chunk::<13>()?;
+        let expiry = i64::from_be_bytes(header[1..9].try_into().ok()?);
+        let (cid_len, aip_len) = (usize::from(u16::from_be_bytes([header[9], header[10]])), usize::from(u16::from_be_bytes([header[11], header[12]])));
+        if rest.len() != cid_len + aip_len || now > expiry {
+            return None;
+        }
+        let client_id = String::from_utf8(rest[..cid_len].to_vec()).ok()?;
+        let assigned_ip = String::from_utf8(rest[cid_len..].to_vec()).ok()?;
+        Some((Zeroizing::new(*secret), client_id, header[0], assigned_ip))
+    }
+}
+
+/// `ResumptionClientHandshake`.
+pub struct ResumeClient {
+    version: u8,
+    secret: Zeroizing<[u8; 32]>,
+    ticket: Vec<u8>,
+    pending: Option<(agreement::PrivateKey, DecapsulationKey, [u8; 32], Vec<u8>)>,
+}
+
+impl ResumeClient {
+    pub fn new(version: u8, secret: Zeroizing<[u8; 32]>, ticket: Vec<u8>) -> Self {
+        Self { version, secret, ticket, pending: None }
+    }
+
+    /// `_load_ticket`: None unless the file is ours, for this server fingerprint and protocol version.
+    pub fn load(path: &Path, fingerprint: &str, protocol_version: u8, version: u8) -> Option<Self> {
+        let (ticket, secret) = load_ticket(path, fingerprint, protocol_version)?;
+        Some(Self::new(version, secret, ticket))
+    }
+
+    pub fn hello<D: Draws>(&mut self, d: &mut D) -> Result<Vec<u8>, Error> {
+        let x = d.x25519()?;
+        let (key, ek) = d.mlkem_keypair()?;
+        let client_random = d.random()?;
+        let hello = ResumptionHello { client_random: &client_random, ticket: &self.ticket, x25519: &x25519_public(&x)?,
+                                      mlkem_ek: ek[..].try_into().map_err(|_| Error::Crypto)? }.pack(self.version)?;
+        self.pending = Some((x, key, client_random, hello.clone()));
+        Ok(hello)
+    }
+
+    pub fn on_accept(&mut self, wire: &[u8]) -> Result<Established, Error> {
+        let (x, key, client_random, hello) = self.pending.take().ok_or(Error::State("Cannot process ResumptionAccept"))?;
+        let accept = ResumptionAccept::parse(self.version, wire)?;
+        let mut transcript = Transcript::default();
+        transcript.update(&hello);
+        transcript.update(&wire[..HEADER_LEN + ResumptionAccept::SIZE - 32]);
+        let digest = transcript.digest();
+        let r = Randoms { client_random: &client_random, server_random: accept.server_random, session_id: accept.session_id, transcript_hash: &digest };
+        let (ecc, kem) = (x25519(&x, accept.x25519)?, decapsulate(&key, accept.ct)?);
+        let secrets = schedule::resume(&r, &self.secret, &ecc, &kem);
+        if !schedule::verify_finished(&secrets.server_finished, RESUME_FINISHED, &digest, accept.finished) {
+            return Err(Error::ResumeFinished);
+        }
+        Established::new(Role::Client, self.version, *accept.session_id, secrets)
+    }
+}
+
+/// `ResumptionServerHandshake.process_hello`: (accept, session, client_id, assigned_ip). The caller re-checks
+/// authorization before it sends the accept or allocates anything.
+pub fn resume_server<D: Draws>(d: &mut D, key: &TicketKey, wire: &[u8], version: u8, now: i64)
+                               -> Result<(Vec<u8>, Established, String, String), Error> {
+    let hello = ResumptionHello::parse(version, wire)?;
+    let (secret, client_id, ticket_version, assigned_ip) = key.validate(hello.ticket, now).ok_or(Error::Ticket)?;
+    if ticket_version != version {
+        return Err(Error::TicketVersion);
+    }
+    let (server_random, session_id) = (d.random()?, d.random()?);
+    let x = d.x25519()?;
+    let ecc = x25519(&x, hello.x25519)?;
+    let (ct, kem) = d.encapsulate(hello.mlkem_ek)?;
+    let server_x = x25519_public(&x)?;
+    let unmacced = ResumptionAccept { server_random: &server_random, session_id: &session_id, x25519: &server_x, ct: &ct, finished: &[0; 32] }
+        .transcript_bytes(version);
+    let mut transcript = Transcript::default();
+    transcript.update(wire);
+    transcript.update(&unmacced);
+    let digest = transcript.digest();
+    let r = Randoms { client_random: hello.client_random, server_random: &server_random, session_id: &session_id, transcript_hash: &digest };
+    let secrets = schedule::resume(&r, &secret, &ecc, &kem);
+    let finished = schedule::finished(&secrets.server_finished, RESUME_FINISHED, &digest);
+    let accept = ResumptionAccept { server_random: &server_random, session_id: &session_id, x25519: &server_x, ct: &ct, finished: &finished }
+        .pack(version)?;
+    Ok((accept, Established::new(Role::Server, version, session_id, secrets)?, client_id, assigned_ip))
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard padded base64, the format `base64.b64encode` writes into the ticket file.
+fn b64_encode(data: &[u8]) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(data.len().div_ceil(3) * 4));
+    for chunk in data.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { char::from(B64[((n >> (18 - 6 * i)) & 63) as usize]) } else { '=' });
+        }
+    }
+    out
+}
+
+/// Strict decoding of what `b64_encode` (or Python) wrote: whole quads, padding only at the end.
+fn b64_decode(text: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let bytes = text.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Zeroizing::new(Vec::with_capacity(bytes.len() / 4 * 3));
+    for (index, quad) in bytes.chunks(4).enumerate() {
+        let pad = quad.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && index + 1 != bytes.len() / 4) {
+            return None;
+        }
+        let mut n = 0u32;
+        for (i, &c) in quad[..4 - pad].iter().enumerate() {
+            n |= u32::try_from(B64.iter().position(|&b| b == c)?).ok()? << (18 - 6 * i);
+        }
+        out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+    }
+    Some(out)
+}
+
+/// The client's ticket file, `{fp, t, s, v}` as `VPNClient._save_ticket` writes it, written the same way: a temp file
+/// in the same directory (O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600), fsync, rename over, fsync the directory.
+pub fn save_ticket(path: &Path, fingerprint: &str, protocol_version: u8, ticket: &[u8], secret: &[u8; 32]) -> io::Result<()> {
+    let fingerprint = serde_json::to_string(fingerprint).map_err(io::Error::other)?;
+    let (ticket, secret) = (b64_encode(ticket), b64_encode(secret));
+    let contents = Zeroizing::new(format!("{{\"fp\": {fingerprint}, \"t\": \"{}\", \"s\": \"{}\", \"v\": {protocol_version}}}",
+                                          ticket.as_str(), secret.as_str()));
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let mut suffix = [0u8; 8];
+    rand::fill(&mut suffix).map_err(|_| io::Error::other("no randomness"))?;
+    let temp = directory.join(format!(".pqvpn_ticket.{}.tmp", hex(&suffix)));
+    let written = OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temp)
+        .and_then(|mut file| {
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temp, path)
+        });
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC).open(directory)?.sync_all()
+}
+
+/// `_load_ticket`: (ticket, resumption secret) if the file matches this server and protocol version.
+pub fn load_ticket(path: &Path, fingerprint: &str, protocol_version: u8) -> Option<(Vec<u8>, Zeroizing<[u8; 32]>)> {
+    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path).ok()?;
+    let mut raw = Zeroizing::new(Vec::new());
+    file.take(MAX_TICKET_FILE).read_to_end(&mut raw).ok()?;
+    let mut data: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let secret_text = match data.get_mut("s") {
+        Some(serde_json::Value::String(s)) => Zeroizing::new(std::mem::take(s)),
+        _ => return None,
+    };
+    let result = (|| {
+        if data.get("fp")?.as_str()? != fingerprint || data.get("v")?.as_u64()? != u64::from(protocol_version) {
+            return None;
+        }
+        let ticket = b64_decode(data.get("t")?.as_str()?)?.to_vec();
+        let secret: [u8; 32] = b64_decode(&secret_text)?.as_slice().try_into().ok()?;
+        Some((ticket, Zeroizing::new(secret)))
+    })();
+    drop(secret_text);
+    result
 }
 
 /// Test-only: replays one step's draws recorded by tests/test_handshake_vectors.py, checking kind and order.
@@ -513,7 +1287,6 @@ pub(crate) fn unhex(value: &serde_json::Value) -> Vec<u8> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex")).collect()
 }
 
-#[cfg(test)]
 pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes.iter().fold(String::new(), |mut out, b| {
@@ -527,8 +1300,11 @@ impl sealed::Sealed for Replay {}
 
 #[cfg(test)]
 impl Draws for Replay {
-    fn random(&mut self) -> Result<[u8; 32], Error> {
-        Ok(unhex(&self.next("random")["value"]).try_into().expect("32-byte random"))
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), Error> {
+        let value = unhex(&self.next("random")["value"]);
+        assert_eq!(value.len(), out.len(), "Python drew a different number of random bytes");
+        out.copy_from_slice(&value);
+        Ok(())
     }
 
     fn x25519(&mut self) -> Result<agreement::PrivateKey, Error> {
@@ -628,16 +1404,16 @@ mod tests {
     }
 }
 
-/// Byte-for-byte replay of tests/vectors/handshake.json (recorded by tests/test_handshake_vectors.py). Until the
-/// state machines land, each step is composed here from the codecs, schedule and control channel, in Python's order.
+
+/// Byte-for-byte replay of tests/vectors/handshake.json (recorded by tests/test_handshake_vectors.py) through the real
+/// state machines: every step gets exactly the draws Python made in it, in order, and must produce Python's bytes.
 #[cfg(test)]
 mod vectors {
     use super::*;
-    use crate::schedule::{self, CLIENT_FINISHED, RESUME_FINISHED, Randoms, SERVER_FINISHED, Secrets};
-    use crate::session::{ControlChannel, Role};
     use serde_json::Value;
 
     const CONFIG: &[u8] = br#"{"client_vpn_ip": "10.8.0.2", "vector": true}"#;
+    const NOW: i64 = 1_800_000_000;
 
     fn file() -> Value {
         serde_json::from_str(include_str!("../../../tests/vectors/handshake.json")).unwrap()
@@ -655,6 +1431,14 @@ mod vectors {
         unhex(&step(run, name)["wire"])
     }
 
+    /// Runs `f` with the step's recorded draws and checks they were all used.
+    fn with_draws<T>(run: &Value, name: &str, f: impl FnOnce(&mut Replay) -> T) -> T {
+        let mut d = Replay::new(step(run, name));
+        let out = f(&mut d);
+        d.done();
+        out
+    }
+
     fn assert_secrets(s: &Secrets, expected: &Value, what: &str) {
         let fields: [(&str, &[u8]); 12] = [
             ("client_finished_key", &s.client_finished[..]), ("server_finished_key", &s.server_finished[..]),
@@ -669,204 +1453,107 @@ mod vectors {
         }
     }
 
-    fn control(role: Role, s: &Secrets, sid: &[u8; 32], version: u8, epoch: u32) -> ControlChannel {
-        let (c2s, s2c) = ((&s.control_c2s_key[..], &s.control_c2s_nonce[..]), (&s.control_s2c_key[..], &s.control_s2c_nonce[..]));
-        let ((sk, sn), (rk, rn)) = if role == Role::Client { (c2s, s2c) } else { (s2c, c2s) };
-        ControlChannel::new(role, sid, version, epoch, sk, sn, rk, rn).unwrap()
-    }
-
     fn full_run(run: &Value, ids: &Value) {
         let suite = Suite::from_version(u8::try_from(run["version"].as_u64().unwrap()).unwrap()).unwrap();
         let server_pk = unhex(&ids["server_kem_pk"]);
-        let server_dk = mlkem_secret(&unhex(&ids["server_kem_sk"])).unwrap();
+        let server_id = Arc::new(Identity::kem(&unhex(&ids["server_kem_sk"]), &server_pk).unwrap());
         let client_pk = unhex(&ids["client_kem_pk"]);
-        let client_dk = mlkem_secret(&unhex(&ids["client_kem_sk"])).unwrap();
-        let seed: [u8; 32] = arr(&ids["client_ed25519"]);
-        let client_identity = if suite == Suite::V2 { ed25519_public(&seed).unwrap() } else { fingerprint(&client_pk) };
+        let client_id = Arc::new(match suite {
+            Suite::V2 => Identity::ed25519(&unhex(&ids["client_ed25519"])).unwrap(),
+            Suite::V3 => Identity::kem(&unhex(&ids["client_kem_sk"]), &client_pk).unwrap(),
+        });
+        let mut client = ClientHandshake::new(suite, &server_pk, &hex(&fingerprint(&server_pk)).to_uppercase(), client_id).unwrap();
+        let mut server = ServerHandshake::new(suite, server_id).unwrap();
 
-        let mut d = Replay::new(step(run, "client_hello"));
-        let c_x = d.x25519().unwrap();
-        let (c_dk, c_ek) = d.mlkem_keypair().unwrap();
-        let (cr, sid) = (d.random().unwrap(), d.random().unwrap());
-        d.done();
-        let ch = ClientHello { client_random: &cr, session_id: &sid, x25519: &x25519_public(&c_x).unwrap(),
-                               mlkem_ek: c_ek[..].try_into().unwrap(), client_identity: &client_identity }.pack(suite).unwrap();
+        let ch = with_draws(run, "client_hello", |d| client.hello(d).unwrap());
         assert_eq!(ch, wire(run, "client_hello"));
-
-        let hello = ClientHello::parse(suite, &ch).unwrap();
-        let mut d = Replay::new(step(run, "server_hello"));
-        let s_x = d.x25519().unwrap();
-        let sr = d.random().unwrap();
-        let (eph_ct, s_k_eph) = d.encapsulate(hello.mlkem_ek).unwrap();
-        let client_static = (suite == Suite::V3).then(|| d.encapsulate(client_pk[..].try_into().unwrap()).unwrap());
-        d.done();
-        let identity_id = fingerprint(&server_pk);
-        let sh = ServerHello { server_random: &sr, session_id: hello.session_id, x25519: &x25519_public(&s_x).unwrap(), eph_ct: &eph_ct,
-                               identity_id: &identity_id, client_ct: client_static.as_ref().map(|(ct, _)| ct) }.pack(suite).unwrap();
-        assert_eq!(sh, wire(run, "server_hello"));
-        let s_xss = x25519(&s_x, hello.x25519).unwrap();
-        let digest = fingerprint(&[&ch[..], &sh].concat());
-        assert_eq!(digest, arr::<32>(&run["transcript_hash"]));
-
-        let reply = ServerHello::parse(suite, &sh).unwrap();
-        assert_eq!(reply.identity_id, &identity_id);
-        let c_xss = x25519(&c_x, reply.x25519).unwrap();
-        let c_k_eph = decapsulate(&c_dk, reply.eph_ct).unwrap();
-        let mut d = Replay::new(step(run, "client_key_exchange"));
-        let (identity_ct, c_k_s) = d.encapsulate(server_pk[..].try_into().unwrap()).unwrap();
-        d.done();
-        let r = Randoms { client_random: &cr, server_random: reply.server_random, session_id: &sid, transcript_hash: &digest };
-        let (client_secrets, signature) = match suite {
-            Suite::V2 => (schedule::v2(&r, &c_xss, &c_k_eph, &c_k_s), Some(ed25519_sign(&seed, &client_proof(&digest, &identity_ct)).unwrap())),
+        let lookup = server.client_identity(&ch).unwrap();
+        let store = match suite {
+            Suite::V2 => None,
             Suite::V3 => {
-                let c_k_c = decapsulate(&client_dk, reply.client_ct.unwrap()).unwrap();
-                (schedule::v3(&r, &c_xss, &c_k_eph, &c_k_s, &c_k_c), None)
+                assert_eq!(lookup, fingerprint(&client_pk));
+                Some(&client_pk[..])
             }
         };
-        let partial = [&identity_ct[..], signature.as_ref().map_or(&[][..], |s| &s[..])].concat();
-        let finished = schedule::finished(&client_secrets.client_finished, CLIENT_FINISHED, &schedule::hash(&[&digest, &partial]));
-        let cke = KeyExchange { ct: &identity_ct, signature: signature.as_ref(), finished: &finished }.pack(suite).unwrap();
+        let sh = with_draws(run, "server_hello", |d| server.respond(d, store).unwrap());
+        assert_eq!(sh, wire(run, "server_hello"));
+        let cke = with_draws(run, "client_key_exchange", |d| client.on_server_hello(d, &sh).unwrap());
         assert_eq!(cke, wire(run, "client_key_exchange"));
-
-        let exchange = KeyExchange::parse(suite, &cke).unwrap();
-        let s_k_s = decapsulate(&server_dk, exchange.ct).unwrap();
-        let r = Randoms { client_random: hello.client_random, server_random: &sr, session_id: hello.session_id, transcript_hash: &digest };
-        let server_secrets = match &client_static {
-            None => schedule::v2(&r, &s_xss, &s_k_eph, &s_k_s),
-            Some((_, s_k_c)) => schedule::v3(&r, &s_xss, &s_k_eph, &s_k_s, s_k_c),
-        };
-        if let Some(sig) = exchange.signature {
-            assert!(ed25519_verify(hello.client_identity, &client_proof(&digest, exchange.ct), sig));
-        }
-        let partial = [&exchange.ct[..], exchange.signature.map_or(&[][..], |s| &s[..])].concat();
-        assert!(schedule::verify_finished(&server_secrets.client_finished, CLIENT_FINISHED, &schedule::hash(&[&digest, &partial]), exchange.finished));
-        let mut transcript = Transcript::default();
-        [&ch, &sh, &cke].iter().for_each(|m| transcript.update(m));
-        let sf = pack_server_finished(suite, &schedule::finished(&server_secrets.server_finished, SERVER_FINISHED, &transcript.digest())).unwrap();
-        Replay::new(step(run, "server_finished")).done();
+        let (sf, mut s) = with_draws(run, "server_finished", |_| server.on_key_exchange(&cke).unwrap());
         assert_eq!(sf, wire(run, "server_finished"));
-        assert!(schedule::verify_finished(&client_secrets.server_finished, SERVER_FINISHED, &transcript.digest(),
-                                          parse_server_finished(suite, &sf).unwrap()));
-        assert_secrets(&client_secrets, &run["secrets"]["0"], "client epoch 0");
-        assert_secrets(&server_secrets, &run["secrets"]["0"], "server epoch 0");
-        epochs(run, suite.version(), &sid, &client_secrets, &server_secrets);
-    }
+        let mut c = client.on_server_finished(&sf).unwrap();
+        assert_eq!(c.session_id(), s.session_id());
+        assert_secrets(c.secrets(), &run["secrets"]["0"], "client epoch 0");
+        assert_secrets(s.secrets(), &run["secrets"]["0"], "server epoch 0");
 
-    /// CONFIG and friends on the control channel, then the rekey to epoch 1 and the rehandshake to epoch 2.
-    fn epochs(run: &Value, version: u8, sid: &[u8; 32], c0: &Secrets, s0: &Secrets) {
-        let (cc, sc) = (control(Role::Client, c0, sid, version, 0), control(Role::Server, s0, sid, version, 0));
+        let ticket = with_draws(run, "issue_ticket", |d| {
+            let key = TicketKey::new(d).unwrap();
+            s.issue_ticket(d, &key, "vector", 86400, "10.8.0.2", NOW).unwrap()
+        });
+        assert_eq!(ticket, wire(run, "issue_ticket"));
+
         let expected = &run["control"];
-        let config = sc.seal(7, CONFIG).unwrap();
-        assert_eq!(hex(&config), expected["config"]);
-        assert_eq!(cc.open(&config, Some(7)).unwrap(), (7, CONFIG.to_vec()));
-        let error = cc.seal(10, b"client says hi").unwrap();
-        assert_eq!(hex(&error), expected["client_error"]);
-        assert_eq!(sc.open(&error, None).unwrap().1, b"client says hi");
-        let second = sc.seal(6, b"").unwrap();
-        assert_eq!(hex(&second), expected["second"]);
-        assert_eq!(cc.open(&second, None).unwrap(), (6, vec![]));
+        let config = s.seal_control(7, CONFIG).unwrap();
+        assert_eq!(hex(&config), expected["config"].as_str().unwrap());
+        assert_eq!(c.open_control(&config, Some(7)).unwrap(), (7, CONFIG.to_vec()));
+        let error = c.seal_control(10, b"client says hi").unwrap();
+        assert_eq!(hex(&error), expected["client_error"].as_str().unwrap());
+        assert_eq!(s.open_control(&error, None).unwrap().1, b"client says hi");
+        let second = s.seal_control(6, b"").unwrap();
+        assert_eq!(hex(&second), expected["second"].as_str().unwrap());
+        assert_eq!(c.open_control(&second, None).unwrap(), (6, vec![]));
 
-        let mut d = Replay::new(step(run, "rekey_request"));
-        let nonce = d.random().unwrap();
-        d.done();
-        let request = [&1u32.to_be_bytes()[..], &nonce].concat();
-        let c1 = schedule::next_epoch(&c0.rekey, sid, 1, &nonce);
-        let frame = cc.seal(8, &request).unwrap();
-        assert_eq!(frame, wire(run, "rekey_request"));
-        let (_, payload) = sc.open(&frame, Some(8)).unwrap();
-        let s1 = schedule::next_epoch(&s0.rekey, sid, u32::from_be_bytes(payload[..4].try_into().unwrap()), payload[4..].try_into().unwrap());
-        let confirmation = schedule::rekey_confirmation(&s0.control_confirm, &payload);
-        let frame = sc.seal(9, &[&payload[..4], &confirmation].concat()).unwrap();
-        Replay::new(step(run, "rekey_response")).done();
-        assert_eq!(frame, wire(run, "rekey_response"));
-        let (_, response) = cc.open(&frame, Some(9)).unwrap();
-        assert_eq!(response[..4], request[..4]);
-        assert!(schedule::verify_rekey_confirmation(&c0.control_confirm, &request, &response[4..]));
-        assert!(!schedule::verify_rekey_confirmation(&c1.control_confirm, &request, &response[4..]), "rekey confirms under the OLD key");
-        assert_secrets(&c1, &run["secrets"]["1"], "client epoch 1");
-        assert_secrets(&s1, &run["secrets"]["1"], "server epoch 1");
+        let request = with_draws(run, "rekey_request", |d| c.begin_rekey(d).unwrap());
+        assert_eq!(request, wire(run, "rekey_request"));
+        assert_eq!(c.begin_rekey(&mut Os), Err(Error::Busy));
+        let (_, payload) = s.open_control(&request, Some(REKEY_REQUEST)).unwrap();
+        let response = with_draws(run, "rekey_response", |_| s.respond_rekey(&payload).unwrap());
+        assert_eq!(response, wire(run, "rekey_response"));
+        let (_, confirmation) = c.open_control(&response, Some(REKEY_RESPONSE)).unwrap();
+        c.finish_rekey(&confirmation).unwrap();
+        assert_eq!((c.epoch(), s.epoch()), (1, 1));
+        assert_secrets(c.secrets(), &run["secrets"]["1"], "client epoch 1");
+        assert_secrets(s.secrets(), &run["secrets"]["1"], "server epoch 1");
 
-        let (cc, sc) = (control(Role::Client, &c1, sid, version, 1), control(Role::Server, &s1, sid, version, 1));
-        let mut d = Replay::new(step(run, "rehandshake_request"));
-        let x = d.x25519().unwrap();
-        let (dk, ek) = d.mlkem_keypair().unwrap();
-        d.done();
-        let request = [&2u32.to_be_bytes()[..], &x25519_public(&x).unwrap(), &ek].concat();
-        let frame = cc.seal(11, &request).unwrap();
-        assert_eq!(frame, wire(run, "rehandshake_request"));
-        let (_, payload) = sc.open(&frame, Some(11)).unwrap();
-        assert_eq!(payload.len(), 4 + 32 + EK_LEN);
-        let mut d = Replay::new(step(run, "rehandshake_response"));
-        let sx = d.x25519().unwrap();
-        let dh = x25519(&sx, payload[4..36].try_into().unwrap()).unwrap();
-        let (ct, kem) = d.encapsulate(payload[36..].try_into().unwrap()).unwrap();
-        d.done();
-        let body = [&2u32.to_be_bytes()[..], &x25519_public(&sx).unwrap(), &ct].concat();
-        let transcript = [&payload[..], &body].concat();
-        let s2 = schedule::rehandshake_epoch(&s1.rekey, sid, 2, &dh, &kem, &transcript).unwrap();
-        let frame = sc.seal(12, &[&body[..], &schedule::rehandshake_confirmation(&s2.control_confirm, &transcript)].concat()).unwrap();
-        assert_eq!(frame, wire(run, "rehandshake_response"));
-        let (_, response) = cc.open(&frame, Some(12)).unwrap();
-        let (body, confirmation) = response.split_at(4 + 32 + CT_LEN);
-        let dh = x25519(&x, body[4..36].try_into().unwrap()).unwrap();
-        let kem = decapsulate(&dk, body[36..].try_into().unwrap()).unwrap();
-        let transcript = [&request[..], body].concat();
-        let c2 = schedule::rehandshake_epoch(&c1.rekey, sid, 2, &dh, &kem, &transcript).unwrap();
-        assert!(schedule::verify_rehandshake_confirmation(&c2.control_confirm, &transcript, confirmation));
-        assert!(!schedule::verify_rehandshake_confirmation(&c1.control_confirm, &transcript, confirmation), "rehandshake confirms under the NEW key");
-        assert_secrets(&c2, &run["secrets"]["2"], "client epoch 2");
-        assert_secrets(&s2, &run["secrets"]["2"], "server epoch 2");
+        let request = with_draws(run, "rehandshake_request", |d| c.begin_rehandshake(d).unwrap());
+        assert_eq!(request, wire(run, "rehandshake_request"));
+        let (_, payload) = s.open_control(&request, Some(REHANDSHAKE_REQUEST)).unwrap();
+        let response = with_draws(run, "rehandshake_response", |d| s.respond_rehandshake(d, &payload).unwrap());
+        assert_eq!(response, wire(run, "rehandshake_response"));
+        let (_, confirmation) = c.open_control(&response, Some(REHANDSHAKE_RESPONSE)).unwrap();
+        c.finish_rehandshake(&confirmation).unwrap();
+        assert_eq!((c.epoch(), s.epoch()), (2, 2));
+        assert_secrets(c.secrets(), &run["secrets"]["2"], "client epoch 2");
+        assert_secrets(s.secrets(), &run["secrets"]["2"], "server epoch 2");
+
+        // Data and control both moved to epoch 2 together.
+        let frame = c.data().seal(1, b"after").unwrap();
+        assert_eq!(s.data().open(&frame, None).unwrap(), (1, b"after".to_vec()));
+        assert_eq!(u32::from_be_bytes(frame[14..18].try_into().unwrap()), 2);
     }
 
-    fn resume_run(run: &Value) {
+    fn resume_run(run: &Value, full: &Value) {
         let version = u8::try_from(run["version"].as_u64().unwrap()).unwrap();
-        let secret: [u8; 32] = arr(&run["resumption_secret"]);
-        let ticket = unhex(&run["ticket"]);
-
-        let mut d = Replay::new(step(run, "resumption_hello"));
-        let x = d.x25519().unwrap();
-        let (dk, ek) = d.mlkem_keypair().unwrap();
-        let cr = d.random().unwrap();
-        d.done();
-        let hello = ResumptionHello { client_random: &cr, ticket: &ticket, x25519: &x25519_public(&x).unwrap(),
-                                      mlkem_ek: ek[..].try_into().unwrap() }.pack(version).unwrap();
+        let key = TicketKey::new(&mut Replay::new(step(full, "issue_ticket"))).unwrap();
+        let mut client = ResumeClient::new(version, Zeroizing::new(arr(&run["resumption_secret"])), unhex(&run["ticket"]));
+        let hello = with_draws(run, "resumption_hello", |d| client.hello(d).unwrap());
         assert_eq!(hello, wire(run, "resumption_hello"));
-
-        let parsed = ResumptionHello::parse(version, &hello).unwrap();
-        assert_eq!(parsed.ticket, &ticket[..]);
-        let mut d = Replay::new(step(run, "resumption_accept"));
-        let (sr, sid) = (d.random().unwrap(), d.random().unwrap());
-        let sx = d.x25519().unwrap();
-        let (ct, kem) = d.encapsulate(parsed.mlkem_ek).unwrap();
-        d.done();
-        let server_x = x25519_public(&sx).unwrap();
-        let unmacced = ResumptionAccept { server_random: &sr, session_id: &sid, x25519: &server_x, ct: &ct, finished: &[0; 32] }.transcript_bytes(version);
-        assert_eq!(u16::from_be_bytes([unmacced[4], unmacced[5]]), 1216, "the hashed header claims the full 1216 bytes");
-        assert_eq!(unmacced.len(), HEADER_LEN + 1184);
-        let mut transcript = Transcript::default();
-        transcript.update(&hello);
-        transcript.update(&unmacced);
-        let digest = transcript.digest();
-        let r = Randoms { client_random: parsed.client_random, server_random: &sr, session_id: &sid, transcript_hash: &digest };
-        let server_secrets = schedule::resume(&r, &secret, &x25519(&sx, parsed.x25519).unwrap(), &kem);
-        let finished = schedule::finished(&server_secrets.server_finished, RESUME_FINISHED, &digest);
-        let accept = ResumptionAccept { server_random: &sr, session_id: &sid, x25519: &server_x, ct: &ct, finished: &finished }.pack(version).unwrap();
+        let (accept, s, client_id, assigned_ip) = with_draws(run, "resumption_accept", |d| resume_server(d, &key, &hello, version, NOW).unwrap());
+        assert_eq!((client_id.as_str(), assigned_ip.as_str()), ("vector", "10.8.0.2"));
         assert_eq!(accept, wire(run, "resumption_accept"));
-
-        let a = ResumptionAccept::parse(version, &accept).unwrap();
-        let mut transcript = Transcript::default();
-        transcript.update(&hello);
-        transcript.update(&accept[..HEADER_LEN + 1184]);
-        assert_eq!(transcript.digest(), digest);
-        let r = Randoms { client_random: &cr, server_random: a.server_random, session_id: a.session_id, transcript_hash: &digest };
-        let client_secrets = schedule::resume(&r, &secret, &x25519(&x, a.x25519).unwrap(), &decapsulate(&dk, a.ct).unwrap());
-        assert!(schedule::verify_finished(&client_secrets.server_finished, RESUME_FINISHED, &digest, a.finished));
-        assert_secrets(&client_secrets, &run["secrets"]["0"], "client resumed");
-        assert_secrets(&server_secrets, &run["secrets"]["0"], "server resumed");
+        let c = client.on_accept(&accept).unwrap();
+        assert_secrets(c.secrets(), &run["secrets"]["0"], "client resumed");
+        assert_secrets(s.secrets(), &run["secrets"]["0"], "server resumed");
+        // An expired ticket and a wrong-version ticket are refused before any draw.
+        assert_eq!(resume_server(&mut Os, &key, &hello, version, NOW + 86401).err(), Some(Error::Ticket));
+        let other = if version == 0x20 { 0x30 } else { 0x20 };
+        let mut wrong = hello.clone();
+        wrong[2] = other;
+        assert_eq!(resume_server(&mut Os, &key, &wrong, other, NOW).err(), Some(Error::TicketVersion));
     }
 
     #[test]
-    fn full_handshakes_rekey_and_rehandshake_match_python() {
+    fn real_state_machines_reproduce_python_handshakes_rekey_and_rehandshake() {
         let v = file();
         let runs: Vec<_> = v["runs"].as_array().unwrap().iter().filter(|r| r["name"] == "v2" || r["name"] == "v3").collect();
         assert_eq!(runs.len(), 2);
@@ -874,11 +1561,14 @@ mod vectors {
     }
 
     #[test]
-    fn resumptions_match_python() {
+    fn real_resumption_reproduces_python() {
         let v = file();
-        let runs: Vec<_> = v["runs"].as_array().unwrap().iter().filter(|r| r["name"].as_str().unwrap().starts_with("resume-")).collect();
-        assert_eq!(runs.len(), 2);
-        runs.iter().for_each(|run| resume_run(run));
+        let runs = v["runs"].as_array().unwrap();
+        for name in ["v2", "v3"] {
+            let full = runs.iter().find(|r| r["name"] == name).unwrap();
+            let resumed = runs.iter().find(|r| r["name"] == format!("resume-{name}")).unwrap();
+            resume_run(resumed, full);
+        }
     }
 
     #[test]
@@ -888,7 +1578,7 @@ mod vectors {
         assert_eq!(kats.len(), 2);
         for kat in kats {
             let key = mlkem_secret(&unhex(&kat["sk"])).unwrap();
-            assert_eq!(hex(&decapsulate(&key, &arr(&kat["ct"])).unwrap()[..]), kat["ss"], "{}", kat["name"]);
+            assert_eq!(hex(&decapsulate(&key, &arr(&kat["ct"])).unwrap()[..]), kat["ss"].as_str().unwrap(), "{}", kat["name"]);
         }
     }
 
@@ -915,7 +1605,7 @@ mod vectors {
         }
     }
 
-    /// Rust may reject more than Python (still failing closed), never less. Stricter cases are printed for the PR.
+    /// Rust may reject more than Python (still failing closed), never less.
     #[test]
     fn primitive_rejections_are_at_least_as_strict_as_python() {
         let v = file();
@@ -924,27 +1614,184 @@ mod vectors {
         for case in p["x25519"].as_array().unwrap() {
             let rust_ok = x25519(&private, &arr(&case["point"])).is_ok();
             assert!(case["result"] != "error" || !rust_ok, "Python rejects X25519 point {} but Rust accepts it", case["point"]);
-            if case["result"] == "ok" && !rust_ok {
-                eprintln!("stricter than Python: X25519 point {}", case["point"]);
-            }
         }
         for case in p["mlkem_encapsulation_key"].as_array().unwrap() {
-            let rust_ok = Os.encapsulate(&arr(&case["ek"])).is_ok();
-            assert_eq!(rust_ok, case["result"] == "ok", "ML-KEM encapsulation key {}", case["name"]);
+            assert_eq!(Os.encapsulate(&arr(&case["ek"])).is_ok(), case["result"] == "ok", "ML-KEM encapsulation key {}", case["name"]);
         }
         for case in p["ed25519"].as_array().unwrap() {
             let rust_ok = ed25519_verify(&arr(&case["public"]), &unhex(&case["message"]), &unhex(&case["signature"]));
             assert_eq!(rust_ok, case["result"] == "ok", "Ed25519 {}", case["name"]);
         }
     }
+}
+
+#[cfg(test)]
+mod machine_tests {
+    use super::*;
+
+    fn kem_identity() -> (Arc<Identity>, Vec<u8>) {
+        let (key, public) = Os.mlkem_keypair().unwrap();
+        let secret = key.key_bytes().unwrap().as_ref().to_vec();
+        (Arc::new(Identity::kem(&secret, &public).unwrap()), public)
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pqvpn-core-{name}-{}", hex(&Os.random().unwrap()[..8])));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    /// A full handshake with real randomness; returns (client, server).
+    fn established(suite: Suite) -> (Established, Established) {
+        let (server_id, server_pk) = kem_identity();
+        let (client_id, client_pk) = match suite {
+            Suite::V2 => (Arc::new(Identity::ed25519(&[7; 32]).unwrap()), vec![]),
+            Suite::V3 => kem_identity(),
+        };
+        let mut client = ClientHandshake::new(suite, &server_pk, &hex(&fingerprint(&server_pk)), client_id).unwrap();
+        let mut server = ServerHandshake::new(suite, server_id).unwrap();
+        server.client_identity(&client.hello(&mut Os).unwrap()).unwrap();
+        let sh = server.respond(&mut Os, (suite == Suite::V3).then_some(&client_pk[..])).unwrap();
+        let (sf, s) = server.on_key_exchange(&client.on_server_hello(&mut Os, &sh).unwrap()).unwrap();
+        (client.on_server_finished(&sf).unwrap(), s)
+    }
 
     #[test]
-    fn os_draws_roundtrip() {
-        let (key, ek) = Os.mlkem_keypair().unwrap();
-        let (ct, shared) = Os.encapsulate(ek[..].try_into().unwrap()).unwrap();
-        assert_eq!(decapsulate(&key, &ct).unwrap(), shared);
-        assert_ne!(Os.random().unwrap(), Os.random().unwrap());
-        let (a, b) = (Os.x25519().unwrap(), Os.x25519().unwrap());
-        assert_eq!(x25519(&a, &x25519_public(&b).unwrap()).unwrap(), x25519(&b, &x25519_public(&a).unwrap()).unwrap());
+    fn os_handshakes_agree_and_out_of_order_calls_fail() {
+        for suite in [Suite::V2, Suite::V3] {
+            let (c, s) = established(suite);
+            let frame = c.seal_control(7, b"cfg").unwrap();
+            assert_eq!(s.open_control(&frame, None).unwrap().1, b"cfg");
+        }
+        let (server_id, server_pk) = kem_identity();
+        let mut client = ClientHandshake::new(Suite::V2, &server_pk, &hex(&fingerprint(&server_pk)), Arc::new(Identity::ed25519(&[1; 32]).unwrap())).unwrap();
+        assert_eq!(client.on_server_finished(&[0; 38]).err(), Some(Error::State("Cannot process ServerFinished")));
+        let mut server = ServerHandshake::new(Suite::V2, server_id).unwrap();
+        assert_eq!(server.respond(&mut Os, None).err(), Some(Error::State("Cannot process ClientHello")));
+        assert_eq!(ClientHandshake::new(Suite::V2, &server_pk, "00", Arc::new(Identity::ed25519(&[1; 32]).unwrap())).err(), Some(Error::Fingerprint));
+        let (other_id, _) = kem_identity();
+        assert_eq!(ClientHandshake::new(Suite::V2, &server_pk, &hex(&fingerprint(&server_pk)), other_id).err(), Some(Error::Identity));
+    }
+
+    #[test]
+    fn tampered_messages_are_rejected() {
+        let (server_id, server_pk) = kem_identity();
+        let mut client = ClientHandshake::new(Suite::V2, &server_pk, &hex(&fingerprint(&server_pk)), Arc::new(Identity::ed25519(&[3; 32]).unwrap())).unwrap();
+        let mut server = ServerHandshake::new(Suite::V2, server_id).unwrap();
+        server.client_identity(&client.hello(&mut Os).unwrap()).unwrap();
+        let sh = server.respond(&mut Os, None).unwrap();
+        let mut cke = client.on_server_hello(&mut Os, &sh).unwrap();
+        cke[6 + 1088] ^= 1; // the Ed25519 signature
+        assert_eq!(server.on_key_exchange(&cke).err(), Some(Error::ClientProof));
+        assert_eq!(server.on_key_exchange(&cke).err(), Some(Error::State("Cannot process ClientKeyExchange")), "a failed handshake stays failed");
+    }
+
+    #[test]
+    fn v3_server_refuses_a_store_key_that_does_not_match_the_hello() {
+        let (server_id, server_pk) = kem_identity();
+        let (client_id, _) = kem_identity();
+        let (_, someone_else) = kem_identity();
+        let mut client = ClientHandshake::new(Suite::V3, &server_pk, &hex(&fingerprint(&server_pk)), client_id).unwrap();
+        let mut server = ServerHandshake::new(Suite::V3, server_id).unwrap();
+        server.client_identity(&client.hello(&mut Os).unwrap()).unwrap();
+        assert_eq!(server.respond(&mut Os, Some(&someone_else)).err(), Some(Error::ClientHash));
+    }
+
+    #[test]
+    fn epoch_changes_check_roles_confirmations_and_order() {
+        let (mut c, mut s) = established(Suite::V3);
+        assert_eq!(s.begin_rekey(&mut Os).err(), Some(Error::Role));
+        assert_eq!(c.respond_rekey(&[0; 36]).err(), Some(Error::Role));
+        assert_eq!(c.finish_rekey(b"x").err(), Some(Error::NoPending));
+        let request = c.begin_rekey(&mut Os).unwrap();
+        let (_, payload) = s.open_control(&request, None).unwrap();
+        assert_eq!(s.respond_rekey(&payload[..35]).err(), Some(Error::RekeyRequest));
+        let mut skipped = payload.clone();
+        skipped[3] = 2;
+        assert_eq!(s.respond_rekey(&skipped).err(), Some(Error::RekeyEpoch));
+        let (_, mut confirmation) = c.open_control(&s.respond_rekey(&payload).unwrap(), None).unwrap();
+        confirmation[10] ^= 1;
+        assert_eq!(c.finish_rekey(&confirmation).err(), Some(Error::RekeyConfirm));
+        assert_eq!(c.epoch(), 0, "a bad confirmation activates nothing");
+
+        let (mut c, mut s) = established(Suite::V2);
+        let request = c.begin_rehandshake(&mut Os).unwrap();
+        let (_, payload) = s.open_control(&request, None).unwrap();
+        let (_, mut response) = c.open_control(&s.respond_rehandshake(&mut Os, &payload).unwrap(), None).unwrap();
+        *response.last_mut().unwrap() ^= 1;
+        assert_eq!(c.finish_rehandshake(&response).err(), Some(Error::RehandshakeConfirm));
+        assert_eq!(c.epoch(), 0);
+        c.abort_epoch_change();
+    }
+
+    #[test]
+    fn tickets_roundtrip_expire_and_reject_tampering() {
+        let key = TicketKey::new(&mut Os).unwrap();
+        let ticket = key.issue(&mut Os, &[9; 32], "alice", 0x30, 60, "10.8.0.9", 1000).unwrap();
+        let (secret, cid, version, ip) = key.validate(&ticket, 1060).unwrap();
+        assert_eq!((*secret, cid.as_str(), version, ip.as_str()), ([9; 32], "alice", 0x30, "10.8.0.9"));
+        assert!(key.validate(&ticket, 1061).is_none(), "expired");
+        let mut tampered = ticket.clone();
+        tampered[20] ^= 1;
+        assert!(key.validate(&tampered, 1000).is_none());
+        assert!(TicketKey::new(&mut Os).unwrap().validate(&ticket, 1000).is_none(), "another key");
+        assert!(key.validate(&ticket[..72], 1000).is_none());
+    }
+
+    #[test]
+    fn base64_matches_rfc_4648_and_is_strict() {
+        for (plain, encoded) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("foobar", "Zm9vYmFy")] {
+            assert_eq!(&*b64_encode(plain.as_bytes()), encoded);
+            assert_eq!(&b64_decode(encoded).unwrap()[..], plain.as_bytes());
+        }
+        for bad in ["Zg=", "Z===", "Zg==Zg==", "Zm9!", "Zm 9v"] {
+            assert!(b64_decode(bad).is_none(), "{bad}");
+        }
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(&b64_decode(&b64_encode(&all)).unwrap()[..], &all[..]);
+    }
+
+    #[test]
+    fn ticket_file_roundtrip_mode_and_symlink_refusal() {
+        let dir = temp_dir("ticket");
+        let path = dir.join(".pqvpn_ticket.json");
+        save_ticket(&path, "ab\"cd", 3, b"ticket bytes", &[5; 32]).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let (ticket, secret) = load_ticket(&path, "ab\"cd", 3).unwrap();
+        assert_eq!((ticket.as_slice(), *secret), (&b"ticket bytes"[..], [5; 32]));
+        assert!(load_ticket(&path, "other", 3).is_none());
+        assert!(load_ticket(&path, "ab\"cd", 2).is_none());
+        assert!(std::fs::read_dir(&dir).unwrap().count() == 1, "no temp file left behind");
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(load_ticket(&link, "ab\"cd", 3).is_none(), "the reader does not follow symlinks");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_private_checks_type_and_mode() {
+        let dir = temp_dir("private");
+        let path = dir.join("key");
+        std::fs::write(&path, [1u8; 32]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(read_private(&path).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(&read_private(&path).unwrap()[..], &[1u8; 32]);
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_private(&link).is_err());
+        assert!(read_private(&dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn kem_identity_must_be_a_consistent_keypair() {
+        let (key, public) = Os.mlkem_keypair().unwrap();
+        let secret = key.key_bytes().unwrap().as_ref().to_vec();
+        let (_, other_public) = Os.mlkem_keypair().unwrap();
+        assert!(Identity::kem(&secret, &public).is_ok());
+        assert_eq!(Identity::kem(&secret, &other_public).err(), Some(Error::Identity));
+        assert_eq!(Identity::kem(&secret[..2399], &public).err(), Some(Error::Identity));
+        assert_eq!(Identity::ed25519(&[0; 31]).err(), Some(Error::Identity));
     }
 }

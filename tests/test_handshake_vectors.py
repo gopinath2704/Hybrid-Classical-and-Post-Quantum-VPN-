@@ -3,13 +3,12 @@
 Every random draw of a normal run is recorded, in call order, per protocol step. pqvpn_core's test-only
 `Replay` feeds the same draws to Rust, which must reproduce every wire message, transcript and secret byte
 for byte. The test below replays the draws through Python, so the file stays tied to the current Python code.
-Rekey and rehandshake mirror VPNClient.rekey/rehandshake and VPNServer._rekey_server/_rehandshake_server.
+Rekey and rehandshake go through the same HandshakeSession methods vpn/runtime.py calls.
 
 Regenerate with: PYTHONPATH=. python tests/test_handshake_vectors.py
 """
 import contextlib
 import hashlib
-import hmac
 import json
 import os
 import struct
@@ -24,7 +23,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 import handshake.kemtls as kemtls
-from crypto.hybrid_crypto import ECCProvider, HybridKEM, PQCProvider
+from crypto.hybrid_crypto import ECCProvider, PQCProvider
 from handshake.kemtls import (PROTOCOL_VERSION, PROTOCOL_VERSION_V3, ClientHello, ClientHelloV3, ClientKeyExchange,
                               ClientKeyExchangeV3, FrameType, HandshakeError, KEMTLSClient, KEMTLSClientV3,
                               KEMTLSServer, KEMTLSServerV3, ResumptionAccept, ResumptionClientHandshake, ResumptionHello,
@@ -108,7 +107,7 @@ def _secrets(session) -> dict:
 
 
 def _channel_and_epochs(run: dict, draws: Draws, client, server) -> None:
-    """Control frames both ways, then rekey to epoch 1 and rehandshake to epoch 2 (runtime.py:576-611, 1087-1172)."""
+    """Control frames both ways, then rekey to epoch 1 and rehandshake to epoch 2."""
     steps = run["steps"]
     run["control"] = {"config": server.encrypt_control(CONFIG, FrameType.CONFIG).hex(),
                       "client_error": client.encrypt_control(b"client says hi", FrameType.ERROR).hex(),
@@ -118,47 +117,21 @@ def _channel_and_epochs(run: dict, draws: Draws, client, server) -> None:
     assert server.decrypt_control(bytes.fromhex(run["control"]["client_error"]))
 
     with draws.step(steps, "rekey_request", "client") as step:
-        nonce = kemtls.os.urandom(32)
-        payload = struct.pack("!I", 1) + nonce
-        pending = client.derive_next_epoch(1, nonce)
-        step["wire"] = client.encrypt_control(payload, FrameType.REKEY_REQUEST).hex()
+        step["wire"] = client.begin_rekey().hex()
     with draws.step(steps, "rekey_response", "server") as step:
-        _, payload = server.decrypt_control(bytes.fromhex(step_wire(steps, "rekey_request")), FrameType.REKEY_REQUEST)
-        nxt = server.derive_next_epoch(1, payload[4:])
-        confirm = hmac.new(bytes(server.secrets.control_confirm_key), b"rekey response" + payload, hashlib.sha256).digest()
-        step["wire"] = server.encrypt_control(payload[:4] + confirm, FrameType.REKEY_RESPONSE).hex()
-        server.activate_epoch(1, nxt)
-    _, response = client.decrypt_control(bytes.fromhex(step_wire(steps, "rekey_response")), FrameType.REKEY_RESPONSE)
-    assert hmac.compare_digest(response[4:], hmac.new(bytes(client.secrets.control_confirm_key),
-                                                      b"rekey response" + payload, hashlib.sha256).digest())
-    client.activate_epoch(1, pending)
+        _, request = server.decrypt_control(bytes.fromhex(step_wire(steps, "rekey_request")), FrameType.REKEY_REQUEST)
+        step["wire"] = server.respond_rekey(request).hex()
+    client.finish_rekey(client.decrypt_control(bytes.fromhex(step_wire(steps, "rekey_response")), FrameType.REKEY_RESPONSE)[1])
     run["secrets"]["1"] = _secrets(client)
     assert _secrets(server) == run["secrets"]["1"]
 
     with draws.step(steps, "rehandshake_request", "client") as step:
-        hybrid = HybridKEM("ML-KEM-768")
-        dh_private, dh_public = hybrid.ecc.generate_keypair()
-        kem_secret, kem_public = hybrid.pqc.generate_keypair()
-        request = struct.pack("!I", 2) + dh_public + kem_public
-        step["wire"] = client.encrypt_control(request, FrameType.REHANDSHAKE_REQUEST).hex()
+        step["wire"] = client.begin_rehandshake().hex()
     with draws.step(steps, "rehandshake_response", "server") as step:
-        _, payload = server.decrypt_control(bytes.fromhex(step_wire(steps, "rehandshake_request")), FrameType.REHANDSHAKE_REQUEST)
-        hybrid = HybridKEM("ML-KEM-768")
-        server_private, server_public = hybrid.ecc.generate_keypair()
-        dh_ss = hybrid.ecc.derive_shared_secret(server_private, payload[4:36])
-        ct, k_mlkem = hybrid.pqc.encapsulate(payload[36:])
-        body = struct.pack("!I", 2) + server_public + ct
-        nxt = server.derive_rehandshake_epoch(2, dh_ss, k_mlkem, payload + body)
-        confirm = hmac.new(bytes(nxt.control_confirm_key), b"rehandshake confirm" + payload + body, hashlib.sha256).digest()
-        step["wire"] = server.encrypt_control(body + confirm, FrameType.REHANDSHAKE_RESPONSE).hex()
-        server.activate_epoch(2, nxt)
-    _, response = client.decrypt_control(bytes.fromhex(step_wire(steps, "rehandshake_response")), FrameType.REHANDSHAKE_RESPONSE)
-    body = response[:4 + 32 + 1088]
-    pending = client.derive_rehandshake_epoch(2, hybrid.ecc.derive_shared_secret(dh_private, body[4:36]),
-                                              hybrid.pqc.decapsulate(kem_secret, body[36:]), request + body)
-    assert hmac.compare_digest(response[-32:], hmac.new(bytes(pending.control_confirm_key),
-                                                        b"rehandshake confirm" + request + body, hashlib.sha256).digest())
-    client.activate_epoch(2, pending)
+        _, request = server.decrypt_control(bytes.fromhex(step_wire(steps, "rehandshake_request")), FrameType.REHANDSHAKE_REQUEST)
+        step["wire"] = server.respond_rehandshake(request).hex()
+    client.finish_rehandshake(client.decrypt_control(bytes.fromhex(step_wire(steps, "rehandshake_response")),
+                                                     FrameType.REHANDSHAKE_RESPONSE)[1])
     run["secrets"]["2"] = _secrets(client)
     assert _secrets(server) == run["secrets"]["2"]
 
