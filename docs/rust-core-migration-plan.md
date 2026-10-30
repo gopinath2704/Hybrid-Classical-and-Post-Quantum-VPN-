@@ -271,6 +271,100 @@ Phase 4 gates:
 
 Caveat: `environment.txt` says `pqvpnd: MISSING`, because the environment is captured before the build step. The 30 native M1 rows show the binary was built and run. The runner will be fixed in Phase 5.
 
+### Phase 5 results
+
+Branch `rust-core/phase-5-hardening` from main a16ae2a. Every number here is from an unprivileged probe unless it says gate run. The gate run needs sudo and has not happened yet.
+
+#### The Phase 4 misses: root cause
+
+Both Phase 4 misses had the same cause: how aws-lc seeds its random number generator.
+
+- **M1 cold.** aws-lc-sys 0.46.0 seeds its Tree DRBG from CPU Jitter Entropy on the first random draw in each process. That costs about 27 ms (a pure aws-lc-rs probe measured 26.6 ms for the first draw and 3 µs for the second).
+  - Python and Rust handshakes were swapped between client and server (2x2), under `unshare -rn`. The cost is entirely on the client and does not depend on the server's backend.
+  - The Python handshake never touches aws-lc's RNG, which is why rust-python was not slower.
+  - The native `pqvpnd connect` paid it too: about 27 of its ~34 ms.
+- **M2.** In the jitter build, aws-lc sets RDRAND as its prediction-resistance source, so every `RAND_bytes` call reads RDRAND. That is about 18 µs per v3-kem handshake, 9.9% of cycles.
+  - PyO3 and the harness glue cost only a few µs: pure Rust measured 198 to 207 µs, through Python 205 to 211 µs. So trimming the glue could never have met the gate.
+
+**Decision (user, 2026-10-30): build aws-lc without jitter entropy** (4425fa6, `AWS_LC_SYS_NO_JITTER_ENTROPY=1` in the repo-root `.cargo/config.toml`, so cargo, maturin, the PKGBUILD, debian/rules and the bench runner all pick it up).
+
+- **What it changes:** the DRBG is seeded from `getrandom` (`CRYPTO_sysrand`), with RDRAND as extra entropy and personalization. Prediction resistance is off. See aws-lc `entropy_sources.c` and `rand_extra/vm_ube_fallback.c`.
+- **What it costs:** aws-lc's second independent entropy source. In aws-lc's own words, randomness "might not use two independent entropy sources". The build is also incompatible with aws-lc FIPS, which this project does not use.
+- **Why it is acceptable:** `getrandom` is the same source the Python path (liboqs, cryptography) uses today, so the RNG is no weaker than the published baseline.
+- **EC2:** aws-lc already skips jitter on VMs that advertise VM UBE, so EC2 numbers may differ from the laptop either way.
+- **Provable:** the runner records the `jent_` symbol count of the installed extension (382ee27). A no-jitter gate run must show 0.
+
+Probe results with the no-jitter build. These are labelled probes, not gate numbers:
+
+| Metric | Jitter (Phase 4 build) | No jitter | Gate |
+| --- | --- | --- | --- |
+| Native `pqvpnd connect` cold, spawn to connected line, no ping polling (ms) | 34.4 | 6.5 | n/a, different clock from M1 |
+| M2 v3-kem, `eval/run_pqvpn.py --handshake rust`, 3 runs of n = 50 (ms) | 0.205 (gate run) | 0.184, 0.187, 0.199 | 0.2 |
+
+The M2 margin is thin. If the pinned gate run lands above 0.2 ms, it is reported as missed. Transcript hashing, length checks and constant-time compares are not trimmed. SHA-256 (transcript, HKDF, fingerprints) is now the largest cost that is not a primitive, at about 12% of cycles.
+
+#### Native client as a backend of the client service (Option T)
+
+- **Decision (user): Option T.** The Python `ClientService` keeps the socket, all 11 IPC commands and `ClientStatus`, so the GUI is unchanged.
+  - With `client_backend = "native"` it supervises `pqvpnd connect --status-json` (562b742).
+  - Option F would have `pqvpnd` own the socket; it was not chosen. It would have meant porting profile import, enrollment and identity creation (the most audited client file handling) to Rust, for about 2 to 3 more weeks.
+- **Prerequisite, done:** `pqvpnd` matches the Python client's network handling.
+  - IPv6 guard: 45d3bfb.
+  - Full and split tunnel routing with exact rollback: 7787c96.
+  - systemd-resolved DNS, reverted first on teardown: 6f991ef.
+- **Status pipe (6f8b129):** JSON lines, wire spec v1, at most 4096 bytes per line, flushed.
+  - States: CONNECTING, CONNECTED (on up, every 1 s and on each epoch change), then exactly one final line after cleanup. That line is DISCONNECTED (exit 0), FAILED (exit 1, or exit 2 for a config refusal) or BLOCKED.
+  - Probe counts are deltas.
+  - The service treats every line as untrusted. An invalid stream stops the child and fails closed.
+- **The GUI contract is tested (00bba49 and b32e645):** `ClientStatus(**status)` raises on an extra key but silently defaults a missing one. So every STATUS, in every state and on both backends, must have exactly the dataclass's keys, with values of the annotated types.
+  - The real `pqvpnd` against the Python server is covered under `unshare -rn`, v2 and v3, with the kill switch on.
+
+#### Kill switch
+
+- **The gap:** the Python client never enforced `kill_switch`; the GUI said "not enforced".
+- **Decision (user): a real kill switch now, for both clients.**
+  - An nft table, `inet pqvpn_killswitch`, installed before the tunnel comes up and narrowed to a "connecting" phase while reconnecting. It fails closed on a crash: SIGKILL leaves the table blocking until `pqvpnd recover` or Disconnect.
+  - Full tunnels that would leak DNS are refused.
+  - Commits: c8f2bb0, 4e9dfed, 9f1b66f, 6c271fa, 600b219, 5e6e24b.
+- **Only the user's Disconnect lifts it.** A lost session leaves traffic blocked and shows BLOCKED.
+
+#### Fuzzing
+
+- **New coverage (ad2aa52):** resume tickets that pass GCM with hostile hello fields (X25519 points, a malformed ML-KEM key, the wrong protocol version); control traffic on a resumed session; and the client ticket-file parser (JSON and base64), which must round-trip through the writer's format.
+- **The 24 h run started 2026-10-30 23:19 IST** from 6f991ef. All 5 targets run side by side, one worker each, with ASan.
+  - It counts for v4.0.0 only if these are unchanged at the tag: `pqvpn_core` tree `60df2ae`, `core/fuzz` tree `b624343`, `core/Cargo.lock` `537a016`. The governor was not pinned, which is fine because the gate is 0 artifacts, not a rate.
+  - The run started with `core/pqvpnd/src` dirty. That crate is not a fuzz dependency, and the run's validity rests on the three tree hashes, not on a clean checkout.
+- **10-minute preflight at 45d3bfb, 0 artifacts:**
+
+| Target | exec/s | Coverage after cmin | Corpus after cmin (files) |
+| --- | --- | --- | --- |
+| dispatch | 22,771 | 536 | 19 |
+| open | 97,463 | 143 | 8 |
+| handshake_decode | 34,240 | 1862 | 1907 |
+| handshake_machines | 6,034 | 3109 | 219 |
+| established | 1,615 | 1966 | 34 |
+
+#### Ticket hardening
+
+- The ticket file stays plaintext with mode 0600; sentinel-10's S4 records the rationale.
+- Both loaders refuse anything that is not a private regular file owned by the effective uid (b0e69eb, 87077bc).
+- The Rust loader opens with `O_NONBLOCK`, so a FIFO planted at the path cannot hang it.
+- A ticket the server rejects is deleted (de1bea7).
+
+#### Phase 5 gates
+
+| Gate | Status | How it is verified |
+| --- | --- | --- |
+| 24 h of fuzzing, no crash | **In progress** (started 2026-10-30 23:19 IST) | 0 files in `artifacts/*/` after 86,400 s per target, and the three tree hashes above unchanged at the tag |
+| `cargo deny` and `cargo audit` clean | sentinel-10, S4 | Both run at the tag commit; output in the release notes |
+| unsafe review | sentinel-10, S4 | `pqvpn_fd` is the only crate with unsafe; `own()` stays a safe fn so the single-crate invariant holds |
+| Pentest suite re-run clean | **Partial** | The network-leak section (#33 to #40) re-ran with the kill-switch case: SECTION 4 OK, while #33, #37 and #39 stay PARTIAL in `report.md`. Pending: the full 70-attack re-run and the real-host (sudo) kill-switch check |
+| Arch and Debian packages build from `git archive HEAD` | **Pending** (pqvpnd is in the PKGBUILD and debian/rules since 186f744; neither build has run) | `makepkg -fC` and the `debian:trixie` build, after the final digest re-pin, which comes last |
+| Full M1 to M8 rerun | **Pending, needs sudo** | One `bench_dataplane.sh` run on a clean tree, governor pinned, `jent_` = 0 recorded; M1 native and M2 reported as separate labelled rows attributed to the jitter decision |
+| M1 LAN cold 30 ms or less (carried from Phase 4) | **Pending** (probe: native 6.5 ms on a shorter clock) | The gate run's native M1 row |
+| M2 0.2 ms or less (carried from Phase 4) | **Pending** (probe: 0.184 to 0.199 ms) | The gate run's M2 v3-kem row; reported as missed if above 0.2 |
+| Tag `v4.0.0` | Pending | After every row above is met or reported |
+
 ## Security invariants and tests
 
 The rewrite must not weaken a single property in the security gap analysis. These are the invariants each Rust PR is checked against:
@@ -325,6 +419,7 @@ Treat the Python and Rust backends as two configurations of one artifact, not as
 - [x] Phase 0: re-run M1 to M8 on current main with flame graphs, then tag `v3-paper-artifact` (needs root on your machine). Baseline b726b42 in `eval/results-summary/phase0-2026-10-28/`; the `v3-paper-artifact` tag already existed and is public, so it was not moved.
 - [x] Phase 1: open one PR per quick win, starting with warm connect through `ClientService` and pyroute2. Merged: #28 warm connect, #29 TCP_NODELAY.
 - [x] Phase 4: Rust handshake behind `handshake = "rust"`, `pqvpnd connect`, the server selector thread. Gate run 6822d09: transcripts, M8, M5 and M7 met; M1 cold (42 ms) and M2 (0.205 ms) missed and reported. The IPC daemon is deferred to Phase 5.
+- [ ] Phase 5: hardening and release. Done: both Phase 4 misses root-caused (aws-lc jitter seeding; built without it, 4425fa6), pqvpnd network parity, a real kill switch on both clients, the native backend of the client service with the GUI contract tested, ticket loader hardening, and new resume and ticket-file fuzz coverage. In progress: the 24 h fuzz run (since 2026-10-30 23:19 IST). Pending: the full pentest re-run, Arch and Debian package builds, the sudo M1 to M8 gate run, then tag `v4.0.0`.
 - [x] Phase 2 spike: a `core/` skeleton with maturin, one known-answer test for frame encryption, and a `--backend` pytest option, to prove the build and packaging path before the real port.
 
 Open question: which venue and deadline is the paper aiming for? That decides whether to freeze after Phase 2, Phase 3 or Phase 4.
