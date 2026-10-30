@@ -4,7 +4,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -1249,12 +1249,26 @@ pub fn save_ticket(path: &Path, fingerprint: &str, protocol_version: u8, ticket:
     OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC).open(directory)?.sync_all()
 }
 
-/// `_load_ticket`: (ticket, resumption secret) if the file matches this server and protocol version.
+/// `_load_ticket`: (ticket, resumption secret) if the file is ours and matches this server and protocol version.
+/// O_NONBLOCK so a FIFO planted at the path cannot hang the open; the inode checks then refuse it.
 pub fn load_ticket(path: &Path, fingerprint: &str, protocol_version: u8) -> Option<(Vec<u8>, Zeroizing<[u8; 32]>)> {
-    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path).ok()?;
+    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path).ok()?;
+    if !ticket_inode_ok(&file.metadata().ok()?, nix::unistd::geteuid().as_raw()) {
+        return None;
+    }
     let mut raw = Zeroizing::new(Vec::new());
     file.take(MAX_TICKET_FILE).read_to_end(&mut raw).ok()?;
-    let mut data: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    parse_ticket(&raw, fingerprint, protocol_version)
+}
+
+/// The opened inode is a regular file owned by `euid` with no group or other access, as `save_ticket` leaves it.
+fn ticket_inode_ok(meta: &std::fs::Metadata, euid: u32) -> bool {
+    meta.is_file() && meta.uid() == euid && meta.mode() & 0o077 == 0
+}
+
+/// The ticket file's JSON: `{"fp": .., "t": b64, "s": b64, "v": ..}`; None unless it is for this server and version.
+pub fn parse_ticket(raw: &[u8], fingerprint: &str, protocol_version: u8) -> Option<(Vec<u8>, Zeroizing<[u8; 32]>)> {
+    let mut data: serde_json::Value = serde_json::from_slice(raw).ok()?;
     let secret_text = match data.get_mut("s") {
         Some(serde_json::Value::String(s)) => Zeroizing::new(std::mem::take(s)),
         _ => return None,
@@ -1777,6 +1791,31 @@ mod machine_tests {
         let link = dir.join("link.json");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(load_ticket(&link, "ab\"cd", 3).is_none(), "the reader does not follow symlinks");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ticket_file_refused_unless_private_regular_and_ours() {
+        let dir = temp_dir("ticket-inode");
+        let path = dir.join(".pqvpn_ticket.json");
+        save_ticket(&path, "fp", 3, b"ticket bytes", &[5; 32]).unwrap();
+        assert!(load_ticket(&path, "fp", 3).is_some());
+        for mode in [0o640, 0o604, 0o610, 0o601] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(load_ticket(&path, "fp", 3).is_none(), "group or other access {mode:o}");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(load_ticket(&path, "fp", 3).is_some(), "owner read-only is still private");
+        let euid = nix::unistd::geteuid().as_raw();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(ticket_inode_ok(&meta, euid) && !ticket_inode_ok(&meta, euid.wrapping_add(1)), "owned by another uid");
+        let subdir = dir.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(load_ticket(&subdir, "fp", 3).is_none(), "a directory");
+        let fifo = dir.join("fifo");
+        assert!(std::process::Command::new("mkfifo").args(["-m", "600"]).arg(&fifo).status().unwrap().success());
+        assert!(load_ticket(&fifo, "fp", 3).is_none(), "a FIFO is refused without blocking the open");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
