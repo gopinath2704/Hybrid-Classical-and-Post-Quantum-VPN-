@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-shot PQ-VPN server install on a fresh Ubuntu host (e.g. an AWS EC2 instance).
-# Automates the "Install and provision" steps of docs/deployment.md; see docs/aws.md.
+# Automates the "Install and provision" steps of docs/deployment.md; see docs/deployment.md (AWS EC2 deployment).
 #
 # Usage (root, from a clean checkout):
 #   sudo bash scripts/deploy-server.sh                              # install only

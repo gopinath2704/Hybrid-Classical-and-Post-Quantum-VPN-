@@ -294,7 +294,7 @@ docker build --target artifact -t pqvpn-artifact .
 docker run --rm -v $(pwd)/results:/app/results pqvpn-artifact
 ```
 
-See [ARTIFACT.md](ARTIFACT.md) for full reproducibility instructions.
+See [docs/evaluation.md](docs/evaluation.md) for full reproducibility instructions.
 
 ---
 
@@ -334,13 +334,13 @@ constraints-tested.txt   Tested version pins and native validation record
 |---|---|
 | [docs/design.md](docs/design.md) | Protocol design, wire formats, key schedule, threat model, design decisions |
 | [docs/deployment.md](docs/deployment.md) | Server deployment, packaging, provisioning guide |
-| [docs/aws.md](docs/aws.md) | Running the server on AWS EC2 |
+| [docs/deployment.md#aws-ec2-deployment](docs/deployment.md#aws-ec2-deployment) | Running the server on AWS EC2 |
 | [docs/accounts.md](docs/accounts.md) | Account API, invites, device binding and authorization separation |
 | [docs/security_audit.md](docs/security_audit.md) | Security audit and validation records (2026-09) |
 | [pentesting/pentest.md](pentesting/pentest.md) | 70-attack pentest checklist and status |
 | [pentesting/report.md](pentesting/report.md) | Per-attack findings and fixes |
-| [report.md](report.md) | Black-box pentest of the live test server (2026-10-24) |
-| [ARTIFACT.md](ARTIFACT.md) | Reproducibility artifact for the research evaluation |
+| [pentesting/report.md](pentesting/report.md) | Black-box pentest of the live test server (2026-10-24) |
+| [docs/evaluation.md](docs/evaluation.md) | Reproducibility artifact for the research evaluation |
 | [eval/results-summary/](eval/results-summary/) | Evaluation write-up, figures and validity report |
 
 ---
@@ -358,7 +358,7 @@ constraints-tested.txt   Tested version pins and native validation record
 - Post-compromise recovery via hybrid re-handshake (scoped: passive after full state compromise)
 - Stateless DoS-resistance cookies
 - ML-DSA-44 comparison protocol variant
-- Reference test server on AWS EC2 ([docs/aws.md](docs/aws.md))
+- Reference test server on AWS EC2 ([docs/deployment.md](docs/deployment.md#aws-ec2-deployment))
 - 70-attack pentest; all findings fixed except two tracked follow-ups (#69 supply-chain pinning, #46 socket group permissions). The low-severity public `/openapi.json` from the live-server pass is also still open
 
 **Pending:**

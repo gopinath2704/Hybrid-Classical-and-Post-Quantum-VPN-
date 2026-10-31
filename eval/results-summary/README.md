@@ -8,9 +8,9 @@ the paper-facing summary and figures live here instead.
 | File | What it is |
 |---|---|
 | [`EVALUATION.md`](EVALUATION.md) | The evaluation write-up: claim, headline findings, tables (median + 95 % CI), interpretation, threats to validity, reproducibility pointer. |
-| [`VALIDITY_REPORT.md`](VALIDITY_REPORT.md) | Per-cell validation of the campaign: what is trustworthy, missing, or suspect, with the concrete root cause for each. |
-| [`RERUN_COMMANDS.md`](RERUN_COMMANDS.md) | Exact commands + host prerequisites to produce the PENDING cells on a capable host; dry-run validation for the new baselines. |
-| [`REMAINING_STEPS.md`](REMAINING_STEPS.md) | What is still outstanding for the paper/artifact, in recommended order. |
+| [Validity report](../../docs/evaluation.md#validity-report) | Per-cell validation of the campaign: what is trustworthy, missing, or suspect, with the concrete root cause for each. |
+| [Re-run commands](../../docs/evaluation.md#re-run-commands) | Exact commands + host prerequisites to produce the PENDING cells on a capable host; dry-run validation for the new baselines. |
+| [Remaining steps](../../docs/evaluation.md#remaining-steps) | What is still outstanding for the paper/artifact, in recommended order. |
 | `figures/handshake_wire_sizes.svg` | **Final** — PQ-VPN handshake wire size by suite (deterministic). |
 | `figures/formal_verification.svg` | **Final** — 13/13 Tamarin lemmas verified. |
 
@@ -30,7 +30,7 @@ this preparation environment is not netem/WireGuard/liboqs-capable, so results
 could not be regenerated here. Rather than fabricate numbers, the trustworthy
 committed evidence is reported as final, the rest is marked PENDING, the harness
 gaps that would have corrupted a future run are fixed, and exact re-run commands
-are provided. See `VALIDITY_REPORT.md` for the full account.
+are provided. See the [validity report](../../docs/evaluation.md#validity-report) for the full account.
 
 ## Harness changes made in this pass (eval files only)
 
