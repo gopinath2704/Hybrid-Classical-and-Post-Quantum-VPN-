@@ -282,8 +282,8 @@ def test_revoke_cli_explains_active_session_boundary(identities,tmp_path,monkeyp
     monkeypatch.setattr(sys,'argv',['pqvpn','client','revoke',fp,'--database',str(db.path)])
     cli.main()
     out=capsys.readouterr().out
-    assert 'revoked for new sessions' in out and 'Restart' in out and 'all clients' in out
-    assert 'Existing active sessions continue until disconnect/expiration/server restart.' in out
+    assert 'Client revoked.' in out and 'within about 30 seconds' in out
+    assert 'Restart' not in out
 
 
 @pytest.mark.parametrize('match',[True,False])
