@@ -14,7 +14,7 @@
 # reported) and M7 at 0,1000,10000/s with every legitimate connect succeeding at 10000/s.
 # Output goes to eval/results-summary/phase3-<date>.
 #
-# PHASE=4 gates Phase 4 (docs/phase4-design.md section 3), definitions unchanged from Phases 0-3:
+# PHASE=4 gates Phase 4 (docs/rust-core-migration-plan.md, Appendix A section 3), definitions unchanged from Phases 0-3:
 #   - M1 LAN cold, v2, n=30, per data-plane/handshake backend, plus the pqvpnd native row
 #     (gate: native cold median <= 30 ms, all 30 connected)
 #   - M2 in-process, both roles, n=50, python and rust handshake (gate: v3-kem rust total <= 0.2 ms)

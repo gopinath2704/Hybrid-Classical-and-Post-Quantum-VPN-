@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reproduce all evaluation results, figures, and tables.
-# Usage: ./reproduce.sh [--iterations N] [--skip-tests]
+# Usage: eval/reproduce.sh [--iterations N] [--skip-tests]
 #
 # Requires: Python 3.11+, liboqs 0.16.0 (native), pip-installed .[dev]
 set -euo pipefail
@@ -16,8 +16,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
 
 echo "================================================================="
 echo "  PQVPN Reproducibility — $(date -Iseconds)"
