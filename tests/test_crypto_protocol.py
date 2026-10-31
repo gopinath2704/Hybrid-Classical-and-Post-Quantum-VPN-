@@ -462,11 +462,32 @@ def test_wrong_session_direction_and_epoch_rejected(identities):
     with pytest.raises(HandshakeError):s.decrypt_frame(bytes(frame))
 def test_nonce_uniqueness(identities):
     c,_=exchange(identities);frames=[c.encrypt_frame(b"x") for _ in range(100)];assert len(set(x[:DATA_HEADER_SIZE] for x in frames))==100
-def test_synchronized_rekey_and_old_epoch_rejection(identities):
-    c,s=exchange(identities);old=c.encrypt_frame(b"old");nonce=os.urandom(32);cn=c.derive_next_epoch(1,nonce);sn=s.derive_next_epoch(1,nonce);c.activate_epoch(1,cn);s.activate_epoch(1,sn)
+def _later(monkeypatch, seconds):
+    """kemtls's clock, `seconds` ahead (no sleeping)."""
+    import time as real, types, handshake.kemtls as kemtls
+    monkeypatch.setattr(kemtls, "time", types.SimpleNamespace(time=real.time, monotonic=lambda: real.monotonic() + seconds))
+def test_synchronized_rekey_and_old_epoch_rejection(identities, monkeypatch):
+    from handshake.kemtls import RECEIVE_GRACE_SECONDS
+    c,s=exchange(identities);old,expired=c.encrypt_frame(b"old"),c.encrypt_frame(b"expired");nonce=os.urandom(32);cn=c.derive_next_epoch(1,nonce);sn=s.derive_next_epoch(1,nonce);c.activate_epoch(1,cn);s.activate_epoch(1,sn)
     assert s.decrypt_frame(c.encrypt_frame(b"new"))[1]==b"new"
-    with pytest.raises(HandshakeError):s.decrypt_frame(old)
+    assert s.decrypt_frame(old)[1]==b"old"  # the receive grace, with epoch 0's own replay window
+    with pytest.raises(HandshakeError,match="replayed"):s.decrypt_frame(old)
+    previous=s._data_previous;_later(monkeypatch,RECEIVE_GRACE_SECONDS)
+    with pytest.raises(HandshakeError,match="wrong session, epoch"):s.decrypt_frame(expired)
+    assert s._data_previous is None and previous.cipher is None and not any(previous.nonce_base)
     with pytest.raises(HandshakeError):s.derive_next_epoch(1,nonce)
+def test_responder_hold_times_out_before_the_receive_grace(identities, monkeypatch):
+    from handshake.kemtls import SEND_HOLD_SECONDS
+    c,s=exchange(identities);nonce=os.urandom(32);inflight=c.encrypt_frame(b"in flight")
+    for side in (c,s):side.activate_epoch(1,side.derive_next_epoch(1,nonce))
+    assert struct.unpack(DATA_HEADER_FORMAT,s.encrypt_frame(b"held")[:DATA_HEADER_SIZE])[6:]==(0,0)
+    held=s._data_held;_later(monkeypatch,SEND_HOLD_SECONDS)
+    frame=s.encrypt_frame(b"after the hold")
+    assert struct.unpack(DATA_HEADER_FORMAT,frame[:DATA_HEADER_SIZE])[6:]==(1,0) and c.decrypt_frame(frame)[1]==b"after the hold"
+    assert s._data_held is None and held.cipher is None and not any(held.nonce_base)
+    assert s.decrypt_frame(inflight)[1]==b"in flight", "the receive grace outlives the hold"
+    previous=s._data_previous;s.secure_wipe()
+    assert s._data_previous is None and not any(previous.nonce_base)
 def test_cross_direction_ciphertext_rejected(identities):
     c,s=exchange(identities)
     with pytest.raises(HandshakeError):c.decrypt_frame(c.encrypt_frame(b"reflection"))
@@ -784,7 +805,8 @@ def test_rehandshake_old_epoch_rejected(v3_identities):
     sn = s.derive_rehandshake_epoch(1, dh_ss2, k2, transcript)
     c.activate_epoch(1, cn)
     s.activate_epoch(1, sn)
-    with pytest.raises(HandshakeError):
+    assert s.decrypt_frame(old_frame)[1] == b"before"  # within the receive grace, once
+    with pytest.raises(HandshakeError, match="replayed"):
         s.decrypt_frame(old_frame)
 
 

@@ -567,8 +567,10 @@ def test_genuinely_idle_session_expires_and_cleans_up(connected, caplog, monkeyp
 
 
 @pytest.mark.parametrize('case', ['ping', 'data', 'replay', 'wrong_session', 'unknown_session',
-    'wrong_endpoint', 'malformed_ping', 'bad_tag', 'truncated', 'spoof', 'malformed_data', 'old_epoch', 'control_domain', 'bad_bind'])
-# The Python loop's own dispatch; the Rust loop's twin is the cargo parity test of the same 14 cases.
+    'wrong_endpoint', 'malformed_ping', 'bad_tag', 'truncated', 'spoof', 'malformed_data', 'previous_epoch', 'old_epoch',
+    'control_domain', 'bad_bind'])
+# The Python loop's own dispatch; the Rust loop's twin is the cargo parity test of the same 15 cases.
+# previous_epoch is inside the receive grace (accepted like ping); old_epoch is N-2.
 @pytest.mark.parametrize('data_plane', ['python'])
 def test_only_authorized_current_records_touch_activity(data_plane, identities, case):
     cs, ss = exchange(identities, data_plane=data_plane)
@@ -597,14 +599,16 @@ def test_only_authorized_current_records_touch_activity(data_plane, identities, 
     elif case == 'truncated': frame = frame[:10]
     elif case in {'data', 'spoof', 'malformed_data'}:
         frame = cs.seal_data(b'bad' if case == 'malformed_data' else ipv4('10.8.0.3' if case == 'spoof' else item.vpn_ip))
-    elif case == 'old_epoch':
+    elif case in {'previous_epoch', 'old_epoch'}:
         ss.activate_epoch(1, ss.derive_next_epoch(1, b'n'*32))
+        if case == 'old_epoch':
+            ss.activate_epoch(2, ss.derive_next_epoch(2, b'n'*32))
     elif case == 'control_domain': frame = cs.encrypt_control(payload, FrameType.ERROR)
     elif case == 'bad_bind': frame = cs.seal_data(b'bad', FrameType.UDP_BIND)
     server._handle_datagram(frame, endpoint)
-    if case in {'ping', 'data'}:
+    if case in {'ping', 'previous_epoch', 'data'}:
         assert item.last_seen > 1
-        if case == 'ping':
+        if case != 'data':
             pong, address = server.udp.sendto.call_args.args
             assert address == endpoint
             assert cs.open_data(pong, FrameType.PONG)[1] == payload

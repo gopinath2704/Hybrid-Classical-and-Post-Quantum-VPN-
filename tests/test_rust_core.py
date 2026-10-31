@@ -282,11 +282,84 @@ def test_mixed_data_planes_interoperate_across_rekey(core, request, suite, clien
         assert server.open_data(client.seal_data(b"up"))[1] == b"up"
         assert client.open_data(server.seal_data(b"down", FrameType.PONG), FrameType.PONG)[1] == b"down"
         if epoch == 0:
-            old, nonce = client.seal_data(b"stale"), bytes(32)
+            old, older, nonce = client.seal_data(b"stale"), client.seal_data(b"older"), bytes(32)
             client.activate_epoch(1, client.derive_next_epoch(1, nonce))
             server.activate_epoch(1, server.derive_next_epoch(1, nonce))
-    with pytest.raises(HandshakeError, match="wrong session, epoch, or direction"):
+    # Within the receive grace the previous epoch opens once; two switches on it is N-2 and never opens.
+    assert server.open_data(old)[1] == b"stale"
+    with pytest.raises(HandshakeError, match="replayed packet"):
         server.open_data(old)
+    client.activate_epoch(2, client.derive_next_epoch(2, bytes(32)))
+    server.activate_epoch(2, server.derive_next_epoch(2, bytes(32)))
+    with pytest.raises(HandshakeError, match="wrong session, epoch, or direction"):
+        server.open_data(older)
+
+
+def _epoch_and_sequence(frame: bytes) -> tuple[int, int]:
+    return struct.unpack(DATA_HEADER_FORMAT, frame[:DATA_HEADER_SIZE])[6:]
+
+
+@pytest.mark.parametrize("kind", ["rekey", "rehandshake"])
+@pytest.mark.parametrize("plane", ["python", "rust"])
+def test_epoch_switch_drops_nothing_in_either_direction(core, identities, plane, kind):
+    """The M6 reproduction in the real call order: the server switches inside respond_*, the client only when the
+    TCP response arrives. Frames in flight either way across that gap are all delivered, each exactly once."""
+    from handshake.kemtls import RECEIVE_GRACE_SECONDS, SEND_HOLD_SECONDS
+    from test_crypto_protocol import exchange
+    assert (core.RECEIVE_GRACE_SECONDS, core.SEND_HOLD_SECONDS) == (RECEIVE_GRACE_SECONDS, SEND_HOLD_SECONDS)
+    client, server = exchange(identities, data_plane=plane)
+    seen_up, seen_down = client.seal_data(b"seen up"), server.seal_data(b"seen down")
+    assert server.open_data(seen_up)[1] == b"seen up" and client.open_data(seen_down)[1] == b"seen down"
+    _, request = server.decrypt_control(getattr(client, f"begin_{kind}")())
+    up = client.seal_data(b"up, sealed before the client saw the response")
+    response = getattr(server, f"respond_{kind}")(request)
+    down = server.seal_data(b"down, sealed right after the server switched")
+    assert _epoch_and_sequence(down) == (0, 1), "held: epoch 0's key and counter, the client may not have switched"
+    assert server.open_data(up)[1].startswith(b"up")
+    assert client.open_data(down)[1].startswith(b"down")
+    late = server.seal_data(b"late")
+    getattr(client, f"finish_{kind}")(client.decrypt_control(response)[1])
+    assert (client.epoch, server.epoch) == (1, 1)
+    assert client.open_data(late)[1] == b"late", "the switched client still accepts the held epoch"
+    # The epoch-0 windows are the originals: frames opened before the switch stay replays.
+    for receiver, frame in ((server, seen_up), (client, seen_down), (server, up), (client, down), (client, late)):
+        with pytest.raises(HandshakeError, match="replayed packet"):
+            receiver.open_data(frame)
+    assert server.open_data(client.seal_data(b"first at epoch 1"))[1] == b"first at epoch 1"
+    promoted = server.seal_data(b"promoted")
+    assert _epoch_and_sequence(promoted) == (1, 0)
+    assert client.open_data(promoted)[1] == b"promoted"
+
+
+@pytest.mark.parametrize("plane", ["python", "rust"])
+def test_responder_promotes_only_on_an_authenticated_new_epoch_frame(core, identities, plane):
+    from test_crypto_protocol import exchange
+    client, server = exchange(identities, data_plane=plane)
+    stale = client.seal_data(b"stale")
+    for side in (server, client):
+        side.activate_epoch(1, side.derive_next_epoch(1, bytes(32)))
+    forged = bytearray(client.seal_data(b"forged"))
+    forged[-1] ^= 1
+    with pytest.raises(HandshakeError, match="Frame decryption failed"):
+        server.open_data(bytes(forged))
+    assert server.open_data(stale)[1] == b"stale"
+    assert _epoch_and_sequence(server.seal_data(b"x")) == (0, 0), "neither a forged N+1 nor an N frame promotes"
+    # A second switch mid-hold: epoch 0 is gone for good, the hold moves to epoch 1 at its own counter.
+    in_grace, after_close = client.seal_data(b"in grace"), client.seal_data(b"after close")
+    for side in (server, client):
+        side.activate_epoch(2, side.derive_next_epoch(2, bytes(32)))
+    held = server.seal_data(b"held")
+    assert _epoch_and_sequence(held) == (1, 0)
+    assert client.open_data(held)[1] == b"held"
+    with pytest.raises(HandshakeError, match="wrong session, epoch, or direction"):
+        server.open_data(stale)
+    assert server.open_data(client.seal_data(b"up"))[1] == b"up"
+    assert _epoch_and_sequence(server.seal_data(b"y")) == (2, 0)
+    assert _epoch_and_sequence(client.seal_data(b"z")) == (2, 1), "the client never holds"
+    assert server.open_data(in_grace)[1] == b"in grace"
+    server.secure_wipe()
+    with pytest.raises(HandshakeError):
+        server.open_data(after_close)
 
 
 def test_rust_mode_python_never_holds_data_ciphers(core, identities):

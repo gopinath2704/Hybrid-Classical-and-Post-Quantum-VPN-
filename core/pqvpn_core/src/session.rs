@@ -1,8 +1,9 @@
 //! Record layer for one session epoch, mirroring `HandshakeSession` `_encrypt`/`_decrypt` in handshake/kemtls.py:
 //! the data channel (`DataSession`, replay window) and the control channel (`ControlChannel`, strict sequence). No I/O.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
@@ -290,14 +291,34 @@ impl ControlChannel {
     }
 }
 
+/// How long a switch keeps the previous epoch's receive state: covers the TCP delay before the peer switches too,
+/// plus UDP delay and reordering of frames sealed before it did. Mirrors `RECEIVE_GRACE_SECONDS` in kemtls.py.
+pub const RECEIVE_GRACE: Duration = Duration::from_secs(5);
+/// How long the responder (server) keeps sealing under the previous epoch after it switched, unless an authenticated
+/// frame at the new epoch shows the client switched first. Covers the TCP response plus a retransmit; strictly
+/// shorter than `RECEIVE_GRACE`, so every held frame still has 3 s to reach a client whose grace is live.
+pub const SEND_HOLD: Duration = Duration::from_secs(2);
+const _: () = assert!(SEND_HOLD.as_nanos() < RECEIVE_GRACE.as_nanos());
+
+/// One snapshot of the data channel, swapped whole: the current epoch and, for `RECEIVE_GRACE` after a switch,
+/// the previous one, kept whole so it opens with its own replay window and the server's hold seals with its own
+/// counter. Dropping a snapshot frees the previous epoch's keys once the last in-flight user lets go.
+struct Epochs {
+    current: Arc<DataSession>,
+    previous: Option<Arc<DataSession>>,
+    switched: Instant,
+    /// Server only: cleared by the first authenticated frame at `current`.
+    holding: AtomicBool,
+}
+
 /// A session's data channel across epochs. Each epoch's keys, send counter and replay window live in
-/// one `DataSession` that is swapped whole on rekey, so a (key, nonce) pair can never be sealed twice.
+/// one `DataSession` that is never rebuilt, so a (key, nonce) pair can never be sealed twice.
 pub struct Session {
     role: Role,
     session_id: [u8; 32],
     version: u8,
-    current: ArcSwapOption<DataSession>,
-    /// Serializes rekey and close so a rekey can never resurrect a closed session; reads stay lock-free.
+    epochs: ArcSwapOption<Epochs>,
+    /// Serializes rekey, grace expiry and close so none can resurrect what another dropped; reads stay lock-free.
     writer: Mutex<()>,
 }
 
@@ -310,38 +331,89 @@ impl Session {
             role,
             session_id: session_id.try_into().map_err(|_| Error::InvalidKey)?,
             version,
-            current: ArcSwapOption::from_pointee(first),
+            epochs: ArcSwapOption::from_pointee(Epochs {
+                current: Arc::new(first), previous: None, switched: Instant::now(), holding: AtomicBool::new(false),
+            }),
             writer: Mutex::new(()),
         })
     }
 
-    fn epoch(&self) -> Result<Arc<DataSession>, Error> {
-        self.current.load_full().ok_or(Error::Closed)
+    /// The live snapshot and, while a previous epoch is still in its grace, the time read. The clock is only read
+    /// while a previous epoch exists; once its grace is over it is dropped here, under the writer lock.
+    fn epochs(&self, now: &impl Fn() -> Instant) -> Result<(Arc<Epochs>, Option<Instant>), Error> {
+        loop {
+            let epochs = self.epochs.load_full().ok_or(Error::Closed)?;
+            if epochs.previous.is_none() {
+                return Ok((epochs, None));
+            }
+            let at = now();
+            if at < epochs.switched + RECEIVE_GRACE {
+                return Ok((epochs, Some(at)));
+            }
+            let _writer = self.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Only the snapshot we judged expired; a concurrent rekey or close has already replaced it.
+            if self.epochs.load().as_ref().is_some_and(|latest| Arc::ptr_eq(latest, &epochs)) {
+                self.epochs.store(Some(Arc::new(Epochs {
+                    current: epochs.current.clone(), previous: None, switched: epochs.switched, holding: AtomicBool::new(false),
+                })));
+            }
+        }
     }
 
     pub fn seal(&self, frame_type: u8, payload: &[u8]) -> Result<Vec<u8>, Error> {
-        self.epoch()?.seal(frame_type, payload)
+        self.seal_at(frame_type, payload, &Instant::now)
+    }
+
+    fn seal_at(&self, frame_type: u8, payload: &[u8], now: &impl Fn() -> Instant) -> Result<Vec<u8>, Error> {
+        let (epochs, at) = self.epochs(now)?;
+        match (&epochs.previous, at) {
+            (Some(previous), Some(at)) if epochs.holding.load(Ordering::Acquire) && at < epochs.switched + SEND_HOLD => {
+                previous.seal(frame_type, payload)
+            }
+            _ => epochs.current.seal(frame_type, payload),
+        }
     }
 
     pub fn open(&self, frame: &[u8], expected: Option<u8>) -> Result<(u8, Vec<u8>), Error> {
-        self.epoch()?.open(frame, expected)
+        self.open_at(frame, expected, &Instant::now)
     }
 
-    /// Hard cutover to `epoch` (must be current + 1): new keys, counter at 0, empty replay window.
+    /// The header epoch picks the state: the previous epoch only while its grace is live; everything else,
+    /// malformed frames included, goes to the current epoch's checks and keeps their rejections.
+    fn open_at(&self, frame: &[u8], expected: Option<u8>, now: &impl Fn() -> Instant) -> Result<(u8, Vec<u8>), Error> {
+        let (epochs, _) = self.epochs(now)?;
+        if let Some(previous) = &epochs.previous {
+            if frame.get(14..18) == Some(&previous.binding.epoch.to_be_bytes()[..]) {
+                return previous.open(frame, expected);
+            }
+        }
+        let opened = epochs.current.open(frame, expected)?;
+        if epochs.holding.load(Ordering::Acquire) {
+            epochs.holding.store(false, Ordering::Release);
+        }
+        Ok(opened)
+    }
+
+    /// Switch to `epoch` (must be current + 1): new keys, counter at 0, empty replay window. The old epoch stays
+    /// for `RECEIVE_GRACE`, and the server (always the responder) keeps sealing under it for up to `SEND_HOLD`.
     pub fn rekey(&self, epoch: u32, send_key: &[u8], send_nonce_base: &[u8], recv_key: &[u8], recv_nonce_base: &[u8]) -> Result<(), Error> {
         let _writer = self.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.epoch()?.binding.epoch.checked_add(1) != Some(epoch) {
+        let current = self.epochs.load_full().ok_or(Error::Closed)?.current.clone();
+        if current.binding.epoch.checked_add(1) != Some(epoch) {
             return Err(Error::Epoch);
         }
         let next = DataSession::new(self.role, &self.session_id, self.version, epoch, send_key, send_nonce_base, recv_key, recv_nonce_base)?;
-        self.current.store(Some(Arc::new(next)));
+        self.epochs.store(Some(Arc::new(Epochs {
+            current: Arc::new(next), previous: Some(current), switched: Instant::now(),
+            holding: AtomicBool::new(self.role == Role::Server),
+        })));
         Ok(())
     }
 
-    /// Drops this session's keys; the last in-flight user frees them (aws-lc cleanses on free).
+    /// Drops this session's keys, the previous epoch's included; the last in-flight user frees them (aws-lc cleanses on free).
     pub fn close(&self) {
         let _writer = self.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.current.store(None);
+        self.epochs.store(None);
     }
 }
 
@@ -391,23 +463,70 @@ mod tests {
         assert_eq!(client.seal(8, b"x"), Err(Error::Exhausted));
     }
 
+    fn epoch_of(frame: &[u8]) -> (u32, u64) {
+        (u32::from_be_bytes(frame[14..18].try_into().unwrap()), u64::from_be_bytes(frame[18..26].try_into().unwrap()))
+    }
+
     #[test]
-    fn rekey_is_a_hard_cutover_and_close_is_final() {
+    fn rekey_keeps_one_previous_epoch_for_its_grace_and_close_is_final() {
         let (sid, c2s, s2c, nc, ns) = ([7; 32], [1; 32], [2; 32], [3; 12], [4; 12]);
         let client = Session::new(Role::Client, &sid, 0x20, 0, &c2s, &nc, &s2c, &ns).unwrap();
         let server = Session::new(Role::Server, &sid, 0x20, 0, &s2c, &ns, &c2s, &nc).unwrap();
-        let old = client.seal(1, b"old").unwrap();
+        let (seen, old, older) = (client.seal(1, b"seen").unwrap(), client.seal(1, b"old").unwrap(), client.seal(1, b"older").unwrap());
+        assert!(server.open(&seen, None).is_ok());
         assert_eq!(client.rekey(2, &c2s, &nc, &s2c, &ns), Err(Error::Epoch));
         client.rekey(1, &[5; 32], &nc, &[6; 32], &ns).unwrap();
         server.rekey(1, &[6; 32], &ns, &[5; 32], &nc).unwrap();
         let new = client.seal(1, b"new").unwrap();
-        assert_eq!(new[18..26], 0u64.to_be_bytes(), "counter restarts with the new key");
-        assert_eq!(server.open(&old, None), Err(Error::Binding));
+        assert_eq!(epoch_of(&new), (1, 0), "counter restarts with the new key");
+        assert_eq!(server.open(&seen, None), Err(Error::Replayed), "the previous epoch keeps its own replay window");
+        assert_eq!(server.open(&old, None), Ok((1, b"old".to_vec())));
+        assert_eq!(server.open(&old, None), Err(Error::Replayed));
         assert_eq!(server.open(&new, Some(4)), Err(Error::UnexpectedType));
         assert_eq!(server.open(&new, Some(1)), Ok((1, b"new".to_vec())));
+        let after_grace = || Instant::now() + RECEIVE_GRACE;
+        assert_eq!(server.open_at(&older, None, &after_grace), Err(Error::Binding), "N-1 after the grace");
+        assert!(server.epochs.load().as_ref().unwrap().previous.is_none(), "the expired epoch is dropped");
+        client.rekey(2, &c2s, &nc, &s2c, &ns).unwrap();
+        server.rekey(2, &s2c, &ns, &c2s, &nc).unwrap();
+        server.rekey(3, &[6; 32], &ns, &[5; 32], &nc).unwrap();
+        assert_eq!(server.open(&client.seal(1, b"n-1").unwrap(), None).map(|(_, p)| p), Ok(b"n-1".to_vec()));
+        let n_minus_2 = Session::new(Role::Client, &sid, 0x20, 1, &[5; 32], &nc, &[6; 32], &ns).unwrap().seal(1, b"x").unwrap();
+        assert_eq!(server.open(&n_minus_2, None), Err(Error::Binding), "N-2 is never accepted");
         server.close();
+        assert!(server.epochs.load().is_none(), "close drops the previous epoch too");
         assert_eq!(server.open(&new, None), Err(Error::Closed));
-        assert_eq!(server.rekey(2, &s2c, &ns, &c2s, &nc), Err(Error::Closed));
+        assert_eq!(server.rekey(4, &s2c, &ns, &c2s, &nc), Err(Error::Closed));
+    }
+
+    /// The server keeps sealing with the previous epoch's key and counter until an authenticated frame at the new
+    /// epoch arrives or `SEND_HOLD` passes; a second switch mid-hold moves the hold to the epoch it just left.
+    #[test]
+    fn responder_holds_its_old_send_epoch_until_the_client_proves_it_switched() {
+        let (sid, c2s, s2c, nc, ns) = ([7; 32], [1; 32], [2; 32], [3; 12], [4; 12]);
+        let client = Session::new(Role::Client, &sid, 0x20, 0, &c2s, &nc, &s2c, &ns).unwrap();
+        let server = Session::new(Role::Server, &sid, 0x20, 0, &s2c, &ns, &c2s, &nc).unwrap();
+        assert_eq!(epoch_of(&server.seal(1, b"a").unwrap()), (0, 0));
+        let stale = client.seal(1, b"stale").unwrap();
+        server.rekey(1, &[6; 32], &ns, &[5; 32], &nc).unwrap();
+        client.rekey(1, &[5; 32], &nc, &[6; 32], &ns).unwrap();
+        assert_eq!(epoch_of(&server.seal(1, b"b").unwrap()), (0, 1), "held: same key, same counter");
+        let after_hold = || Instant::now() + SEND_HOLD;
+        assert_eq!(epoch_of(&server.seal_at(1, b"c", &after_hold).unwrap()), (1, 0), "the hold times out");
+        assert_eq!(epoch_of(&server.seal(1, b"d").unwrap()), (0, 2), "and only for that call's clock");
+        let mut forged = client.seal(1, b"forged").unwrap();
+        *forged.last_mut().unwrap() ^= 1;
+        assert_eq!(server.open(&forged, None), Err(Error::Tag));
+        assert!(server.open(&stale, None).is_ok());
+        assert_eq!(epoch_of(&server.seal(1, b"e").unwrap()), (0, 3), "neither a forged N+1 nor an N frame promotes");
+        server.rekey(2, &s2c, &ns, &c2s, &nc).unwrap();
+        assert_eq!(epoch_of(&server.seal(1, b"f").unwrap()), (1, 1), "the hold moves to epoch 1; epoch 0 is gone");
+        client.rekey(2, &c2s, &nc, &s2c, &ns).unwrap();
+        assert!(server.open(&client.seal(1, b"up").unwrap(), None).is_ok());
+        assert_eq!(epoch_of(&server.seal(1, b"g").unwrap()), (2, 0), "promoted");
+        assert_eq!(client.open(&server.seal(1, b"h").unwrap(), None), Ok((1, b"h".to_vec())));
+        client.rekey(3, &c2s, &nc, &s2c, &ns).unwrap();
+        assert_eq!(epoch_of(&client.seal(1, b"i").unwrap()), (3, 0), "the client never holds");
     }
 
     proptest::proptest! {

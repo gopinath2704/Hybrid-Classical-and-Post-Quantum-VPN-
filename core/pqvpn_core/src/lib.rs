@@ -497,6 +497,8 @@ fn inbound_ok(role_name: &str, packet: &[u8], address: [u8; 4], mtu: usize) -> P
 
 #[pymodule]
 fn pqvpn_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("RECEIVE_GRACE_SECONDS", session::RECEIVE_GRACE.as_secs_f64())?;
+    m.add("SEND_HOLD_SECONDS", session::SEND_HOLD.as_secs_f64())?;
     m.add_function(wrap_pyfunction!(encrypt_frame, m)?)?;
     m.add_function(wrap_pyfunction!(inbound_ok, m)?)?;
     m.add_function(wrap_pyfunction!(resume_server, m)?)?;
