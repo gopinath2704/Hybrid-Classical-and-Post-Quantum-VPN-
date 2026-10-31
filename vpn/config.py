@@ -50,6 +50,8 @@ class ClientConfig:
     # Omitted: block in full mode, leave unrelated IPv6 alone in split mode.
     ipv6_policy:str|None=None
     experimental_suite:str=""
+    # "native": the client service runs pqvpnd instead of the in-process VPNClient.
+    client_backend:str="python"
 def _load(path, section, cls):
     config_path=Path(path).resolve()
     values=tomllib.loads(config_path.read_text(encoding="utf-8")).get(section,{})
@@ -164,3 +166,13 @@ def validate_client(cfg: ClientConfig) -> None:
     handshake_backend(cfg)
     if cfg.experimental_suite and cfg.experimental_suite not in _VALID_SUITES:
         raise ValueError(f'experimental_suite must be one of {sorted(_VALID_SUITES)} or empty')
+    if cfg.client_backend not in ('python', 'native'): raise ValueError('client_backend must be python or native')
+    if cfg.kill_switch:
+        # Everything outside the tunnel is blocked, so split tunnel or allowed IPv6 would contradict it; and from the
+        # blocked state a hostname cannot be resolved without letting DNS leak, so the server must be an address.
+        if not cfg.full_tunnel: raise ValueError('kill_switch requires full_tunnel = true')
+        if cfg.ipv6_policy == 'allow': raise ValueError('kill_switch requires ipv6_policy block or fail')
+        try:
+            ipaddress.IPv4Address(cfg.server_host)
+        except (ipaddress.AddressValueError, TypeError) as exc:
+            raise ValueError('kill_switch requires server_host to be an IPv4 address') from exc

@@ -10,6 +10,7 @@ import socket
 import stat
 import subprocess
 import tarfile
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -463,6 +464,8 @@ def test_packaging_foundation_has_safe_launcher_and_managed_service():
     assert '"cryptography==50.0.1"' in debian_dependency_patch
     assert '"liboqs-python==0.16.0"' in debian_dependency_patch
     assert "get_crypto_status" in debian_rules
+    for rules in (arch, debian_rules):
+        assert "-p pqvpnd" in rules and "core/target/release/pqvpnd" in rules and "/usr/bin/pqvpnd" in rules
     installer = (root / "scripts/install-client.sh").read_text()
     assert "Environment=PQVPN_ALLOWED_UIDS=%s" in installer and '"$SUDO_UID"' in installer
     assert "install=pqvpn.install" in arch
@@ -471,9 +474,9 @@ def test_packaging_foundation_has_safe_launcher_and_managed_service():
 
 def _make_arch_source_archive(root: Path, archive: Path) -> None:
     included = (
-        "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
+        "app", "crypto", "handshake", "vpn", "pyproject.toml",
         "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
-        "packaging/common", "config/account-api.toml", "scripts", "core",
+        "packaging/common", "config/account-api.toml", "scripts", "core", ".cargo",
     )
     subprocess.run(
         [
@@ -496,9 +499,9 @@ def _stable_archive_digest(root: Path, tmp: Path) -> str:
     and never matched in CI.
     """
     included = (
-        "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
+        "app", "crypto", "handshake", "vpn", "pyproject.toml",
         "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
-        "packaging/common", "config/account-api.toml", "scripts", "core",
+        "packaging/common", "config/account-api.toml", "scripts", "core", ".cargo",
     )
     manifest = subprocess.run(
         ["git", "ls-tree", "-r", "HEAD^{tree}", "--", *included],
@@ -520,7 +523,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
     # changes: python -m pytest -q tests/test_onboarding.py -k checksum  (the
     # failure message prints the new digest).
     digest = _stable_archive_digest(root, tmp_path)
-    assert digest == "912f0020a52c128b1cd3fa67ecccd5ac35e2d4d4a16e8a70ef8b95034234229e"
+    assert digest == "41e6d2a590479a60b999a2eec15f8b4d3f6133eaecc306e1cf6ad4917934f185"
 
     with tarfile.open(archive, "r:gz") as source:
         names = source.getnames()
@@ -532,6 +535,17 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
         "client_identity_private.key", "server_identity_private.key",
     }
     assert not any(forbidden_parts.intersection(Path(name).parts) for name in names)
+
+
+def test_aws_lc_is_built_without_jitter_entropy(tmp_path):
+    """Every cargo/maturin build (dev, bench, Arch, Debian, fuzz) runs from the root and ships the same .cargo config."""
+    root = Path(__file__).parents[1]
+    config = tomllib.loads((root / ".cargo/config.toml").read_text())
+    assert config["env"]["AWS_LC_SYS_NO_JITTER_ENTROPY"] == "1"
+    archive = tmp_path / "pqvpn-3.0.0.tar.gz"
+    _make_arch_source_archive(root, archive)
+    with tarfile.open(archive, "r:gz") as source:
+        assert "pqvpn-3.0.0/.cargo/config.toml" in source.getnames()
 
 
 def test_packages_do_not_include_deployment_identity_or_config(tmp_path):

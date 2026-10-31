@@ -289,10 +289,86 @@ for _ in $(seq 1 40); do
 done
 ip netns exec "$CLIENT1_NS" curl --noproxy '*' -fsS --max-time 5 http://198.51.100.2:8080/ >/dev/null
 
+# Kill switch (K2): a server port other than the control/data port (7070 on 192.0.2.1, reachable over the
+# physical bypass route without it) and IPv6 must be unreachable while connected, after a lost session and
+# after SIGKILL, until `client recover`; SIGTERM (a user disconnect) lifts it.
+kill "${PIDS[-1]}"
+wait_bounded "${PIDS[-1]}"
+ip netns exec "$CLIENT1_NS" curl --noproxy '*' -fsS --max-time 2 http://192.0.2.1:7070/ >/dev/null
+cp "$RUN_DIR/client1/client.toml" "$RUN_DIR/client1/kill_switch.toml"
+printf 'kill_switch = true\n' >>"$RUN_DIR/client1/kill_switch.toml"
+ks_blocks() {
+  ip netns exec "$CLIENT1_NS" nft list table inet pqvpn_killswitch >/dev/null 2>&1 || { echo "kill switch missing: $1" >&2; exit 1; }
+  for destination in 192.0.2.1:7070 198.51.100.2:8080; do
+    if ip netns exec "$CLIENT1_NS" curl --noproxy '*' -fsS --max-time 2 "http://$destination/" >/dev/null 2>&1; then
+      echo "kill switch leak ($1): $destination reachable" >&2; exit 1
+    fi
+  done
+  if ip netns exec "$CLIENT1_NS" ping -6 -c 1 -W 1 2001:db8:ffff::1 >/dev/null 2>&1; then
+    echo "kill switch leak ($1): IPv6 reachable" >&2; exit 1
+  fi
+}
+ks_wait_up() {
+  for _ in $(seq 1 40); do
+    ip -n "$CLIENT1_NS" addr show pqvpn1 2>/dev/null | grep -q '10.8.0.' && return
+    sleep .25
+  done
+  echo 'kill-switch client did not connect' >&2; exit 1
+}
+ks_recover() {
+  ALLOW_MOCK_PQC=1 ip netns exec "$CLIENT1_NS" python -m vpn.cli client recover | grep -q 'kill switch removed'
+  if ip netns exec "$CLIENT1_NS" nft list table inet pqvpn_killswitch >/dev/null 2>&1; then
+    echo 'recover left the kill switch' >&2; exit 1
+  fi
+}
+# 1. Connected: only the tunnel works.
+start_client "$CLIENT1_NS" "$RUN_DIR/client1/kill_switch.toml" pqvpn1 "$RUN_DIR/client1-ks.log"
+ks_wait_up
+if ip netns exec "$CLIENT1_NS" curl --noproxy '*' -fsS --max-time 2 http://192.0.2.1:7070/ >/dev/null 2>&1; then
+  echo 'kill switch leak (connected): server port 7070 over the bypass route' >&2; exit 1
+fi
+ip netns exec "$CLIENT1_NS" curl --noproxy '*' -fsS --max-time 5 http://198.51.100.2:8080/ >/dev/null
+# 2. Lost session (server UDP blackholed): the client exits, the kill switch keeps blocking.
+KS_CLIENT=${PIDS[-1]}
+ip netns exec "$SERVER_NS" nft add table inet pqvpn_test_blackhole
+ip netns exec "$SERVER_NS" nft 'add chain inet pqvpn_test_blackhole output { type filter hook output priority filter; policy accept; }'
+ip netns exec "$SERVER_NS" nft add rule inet pqvpn_test_blackhole output udp sport 51820 drop
+for _ in $(seq 1 100); do kill -0 "$KS_CLIENT" 2>/dev/null || break; sleep .1; done
+if kill -0 "$KS_CLIENT" 2>/dev/null; then echo 'kill-switch dead-peer exit timed out' >&2; exit 1; fi
+if wait "$KS_CLIENT"; then echo 'lost session must exit nonzero' >&2; exit 1; fi
+grep -q 'pqvpn client recover' "$RUN_DIR/client1-ks.log"
+ks_blocks 'after a lost session'
+ks_recover
+ip netns exec "$SERVER_NS" nft delete table inet pqvpn_test_blackhole
+ip netns exec "$CLIENT1_NS" curl --noproxy '*' -fsS --max-time 2 http://192.0.2.1:7070/ >/dev/null
+ip netns exec "$CLIENT1_NS" ping -6 -c 1 -W 2 2001:db8:ffff::1
+# 3. SIGKILL: nothing cleans up, the kill switch still blocks until recover.
+start_client "$CLIENT1_NS" "$RUN_DIR/client1/kill_switch.toml" pqvpn1 "$RUN_DIR/client1-ks-kill.log"
+ks_wait_up
+kill -KILL "${PIDS[-1]}"
+wait "${PIDS[-1]}" 2>/dev/null || true
+ks_blocks 'after SIGKILL'
+ks_recover
+# SIGKILL's other residue, documented: the stale IPv6 guard and server bypass route.
+for table in $(ip netns exec "$CLIENT1_NS" nft list tables ip6 | awk '/pqvpn_client6_/ {print $3}'); do
+  ip netns exec "$CLIENT1_NS" nft delete table ip6 "$table"
+done
+ip -n "$CLIENT1_NS" route del 192.0.2.1/32 2>/dev/null || true
+ip netns exec "$CLIENT1_NS" ping -6 -c 1 -W 2 2001:db8:ffff::1
+# 4. SIGTERM, the user's disconnect: lifted with everything else.
+start_client "$CLIENT1_NS" "$RUN_DIR/client1/kill_switch.toml" pqvpn1 "$RUN_DIR/client1-ks-term.log"
+ks_wait_up
+kill "${PIDS[-1]}"
+wait_bounded "${PIDS[-1]}"
+if ip netns exec "$CLIENT1_NS" nft list table inet pqvpn_killswitch >/dev/null 2>&1; then
+  echo 'kill switch survived a clean disconnect' >&2; exit 1
+fi
+ip netns exec "$CLIENT1_NS" curl --noproxy '*' -fsS --max-time 2 http://192.0.2.1:7070/ >/dev/null
+
 # Run the quiet/idle regressions with real TUN in an isolated existing namespace.
 # DNS is disabled here: host resolvectl must not be mutated from a netns test.
 ALLOW_MOCK_PQC=1 ip netns exec "$INTERNET_NS" env PQVPN_TEST_NATIVE_TUN=1 python -m pytest -q \
   tests/test_runtime.py -k 'keepalive_prevents or genuinely_idle or control_activity or udp_dead_peer or rekey_during'
 PQVPN_RUNTIME_DIR="$RUN_DIR/fw" ip netns exec "$SERVER_NS" bash "$ROOT_DIR/scripts/server-network.sh" cleanup "$RUN_DIR/server/server.toml"
 test "$(ip netns exec "$SERVER_NS" sysctl -n net.ipv4.ip_forward)" = 0
-echo "namespace VPN integration succeeded: client IPs $IP1 and $IP2; UDP/TCP/rekey/spoof/disconnect/reconnect and IPv6 bypass prevention/restoration verified"
+echo "namespace VPN integration succeeded: client IPs $IP1 and $IP2; UDP/TCP/rekey/spoof/disconnect/reconnect and IPv6 bypass prevention/restoration and kill switch (connected, lost session, SIGKILL, recover, SIGTERM) verified"

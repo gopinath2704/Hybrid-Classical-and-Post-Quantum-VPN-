@@ -1,6 +1,0 @@
-system,profile,metric,run,value,unit
-pqvpn-dp-rust-hs-python,n=50,baseline_rss_kb,0,45556,kB
-pqvpn-dp-rust-hs-python,n=50,loaded_rss_kb,1,48636,kB
-pqvpn-dp-rust-hs-python,n=50,connected_clients,2,50,count
-pqvpn-dp-rust-hs-python,n=50,per_session_kb,3,61.6,kB
-pqvpn-dp-rust-hs-python,n=50,per_session_bytes,4,63078,B

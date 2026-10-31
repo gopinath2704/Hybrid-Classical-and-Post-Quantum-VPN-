@@ -60,6 +60,7 @@ struct IfReqFlags {
     flags: libc::c_short,
     _rest: [u8; 22],
 }
+const _: () = assert!(std::mem::size_of::<IfReqFlags>() == 40, "struct ifreq on 64-bit Linux");
 
 /// Opens a TUN interface the way `TUNInterface.open` does (IFF_TUN | IFF_NO_PI, non-blocking, close-on-exec),
 /// for `pqvpnd`, which has no Python to hand a descriptor over. Returns the name the kernel assigned.
@@ -130,8 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn ifreq_layout_and_tun_name_checks() {
-        assert_eq!(std::mem::size_of::<IfReqFlags>(), 40, "struct ifreq on 64-bit Linux");
+    fn tun_name_checks() {
         for bad in ["", "a-name-of-16-byt", "a\0b", "a/b"] {
             assert_eq!(open_tun(bad).unwrap_err().kind(), io::ErrorKind::InvalidInput, "{bad:?}");
         }

@@ -1,281 +1,62 @@
-# PQVPN Deployment
+# PQ-VPN Deployment
 
-## Linux VPS deployment gate
+PQ-VPN is a research prototype. Passing unit tests does not approve a deployment:
+first run doctor, the native ML-KEM tests and the root namespace suite on a disposable
+Linux VM, then check a real server with a separate Linux client. Record each of those
+results on its own line. For AWS, see [AWS EC2 deployment](#aws-ec2-deployment), which
+`scripts/deploy-server.sh` automates.
 
-Status: **Deployable research/prototype PQ-VPN**. Unit tests are not a deployment
-approval. First pass doctor, native ML-KEM tests, and the full root namespace
-suite on a disposable Linux VM. Then validate a real VPS with a separate Linux
-client. Privileged namespace, systemd, and VPS results must be recorded separately.
-For an AWS EC2 server, see [aws.md](aws.md) and `scripts/deploy-server.sh`.
+## Components and tested versions
 
-## Exact tested dependencies
+| Part | What runs | Pinned by |
+|---|---|---|
+| Server daemon, account API, GUI, Python client | CPython (tested baseline **3.14.7**, minimum 3.11) | `pyproject.toml`, `constraints-tested.txt` |
+| Python ML-KEM | native **liboqs 0.16.0** (commit `5a1a854b0dc9f2141bdc771c555ee60c37950183`) + liboqs-python 0.16.0 | `scripts/install-liboqs.sh`, `constraints-tested.txt` |
+| Rust core `pqvpn_core` (data plane, handshake) and native client `pqvpnd` | aws-lc-rs (ML-KEM, X25519, Ed25519, AES-GCM) | `core/Cargo.lock`, toolchain `core/rust-toolchain.toml` (1.99.1; MSRV 1.85) |
 
-The recorded baseline is CPython **3.14.7**, **liboqs-python 0.16.0**, native
-**liboqs 0.16.0**, Linux x86_64. `constraints-tested.txt` records the tested
-versions and pins every Python dependency in the test environment.
-Install `.` for the daemon or CLI, `.[desktop]` for the PySide6 GUI, and `.[dev]`
-for validation and benchmarks. Always pass `-c constraints-tested.txt`
-to reproduce all transitive pins. IPv6 leak blocking additionally needs nftables
-on the client. The core install excludes management, benchmark, and test packages.
-No environment is shipped. Other Python versions/platforms require fresh validation.
-Doctor distinguishes the Python 3.11 runtime minimum from the tested 3.14.7 baseline;
-meeting the minimum does not validate another Python version.
-The Ubuntu 24.04 Docker examples use distro Python and remain independently
-unvalidated; Compose syntax validation does not establish image/runtime validity.
+Doctor reports the 3.11 minimum and the 3.14.7 baseline separately; meeting the
+minimum does not validate another Python. Install `.` for the daemon and CLI,
+`.[desktop]` for the GUI and `.[dev]` for tests and benchmarks, always with
+`-c constraints-tested.txt`.
 
-Install Python 3.11+ from a trusted distribution/build, plus venv support, git,
-CMake, Ninja, a C compiler, OpenSSL development headers, iproute2, nftables,
-util-linux (flock), rsync and procps (sysctl). Native liboqs must be installed
-explicitly before importing the application or starting the service:
+aws-lc is built without CPU Jitter Entropy (`AWS_LC_SYS_NO_JITTER_ENTROPY=1` in the
+repo-root `.cargo/config.toml`, picked up by cargo, maturin, the PKGBUILD and
+debian/rules). Its DRBG is seeded from `getrandom` plus RDRAND, the same OS source the
+Python path uses. The cost is aws-lc's second independent entropy source and FIPS
+compatibility (not used here). The reason, about 27 ms on every cold connect, is in
+[docs/rust-core-migration-plan.md](rust-core-migration-plan.md#phase-5-results).
+
+## Native liboqs
+
+Install OS prerequisites (Python with venv, git, CMake, Ninja, a C compiler, OpenSSL
+headers, iproute2, nftables, util-linux, rsync, procps), then:
 
 ```bash
-python3 --version  # must report the tested 3.14.7 baseline
-sudo bash scripts/install-liboqs.sh /usr/local
-# The helper verifies the exact 0.16.0 commit, builds a shared library and runs ldconfig.
+sudo bash scripts/install-liboqs.sh /usr/local   # verifies the 0.16.0 commit, builds a shared library, runs ldconfig
 ldconfig -p | grep liboqs
 ```
 
-The build procedure follows the upstream [liboqs shared-library build instructions](https://github.com/open-quantum-safe/liboqs)
-and [Python binding installation guidance](https://github.com/open-quantum-safe/liboqs-python).
-PQVPN probes for a preinstalled library before importing the binding; missing
-native liboqs fails closed without triggering its automatic download/build path.
-For a custom prefix set `OQS_INSTALL_PATH` and configure the dynamic loader before
-launch. Do not use mock PQC in deployment. Save the native build/compiler provenance
-alongside test results; version pins alone do not reproduce an operating-system image.
+The helper refuses any other commit. PQ-VPN looks for the installed library before
+importing the binding, so a missing liboqs fails closed (`PQCUnavailableError`) and
+never triggers the binding's automatic download/build. Never use mock PQC in a
+deployment. For a custom prefix set `OQS_INSTALL_PATH` and configure the loader.
+Before deploying, recheck the upstream
+[liboqs advisories](https://github.com/open-quantum-safe/liboqs/security): a needed
+upgrade is a new validation pass, not a drop-in.
 
-## Desktop Milestone 3 managed installation
+## Server
 
-The installed desktop client uses service-owned managed state. Install the updated
-unit, start it separately, and launch the GUI only as the normal desktop user:
+### Install and provision
 
-```bash
-sudo install -o root -g root -m 0644 packaging/common/pqvpn-client-deploy.service /etc/systemd/system/pqvpn-client.service
-# The service accepts IPC only from root and the uids in PQVPN_ALLOWED_UIDS (comma-separated).
-sudo install -d /etc/systemd/system/pqvpn-client.service.d
-printf '[Service]\nEnvironment=PQVPN_ALLOWED_UIDS=%s\n' "$(id -u)" | sudo tee /etc/systemd/system/pqvpn-client.service.d/allowed-uids.conf
-sudo systemctl daemon-reload
-sudo systemctl enable --now pqvpn-client.service
-systemctl status pqvpn-client.service
-
-# Run this as the logged-in user, never through sudo:
-.venv/bin/python -m app.client
-```
-
-The service creates `/var/lib/pqvpn` mode `0700`. Its raw Ed25519 private identity
-is atomically created once at mode `0600`; the public identity is `0644`. Imported
-public profiles live in a `0600` deterministic JSON store with `0644` extracted
-server public keys below service-only directories. The GUI receives only identity
-existence, the public key/fingerprint, public profiles, and public enrollment data.
-
-No trusted profile is installed by a package. Import is local-only: the normal-user
-GUI reads a chosen `.pqvpn` file with an 8 KiB bound, sends its text over the existing
-16 KiB local IPC frame, and the privileged service independently validates it. The
-application does not retrieve profiles from URLs. Profile import, selection, and
-removal are refused while connecting, connected, or disconnecting. To change server,
-disconnect first.
-
-An explicit TOML is still supported for development:
-
-```bash
-sudo PQVPN_ALLOWED_UIDS=$(id -u) .venv/bin/python -m app.client --service --config config/client.toml
-sudo .venv/bin/python -m vpn.cli client connect --config config/client.toml
-```
-
-Precedence is exact: `--config PATH` means legacy TOML only; no `--config` means
-managed identity/profile state only. The sources are not merged and the GUI cannot
-write arbitrary TOML. Full-tunnel, IPv6, and DNS policy remain read-only managed
-defaults in this milestone because adding general privileged policy mutation would
-unnecessarily broaden IPC.
-
-### Create a public server profile on the Ubuntu administrator host
-
-After independently authenticating the server public identity and endpoint, create
-the profile from the existing **public** key. This example writes no secret:
-
-```bash
-sudo /opt/pqvpn/.venv/bin/python - <<'PY'
-import base64, hashlib, json
-from pathlib import Path
-
-public = Path("/etc/pqvpn/server_identity_public.key").read_bytes()
-if len(public) != 1184:
-    raise SystemExit("expected a 1,184-byte ML-KEM-768 public key")
-profile = {
-    "version": 1,
-    "profile_id": "ubuntu-lab",
-    "name": "Ubuntu Lab Server",
-    "server_host": "192.168.8.43",
-    "server_control_port": 51820,
-    "server_identity_public_key": base64.b64encode(public).decode("ascii"),
-    "server_identity_fingerprint": hashlib.sha256(public).hexdigest(),
-    "expected_vpn_subnet": "10.8.0.0/24",
-}
-Path("/tmp/ubuntu-lab.pqvpn").write_text(
-    json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-)
-PY
-```
-
-Transfer `/tmp/ubuntu-lab.pqvpn` over an authenticated channel. It contains the
-pinned public server identity but no private key, password, token, invite secret,
-or session material.
-
-### Offline enrollment administration
-
-The GUI can copy or export a `.pqenroll` request. Export is not authorization.
-Transfer it to the administrator over an authenticated channel, inspect its public
-client ID/fingerprint, and authorize it through the existing database abstraction:
-
-```bash
-sudo /opt/pqvpn/.venv/bin/python -m vpn.cli client authorize-request \
-  /tmp/shadow-laptop.pqenroll \
-  --database /var/lib/pqvpn/authorized/authorized_clients.json
-```
-
-The parser rejects malformed/oversized JSON, duplicate properties, non-Ed25519 key
-lengths, fingerprint mismatches, unknown fields, and invalid client IDs. This
-offline path uses no HTTP listener; the self-service path (invite-only registration
-and device binding through the account API) is described in
-[accounts.md](accounts.md). Revocation semantics are
-unchanged: it applies to new sessions; active sessions continue until ordinary
-termination or server restart.
-
-### Packaging foundation
-
-These files package the PQ-VPN research/prototype client. The Arch package is
-installed and used on the maintainer's machine. The Debian package (3.0.0-1) builds
-and passes lintian (only `no-manual-page` warnings) on Debian 13, but has not yet
-been install-tested on a real Debian-family host. A package is an alternative to
-`scripts/install-client.sh`, not a companion: both install a `pqvpn-client` unit, so
-use one or the other.
-
-Both distribution formats install the normal-user `pqvpn-gui` desktop launcher,
-the Python application, icon, documentation, the separately managed privileged
-`pqvpn-client.service`, and the unprivileged `pqvpn-account-api.service`. The
-account API receives no capabilities, writes only under
-`/var/lib/pqvpn/accounts`, and ships a fail-closed TLS configuration template.
-The client service accepts local IPC only from root and the uids listed in
-`PQVPN_ALLOWED_UIDS`. The Arch package cannot know the desktop user, so create the
-`allowed-uids.conf` drop-in shown above once, before the first install (the package
-prints the command). The Debian postinst writes it from `SUDO_UID` when installed
-with `sudo apt install`/`sudo dpkg -i`, never overwrites an existing drop-in, and
-otherwise prints the command. Packaging does not install a client private key, a trusted server profile, a TLS
-private key, or an authorized-client database.
-
-Native ML-KEM is fail-closed. Neither liboqs nor the Python `oqs` binding are
-available in distribution repositories, so they must be installed manually before
-building or running PQ-VPN:
-
-```bash
-sudo bash scripts/install-liboqs.sh /usr/local   # native C library (0.16.0)
-pip install liboqs-python==0.16.0                 # Python binding
-```
-
-The packaged service runs the system `python3 -s`, so for packages the binding must
-be installed system-wide (on Debian-family systems:
-`sudo pip install --break-system-packages liboqs-python==0.16.0`). The binding that
-`install-client.sh` installs lives in `/opt/pqvpn/.venv` and is not visible to a package.
-
-Without them, PQ-VPN raises `PQCUnavailableError` at startup with an install
-hint. No application runtime download, mock fallback, hidden native copy, or
-unpinned native build is enabled.
-
-#### Arch / Omarchy
-
-Install native liboqs 0.16.0 using the project installer before building the
-main package:
-
-```bash
-sudo bash scripts/install-liboqs.sh /usr/local
-```
-
-The private development branch has no release archive, so create the main
-package source from the committed `HEAD` with this exact command. The allowlist
-contains every source/build/install input consumed by `packaging/arch/PKGBUILD`,
-while excluding the deployment-specific `config/client.toml`, all identities and
-live state, tests, caches, untracked files, and the Arch PKGBUILD itself. Excluding
-the PKGBUILD avoids making its checksum self-referential.
-
-```bash
-git archive --format=tar.gz --mtime=2026-09-14T00:00:00Z \
-  --prefix=pqvpn-3.0.0/ \
-  --output=packaging/arch/pqvpn-3.0.0.tar.gz 'HEAD^{tree}' -- \
-  app benchmarks.py crypto handshake vpn pyproject.toml README.md \
-  docs/design.md docs/deployment.md docs/accounts.md packaging/common \
-  config/account-api.toml scripts core
-(cd packaging/arch && makepkg --verifysource)
-(cd packaging/arch && makepkg --cleanbuild --syncdeps)
-```
-
-Archiving `HEAD^{tree}` omits Git's commit-ID PAX header, and the fixed `--mtime`
-makes the archive independent of the final commit timestamp. `git archive` reads
-only committed objects and produces the required `pqvpn-3.0.0/` top-level
-directory; it never copies `.git`, the working tree's untracked keys, or user/system
-state. If a later commit changes any allowlisted input, recreate the archive, run
-`(cd packaging/arch && updpkgsums)`, and review and commit the resulting real
-checksum before building. Never substitute `SKIP`. Refresh the main package source
-checksum in a follow-up checksum-only commit after the implementation commit exists.
-The packaged command launchers and privileged client service use Python's `-s`
-mode, so an invoking user's `~/.local` site-packages cannot shadow the
-Pacman-managed wrapper.
-
-Always rebuild with a clean `src/` (`--cleanbuild`, or `makepkg -fC --nodeps` for a
-quick local rebuild). The archive preserves its fixed 2026-09-14 mtimes, so a reused
-`src/pqvpn-3.0.0/build/lib` looks newer than the sources, setuptools skips the copy,
-and the package silently ships the previous code. Check before installing:
-`tar --zstd -xOf pqvpn-3.0.0-1-x86_64.pkg.tar.zst usr/lib/python3.14/site-packages/app/client.py | grep -c parse_allowed_uids`
-must print `2`.
-
-#### Debian / Ubuntu 26.04-class
-
-Install native liboqs 0.16.0 using the project installer before building the
-main package:
-
-```bash
-sudo bash scripts/install-liboqs.sh /usr/local
-```
-
-`dpkg-buildpackage` expects `debian/` at the top of the source tree, so build from a
-tree of committed files with `packaging/deb/debian` copied to `debian/`:
-
-```bash
-mkdir -p /tmp/debbuild/pqvpn-3.0.0
-git archive HEAD | tar -x -C /tmp/debbuild/pqvpn-3.0.0
-cp -a packaging/deb/debian /tmp/debbuild/pqvpn-3.0.0/debian
-cd /tmp/debbuild/pqvpn-3.0.0 && dpkg-buildpackage --build=binary --no-sign
-```
-
-On a non-Debian host, run the same build in a `debian:trixie` container after
-installing `build-essential cargo rustc python3-maturin debhelper dh-python
-dh-sequence-installsysusers pybuild-plugin-pyproject python3-all python3-build
-python3-cryptography python3-installer python3-setuptools python3-wheel`.
-The Rust core (`core/`, built with maturin) needs network access for `cargo` at
-build time; vendored offline builds are a follow-up.
-
-The build-time check only prints the PQC mode; it does not fail when native liboqs
-is absent (a build without liboqs prints `pqc_mode: unavailable` and succeeds), so
-liboqs is enforced at runtime, not at build time. The Debian-only
-`use-debian-runtime-dependencies.patch` prevents upstream PyPI pins from
-producing dependencies unavailable in Ubuntu; the complete runtime set remains
-explicit in `packaging/deb/debian/control`, including `systemd-resolved` (the client
-fails closed on managed DNS without `resolvectl`). Installing enables and starts
-`pqvpn-client`; `pqvpn-account-api` is installed but neither enabled nor started,
-since its unit points at the `/opt/pqvpn` server layout. Inspect the results with
-`dpkg-deb --info`, `dpkg-deb --contents`, and `dpkg-deb --field`; then install
-in a clean Ubuntu 26.04 environment and confirm `oqs.oqs_version()` and
-`oqs.oqs_python_version()` both return `0.16.0` and `ML-KEM-768` is enabled.
-
-The upstream PQ-VPN repository currently lacks a declared license, so
-redistribution of these packages must remain blocked until the owner adds one.
-
-## Install and provision, then diagnose
+`scripts/deploy-server.sh` runs these steps (and the account API setup) on Ubuntu.
+By hand, from a clean checkout:
 
 ```bash
 sudo useradd --system --home /opt/pqvpn --shell /usr/sbin/nologin pqvpn
 sudo install -d -o root -g root -m 0755 /opt/pqvpn
 sudo install -d -o root -g pqvpn -m 0750 /etc/pqvpn
 sudo install -d -o root -g pqvpn -m 2770 /var/lib/pqvpn/authorized
-sudo rsync -a --chown=root:root --exclude=.git --exclude=.venv --exclude=venv --exclude=env --exclude=ENV --exclude=__pycache__ --exclude=.pytest_cache ./ /opt/pqvpn/
+sudo rsync -a --chown=root:root --exclude=.git --exclude=.venv --exclude=venv --exclude=env --exclude=ENV --exclude=__pycache__ --exclude=.pytest_cache --exclude=target ./ /opt/pqvpn/
 sudo python3 -m venv /opt/pqvpn/.venv
 sudo /opt/pqvpn/.venv/bin/python -m pip install -c /opt/pqvpn/constraints-tested.txt /opt/pqvpn
 sudo chown -R root:root /opt/pqvpn
@@ -288,759 +69,513 @@ sudo chown root:pqvpn /etc/pqvpn/server_identity_public.key
 sudo chmod 0640 /etc/pqvpn/server_identity_public.key
 sudo install -o root -g pqvpn -m 0640 config/server.toml /etc/pqvpn/server.toml
 sudo editor /etc/pqvpn/server.toml
-# Obtain only the client's public key through authenticated provisioning.
+# Only the client's PUBLIC key, received over an authenticated channel:
 sudo .venv/bin/python -m vpn.cli client authorize /tmp/alice_public.key --database /var/lib/pqvpn/authorized/authorized_clients.json --client-id alice
-```
-
-Private identity files must be regular, non-symlink files with mode 0600 or 0400.
-The server checks static key lengths and keypair consistency before opening TUN
-or listeners. The client checks its private identity equivalently. Never copy a
-server private key to clients; provision only its public key and SHA-256 pin.
-The database is strictly validated at startup; malformed records, mismatched
-fingerprints, duplicate identities/client IDs/static leases and unusable addresses
-fail startup. CLI updates lock, fsync and atomically replace the database. Restart
-after authorization/static-address changes so startup validates the entire new
-allocation policy. Keep private keys and the authorization database out of archives.
-
-Doctor is read-only: PASS/WARN/FAIL, nonzero for blocking failures. It checks
-native crypto, configuration, identities, visible routes/interfaces (including
-Docker routes), command availability, WAN/default route, ports, forwarding state,
-and service-user readability. Port availability is a snapshot, not a reservation;
-provider policy and hidden networks cannot be inferred from local checks.
-
-### Rust data plane
-
-`scripts/deploy-server.sh` leaves `data_plane` alone unless `PQVPN_DATA_PLANE` is set.
-With `PQVPN_DATA_PLANE=rust` it builds `core/pqvpn_core` into `/opt/pqvpn/.venv`
-(pip runs maturin with `--locked`), sets `data_plane = "rust"` in
-`/etc/pqvpn/server.toml` (backup `server.toml.bak.<stamp>`, every other line kept),
-validates the config (which imports `pqvpn_core`) and restarts `pqvpn-server`, which
-drops live tunnels. Later deploys without the variable rebuild the core while
-`server.toml` says rust, so it never lags the Python code. Deploy only from a
-committed tree: `--locked` fails on a stale `core/Cargo.lock`.
-
-The build needs a root Rust toolchain at least as new as the 1.85 MSRV;
-`core/rust-toolchain.toml` pins the version used. The script installs cmake and a C
-compiler, never rustup. Install it once:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
-sudo env RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal --default-toolchain "$(sed -n 's/^channel = "\(.*\)"/\1/p' core/rust-toolchain.toml)"
-```
-
-The release profile uses thin LTO and one codegen unit. On a 2 GB host, add swap
-before the first build if `free -m` shows under about 1.5 GB available and no swap.
-Check the switch with
-`ps -L -o comm= -p "$(systemctl show -p MainPID --value pqvpn-server)" | grep -x pqvpn-dp`
-(the Rust loop's thread); `journalctl -u pqvpn-server` must not show `rust data plane failed`.
-Roll back with `sudo env PQVPN_DATA_PLANE=python bash scripts/deploy-server.sh`, or by hand:
-`sudo sed -i 's/^data_plane = "rust"/data_plane = "python"/' /etc/pqvpn/server.toml && sudo systemctl restart pqvpn-server`.
-
-## Native and root namespace gate
-
-Install dev dependencies in a fresh validation environment with the same Python:
-
-```bash
-python3 -m venv /tmp/pqvpn-validation
-/tmp/pqvpn-validation/bin/python -m pip install -c constraints-tested.txt '.[dev]'
-ALLOW_MOCK_PQC=0 /tmp/pqvpn-validation/bin/python -m pytest -q -m native_pqc
-sudo -u pqvpn /opt/pqvpn/.venv/bin/python -m vpn.cli doctor server --config /etc/pqvpn/server.toml
-sudo env PATH="/tmp/pqvpn-validation/bin:$PATH" /tmp/pqvpn-validation/bin/python -m pytest -q -m 'integration and requires_root'
-```
-
-The namespace test requires root, `/dev/net/tun`, iproute2, nftables, curl and ping.
-It is bounded at 180 seconds and includes two clients, public TCP/UDP/NAT, isolation,
-metadata/private blocking and allowlist reconciliation, quiet/idle sessions,
-manual/automatic rekey, a real UDP blackhole, reconnect and forwarding-state restore.
-Its isolated namespaces deliberately do not call the host's systemd-resolved.
-DNS command rollback is unit-tested; actual resolver integration/restoration must
-also be checked on the disposable systemd VM and real client. A SKIP is not a PASS.
-
-## Firewall policy and subnet selection
-
-The exclusively owned tables are `inet pqvpn`, `ip pqvpn_nat`, and
-`inet pqvpn_mangle`. Setup atomically replaces these tables from validated TOML;
-repeated setup reconciles changes. No unrelated tables or global DROP policy are
-installed. Existing host policy can still deny PQVPN traffic.
-
-Default TUN policy:
-
-- Allow IPv4 traffic through the configured WAN, after destination filtering.
-- Allow established/related WAN return traffic to VPN clients.
-- Deny client-to-client, other-interface forwarding, and arbitrary VPS host services.
-- Allow only ICMP echo to `server_vpn_ip` when `allow_server_ping=true`.
-- Deny link-local metadata `169.254.0.0/16`, RFC1918, CGNAT, loopback, unspecified,
-  benchmarking, multicast and reserved destination ranges.
-
-`allowed_forward_networks=[]` is empty by default. To deliberately allow a private
-service through WAN set e.g. `["10.50.0.10/32"]`. Exceptions precede destination
-denies but cannot enable client-to-client or VPS-host access. Filtering uses the
-inner destination, so a private-address WAN gateway does not block public Internet.
-There is no host-service or client-to-client opt-in in this pass.
-
-`manage_ip_forward=true` records the original sysctl once under
-`/run/pqvpn/ip_forward.prev`; repeated setup preserves it, and cleanup restores then
-removes it. `false` requires forwarding already enabled. Coordinate ownership with
-other forwarding services. Only one PQVPN firewall instance manages these tables
-and this saved state; the namespace harness uses its own runtime directory.
-
-Use doctor to detect visible VPN-subnet collisions on both server and client.
-If `10.8.0.0/24` is already used, explicitly choose e.g. `10.66.0.0/24`, update
-`server_vpn_ip`, static leases, and the client's `expected_vpn_subnet`. Do not
-silently select a random subnet. Client control uses the provisioned TCP port;
-the UDP port comes from authenticated server CONFIG (`server_udp_port` was removed).
-
-## Start systemd only after the VM gate
-
-```bash
-sudo cp packaging/common/pqvpn-server.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now pqvpn-server
-sudo journalctl -u pqvpn-server -f
-sudo ss -lntup
-sudo nft list ruleset
-ip addr show pqvpn0
-```
-
-The unit runs `User=pqvpn`, `Group=pqvpn`, `WorkingDirectory=/opt/pqvpn` and
-`ExecStart=/opt/pqvpn/.venv/bin/python -m vpn.cli server --config /etc/pqvpn/server.toml`.
-There is no EnvironmentFile. `PQVPN_PYTHON` selects the same Python for setup;
-relative key/database paths resolve within `/etc/pqvpn`, including standard identity/database filenames when fields are omitted. `RuntimeDirectory=pqvpn`
-recreates runtime storage. Setup/cleanup are privileged helpers; the Python daemon
-retains CAP_NET_ADMIN, a meaningful privilege boundary. Existing systemd restrictions
-are retained. No additional hardening directives were added without actual systemd
-startup testing; that test remains a deployment gate.
-
-## Provider and real-client checklist
-
-Open only the configured VPN TCP/UDP ports (defaults 51820/TCP and 51820/UDP) in the
-provider and host policy. Keep SSH reachable, preferably only from administrator
-addresses. PQVPN does not require any public 8000/API/database port. Local doctor,
-`ss`, and nftables checks cannot certify the provider firewall.
-
-Verify with a separate Linux client: exit IP becomes the VPS address; TCP/UDP and
-approved DNS work; two clients remain isolated; metadata/private/host services are
-blocked; rekey succeeds under traffic; server restart and temporary UDP blackhole
-trigger FAILED and restore routes/DNS; manual reconnect succeeds. Recheck VPS SSH
-access, TUN, listeners, nftables and absence of public management exposure.
-
-The service does not launch FastAPI. Optional management binds loopback. Remote
-management requires an explicitly configured TLS reverse proxy, a random 32-byte
-bearer token, and explicit HTTPS CORS origins; no direct public Uvicorn listener.
-See [management API](deployment.md) for short-lived WebSocket tickets.
-
-## Current validation record
-
-The [2026-09-07 validation matrix](security_audit.md#pre-vps-hardening--2026-09-07)
-records the complete regression, syntax, dependency installation, native ML-KEM and
-read-only doctor checks. The development doctor used temporary native identities,
-`service_user="shadow"`, and the visible WAN; it did not provision `/etc/pqvpn` or
-start systemd. Run doctor again with the actual service account and VPS config.
-The host is UID 1000 with TUN visible outside the sandbox: root namespace integration
-is still SKIPPED, not passed. Real VPS/client validation is NOT PERFORMED.
-
-Current Docker examples are not the validated native installation path. Their raw
-Python entrypoints do not invoke firewall helpers: explicit setup/cleanup inside the
-server network namespace is required for NAT/isolation. The development client image
-also lacks systemd-resolved; its managed DNS config fails safely unless a supported
-manager is supplied or the operator explicitly chooses `dns_mode="none"`. Do not treat
-`docker compose config` success as a working container VPN or native systemd result.
-
-## Native source provenance and advisory review
-
-`liboqs 0.16.0` is pinned to full source commit
-`5a1a854b0dc9f2141bdc771c555ee60c37950183` in `scripts/install-liboqs.sh` and
-`constraints-tested.txt`. The helper clones tag 0.16.0 and compares HEAD with that
-commit before running CMake; any mismatch fails. It never selects latest/main.
-The Python binding remains 0.16.0 and every Python dependency version remains unchanged.
-
-On 2026-09-07, the upstream [security policy/advisories](https://github.com/open-quantum-safe/liboqs/security)
-and [release list](https://github.com/open-quantum-safe/liboqs/releases) still identified
-0.16.0 as the supported current release. No published advisory requiring a newer
-version for this baseline was found. The [Python binding security page](https://github.com/open-quantum-safe/liboqs-python/security)
-was also checked. Recheck before deployment; a required security update needs a separate
-dependency-validation pass, not an untested upgrade.
-
-This pass built the verified revision in a temporary prefix with only ML-KEM-768
-enabled and ran native tests and complete regressions against that loaded library.
-`constraints-tested.txt` records compiler/build options and the tested binary digest.
-The installer keeps its broader default algorithm build; the validation does not
-certify unused algorithms or an OS image. The prior installed library exposed the
-same 0.16.0 version but lacked a source provenance record. Python versions are pinned
-through the existing tested constraints; package artifact hash locking remains outside
-this prototype baseline.
-
-## Revocation semantics
-
-```bash
-sudo /opt/pqvpn/.venv/bin/python -m vpn.cli client revoke FINGERPRINT --database /var/lib/pqvpn/authorized/authorized_clients.json
-```
-
-Revocation disables future authentication: a new ClientHello reads the updated
-database and is rejected. Existing sessions and handshakes already authorized may
-continue until disconnect, expiry or server restart. The CLI says this explicitly.
-There is no live reload or per-identity active-session termination API. For immediate
-termination, `sudo systemctl restart pqvpn-server` disconnects **all clients**;
-revoked identities cannot establish a new session afterward.
-
-## Reproducible pre-VPS source
-
-Use the local annotated `v2-minimal-layout` tag, resolve it with
-`git rev-parse 'v2-minimal-layout^{commit}'`, and deploy that exact commit after the disposable
-root namespace gate. The hardening pass creates no automatic push. Never archive or
-copy private keys, the authorized-client DB, tokens, virtual environments or build
-outputs as part of source distribution. Provision secrets separately.
-
-Docker remains a development/integration convenience, not the first VPS path.
-Native systemd is the intended path, but actual daemon-reload/start/status/journal,
-real TUN/nft/listeners remain unvalidated until executed. Real systemd-resolved
-before/during/after state and approved-resolver lookups remain a separate Linux-client
-gate. IPv6 leak unit tests do not replace the expanded privileged namespace test.
-
-See the [exact next-phase handoff](deployment.md) for local-tag transfer,
-disposable root namespace execution, provisioning and separate real-runtime gates.
-
-## Privileged systemd execution trust boundary
-
-Every executable, script, interpreter and module used directly or indirectly by
-`ExecStartPre=+` and `ExecStopPost=+` must be root-owned and not writable by
-`pqvpn`, its groups, or other users. This includes `/opt/pqvpn/scripts/server-network.sh`,
-`/opt/pqvpn/vpn/network.py`, all application
-packages, `/opt/pqvpn/.venv/bin/python`, the entire venv/dependencies, symlink targets,
-and their containing directories. Install the system Python, standard library,
-native liboqs and helper OS commands administratively with the same trust boundary.
-Do not grant write ACLs to the service account. The `+` prefixes remain necessary
-for privileged nftables and forwarding sysctl setup/restoration; the daemon retains
-`User=pqvpn`, `Group=pqvpn` and its existing limited capabilities.
-
-`/opt/pqvpn` and its source/venv are `root:root`, directories/executables 0755 and
-ordinary files 0644 (or more restrictive while retaining service read/execute).
-Create the production venv and install dependencies as administrator, never as
-`pqvpn`. Perform future source/dependency updates administratively, while stopped,
-then restore ownership/modes and rerun production doctor before restart. For an
-existing service-owned installation, rebuild source and venv from trusted inputs;
-chown alone cannot remove previously planted code. The provisioning commands assume a
-fresh installation from the validated source.
-
-`/etc/pqvpn` is `root:pqvpn 0750`: the group may read/traverse, never write.
-`server.toml`, the public identity and `authorized_clients.json` are `root:pqvpn 0640`.
-The private identity is `pqvpn:root 0400`, compatible with the existing validator;
-the daemon cannot replace it through the directory. As its file owner, it could
-chmod its private key, so 0400 is not immutability against a compromised daemon.
-No private key or policy file is imported/executed by the privileged helpers.
-
-Run authorize/revoke as root. The database lives in `/var/lib/pqvpn/authorized`
-(`root:pqvpn 2770`, setgid) with its lock and temporary files, so the account API
-(group `pqvpn`) can update it without write access to `/etc/pqvpn`. Each atomic
-update writes mode `0640` with the directory's group, so no chown/chmod follows;
-never chown/chmod paths inside that group-writable directory as root. Locking,
-fsync and atomic replacement are unchanged. Never grant any service account
-configuration-directory write access to support administration.
-
-Server doctor checks the complete `/opt/pqvpn` tree, symlink targets and ancestors
-when examining `/etc/pqvpn` configuration or running from `/opt/pqvpn`. It fails on
-non-root owners, any group/world write bits, missing required helpers/interpreter,
-or unreadable entries. Ordinary development profiles explicitly report this check
-as not applicable. It is a read-only filesystem snapshot, not runtime systemd
-validation or a complete audit of external system libraries/loader configuration.
-
-## Legacy explicit-TOML client setup
-### Linux development client setup
-
-Status: **Deployable research/prototype PQ-VPN**. Use a separate Linux client after
-native and root-namespace validation on a disposable VM. Routed IPv6, a kill switch,
-dynamic authenticated PMTU, and active-adversary post-compromise recovery remain future work.
-
-Use the tested CPython 3.14.7, liboqs-python 0.16.0 and native liboqs 0.16.0 baseline.
-Install native liboqs explicitly using the [server guide](deployment.md)
-before importing the application. Create a fresh environment:
-
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -c constraints-tested.txt .
-.venv/bin/python -m vpn.cli client-key generate
-# Provision server public identity + exact SHA-256 fingerprint securely.
-# Send only config/client_identity_public.key to the administrator for authorization.
-editor config/client.toml
-.venv/bin/python -m vpn.cli doctor client --config config/client.toml
-sudo -E .venv/bin/python -m vpn.cli client connect --config config/client.toml
-```
-
-Doctor checks the server pin, client private-key permissions, native crypto, TUN,
-iproute2, DNS manager, name resolution, route to server, and obvious VPN-subnet
-collisions. Check your LAN/container routes too. Set `expected_vpn_subnet` to the
-provisioned server subnet; a different authenticated server subnet fails connection
-setup. `server_control_port` configures TCP; authenticated CONFIG supplies UDP.
-The obsolete `server_udp_port` setting is rejected rather than silently ignored.
-
-`ping_interval=5`, `ping_timeout=4`, and `dead_peer_timeout=30` are validated seconds.
-Only current authenticated server UDP (matching PONG, valid DATA, initial bind ACK)
-refreshes the monotonic receive deadline. Outgoing PING, wrong endpoint/session,
-replays, obsolete epochs, malformed records and bad AEAD do not. No valid UDP before
-the deadline means FAILED, TUN/socket close, key wipe best-effort and route/DNS
-cleanup even if TCP is still established. Manual reconnect is supported; no automatic
-reconnect was added. Healthy PING/PONG refreshes server idle activity as well.
-
-## IPv6 policy
-
-IPv4 tunnel: supported. IPv6 tunnel: unsupported. IPv6 leak prevention: supported
-through temporary blocking or a fail-closed preflight policy. Full tunnel means all
-supported IPv4 Internet traffic is routed through PQVPN, while unsupported IPv6 is
-blocked by default; existing more-specific IPv4/LAN routes retain normal precedence.
-This does not provide dual-stack tunneling.
-
-`ipv6_policy` accepts only:
-
-- `block`: full-tunnel default. Requires `nft` and CAP_NET_ADMIN/root. An exclusively
-  created `ip6 pqvpn_client6_<random>` table blocks all non-loopback IPv6 OUTPUT and
-  IPv6 FORWARD traffic in the client's network namespace, including existing flows.
-  Loopback remains available. The policy also blocks IPv6 LAN, link-local, multicast
-  and neighbor-discovery output while active; routed IPv4 is unaffected. No persistent
-  sysctl, global config file or unrelated firewall table is changed.
-- `fail`: read IPv6 routes in all tables and IPv6 addresses before TUN/routing mutation,
-  and check again before tunnel route installation. A unicast default/non-link-local
-  route or usable global-scope address (including ULA) refuses connection. Errors
-  inspecting state also abort. This is a conservative snapshot, not an Internet
-  reachability test or continuous monitor; later network changes are not blocked.
-  Use `block` for protection on changing networks.
-- `allow`: explicitly allow unsupported IPv6 to bypass PQVPN, with a prominent warning.
-  IPv6 traffic is unprotected and can expose the client's normal Internet address.
-  This is never the full-tunnel default.
-
-If omitted, the policy is `block` in full mode and `allow` in split mode. Explicit
-`block` also works in split mode. The shipped full-tunnel TOML examples explicitly
-set `block`; remove that setting when switching to split mode if unrelated IPv6
-should remain available. Emulated TUN mode performs no real networking or blocking.
-
-The block installs atomically before IPv4 tunnel routes, and its exact owned table
-is removed after route/DNS rollback on disconnect, failed setup, dead-peer/control
-loss, SIGTERM and rekey failure. Failed installation cannot replace an existing table.
-If kernel cleanup is denied, the table name is logged for operator recovery. SIGKILL
-or process/kernel crashes cannot run cleanup and may leave the IPv6 block installed;
-this is not a general kill switch. Do not flush unrelated firewall tables to recover.
-
-Doctor reports the effective policy and inspects IPv6 state without installing rules.
-On a disposable test client, record `ip -6 route show table all` and verify a working
-IPv6 destination before connection, failure to reach it while `block` is active, and
-restored IPv6 reachability after disconnect. The expanded root namespace suite includes
-bounded ICMPv6/TCP checks, preserved loopback, SIGTERM restoration and dead-peer cleanup.
-Those kernel checks remain pending until the root suite actually runs.
-
-## DNS policy
-
-`dns_mode="systemd-resolved"` is the safe default. For full tunnel, configured VPN
-DNS (client override or authenticated server list) requires working resolvectl;
-missing commands or partial failures abort setup and roll back routes/DNS. Full
-mode routes DNS with `~.`. Install and enable systemd-resolved before connecting.
-No permanent `/etc/resolv.conf` overwrite is performed.
-
-`dns_mode="none"` explicitly opts out, emits a warning, and accepts unmanaged DNS
-and possible leakage over a more-specific LAN route. It is not a safe default.
-If both configured and advertised DNS lists are empty, no DNS is installed; this
-also requires operator attention before full-tunnel deployment.
-
-Split tunnel does not automatically install `~.`. Configure
-`dns_routing_domains=["~corp.example"]` for intentional split DNS routing. An empty
-list configures link DNS servers without a global routing-domain override; existing
-systemd-resolved link policy determines their use. Setting `~.` explicitly requests
-global routing. Inspect `resolvectl status` rather than assuming resolver selection.
-
-## Separate real-client checks
-
-Record `ip -4 route show` and `resolvectl status` before connecting. Verify the public
-exit IP, TCP/UDP, the approved resolver and DNS routing domains after connecting.
-Try the VPS's VPN IP for allowed ICMP; arbitrary host TCP/UDP, other VPN clients,
-metadata and private destinations must fail unless the precise forwarded private
-network is allowlisted. During traffic verify epoch changes and uninterrupted data.
-Then block UDP temporarily or restart the server: the client must fail and restore
-its prior routes and resolver state. Verify reconnect. Native DNS restoration is
-still a real-systemd-client validation gate; namespace tests do not mutate host DNS.
-
-The desktop service owns the one GUI-controlled client; the explicit foreground CLI
-is a separate development workflow and must not run concurrently with it. Server
-authentication is ML-KEM-based; client authentication is classical Ed25519, with
-hybrid X25519 + ML-KEM session establishment.
-
-## Current validation record
-
-The [2026-09-07 validation matrix](security_audit.md#pre-vps-hardening--2026-09-07)
-records a successful client doctor with native temporary identities, a matching pin,
-managed DNS and a loopback server address used only for read-only route diagnostics.
-This is not a connection to a deployed server. Re-run doctor against the real server
-hostname and provisioned subnet before connecting. Omitted identity path fields use
-the standard filenames beside the TOML, just like the explicit example paths.
-
-The CLI dependencies are declared in `pyproject.toml` and pinned by the tested
-constraints. The removed browser management/PyWebView stack is not part of the
-current application. The Docker development profile lacks a running DNS manager by default;
-its full-tunnel managed DNS must fail safely until the operator supplies one or
-explicitly opts into unmanaged DNS. Root/TUN integration and real Linux-client DNS
-restoration remain pending.
-
-## Removed browser management stack
-
-FastAPI, WebSocket telemetry tickets, PyWebView, and the browser dashboard were
-removed before Desktop Milestone 2. They are not supported installation options and
-must not be reintroduced for enrollment. Current management is the bounded local
-Unix-socket desktop IPC described in `docs/design.md`.
-
-## Milestone 3 live validation: Omarchy client + Ubuntu VM
-
-This section retains the reusable operator procedure. A completed validation record
-for 2026-09-15 follows the procedure.
-
-On the Ubuntu VM, first create `/tmp/ubuntu-lab.pqvpn` with the public-only profile
-command above. On the Omarchy client, install the reviewed source/venv and updated
-unit, then begin from no managed identity or profiles:
-
-```bash
-sudo systemctl stop pqvpn-client.service
-if sudo test -e /var/lib/pqvpn; then
-  sudo mv /var/lib/pqvpn "/var/lib/pqvpn.m3-backup.$(date +%Y%m%d%H%M%S)"
-fi
-sudo systemctl daemon-reload
-sudo systemctl start pqvpn-client.service
-sudo systemctl status --no-pager pqvpn-client.service
-```
-
-Launch `PQ-VPN` from the desktop launcher as the normal user. Confirm the setup
-card reports `Device identity: Ready`; copy and record the displayed public
-fingerprint. Stop and start the service once and confirm that fingerprint is
-unchanged before continuing.
-
-Transfer and import the profile:
-
-```bash
-mkdir -p "$HOME/Downloads"
-scp shadowuser@192.168.8.43:/tmp/ubuntu-lab.pqvpn "$HOME/Downloads/"
-```
-
-In the GUI choose **Servers → Import Profile**, select
-`$HOME/Downloads/ubuntu-lab.pqvpn`, verify the exact endpoint, server fingerprint,
-and subnet, then select `Ubuntu Lab Server`. Copy/export an enrollment request with
-client ID `shadow-laptop`; do not interpret export as authorization.
-
-Transfer the public request to the VM and authorize it there:
-
-```bash
-scp "$HOME/Downloads/shadow-laptop.pqenroll" shadowuser@192.168.8.43:/tmp/
-ssh -t shadowuser@192.168.8.43 \
-  'sudo /opt/pqvpn/.venv/bin/python -m vpn.cli client authorize-request /tmp/shadow-laptop.pqenroll --database /var/lib/pqvpn/authorized/authorized_clients.json'
-```
-
-Before clicking Connect, capture the client baseline:
-
-```bash
-ip -4 route show
-ip -6 route show table all
-resolvectl status
-```
-
-Click Connect and verify the GUI reports `CONNECTED`. Then run:
-
-```bash
-python - <<'PY'
-from dataclasses import asdict
-from pprint import pprint
-from app.client import IPCClient
-pprint(asdict(IPCClient().status()))
-PY
-ip -details link show pqvpn0
-ip -4 address show dev pqvpn0
-ping -c 4 10.8.0.1
-ip -4 route show
-resolvectl status pqvpn0
-sudo nft list tables | grep pqvpn_client6
-timeout 5 ping -6 -c 1 2606:4700:4700::1111 && echo 'UNEXPECTED: IPv6 escaped' || echo 'Expected: IPv6 blocked'
-```
-
-The status evidence must show the expected client VPN IP/subnet, selected server
-fingerprint, `pqc_mode: native_liboqs`, `is_quantum_safe: true`, epoch, and live
-profile name. The GUI Security page must identify active ML-KEM-768 + X25519
-server/session protection, classical Ed25519 client authentication, and
-AES-256-GCM. Routes must include `0.0.0.0/1` and `128.0.0.0/1` through `pqvpn0` plus
-the physical bypass to the server. DNS must be attached to `pqvpn0` with routing
-domain `~.`, and the owned IPv6 guard must exist.
-
-Click Disconnect and verify cleanup:
-
-```bash
-ip link show pqvpn0 && echo 'UNEXPECTED: pqvpn0 remains' || echo 'Expected: TUN removed'
-ip -4 route show
-ip -6 route show table all
-resolvectl status
-sudo nft list tables | grep pqvpn_client6 && echo 'UNEXPECTED: IPv6 guard remains' || echo 'Expected: guard removed'
-```
-
-Reconnect from the GUI, confirm `CONNECTED`, and confirm the device fingerprint is
-identical to the one recorded before the service restart. For automatic rekey,
-keep gateway traffic running across the normal 3,600-second countdown and poll
-status until epoch advances; do not silently shorten deployment policy:
-
-```bash
-ping 10.8.0.1
-# In another terminal, poll without changing service state:
-watch -n 5 'python -c "from app.client import IPCClient; s=IPCClient().status(); print(s.state, s.epoch, s.rekey_countdown, s.pqc_mode)"'
-```
-
-Record uninterrupted ping plus the epoch transition (for example `0 → 1`). Then
-disconnect and repeat the cleanup checks. If an administrator explicitly chooses
-an accelerated rekey test, restore `rekey_interval = 3600` and restart the server
-afterward.
-
-### Completed validation record — 2026-09-15
-
-The Omarchy host completed this sequence against the Ubuntu 26.04 VM at its
-then-current bridged address `192.168.200.43`. Only `vpn/cli.py` and
-`vpn/enrollment.py` were deployed for enrollment support; their SHA-256 values
-matched locally/remotely, `authorize-request` appeared, and the running server PID
-did not change. The public `shadow-laptop.pqenroll` request was authorized with
-client fingerprint
-`71a07a73d1b4acc332db2f6083cedf34bd0a67ed887d910fdb1c313cde614fb1`.
-
-The real GUI reached `CONNECTED` on `pqvpn0` with `10.8.0.2/24`, reached
-`10.8.0.1`, installed both IPv4 `/1` routes and the endpoint bypass, attached
-`1.1.1.1` and `9.9.9.9` plus `~.` to the VPN link, and blocked IPv6 through its
-owned nftables table. Status and mapped-library evidence showed native liboqs
-0.16.0, `is_quantum_safe: true`, the pinned server fingerprint
-`caa34de32b573b511bde3f5a85b738ecc7cf7aa44b22fdc37e128d00016cf439`,
-and changing RTT/jitter/uptime metrics. GUI disconnect removed the TUN, `/1` and
-bypass routes, link DNS, and owned IPv6 table, restoring the baseline route and DNS
-state. Reconnection reused the same profile and the same private/public identity
-inodes, sizes, modes, timestamps, and fingerprint, proving no identity regeneration.
-
-For accelerated rekey validation, the administrator temporarily changed the server
-interval from 3,600 to 60 seconds and restarted for that policy change. Epoch
-advanced `0 → 1` while all 223 transmitted gateway pings were received. After the
-final GUI disconnect, the interval was restored to 3,600 seconds, the server was
-restarted and verified active, a short reconnect negotiated 3,600, and final route,
-DNS, interface, and firewall cleanup passed.
-
-## Pre-VPS Validation Handoff
-### Pre-VPS validation handoff
-
-These are next-phase commands, not results from this source-validation session.
-Use a disposable root-capable Linux VM first, then an explicitly provisioned VPS
-and two separate Linux clients. No remote deployment or push was performed.
-
-## Transfer the local source baseline
-
-The tag is local and will not appear in a fresh GitHub clone until separately
-published. To transfer source without pushing, run on the validated workstation:
-
-```bash
-git rev-parse 'v2-minimal-layout^{commit}'
-git bundle create /tmp/pqvpn-pre-vps.bundle v2-minimal-layout
-git bundle verify /tmp/pqvpn-pre-vps.bundle
-```
-
-Transfer that bundle through your authenticated channel. On each test machine:
-
-```bash
-git clone --branch v2-minimal-layout /path/to/pqvpn-pre-vps.bundle pqvpn-source
-cd pqvpn-source
-git rev-parse HEAD
-git rev-parse 'v2-minimal-layout^{commit}'
-git status --short
-```
-
-Both hashes must equal the full commit hash in the final release report. The bundle
-contains committed source/history, not untracked environments or provisioned keys.
-
-## Disposable root namespace gate
-
-Prerequisites: root, `/dev/net/tun`, `ip`, `nft`, `curl`, `ping`, `sysctl`, `flock`,
-GNU coreutils (including `timeout`), Bash, and the tested Python 3.14.7 environment.
-Native build prerequisites are Git, CMake, Ninja, a C compiler and OpenSSL headers.
-Use a host with working IPv6 support for the added physical-path leak checks.
-
-From the clean validated checkout:
-
-```bash
-python3 --version
-sudo bash scripts/install-liboqs.sh /usr/local
-python3 -m venv /tmp/pqvpn-validation
-/tmp/pqvpn-validation/bin/python -m pip install -c constraints-tested.txt '.[dev]'
-ALLOW_MOCK_PQC=0 /tmp/pqvpn-validation/bin/python -m pytest -q -m native_pqc
-sudo id -u
-test -c /dev/net/tun
-sudo env PATH="/tmp/pqvpn-validation/bin:$PATH" ALLOW_MOCK_PQC=0 timeout 180s bash tests/namespace_vpn.sh
-```
-
-The installer verifies liboqs 0.16.0 source commit
-`5a1a854b0dc9f2141bdc771c555ee60c37950183`. The binding is pinned to 0.16.0.
-The liboqs installer accepts an OPTIONAL absolute prefix (default `/usr/local`),
-for example `sudo bash scripts/install-liboqs.sh /usr/local`. The documented equivalent pytest gate is:
-
-```bash
-sudo env PATH="/tmp/pqvpn-validation/bin:$PATH" ALLOW_MOCK_PQC=0 /tmp/pqvpn-validation/bin/python -m pytest -q -m 'integration and requires_root'
-```
-
-Run one namespace invocation; preserve its output and exit status. A skipped marker
-does not pass this gate. The harness permits mock development mode internally;
-require the preceding two native tests to pass and inspect runtime output for native
-ML-KEM before accepting a native-backed namespace result. It creates isolated
-namespaces and temporary firewall state, and never tests real systemd-resolved.
-
-## VPS provisioning after the disposable gate passes
-
-Use the same bundle/commit and native install commands on the VPS. Install the OS
-prerequisites in [server deployment](deployment.md), including rsync and
-systemd. On a fresh machine, from the clean source checkout:
-
-```bash
-sudo useradd --system --home /opt/pqvpn --shell /usr/sbin/nologin pqvpn
-sudo install -d -o root -g root -m 0755 /opt/pqvpn
-sudo install -d -o root -g pqvpn -m 0750 /etc/pqvpn
-sudo install -d -o root -g pqvpn -m 2770 /var/lib/pqvpn/authorized
-sudo rsync -a --chown=root:root --exclude=.git --exclude=.venv --exclude=venv --exclude=env --exclude=ENV --exclude=__pycache__ --exclude=.pytest_cache ./ /opt/pqvpn/
-sudo python3 -m venv /opt/pqvpn/.venv
-sudo /opt/pqvpn/.venv/bin/python -m pip install -c /opt/pqvpn/constraints-tested.txt /opt/pqvpn
-sudo chown -R root:root /opt/pqvpn
-sudo chmod -R u=rwX,go=rX /opt/pqvpn
-cd /opt/pqvpn
-sudo .venv/bin/python -m vpn.cli identity generate --private /etc/pqvpn/server_identity_private.key --public /etc/pqvpn/server_identity_public.key
-sudo chown pqvpn:root /etc/pqvpn/server_identity_private.key
-sudo chmod 0400 /etc/pqvpn/server_identity_private.key
-sudo chown root:pqvpn /etc/pqvpn/server_identity_public.key
-sudo chmod 0640 /etc/pqvpn/server_identity_public.key
-sudo install -o root -g pqvpn -m 0640 config/server.toml /etc/pqvpn/server.toml
-sudo editor /etc/pqvpn/server.toml
-```
-
-Choose the WAN, free VPN subnet, DNS servers, ports and rekey interval explicitly.
-`resumption_ticket_lifetime` (default 86400 seconds) controls 1-RTT session
-resumption; set to 0 to disable. For a short rekey test, configure
-`rekey_interval=10` on the disposable test VPS; record that test configuration
-separately from the source tag.
-
-On each client, install the same native revision, then follow the existing client CLI:
-
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -c constraints-tested.txt .
-.venv/bin/python -m vpn.cli client-key generate
-editor config/client.toml
-```
-
-Provision the server public key and exact SHA-256 fingerprint through an authenticated
-channel. Set the real server host/control port, matching `expected_vpn_subnet`,
-`full_tunnel=true`, `ipv6_policy="block"`, and managed DNS. Send only each client's
-public key to the administrator. On the VPS, using the received public files:
-
-```bash
-sudo .venv/bin/python -m vpn.cli client authorize /tmp/alice_public.key --database /var/lib/pqvpn/authorized/authorized_clients.json --client-id alice
-sudo .venv/bin/python -m vpn.cli client authorize /tmp/bob_public.key --database /var/lib/pqvpn/authorized/authorized_clients.json --client-id bob
 sudo -u pqvpn .venv/bin/python -m vpn.cli doctor server --config /etc/pqvpn/server.toml
-python3 -m venv /tmp/pqvpn-validation
-/tmp/pqvpn-validation/bin/python -m pip install -c constraints-tested.txt '.[dev]'
-ALLOW_MOCK_PQC=0 /tmp/pqvpn-validation/bin/python -m pytest -q -m native_pqc
 ```
 
-Run the root namespace command above on the VPS too when possible, before public
-deployment. Configure provider and host firewalls to permit the configured VPN TCP
-and UDP ports (both default to 51820) and appropriate administrator SSH access.
-Do not expose port 8000 or a management API. Provider commands depend on the provider;
-local doctor cannot verify that policy.
+In `server.toml`, choose the WAN (`outbound_interface`), a free VPN subnet, DNS
+servers, ports and `rekey_interval` explicitly. `protocol_version` must match the
+clients: managed desktop clients speak 2 (the code default), while the repo example
+sets 3. A v3 server rejects v2 clients ("Unsupported version"). Other server options:
+`resumption_ticket_lifetime` (default 86400 s, 0 disables 1-RTT resumption) and
+`cookie_mode` (`off` by default, `under_load` or `always`, a stateless cookie against
+ClientHello floods).
 
-## Setup, systemd and real-client gates
+Private identities must be regular, non-symlink files with mode 0600 or 0400. The
+server checks key lengths and keypair consistency before it opens TUN or a listener.
+Never copy a server private key to a client; clients get only its public key and
+SHA-256 pin. The client database is strictly validated at startup: malformed records,
+mismatched fingerprints, duplicate identities, client IDs or static leases, and
+unusable addresses all fail startup. CLI updates lock, fsync and atomically replace it.
+Each handshake re-reads the database, so a newly authorized client can connect
+without a restart; account auto-approve relies on this. Static leases (`--vpn-ip`) are
+reserved only at startup, so restart `pqvpn-server` after adding or changing one.
 
-The service runs `scripts/server-network.sh setup /etc/pqvpn/server.toml` via ExecStartPre,
-using `/opt/pqvpn/.venv/bin/python`; ExecStopPost runs server cleanup. Start it with
-the documented commands, which therefore perform setup before starting the daemon:
+Doctor is read-only (PASS/WARN/FAIL, nonzero on a blocking failure). It checks native
+crypto, config, identities, visible routes and interfaces (including Docker), commands,
+the WAN, ports, forwarding and service-user access. It cannot see the provider firewall.
+
+### Privileged systemd execution trust boundary
+
+`packaging/common/pqvpn-server.service` runs the daemon as `User=pqvpn`,
+`Group=pqvpn` with only `CAP_NET_ADMIN`, `ProtectSystem=strict` and
+`RuntimeDirectory=pqvpn`. Firewall setup and cleanup run as root through
+`ExecStartPre=+` and `ExecStopPost=+` (`/opt/pqvpn/scripts/server-network.sh setup|cleanup /etc/pqvpn/server.toml`).
+
+So every file that root path executes or imports must be root-owned and not writable
+by `pqvpn`, its groups or others: `/opt/pqvpn/scripts/server-network.sh`,
+`/opt/pqvpn/vpn/network.py`, all application packages, `/opt/pqvpn/.venv/bin/python`,
+the whole venv, symlink targets and their parent directories. Create the venv and
+install dependencies as root, never as `pqvpn`. Update while stopped, restore
+ownership and modes, and rerun doctor before restarting. `chown` cannot remove code
+already planted in a service-owned tree; rebuild such an install from trusted inputs.
+Server doctor checks the whole `/opt/pqvpn` tree, symlink targets and ancestors.
+
+| Path | Owner and mode | Why |
+|---|---|---|
+| `/opt/pqvpn` (code + venv) | `root:root`, dirs 0755, files 0644 | root executes it |
+| `/etc/pqvpn` | `root:pqvpn 0750` | group may read, never write |
+| `server.toml`, public identity | `root:pqvpn 0640` | |
+| server private identity | `pqvpn:root 0400` | the daemon reads it but cannot replace it via the directory (as owner it could still chmod it) |
+| `/var/lib/pqvpn/authorized` | `root:pqvpn 2770` (setgid) | holds `authorized_clients.json`, its lock and temp files, so the account API (group `pqvpn`) can update it without write access to `/etc/pqvpn` |
+
+Each database update writes mode 0640 with the directory's group. Never chown or chmod
+paths inside that group-writable directory as root.
+
+### Start the service
 
 ```bash
 sudo cp packaging/common/pqvpn-server.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now pqvpn-server
-sudo systemctl status pqvpn-server
 sudo journalctl -u pqvpn-server -b --no-pager
 ip addr show pqvpn0
 sudo ss -lntup
 sudo nft list ruleset
 ```
 
-Require the expected TUN address, TCP/UDP listeners, PQVPN filter/NAT/mangle tables,
-working SSH and no public management listener. If manual setup is needed for a
-foreground daemon, its actual invocation is:
+Expect the TUN address, the TCP and UDP listeners and the three PQ-VPN tables. For a
+foreground daemon, run setup yourself first:
+`sudo env PQVPN_PYTHON=/opt/pqvpn/.venv/bin/python bash scripts/server-network.sh setup /etc/pqvpn/server.toml`.
+Relative key and database paths in the TOML resolve inside `/etc/pqvpn`.
+
+### Rust data plane and handshake
+
+Both settings live in `[server]` (and in an explicit client TOML). Defaults are `python`.
+
+| Setting | Effect | Requires |
+|---|---|---|
+| `data_plane = "rust"` | UDP loop in Rust (recvmmsg/sendmmsg, GSO/GRO); thread `pqvpn-dp` | `pqvpn_core` importable |
+| `handshake = "rust"` | handshake state machines in Rust; Python keeps authorization, the address pool, cookies, the rate limiter and revocation | `data_plane = "rust"`; not `experimental_suite = "v3-mldsa"` |
+
+Config validation refuses a combination it cannot run, so a bad value fails at start,
+not mid-session.
+
+The server build needs a root Rust toolchain. `deploy-server.sh` installs cmake and a
+C compiler, never rustup, so install it once:
 
 ```bash
-sudo env PQVPN_PYTHON=/opt/pqvpn/.venv/bin/python bash scripts/server-network.sh setup /etc/pqvpn/server.toml
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+sudo env RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal --default-toolchain "$(sed -n 's/^channel = "\(.*\)"/\1/p' core/rust-toolchain.toml)"
 ```
 
-On each real Linux client, record baseline IPv4/IPv6 routes and resolver state,
-then use the documented doctor and connection commands:
+Then `sudo env PQVPN_DATA_PLANE=rust bash scripts/deploy-server.sh` builds
+`core/pqvpn_core` into `/opt/pqvpn/.venv` (pip runs maturin with `--locked`, so deploy
+only a committed tree), sets `data_plane = "rust"` (backup `server.toml.bak.<stamp>`),
+validates the config and restarts `pqvpn-server`, which drops live tunnels. Later
+deploys rebuild the core whenever `server.toml` says rust. The script does not touch
+`handshake`: set `handshake = "rust"` in `/etc/pqvpn/server.toml` by hand after the
+data plane is rust, then restart. The release profile uses thin LTO; on a 2 GB host add
+swap before the first build if `free -m` shows less than about 1.5 GB available.
+
+The Rust loop asks for a 4 MB UDP receive buffer, which the kernel caps at
+`net.core.rmem_max`, and Debian/Ubuntu keep the default of about 208 KB. To let it
+take effect, set `net.core.rmem_max = 4194304` in `/etc/sysctl.d/` and run
+`sysctl --system`. UNVERIFIED on EC2: no throughput number was measured there.
+
+Check: `ps -L -o comm= -p "$(systemctl show -p MainPID --value pqvpn-server)" | grep -x pqvpn-dp`,
+and `journalctl -u pqvpn-server` must not show `rust data plane failed`. Roll back with
+`sudo env PQVPN_DATA_PLANE=python bash scripts/deploy-server.sh` (set `handshake =
+"python"` first if you changed it, or validation refuses the config).
+
+### Firewall policy and subnet
+
+Setup atomically replaces the tables PQ-VPN owns (`inet pqvpn`, `ip pqvpn_nat`,
+`inet pqvpn_mangle`) from the validated TOML, so re-running reconciles. No unrelated
+table or global DROP policy is installed. Existing host policy can still block VPN traffic.
+
+TUN policy: IPv4 to the WAN after destination filtering, and established return
+traffic. Denied: client to client, other interfaces, VPS host services (only ICMP
+echo to `server_vpn_ip` with `allow_server_ping = true`), metadata `169.254.0.0/16`,
+RFC1918, CGNAT, loopback, multicast and reserved ranges. `allowed_forward_networks`
+(empty by default, e.g. `["10.50.0.10/32"]`) opens specific private destinations
+through the WAN; it cannot enable client-to-client or host access.
+
+`manage_ip_forward = true` saves the original sysctl once in `/run/pqvpn/ip_forward.prev`
+and cleanup restores it. `false` requires forwarding already on. If doctor reports
+that `10.8.0.0/24` collides, choose another subnet explicitly and update
+`server_vpn_ip`, static leases and each client's `expected_vpn_subnet`. Clients use the
+provisioned TCP port; the UDP port comes from the authenticated server CONFIG.
+
+### Revocation
 
 ```bash
-ip -4 route show
-ip -6 route show table all
-resolvectl status
+sudo /opt/pqvpn/.venv/bin/python -m vpn.cli client revoke FINGERPRINT --database /var/lib/pqvpn/authorized/authorized_clients.json
+```
+
+A new ClientHello, rekey or rehandshake from a disabled client is refused right away.
+Every 30 s the server re-reads the database, ends the sessions of clients that are no
+longer enabled, and rotates the resumption-ticket key so their tickets stop working
+(`_revocation_loop` in `vpn/runtime.py`). The same applies to account sign-out and
+administrator revocation ([accounts.md](accounts.md)). No server restart is needed.
+
+## Validation gates
+
+**Native and root namespace gate** (disposable VM; needs root, `/dev/net/tun`, iproute2,
+nftables, curl, ping):
+
+```bash
+python3 -m venv /tmp/pqvpn-validation
+/tmp/pqvpn-validation/bin/python -m pip install -c constraints-tested.txt '.[dev]'
+ALLOW_MOCK_PQC=0 /tmp/pqvpn-validation/bin/python -m pytest -q -m native_pqc
+sudo env PATH="/tmp/pqvpn-validation/bin:$PATH" ALLOW_MOCK_PQC=0 /tmp/pqvpn-validation/bin/python -m pytest -q -m 'integration and requires_root'
+```
+
+The namespace test (bounded at 180 s) covers two clients, public TCP/UDP/NAT,
+isolation, metadata and private blocking, allowlist reconciliation, idle sessions,
+rekey, a UDP blackhole, reconnect and forwarding restore. It does not touch the host's
+systemd-resolved. A SKIP is not a PASS. The leak harness
+`bash pentesting/attacks/attack33_40_network_leaks.sh` (no sudo, private namespace)
+adds DNS, IPv6 and kill-switch cases.
+
+**Provider and real-client checklist.** Open only the VPN ports (51820/TCP and
+51820/UDP by default), SSH from administrator addresses, and 8443/TCP only if the
+account API is used. Then, from a separate Linux client, record `ip -4 route show`,
+`ip -6 route show table all` and `resolvectl status` before connecting, and check:
+
+| Gate | Evidence |
+|---|---|
+| Exit IP | external IPv4 lookup shows the server address |
+| DNS | `resolvectl status` shows the VPN DNS on `pqvpn0`, with `~.` in full tunnel |
+| TCP / UDP | bounded requests to known public services succeed |
+| IPv6 | a known working IPv6 destination becomes unreachable (`ping -6`, `curl -6`); `ping -6 ::1` still works |
+| Rekey | traffic continues across several rekey intervals while the status epoch advances |
+| Dead peer | drop server UDP in a separate test nft table: the client must reach FAILED within `dead_peer_timeout` and restore routes, DNS and IPv6 |
+| Control loss | `sudo systemctl restart pqvpn-server`: clients clean up, then reconnect |
+| Isolation | client A cannot reach a listener on client B; host services, `169.254.169.254` and private services are blocked |
+| Disconnect / SIGTERM | routes and `resolvectl status` match the baseline, and no `pqvpn_client6_*` table remains |
+
+Use bounded probes (`curl --max-time`, `ping -c N -W S`).
+
+## Clients
+
+### Desktop (managed) client
+
+The GUI runs as the desktop user and talks to the privileged `pqvpn-client` service
+over a local socket. The service accepts IPC only from root and the uids in
+`PQVPN_ALLOWED_UIDS`, set in a drop-in. `install-client.sh` and the Debian postinst
+write it from `SUDO_UID`. For the Arch package, create it yourself before the first install:
+
+```bash
+sudo install -d /etc/systemd/system/pqvpn-client.service.d
+printf '[Service]\nEnvironment=PQVPN_ALLOWED_UIDS=%s\n' "$(id -u)" | sudo tee /etc/systemd/system/pqvpn-client.service.d/allowed-uids.conf
+```
+
+Without the drop-in the GUI shows "not authorized". From a checkout,
+`sudo bash scripts/install-client.sh` installs liboqs, a root-owned `/opt/pqvpn` with
+the GUI extra, the service and the `pqvpn-gui` launcher. It builds no Rust, so it gives
+the Python backend only. Use either it or a package, not both: both install a
+`pqvpn-client` unit.
+
+The service keeps its state in `/var/lib/pqvpn` (mode 0700): an Ed25519 device identity
+created once (private key 0600), and imported public profiles. The GUI gets only
+public data. By default it signs in at `https://52.62.237.95:8443` and pins the
+bundled `app/server-account-api.crt` exclusively. `PQVPN_ACCOUNT_API_URL` and
+`PQVPN_ACCOUNT_CA_CERT` override that. Registration needs an invite, and signing out
+suspends the device on the server; see [accounts.md](accounts.md).
+
+Without an account, a profile can be imported by hand. Create a `.pqvpn` file from
+the server's **public** key and send it over an authenticated channel. Then authorize
+the `.pqenroll` request the GUI exports:
+
+```bash
+sudo /opt/pqvpn/.venv/bin/python - <<'PY'
+import base64, hashlib, json
+from pathlib import Path
+public = Path("/etc/pqvpn/server_identity_public.key").read_bytes()
+assert len(public) == 1184, "expected an ML-KEM-768 public key"
+profile = {"version": 1, "profile_id": "lab", "name": "Lab Server", "server_host": "SERVER_IP",
+           "server_control_port": 51820, "expected_vpn_subnet": "10.8.0.0/24",
+           "server_identity_public_key": base64.b64encode(public).decode("ascii"),
+           "server_identity_fingerprint": hashlib.sha256(public).hexdigest()}
+Path("/tmp/lab.pqvpn").write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+sudo /opt/pqvpn/.venv/bin/python -m vpn.cli client authorize-request /tmp/laptop.pqenroll \
+  --database /var/lib/pqvpn/authorized/authorized_clients.json
+```
+
+The profile and the enrollment request hold public keys only. Import (8 KiB bound),
+selection and removal are refused while a tunnel is up. Managed mode uses protocol v2
+and the Python backend.
+
+### Packages
+
+Both formats install the GUI launcher, the Python application, `pqvpn_core`,
+`/usr/bin/pqvpnd`, the `pqvpn-client.service` (enabled) and `pqvpn-account-api.service`
+(installed but not enabled, since its unit points at the `/opt/pqvpn` server layout).
+They never ship a private key, a trusted profile, a TLS key or a client database.
+liboqs and liboqs-python are not in the distribution repos, so install them first. The
+packaged service runs the system `python3 -s`, so the binding must be system-wide:
+
+```bash
+sudo bash scripts/install-liboqs.sh /usr/local
+sudo pip install --break-system-packages liboqs-python==0.16.0
+```
+
+The flag is needed because the system Python on both Arch and Debian is PEP 668
+"externally managed".
+
+Both builds need network access for `cargo` (crates pinned by `Cargo.lock`; vendoring
+is a follow-up). The repository declares no license, so the packages must not be
+redistributed until the owner adds one.
+
+**Arch / Omarchy.** The PKGBUILD builds from an allowlisted `git archive` of the
+committed tree, with fixed mtimes so the checksum depends only on content:
+
+```bash
+git archive --format=tar.gz --mtime=2026-09-14T00:00:00Z --prefix=pqvpn-3.0.0/ \
+  --output=packaging/arch/pqvpn-3.0.0.tar.gz 'HEAD^{tree}' -- \
+  app crypto handshake vpn pyproject.toml README.md \
+  docs/design.md docs/deployment.md docs/accounts.md packaging/common \
+  config/account-api.toml scripts core .cargo
+(cd packaging/arch && updpkgsums && makepkg -fC)
+sudo pacman -U packaging/arch/pqvpn-3.0.0-1-x86_64.pkg.tar.zst
+sudo systemctl restart pqvpn-client
+```
+
+The allowlist must match both lists in `tests/test_onboarding.py`, and that test pins
+the archive's content digest. After a commit that changes any listed path, recreate the
+archive, refresh `sha256sums` and the test pin in a checksum-only commit, and never
+use `SKIP`. Always build with `-C`: the archive's fixed mtimes make a reused `src/`
+build look newer than the sources, and the package silently ships old code. Check before installing:
+`tar --zstd -xOf pqvpn-3.0.0-1-x86_64.pkg.tar.zst usr/lib/python3.14/site-packages/app/client.py | grep -c parse_allowed_uids`
+must print `2`. `options=('!lto')` is required because makepkg's LTO makes aws-lc objects unlinkable.
+
+**Debian 13 (trixie).** `dpkg-buildpackage` wants `debian/` at the top of the tree.
+On a non-Debian host, build in a `debian:trixie` container (rustc 1.85.1 there is the MSRV check):
+
+```bash
+rm -rf /tmp/debbuild && mkdir -p /tmp/debbuild/pqvpn-3.0.0
+git archive HEAD | tar -x -C /tmp/debbuild/pqvpn-3.0.0
+cp -a packaging/deb/debian /tmp/debbuild/pqvpn-3.0.0/debian
+sudo docker run --rm -v /tmp/debbuild:/build -e OWNER="$(id -u):$(id -g)" debian:trixie bash -c '
+  apt-get update && apt-get install -y --no-install-recommends ca-certificates build-essential cargo rustc \
+    python3-maturin debhelper dh-python dh-sequence-installsysusers pybuild-plugin-pyproject python3-all \
+    python3-build python3-cryptography python3-installer python3-setuptools python3-wheel &&
+  cd /build/pqvpn-3.0.0 && dpkg-buildpackage --build=binary --no-sign; s=$?; chown -R "$OWNER" /build; exit $s'
+```
+
+This exact `docker run` wrapper is UNVERIFIED. It installs the same package list as
+the 2026-10-31 trixie build, which succeeded, but it was written for this doc and has
+not been run as written. `ca-certificates` must be listed because
+`--no-install-recommends` skips it, and
+cargo cannot fetch crates without it. The closing `chown` returns the root-owned
+output to you. debian/rules sets `PYO3_BUILD_EXTENSION_MODULE=1` on both the maturin
+and the `pqvpnd` cargo line, so nothing links libpython, and `optimize=-lto` for the
+same reason as the PKGBUILD. dpkg-shlibdeps warnings about unresolved `PyErr_*` in the
+abi3 extension are expected. The build-time check only prints `pqc_mode`, because liboqs
+is enforced at runtime. Install-testing the `.deb` on a real Debian-family host is
+UNVERIFIED (it has been built in the container only).
+
+### Explicit-TOML client (CLI)
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -c constraints-tested.txt .
+.venv/bin/python -m vpn.cli client-key generate          # add --kem for protocol_version = 3
+# send only config/client_identity_public.key to the administrator; set server_host,
+# the server key + fingerprint and expected_vpn_subnet in config/client.toml
 .venv/bin/python -m vpn.cli doctor client --config config/client.toml
 sudo -E .venv/bin/python -m vpn.cli client connect --config config/client.toml
 ```
 
-While connected, use a second terminal for these gates:
+`--config PATH` means that TOML only; without it the service uses managed state. The
+two are never merged. The service can also run a TOML:
+`sudo PQVPN_ALLOWED_UIDS=$(id -u) .venv/bin/python -m app.client --service --config config/client.toml`.
+Do not run the foreground CLI alongside the service. The obsolete `server_udp_port`
+setting is rejected. `ping_interval` (5 s), `ping_timeout` (4 s) and
+`dead_peer_timeout` (30 s) govern liveness: only authenticated server UDP refreshes the
+deadline, and when it expires the client fails, closes the TUN and restores routes and
+DNS. Reconnecting is manual.
 
-| Gate | Required evidence |
+### Native client (pqvpnd)
+
+`sudo pqvpnd connect --config client.toml [--status-json]` reads the same `[client]`
+table and refuses, with a reason, any option it does not implement. It runs `ip`, `nft`
+and `resolvectl` only from `/usr/bin`, `/usr/sbin`, `/bin` or `/sbin`, and uses
+aws-lc's ML-KEM, not liboqs. With `client_backend = "native"` in an explicit TOML, the
+client service supervises `/usr/bin/pqvpnd connect --status-json` and treats each JSON
+status line as untrusted (an invalid stream stops it and fails closed). Managed profiles
+always use the Python backend.
+
+### Kill switch
+
+`kill_switch = true` requires `full_tunnel = true`, `ipv6_policy` `block` or `fail`, and
+an IPv4 literal as `server_host`. Both clients install an nft table,
+`inet pqvpn_killswitch`, before the tunnel comes up. While it is on, nothing leaves the
+host outside the tunnel, LAN and IPv6 included. A lost session or a crash (even
+SIGKILL) leaves traffic blocked, and the GUI shows BLOCKED. Only the user's Disconnect,
+`sudo pqvpn client recover` or `sudo pqvpnd recover` lifts it; both commands are safe
+to repeat. The switch is not active after a reboot until the first connect. After a
+SIGKILL, also remove the leftover IPv6 guard by hand (`sudo nft list tables ip6`, then
+`sudo nft delete table ip6 pqvpn_client6_<id>`); recover does not remove it. The
+real-host `sudo kill -9` check is UNVERIFIED (verified in a network namespace only).
+
+### IPv6 policy
+
+IPv4 is tunnelled; IPv6 is not, so the client blocks it instead of letting it leak.
+`ipv6_policy`:
+
+- `block` (full-tunnel default): an owned `ip6 pqvpn_client6_<random>` table drops all
+  non-loopback IPv6 output and forwarding, including existing flows. Needs `nft` and
+  root. It is installed before the IPv4 routes and removed after route/DNS rollback on
+  disconnect, failure, dead peer, SIGTERM or rekey failure.
+- `fail`: refuse to connect if a default or global IPv6 route or address exists
+  (checked twice before routes go in). This is a snapshot, not a monitor; use `block` on
+  changing networks.
+- `allow`: unprotected IPv6 bypasses the tunnel, with a warning. Never the full-tunnel default.
+
+When the setting is omitted, the policy is `block` in full-tunnel mode and `allow` in
+split mode. The shipped full-tunnel example sets `block` explicitly; remove that line
+when switching to split mode.
+
+### DNS policy
+
+`dns_mode = "systemd-resolved"` is the default. A full tunnel routes DNS with `~.` to
+the VPN servers (client override, or the authenticated server list) through
+`resolvectl`. A missing `resolvectl` or a partial failure aborts setup and rolls back.
+**A full tunnel with managed DNS and no DNS servers is refused**, because it would leak
+DNS outside the tunnel; both clients enforce this. Split tunnel installs no `~.`. Use
+`dns_routing_domains = ["~corp.example"]` for split DNS. `dns_mode = "none"` opts out
+with a warning and accepts possible DNS leaks. The client never rewrites `/etc/resolv.conf`.
+
+## AWS EC2 deployment
+
+One small Ubuntu instance runs the server; `scripts/deploy-server.sh` performs the
+install above. The validation gates still apply.
+
+### 1. AWS side
+
+| Setting | Value |
 |---|---|
-| Exit IP | An IPv4 external address lookup reports the VPS public IP; record before/during values. |
-| DNS | `resolvectl status` shows the approved DNS on pqvpn0 and full-tunnel `~.`; resolve a fresh name and verify the selected interface/resolver. |
-| TCP | Bounded HTTP requests to a known reachable public test service succeed through the tunnel. |
-| UDP | Exchange a datagram with a controlled public UDP echo service and verify its reply; the namespace harness contains the socket probe. |
-| IPv6 | A known working IPv6 destination becomes unreachable using both bounded `ping -6` and `curl -6`; `ping -6 ::1` still works. Verify the owned table with `sudo nft list tables ip6`. No working pre-connect IPv6 means the real-path leak test is inconclusive. |
-| Rekey | Continue TCP/UDP traffic over multiple configured rekey intervals. Observe advancing epoch fields in captured PQVPN UDP headers, or use the optional API-owned client's epoch telemetry described in the management guide. The API cannot observe/control a separate CLI client. Traffic continuity alone is not proof of rekey. |
-| Dead peer | On a disposable test VPS, temporarily drop server UDP/51820 output in a separately owned test nft table while leaving TCP alive, as in `tests/namespace_vpn.sh`. Require client FAILED within its dead-peer timeout, TUN removal and route/DNS/IPv6 restoration; remove only that test table and reconnect. |
-| Control loss | `sudo systemctl restart pqvpn-server` disconnects all clients; verify client cleanup and reconnect. |
-| Two-client isolation | Run a known listener on client B's VPN address. Client A must not reach it; verify the listener locally first. |
-| Host/metadata/private blocking | Known VPS host services, `169.254.169.254`, and controlled private services must be inaccessible unless a precise forwarded destination is allowlisted. The root harness supplies known-positive fixtures; an unreachable service alone cannot prove filtering. |
-| Disconnect/SIGTERM | Stop the client normally and via SIGTERM in separate runs; compare routes and `resolvectl status` with baseline and recheck IPv6 connectivity. No owned client IPv6 guard should remain. |
+| AMI | Ubuntu Server 26.04 LTS, x86_64 |
+| Instance type | `t3.small` (2 GB; the liboqs and Rust builds are slow on `t3.micro`) |
+| Disk | 16 GB gp3 |
+| Metadata | IMDSv2 required |
+| Elastic IP | allocate and associate, so `server_host` stays fixed |
 
-Use bounded probes (`curl --max-time`, `ping -c ... -W ...`) and record each gate
-separately. Do not mark Docker, systemd, real resolver restoration, or VPS/client
-validation passed until the corresponding runtime has actually been exercised.
-Revocation affects future sessions; active sessions continue until disconnect,
-expiration or server restart. No remote session-kill subsystem is present.
+Security group, inbound only:
 
-## Privileged systemd execution trust boundary
+| Port | Protocol | Source | Purpose |
+|---|---|---|---|
+| 22 | TCP | your IP `/32` | SSH |
+| 51820 | TCP | `0.0.0.0/0` | control channel (handshake) |
+| 51820 | UDP | `0.0.0.0/0` | data channel |
+| 8443 | TCP | trusted `/32`s, or `0.0.0.0/0` (see 4a) | account API (HTTPS) |
 
-Every executable, script, interpreter and module used directly or indirectly by
-`ExecStartPre=+` and `ExecStopPost=+` must be root-owned and not writable by
-`pqvpn`, its groups, or other users. This includes `/opt/pqvpn/scripts/server-network.sh`,
-`/opt/pqvpn/vpn/network.py`, all application
-packages, `/opt/pqvpn/.venv/bin/python`, the entire venv/dependencies, symlink targets,
-and their containing directories. Install the system Python, standard library,
-native liboqs and helper OS commands administratively with the same trust boundary.
-Do not grant write ACLs to the service account. The `+` prefixes remain necessary
-for privileged nftables and forwarding sysctl setup/restoration; the daemon retains
-`User=pqvpn`, `Group=pqvpn` and its existing limited capabilities.
+AWS CLI equivalent (replace the region, key name and IP):
 
-`/opt/pqvpn` and its source/venv are `root:root`, directories/executables 0755 and
-ordinary files 0644 (or more restrictive while retaining service read/execute).
-Create the production venv and install dependencies as administrator, never as
-`pqvpn`. Perform future source/dependency updates administratively, while stopped,
-then restore ownership/modes and rerun production doctor before restart. For an
-existing service-owned installation, rebuild source and venv from trusted inputs;
-chown alone cannot remove previously planted code. The provisioning commands assume a
-fresh installation from the validated source.
+```bash
+REGION=eu-west-2 KEY=pqvpn MYIP=$(curl -s https://checkip.amazonaws.com)/32
+AMI=$(aws ssm get-parameter --region $REGION --query Parameter.Value --output text \
+  --name /aws/service/canonical/ubuntu/server/26.04/stable/current/amd64/hvm/ebs-gp3/ami-id)
+SG=$(aws ec2 create-security-group --region $REGION --group-name pqvpn \
+  --description "PQ-VPN" --query GroupId --output text)
+aws ec2 authorize-security-group-ingress --region $REGION --group-id $SG --protocol tcp --port 22 --cidr $MYIP
+aws ec2 authorize-security-group-ingress --region $REGION --group-id $SG --protocol tcp --port 51820 --cidr 0.0.0.0/0
+aws ec2 authorize-security-group-ingress --region $REGION --group-id $SG --protocol udp --port 51820 --cidr 0.0.0.0/0
+ID=$(aws ec2 run-instances --region $REGION --image-id $AMI --instance-type t3.small \
+  --key-name $KEY --security-group-ids $SG --metadata-options HttpTokens=required \
+  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=16,VolumeType=gp3}' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=pqvpn}]' \
+  --query 'Instances[0].InstanceId' --output text)
+EIP=$(aws ec2 allocate-address --region $REGION --query AllocationId --output text)
+aws ec2 wait instance-running --region $REGION --instance-ids $ID
+aws ec2 associate-address --region $REGION --instance-id $ID --allocation-id $EIP
+```
 
-`/etc/pqvpn` is `root:pqvpn 0750`: the group may read/traverse, never write.
-`server.toml`, the public identity and `authorized_clients.json` are `root:pqvpn 0640`.
-The private identity is `pqvpn:root 0400`, compatible with the existing validator;
-the daemon cannot replace it through the directory. As its file owner, it could
-chmod its private key, so 0400 is not immutability against a compromised daemon.
-No private key or policy file is imported/executed by the privileged helpers.
+These create billable resources; tear them down in step 5.
 
-Run authorize/revoke as root. The database lives in `/var/lib/pqvpn/authorized`
-(`root:pqvpn 2770`, setgid) with its lock and temporary files, so the account API
-(group `pqvpn`) can update it without write access to `/etc/pqvpn`. Each atomic
-update writes mode `0640` with the directory's group, so no chown/chmod follows;
-never chown/chmod paths inside that group-writable directory as root. Locking,
-fsync and atomic replacement are unchanged. Never grant any service account
-configuration-directory write access to support administration.
+### 2. Server install
 
-Server doctor checks the complete `/opt/pqvpn` tree, symlink targets and ancestors
-when examining `/etc/pqvpn` configuration or running from `/opt/pqvpn`. It fails on
-non-root owners, any group/world write bits, missing required helpers/interpreter,
-or unreadable entries. Ordinary development profiles explicitly report this check
-as not applicable. It is a read-only filesystem snapshot, not runtime systemd
-validation or a complete audit of external system libraries/loader configuration.
+```bash
+ssh -i pqvpn.pem ubuntu@<ELASTIC_IP>
+sudo apt-get update && sudo apt-get install -y git
+git clone https://github.com/gopinath2704/hybrid-classical-and-post-quantum-vpn-.git pqvpn-src
+cd pqvpn-src
+sudo env PQVPN_PUBLIC_HOST=<ELASTIC_IP> bash scripts/deploy-server.sh                      # install only
+sudo env PQVPN_PUBLIC_HOST=<ELASTIC_IP> bash scripts/deploy-server.sh /tmp/alice_public.key alice  # + authorize, doctor, start
+```
+
+The script installs OS packages and liboqs, creates `/opt/pqvpn` and the service users,
+generates the server identity, installs `server.toml` (WAN auto-detected) and the
+account API with a self-signed certificate whose SAN covers `PQVPN_PUBLIC_HOST`, and
+prints the server fingerprint. It is idempotent: an existing identity, `server.toml`
+and client database are kept, and a legacy client database under `/etc/pqvpn/` is
+migrated to `/var/lib/pqvpn/authorized/`. For the Rust backends, install root rustup
+and pass `PQVPN_DATA_PLANE=rust` ([Rust data plane and handshake](#rust-data-plane-and-handshake)).
+
+### 3. TOML (CLI) client
+
+On the client, generate a key (`client-key generate --kem` for v3) and copy only the
+public key to the server (`scp ... ubuntu@<ELASTIC_IP>:/tmp/alice_public.key`) before
+the second deploy command above. Fetch and pin the server key:
+
+```bash
+ssh -i pqvpn.pem ubuntu@<ELASTIC_IP> sudo cat /etc/pqvpn/server_identity_public.key > config/server_identity_public.key
+sha256sum config/server_identity_public.key   # must equal the printed fingerprint
+```
+
+Set `server_host` and `server_identity_fingerprint` in `config/client.toml`, connect,
+and check that `curl -4 --max-time 10 https://checkip.amazonaws.com` prints the
+Elastic IP. Add more clients with `client authorize` (as in
+[Install and provision](#install-and-provision)). They can connect at once; restart
+only after adding a static lease.
+
+### 4a. Desktop (managed) clients
+
+- Set `protocol_version = 2` in `/etc/pqvpn/server.toml` and restart `pqvpn-server`.
+- Deploy with `PQVPN_PUBLIC_HOST`. If the script says it is regenerating the
+  certificate, stop and plan: every client needs the new `/etc/pqvpn/tls/account-api.crt`
+  (copy it over SSH), and `app/server-account-api.crt` must be replaced before
+  rebuilding packages.
+- Open 8443. Opening it to `0.0.0.0/0` relies on invite-only registration and the
+  login and registration rate limits; the reference server does this so users on
+  changing IPs can register, and accepts that `/server/info` and `/openapi.json` are public.
+- Create one invite per user and send the code privately (it prints once):
+  `sudo /opt/pqvpn/.venv/bin/python -m vpn.cli account invite-create --uses 1 --expires-hours 72 --accounts-db /var/lib/pqvpn/accounts/accounts.db`.
+
+Users then install the client, register with the code and press Connect.
+
+### Updating the server
+
+Disconnect clients first: restarting `pqvpn-server` drops live tunnels.
+
+```bash
+# from your machine: ship the committed tree
+git archive HEAD | ssh -i pqvpn.pem ubuntu@<HOST> 'rm -rf /tmp/pqvpn-src && mkdir /tmp/pqvpn-src && tar -x -C /tmp/pqvpn-src'
+# on the instance: back up state, then redeploy (always restarts the account API)
+sudo cp -a /var/lib/pqvpn/accounts/accounts.db{,.bak-$(date +%s)}
+sudo cp -a /var/lib/pqvpn/authorized/authorized_clients.json{,.bak-$(date +%s)}
+sudo env PQVPN_PUBLIC_HOST=<ELASTIC_IP> bash /tmp/pqvpn-src/scripts/deploy-server.sh
+```
+
+Account schema upgrades are one-way, so rolling back needs the database backup.
+
+### SSH from changing networks
+
+The SSH rule is a `/32`. On a mobile tether your IP changes often, so recheck it
+(`curl https://checkip.amazonaws.com`) and update the rule. On some carrier networks
+SSH to the raw IPv4 times out while SSH to the instance's public DNS name
+(`ubuntu@ec2-<a>-<b>-<c>-<d>.<region>.compute.amazonaws.com`) works, because the name
+resolves to a NAT64 address.
+
+### 5. Stop or tear down
+
+A running instance bills hourly; stop it when idle (`aws ec2 stop-instances`). The
+Elastic IP stays associated and is billed a little while the instance is stopped.
+
+```bash
+aws ec2 terminate-instances --region $REGION --instance-ids $ID
+aws ec2 wait instance-terminated --region $REGION --instance-ids $ID
+aws ec2 release-address --region $REGION --allocation-id $EIP
+aws ec2 delete-security-group --region $REGION --group-id $SG
+```
+
+## Docker
+
+The Ubuntu 24.04 images (`Dockerfile`, `docker-compose.yml`) are for development and
+the evaluation artifact, not a validated deployment path. Their entrypoints do not run
+the firewall helpers, and the client image has no systemd-resolved, so managed DNS
+fails safely there. `docker compose config` passing does not prove a working VPN.

@@ -1,4 +1,5 @@
 """Seeds corpus/<target>/ for the handshake fuzz targets from tests/vectors/handshake.json. Run from core/fuzz."""
+import base64
 import hashlib
 import json
 import struct
@@ -27,6 +28,26 @@ for run in VECTORS["runs"]:
             for framed in (0, 16):
                 body = wire[6:] if framed else wire
                 write("handshake_machines", bytes([MACHINE[step["name"]] | suite_bit << 3 | framed]) + body)
+# handshake_machines step 6: the hello's own fields around the fixture's genuine ticket; step 7: control frames on a
+# resumed session (unframed) and next-epoch rekey requests (framed).
+for run in VECTORS["runs"]:
+    suite_bit = 1 if run["version"] == 0x30 else 0
+    for step in run["steps"]:
+        wire = bytes.fromhex(step["wire"])
+        if step["name"] == "resumption_hello":
+            body = wire[6:]
+            ticket_len = struct.unpack("!H", body[32:34])[0]
+            fields = body[:32] + body[34 + ticket_len:]
+            for framed in (0, 16):
+                write("handshake_machines", bytes([6 | suite_bit << 3 | framed]) + fields)
+        if step["name"] in ("rekey_request", "rekey_response", "issue_ticket"):
+            write("handshake_machines", bytes([7 | suite_bit << 3]) + wire)
+            write("handshake_machines", bytes([7 | suite_bit << 3 | 16]) + struct.pack("!I", 1) + wire[-32:])
+# handshake_decode bit 4: the client ticket file, as save_ticket writes it, for the target's fingerprint "fp" and v3.
+for version in (3, 2):
+    ticket = base64.b64encode(bytes(range(80))).decode()
+    secret = base64.b64encode(bytes(range(32))).decode()
+    write("handshake_decode", bytes([16]) + f'{{"fp": "fp", "t": "{ticket}", "s": "{secret}", "v": {version}}}'.encode())
 for case in VECTORS["codec_rejections"]:
     if case["parser"] == "cookie_challenge":
         write("handshake_decode", bytes([6 << 1]) + bytes.fromhex(case["wire"]))

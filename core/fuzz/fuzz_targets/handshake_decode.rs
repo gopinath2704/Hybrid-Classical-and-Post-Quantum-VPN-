@@ -1,13 +1,17 @@
 #![no_main]
 //! Every handshake decoder on arbitrary bytes, plus the ticket plaintext parser: each must reject or accept without
 //! panicking, and anything accepted must re-encode to exactly the bytes it came from.
-//! The first byte picks the decoder (bits 1-3) and the suite (bit 0); the rest is the input.
+//! The first byte picks the decoder (bits 1-3) and the suite (bit 0); the rest is the input. Bit 4 instead picks the
+//! client's ticket-file parser (JSON + base64), whose accepted input must round-trip through the writer's format.
 use pqvpn_core::handshake::*;
 
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     let Some((&selector, wire)) = data.split_first() else { return };
     let suite = if selector & 1 == 0 { Suite::V2 } else { Suite::V3 };
     let version = suite.version();
+    if selector & 16 != 0 {
+        return fuzz_parse_ticket(wire);
+    }
     match (selector >> 1) & 7 {
         0 => if let Ok(m) = ClientHello::parse(suite, wire) { assert_eq!(m.pack(suite).unwrap(), wire) },
         1 => if let Ok(m) = ServerHello::parse(suite, wire) { assert_eq!(m.pack(suite).unwrap(), wire) },

@@ -59,9 +59,8 @@ config/*.lock
 *.pqenroll
 
 # Dev runtime data
-dev/accounts.db
-dev/authorized_clients.json
-dev/*.key
+config/dev-accounts.db*
+config/dev-authorized_clients.json
 config/.pqvpn_ticket.json
 
 # Rust core

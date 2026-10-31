@@ -6,7 +6,7 @@ Inherits all rules from the workspace CLAUDE.md (`/home/shadow/Sentinel/CLAUDE.m
 
 - **Language**: Python 3.x
 - **Test command**: `python -m pytest tests/ -x`
-- **Benchmark command**: `python benchmarks.py`
+- **Benchmark command**: `python eval/benchmarks.py`
 - **Graph location**: `graphify-out/`
 
 ## Security Rules

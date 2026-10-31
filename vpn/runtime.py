@@ -11,6 +11,7 @@ import select
 import selectors
 import shlex
 import socket
+import stat
 import struct
 import subprocess
 import threading
@@ -29,7 +30,7 @@ from handshake.kemtls import (Channel, DATA_HEADER_FORMAT, DATA_HEADER_SIZE, DAT
 from vpn.config import ClientConfig, ServerConfig, validate_server, validate_client
 from vpn.network import NetworkQualityMonitor, TUNInterface, TUNMode
 from vpn.identity import AuthorizedClients, load_client_kem_private, load_client_private, validate_server_identity
-from vpn.network import IPv6Guard, effective_policy, preflight as ipv6_preflight
+from vpn.network import IPv6Guard, KillSwitch, effective_policy, preflight as ipv6_preflight
 
 logger = logging.getLogger("pqvpn.runtime")
 MAX_CONTROL_MESSAGE = 16384
@@ -199,6 +200,9 @@ class ClientNetwork:
     def apply(self) -> None:
         if self.tun.mode != TUNMode.NATIVE:
             return
+        if self.full and self.dns_mode != "none" and not self.dns:
+            # Nothing would be configured and every lookup would go to the uplink's resolver: refuse, never leak.
+            raise RuntimeError("full tunnel with managed DNS but no DNS servers")
         try:
             self.ipv6.apply()
             route = shlex.split(run_ip("route", "get", self.server_public).stdout.splitlines()[0])
@@ -965,6 +969,7 @@ class VPNClient:
         self._epoch_ready.set()
         self._resumption_ticket: bytes | None = None
         self._resumption_secret: bytes | None = None
+        self._kill_switch_preexisting = False
 
     def _ticket_path(self) -> Path:
         """Ticket stored next to client config for persistence across restarts."""
@@ -1004,8 +1009,14 @@ class VPNClient:
     def _load_ticket(self, fingerprint: str) -> tuple[bytes, bytes] | None:
         import base64
         try:
-            fd = os.open(self._ticket_path(), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            # O_NONBLOCK: a FIFO planted at the path must not hang connect; it fails the S_ISREG check instead.
+            fd = os.open(self._ticket_path(), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
             with os.fdopen(fd, encoding="utf-8") as f:
+                # Same rule as identity.read_private, plus ownership: only a ticket this user wrote is trusted.
+                info = os.fstat(f.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                        or stat.S_IMODE(info.st_mode) not in (0o400, 0o600)):
+                    return None
                 data = json.load(f)
             if data.get("fp") != fingerprint or data.get("v") != self.cfg.protocol_version:
                 return None
@@ -1028,6 +1039,10 @@ class VPNClient:
         try:
             if not self.cfg.dev_emulated_tun:
                 ipv6_preflight(effective_policy(self.cfg.full_tunnel, self.cfg.ipv6_policy))
+            if self.cfg.kill_switch:
+                # Block everything but the handshake before it starts; server_host is an IPv4 literal (validate_client).
+                self._kill_switch_preexisting = KillSwitch.present()
+                KillSwitch.install("connecting", self.cfg.server_host, self.cfg.server_control_port)
             identity = Path(self.cfg.server_identity_public_key).read_bytes()
             self.server_ip = socket.gethostbyname(self.cfg.server_host)
             self.control = set_nodelay(socket.create_connection((self.server_ip, self.cfg.server_control_port), timeout=10))
@@ -1053,6 +1068,11 @@ class VPNClient:
                     logger.info("session resumed via 1-RTT ticket")
                 except (HandshakeError, OSError) as exc:
                     logger.info("resumption failed (%s), falling back to full handshake", exc)
+                    # A rejected ticket (e.g. key rotated on revocation) must not linger if the full handshake fails too.
+                    try:
+                        self._ticket_path().unlink(missing_ok=True)
+                    except OSError:
+                        pass
                     self.control.close()
                     self.control = set_nodelay(socket.create_connection(
                         (self.server_ip, self.cfg.server_control_port), timeout=10))
@@ -1110,6 +1130,8 @@ class VPNClient:
                                          self.cfg.full_tunnel, self.cfg.split_tunnel, dns, self.cfg.kill_switch,
                                          self.cfg.dns_mode, self.cfg.dns_routing_domains, self.cfg.ipv6_policy)
             self.network.apply()
+            if self.cfg.kill_switch:
+                KillSwitch.install("up", self.server_ip, self.cfg.server_control_port, self.tun.name, self.tunnel["udp_port"])
             self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.udp.bind(("0.0.0.0", 0))
             self.udp.settimeout(3)
@@ -1380,6 +1402,9 @@ class VPNClient:
         dp, self._dp = self._dp, None
         if dp:
             dp.stop()
+        # The kill switch stays blocking after a lost session, or a failed reconnect from an already blocked state;
+        # only a user disconnect (send_close) or a fresh connect that never got up removes it.
+        blocked = self.cfg.kill_switch and not send_close and (self.state == "FAILED" or self._kill_switch_preexisting)
         if self.state != "FAILED":
             self.state = "DISCONNECTED"
         try: self._responses.put_nowait(None)
@@ -1418,3 +1443,18 @@ class VPNClient:
         for thread in (self._control_thread, self._scheduler_thread):
             if thread and thread is not threading.current_thread():
                 thread.join(timeout=2)
+        if self.cfg.kill_switch:
+            self._settle_kill_switch(blocked)
+
+    def _settle_kill_switch(self, blocked: bool) -> None:
+        try:
+            if blocked:
+                KillSwitch.install("connecting", self.cfg.server_host, self.cfg.server_control_port)
+                self.state = "BLOCKED"
+            else:
+                KillSwitch.remove()
+                self._kill_switch_preexisting = False
+        except Exception:
+            # A failed narrow-down leaves the previous, at least as strict, table; a failed removal leaves traffic blocked.
+            logger.exception("kill switch update failed; run `pqvpn client recover` to remove it")
+            self.state = "BLOCKED"

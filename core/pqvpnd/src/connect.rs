@@ -20,7 +20,7 @@ use pqvpn_core::session::Role;
 
 use crate::config::{self, ClientConfig};
 use crate::identity::{self, Identities};
-use crate::net::Network;
+use crate::net::{self, Network};
 
 /// `socket.create_connection(..., timeout=10)`, which also bounds every handshake read.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -120,6 +120,8 @@ pub struct Tunnel {
     pub rekey_interval: u64,
     pub rehandshake_interval: u64,
     pub resumption: bool,
+    /// The server's DNS servers, used when `dns_servers` is empty.
+    pub dns: Vec<String>,
 }
 
 /// Parses CONFIG and applies the checks `connect` makes (advertised subnet, UDP port), plus type and range
@@ -142,6 +144,9 @@ pub fn parse_tunnel(payload: &[u8], expected_subnet: (Ipv4Addr, u8)) -> Result<T
         rehandshake_interval: config.get("rehandshake_interval").map_or(Some(0), serde_json::Value::as_u64)
             .ok_or_else(|| bad("rehandshake_interval"))?,
         resumption: config.get("resumption").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        dns: config.get("dns").and_then(serde_json::Value::as_array).and_then(|list| {
+            list.iter().map(|v| v.as_str().filter(|s| s.parse::<IpAddr>().is_ok()).map(str::to_owned)).collect()
+        }).ok_or_else(|| bad("dns"))?,
     };
     let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
     let advertised = (Ipv4Addr::from(u32::from(tunnel.server_vpn_ip) & mask), prefix);
@@ -169,6 +174,8 @@ fn handshake(cfg: &ClientConfig, ids: &Identities, server: SocketAddr) -> Result
             }
             Err(error) => {
                 eprintln!("pqvpnd: resumption failed ({error}), falling back to full handshake");
+                // A ticket the server rejected (e.g. key rotated on revocation) must not linger if the full handshake fails too.
+                let _ = std::fs::remove_file(cfg.ticket_path());
                 control = control_connection(server)?;
             }
         }
@@ -237,12 +244,128 @@ enum Pending {
     Rehandshake(f64),
 }
 
-/// The whole client: returns Ok when stopped by a signal, Err when the session fails or ends.
-pub fn connect(config_path: &Path, stop_signals: &SigSet) -> Result<(), ConnectError> {
+/// The longest status line, newline excluded.
+pub const STATUS_MAX: usize = 4095;
+const STATUS_MAX_RTTS: usize = 64;
+const STATUS_MAX_ERROR: usize = 512;
+
+/// `--status-json`: status wire spec v1 on stdout, one JSON object per line. Lines carry no key material.
+pub struct Status {
+    enabled: bool,
+    kill_switch: bool,
+    /// The CONNECTED fields fixed for the session; None until the tunnel is up.
+    tunnel: Option<serde_json::Map<String, serde_json::Value>>,
+    epoch: u32,
+    last: f64,
+}
+
+/// One line of the wire spec: `connected` adds the CONNECTED fields; `error` is shortened to keep the line bounded.
+pub fn status_line(state: &str, error: &str, kill_switch: bool, connected: Option<serde_json::Map<String, serde_json::Value>>) -> String {
+    let error: String = error.chars().take(STATUS_MAX_ERROR).collect();
+    let mut line = serde_json::json!({"v": 1, "state": state, "error": error, "kill_switch": kill_switch});
+    if let (Some(fields), Some(object)) = (connected, line.as_object_mut()) {
+        object.extend(fields);
+    }
+    line.to_string()
+}
+
+impl Status {
+    pub fn new(enabled: bool) -> Self {
+        Status { enabled, kill_switch: false, tunnel: None, epoch: 0, last: 0.0 }
+    }
+
+    fn emit(&self, line: &str) {
+        if self.enabled {
+            debug_assert!(line.len() <= STATUS_MAX && !line.contains('\n'));
+            let mut out = io::stdout().lock();
+            let _ = writeln!(out, "{line}").and_then(|()| out.flush());
+        }
+    }
+
+    fn state(&self, state: &str, error: &str) {
+        self.emit(&status_line(state, error, self.kill_switch, None));
+    }
+
+    /// A CONNECTED line, with the keepalive results since the last one (fed to Python's NetworkQualityMonitor).
+    fn connected(&mut self, now: f64, epoch: u32, rekey_in: Option<f64>, rehandshake_in: Option<f64>, shared: &Shared) {
+        let Some(tunnel) = self.tunnel.clone() else { return };
+        let probes = std::mem::take(&mut *shared.probes.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let mut fields = tunnel;
+        fields.insert("epoch".into(), epoch.into());
+        fields.insert("rekey_in".into(), rekey_in.map(|s| s.max(0.0)).into());
+        fields.insert("rehandshake_in".into(), rehandshake_in.map(|s| s.max(0.0)).into());
+        let rtts: Vec<f64> = probes.rtts_ms.into_iter().take(STATUS_MAX_RTTS).collect();
+        fields.insert("probes".into(), serde_json::json!({"sent": probes.sent, "lost": probes.lost, "rtts_ms": rtts}));
+        self.emit(&status_line("CONNECTED", "", self.kill_switch, Some(fields)));
+        (self.epoch, self.last) = (epoch, now);
+    }
+
+    /// Every second while connected, and at once when the epoch changes.
+    fn tick(&mut self, now: f64, epoch: u32, rekey_in: Option<f64>, rehandshake_in: Option<f64>, shared: &Shared) {
+        if self.enabled && (now - self.last >= 1.0 || epoch != self.epoch) {
+            self.connected(now, epoch, rekey_in, rehandshake_in, shared);
+        }
+    }
+}
+
+/// The whole client: returns Ok when stopped by a signal, Err when the session fails or ends. With `status_json`,
+/// stdout carries the status lines, ending in exactly one final line written after every cleanup.
+pub fn connect(config_path: &Path, stop_signals: &SigSet, status_json: bool) -> Result<(), ConnectError> {
+    let mut status = Status::new(status_json);
+    let result = run(config_path, stop_signals, &mut status);
+    // The table, not the outcome, decides BLOCKED: whatever this process left in place is what the reader faces.
+    let blocking = status.kill_switch && net::killswitch_present().unwrap_or(true);
+    status.kill_switch = blocking;
+    let error = result.as_ref().err().map(ToString::to_string).unwrap_or_default();
+    status.state(if blocking { "BLOCKED" } else if result.is_ok() { "DISCONNECTED" } else { "FAILED" }, &error);
+    result
+}
+
+fn run(config_path: &Path, stop_signals: &SigSet, status: &mut Status) -> Result<(), ConnectError> {
     let cfg = config::load(config_path).map_err(ConnectError::Config)?;
-    let ids = identity::load(&cfg).map_err(ConnectError::Identity)?;
+    // `ipv6_preflight` first, as in `VPNClient.connect`: refuse before touching anything.
+    crate::net::ipv6_preflight(cfg.ipv6_policy).map_err(net("IPv6 preflight"))?;
+    if !cfg.kill_switch {
+        status.state("CONNECTING", "");
+        return session(&cfg, stop_signals, &mut false, status);
+    }
+    // Block everything but the handshake before it starts; config checked server_host is an IPv4 literal.
+    let server: Ipv4Addr = cfg.server_host.parse().expect("validated");
+    let preexisting = net::killswitch_present().map_err(net("kill switch"))?;
+    net::killswitch_install(server, cfg.server_control_port, None).map_err(net("kill switch"))?;
+    status.kill_switch = true;
+    status.state("CONNECTING", "");
+    let mut up = false;
+    let result = session(&cfg, stop_signals, &mut up, status);
+    // `_settle_kill_switch`, after the network is restored: a stop signal (the user's disconnect) or a fresh connect
+    // that never came up removes it; a lost session, or a failed reconnect from the blocked state, keeps blocking.
+    let settled = if result.is_err() && (up || preexisting) {
+        net::killswitch_install(server, cfg.server_control_port, None)
+            .inspect(|()| eprintln!("pqvpnd: kill switch is blocking all traffic; run `pqvpnd recover` to restore it"))
+    } else {
+        net::killswitch_remove()
+    };
+    if let Err(error) = settled {
+        eprintln!("pqvpnd: kill switch update failed ({error}); run `pqvpnd recover` to remove it");
+    }
+    result
+}
+
+/// `dns = cfg.dns_servers or tunnel["dns"]`, refusing a full tunnel whose managed DNS would configure nothing
+/// and so send every lookup to the uplink's resolver.
+pub fn dns_servers<'a>(cfg: &'a ClientConfig, tunnel: &'a Tunnel) -> Result<&'a [String], ConnectError> {
+    let dns = if cfg.dns_servers.is_empty() { &tunnel.dns } else { &cfg.dns_servers };
+    if cfg.full_tunnel && cfg.manage_dns && dns.is_empty() {
+        return Err(ConnectError::Network("full tunnel with managed DNS but no DNS servers".into()));
+    }
+    Ok(dns)
+}
+
+/// Handshake to teardown; `up` records whether the tunnel (and with it the kill switch's "up" phase) was reached.
+fn session(cfg: &ClientConfig, stop_signals: &SigSet, up: &mut bool, status: &mut Status) -> Result<(), ConnectError> {
+    let ids = identity::load(cfg).map_err(ConnectError::Identity)?;
     let server_ip = resolve_ipv4(&cfg.server_host, cfg.server_control_port)?;
-    let (mut control, mut established) = handshake(&cfg, &ids, SocketAddr::from((server_ip, cfg.server_control_port)))?;
+    let (mut control, mut established) = handshake(cfg, &ids, SocketAddr::from((server_ip, cfg.server_control_port)))?;
 
     let (_, payload) = established.open_control(&recv_message(&mut control).map_err(net("CONFIG"))?, Some(CONFIG)).map_err(protocol)?;
     let tunnel = parse_tunnel(&payload, cfg.expected_vpn_subnet)?;
@@ -258,7 +381,13 @@ pub fn connect(config_path: &Path, stop_signals: &SigSet) -> Result<(), ConnectE
     control.set_read_timeout(Some(SESSION_TIMEOUT)).map_err(net("control timeout"))?;
     control.set_write_timeout(Some(SESSION_TIMEOUT)).map_err(net("control timeout"))?;
 
-    let network = Network::up(&cfg.tun_name, tunnel.client_ip, tunnel.prefix, tunnel.mtu, server_ip).map_err(net("network setup"))?;
+    let dns = dns_servers(cfg, &tunnel)?;
+    let mut network = Network::up(&cfg.tun_name, tunnel.client_ip, tunnel.prefix, tunnel.mtu, server_ip, cfg.ipv6_policy, &cfg.routes()).map_err(net("network setup"))?;
+    network.dns(cfg.manage_dns, dns, &cfg.dns_domains(), net::resolvectl_binary).map_err(net("DNS setup"))?;
+    if cfg.kill_switch {
+        net::killswitch_install(server_ip, cfg.server_control_port, Some((&network.tun_name, tunnel.udp_port))).map_err(net("kill switch"))?;
+        *up = true;
+    }
     let server_udp = SocketAddrV4::new(server_ip, tunnel.udp_port);
     let udp = udp_bind(&established, server_udp)?;
     let tun: OwnedFd = network.tun.as_ref().expect("up() opened it").try_clone().map_err(net("TUN dup"))?;
@@ -266,11 +395,23 @@ pub fn connect(config_path: &Path, stop_signals: &SigSet) -> Result<(), ConnectE
     shared.add(established.data(), established.session_id(), tunnel.client_ip.octets());
     let ping = Ping { initial: cfg.ping_interval.min(2.0), interval: cfg.ping_interval, timeout: cfg.ping_timeout };
     let worker = dataplane::spawn(shared.clone(), Worker { udp: OwnedFd::from(udp), tun, ping: Some(ping) }).map_err(net("data plane"))?;
+    status.tunnel = Some(serde_json::json!({
+        "client_vpn_ip": tunnel.client_ip.to_string(), "server_vpn_ip": tunnel.server_vpn_ip.to_string(), "prefix": tunnel.prefix,
+        "endpoint": server_udp.to_string(), "tun_name": network.tun_name, "mtu": tunnel.mtu,
+        // The suite this session negotiated: pqvpnd offers only the configured one, and the server accepts it or fails.
+        "suite": if cfg.protocol_version == 3 { "v3-kem" } else { "v2-ed25519" },
+        "ipv6_guard": network.ipv6_table.is_some(), "dns_managed": network.dns_managed(),
+    }).as_object().cloned().expect("an object"));
     let mut running = Running { shared, worker: Some(worker), _network: network };
-    println!("connected {} via {server_udp} epoch {}", tunnel.client_ip, established.epoch());
-    let _ = io::stdout().flush();
+    let connected = format!("connected {} via {server_udp} epoch {}", tunnel.client_ip, established.epoch());
+    if status.enabled {
+        eprintln!("pqvpnd: {connected}");
+    } else {
+        println!("{connected}");
+        let _ = io::stdout().flush();
+    }
 
-    let result = control_loop(&cfg, &tunnel, &mut control, &mut established, &running.shared, stop_signals);
+    let result = control_loop(cfg, &tunnel, &mut control, &mut established, &running.shared, stop_signals, status);
     running.stop_data_plane();
     if result.is_ok() {
         // `disconnect()`: tell the server, best effort, after the data plane is down.
@@ -286,7 +427,7 @@ pub fn connect(config_path: &Path, stop_signals: &SigSet) -> Result<(), ConnectE
 /// `_control_loop` + `_schedule_rekey` + `_forward_rust`'s supervision, on one thread: poll the control socket
 /// and the stop signals, run the rekey and rehandshake timers, and enforce the dead-peer timeout.
 fn control_loop(cfg: &ClientConfig, tunnel: &Tunnel, control: &mut TcpStream, established: &mut Established, shared: &Shared,
-                stop_signals: &SigSet) -> Result<(), ConnectError> {
+                stop_signals: &SigSet, status: &mut Status) -> Result<(), ConnectError> {
     let signals = SignalFd::with_flags(stop_signals, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC).map_err(|e| net("signalfd")(e.into()))?;
     let mut os = Os;
     let interval = |seconds: u64| (seconds > 0).then_some(seconds as f64);
@@ -294,6 +435,7 @@ fn control_loop(cfg: &ClientConfig, tunnel: &Tunnel, control: &mut TcpStream, es
     let mut next_rekey = interval(tunnel.rekey_interval).map(|i| started + i);
     let mut next_rehandshake = interval(tunnel.rehandshake_interval).map(|i| started + i);
     let mut pending: Option<Pending> = None;
+    status.connected(started, established.epoch(), next_rekey.map(|due| due - started), next_rehandshake.map(|due| due - started), shared);
     loop {
         let (control_ready, stop) = {
             let mut fds = [PollFd::new(control.as_fd(), PollFlags::POLLIN), PollFd::new(signals.as_fd(), PollFlags::POLLIN)];
@@ -333,6 +475,7 @@ fn control_loop(cfg: &ClientConfig, tunnel: &Tunnel, control: &mut TcpStream, es
         if now - shared.last_rx().max(started) > cfg.dead_peer_timeout {
             return Err(ConnectError::Network("authenticated UDP dead-peer timeout".into()));
         }
+        status.tick(now, established.epoch(), next_rekey.map(|due| due - now), next_rehandshake.map(|due| due - now), shared);
         match pending {
             Some(Pending::Rekey(deadline) | Pending::Rehandshake(deadline)) if now > deadline => {
                 established.abort_epoch_change();
@@ -372,7 +515,9 @@ mod tests {
     fn parses_the_servers_config() {
         let tunnel = config(GOOD).unwrap();
         assert_eq!(tunnel, Tunnel { client_ip: Ipv4Addr::new(10, 8, 0, 2), server_vpn_ip: Ipv4Addr::new(10, 8, 0, 1), prefix: 24,
-                                    udp_port: 51820, mtu: 1380, rekey_interval: 3600, rehandshake_interval: 0, resumption: true });
+                                    udp_port: 51820, mtu: 1380, rekey_interval: 3600, rehandshake_interval: 0, resumption: true,
+                                    dns: vec![] });
+        assert_eq!(config(&GOOD.replace("\"dns\": []", "\"dns\": [\"10.8.0.1\", \"::1\"]")).unwrap().dns, ["10.8.0.1", "::1"]);
     }
 
     #[test]
@@ -386,11 +531,43 @@ mod tests {
             ("\"client_vpn_ip\": \"10.8.0.2\"", "\"client_vpn_ip\": \"::1\"", "client_vpn_ip"),
             ("\"rekey_interval\": 3600", "\"rekey_interval\": -1", "rekey_interval"),
             ("\"prefix\": 24", "\"prefix\": \"24\"", "prefix"),
+            ("\"dns\": []", "\"dns\": [\"--set-everything\"]", "dns"),
+            ("\"dns\": [], ", "", "dns"),
         ] {
             let error = config(&GOOD.replace(from, to)).unwrap_err().to_string();
             assert!(error.contains(needle), "{to}: {error}");
         }
         assert!(config("not json").is_err());
+    }
+
+    #[test]
+    fn status_lines_follow_the_wire_spec_and_stay_bounded() {
+        let line: serde_json::Value = serde_json::from_str(&status_line("CONNECTING", "", true, None)).unwrap();
+        assert_eq!(line, serde_json::json!({"v": 1, "state": "CONNECTING", "error": "", "kill_switch": true}));
+        // The worst case: the longest error plus every CONNECTED field, with the most and longest RTTs.
+        let fields = serde_json::json!({
+            "client_vpn_ip": "255.255.255.255", "server_vpn_ip": "255.255.255.255", "prefix": 30, "endpoint": "255.255.255.255:65535",
+            "tun_name": "a-name-of-15-ch", "mtu": 1400, "suite": "v2-ed25519", "ipv6_guard": true, "dns_managed": true,
+            "epoch": u32::MAX, "rekey_in": f64::MAX, "rehandshake_in": f64::MAX,
+            "probes": {"sent": u64::MAX, "lost": u64::MAX, "rtts_ms": vec![-f64::MAX / 3.0; STATUS_MAX_RTTS]},
+        }).as_object().cloned().unwrap();
+        let text = status_line("FAILED", &"é\"\\\n".repeat(1000), false, Some(fields));
+        assert!(text.len() <= STATUS_MAX && !text.contains('\n'), "{} bytes", text.len());
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["v"], 1);
+        assert_eq!(parsed["probes"]["rtts_ms"].as_array().unwrap().len(), STATUS_MAX_RTTS);
+    }
+
+    #[test]
+    fn full_tunnel_with_managed_dns_needs_servers() {
+        let cfg = |extra: &str| config::parse(&format!("[client]\nserver_identity_fingerprint = \"{}\"\n{extra}", "a".repeat(64)), Path::new("/")).unwrap();
+        let (none, some) = (config(GOOD).unwrap(), config(&GOOD.replace("\"dns\": []", "\"dns\": [\"10.8.0.1\"]")).unwrap());
+        let error = dns_servers(&cfg(""), &none).unwrap_err().to_string();
+        assert!(error.contains("no DNS servers"), "{error}");
+        assert_eq!(dns_servers(&cfg(""), &some).unwrap(), ["10.8.0.1"], "the server's list");
+        assert_eq!(dns_servers(&cfg("dns_servers = [\"9.9.9.9\"]"), &some).unwrap(), ["9.9.9.9"], "the client's list wins");
+        assert!(dns_servers(&cfg("dns_mode = \"none\""), &none).unwrap().is_empty(), "explicitly unmanaged");
+        assert!(dns_servers(&cfg("full_tunnel = false"), &none).unwrap().is_empty(), "split tunnel leaves other DNS alone");
     }
 
     #[test]

@@ -633,12 +633,12 @@ mod tests {
         SocketAddrV4::new([127, 0, 0, 1].into(), port)
     }
 
-    /// The 14 cases of `test_only_authorized_current_records_touch_activity`, against a server
-    /// whose session is already bound to `addr(12345)`.
+    /// The 15 cases of `test_only_authorized_current_records_touch_activity`, against a server
+    /// whose session is already bound to `addr(12345)`. `previous_epoch` is within the receive grace; `old_epoch` is N-2.
     #[test]
     fn only_authorized_current_records_touch_activity() {
         let cases = ["ping", "data", "replay", "wrong_session", "unknown_session", "wrong_endpoint", "malformed_ping",
-                     "bad_tag", "truncated", "spoof", "malformed_data", "old_epoch", "control_domain", "bad_bind"];
+                     "bad_tag", "truncated", "spoof", "malformed_data", "previous_epoch", "old_epoch", "control_domain", "bad_bind"];
         for case in cases {
             let (client, server) = sessions(0);
             let shared = Shared::new(Role::Server, 1380, None);
@@ -672,7 +672,11 @@ mod tests {
                 "data" => frame = client.seal(DATA, &ipv4(LEASE, [1, 1, 1, 1], b"")).unwrap(),
                 "spoof" => frame = client.seal(DATA, &ipv4([10, 8, 0, 3], [1, 1, 1, 1], b"")).unwrap(),
                 "malformed_data" => frame = client.seal(DATA, b"bad").unwrap(),
-                "old_epoch" => server.rekey(1, &[5; 32], &[4; 12], &[6; 32], &[3; 12]).unwrap(),
+                "previous_epoch" => server.rekey(1, &[5; 32], &[4; 12], &[6; 32], &[3; 12]).unwrap(),
+                "old_epoch" => {
+                    server.rekey(1, &[5; 32], &[4; 12], &[6; 32], &[3; 12]).unwrap();
+                    server.rekey(2, &[6; 32], &[4; 12], &[5; 32], &[3; 12]).unwrap();
+                }
                 "control_domain" => frame[3] = 2,
                 "bad_bind" => frame = client.seal(BIND, b"bad").unwrap(),
                 _ => {}
@@ -680,8 +684,8 @@ mod tests {
             let out = shared.server_inbound(&frame, from, 2.0);
             let seen = shared.last_seen(&SID);
             match case {
-                "ping" => {
-                    let Out::Udp(pong, to) = out else { panic!("ping: no pong") };
+                "ping" | "previous_epoch" => {
+                    let Out::Udp(pong, to) = out else { panic!("{case}: no pong") };
                     assert_eq!(to, from);
                     assert_eq!(client.open(&pong, Some(PONG)).unwrap().1, stamp);
                     assert_eq!(seen, Some(2.0));
@@ -913,7 +917,12 @@ mod tests {
             client_session.rekey(epoch, &c2s, &nc, &s2c, &ns).unwrap();
             server_session.rekey(epoch, &s2c, &ns, &c2s, &nc).unwrap();
         }
-        std::thread::sleep(Duration::from_millis(30));
+        // The server holds epoch 4 until a client epoch-5 frame gets through the relay's queue (or SEND_HOLD passes).
+        let final_epoch = |(direction, rest): &(u8, Vec<u8>)| *direction == 2 && rest[..4] == 5u32.to_be_bytes();
+        let deadline = Instant::now() + crate::session::SEND_HOLD + Duration::from_secs(1);
+        while !lock(&seen).iter().any(final_epoch) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         stop.store(true, Relaxed);
         for handle in pumps.into_iter().chain([sealer, relay_thread]) {
             handle.join().unwrap();

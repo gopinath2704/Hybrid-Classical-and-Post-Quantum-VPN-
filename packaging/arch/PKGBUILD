@@ -15,19 +15,26 @@ install=pqvpn.install
 options=('!lto')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel' 'cargo' 'maturin')
 source=("${pkgname}-${pkgver}.tar.gz")
-sha256sums=('743885842beb228835360032374d3a7176be23bb2d3c577f431194791b57bcd5')
+sha256sums=('67bc0fb0bb74719d9f277d1d18915e1c926857eccdff746e2fe4b7e4665ae94e')
+
+prepare() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  # ponytail: crates come from crates.io here, pinned by Cargo.lock; vendor them into the tarball for fully offline builds.
+  cargo fetch --locked --manifest-path core/Cargo.toml
+}
 
 build() {
   cd "${srcdir}/${pkgname}-${pkgver}"
   PYTHONNOUSERSITE=1 python -m build --wheel --no-isolation
-  # ponytail: cargo fetches crates at build time; vendor them for offline builds later.
-  maturin build --release --locked --compatibility linux -m core/pqvpn_core/Cargo.toml -o dist-core
+  maturin build --release --frozen --compatibility linux -m core/pqvpn_core/Cargo.toml -o dist-core
+  cargo build --release --frozen --manifest-path core/Cargo.toml -p pqvpnd
 }
 
 package() {
   cd "${srcdir}/${pkgname}-${pkgver}"
   PYTHONNOUSERSITE=1 python -m installer --destdir="${pkgdir}" dist/*.whl
   PYTHONNOUSERSITE=1 python -m installer --destdir="${pkgdir}" dist-core/*.whl
+  install -Dm755 core/target/release/pqvpnd "${pkgdir}/usr/bin/pqvpnd"
   # Pacman-managed launchers must not import packages from the invoking user's ~/.local.
   sed -i '1c #!/usr/bin/python -s' "${pkgdir}/usr/bin/pqvpn" "${pkgdir}/usr/bin/pqvpn-gui" "${pkgdir}/usr/bin/pqvpn-account-api"
   install -Dm644 packaging/common/pqvpn.desktop "${pkgdir}/usr/share/applications/pqvpn.desktop"

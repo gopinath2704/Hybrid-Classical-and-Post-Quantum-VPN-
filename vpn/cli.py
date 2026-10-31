@@ -295,11 +295,14 @@ def _parser() -> argparse.ArgumentParser:
 
     revoke = client_actions.add_parser(
         "revoke",
-        description=("Revoke new sessions only. Restart the VPN server to terminate "
-                     "existing sessions; no live reload is implemented."),
+        description=("Revoke a client. A running server ends its existing sessions "
+                     "within about 30 seconds."),
     )
     revoke.add_argument("fingerprint")
     revoke.add_argument("--database", default="config/authorized_clients.json")
+
+    client_actions.add_parser(
+        "recover", description="Remove the kill switch left blocking traffic after a crash or lost session (root)")
 
     connect = client_actions.add_parser("connect")
     connect.add_argument("--config", default="config/client.toml")
@@ -331,8 +334,8 @@ def _parser() -> argparse.ArgumentParser:
     reject.add_argument("--accounts-db", default=str(DEFAULT_ACCOUNT_DATABASE))
     account_revoke = account_actions.add_parser(
         "revoke",
-        description=("Revoke an approved device for new sessions. Restart the VPN server "
-                     "to terminate existing sessions; no live reload is implemented."),
+        description=("Revoke an approved device. A running server ends its existing "
+                     "sessions within about 30 seconds."),
     )
     account_revoke.add_argument("device_id", type=int)
     account_revoke.add_argument("--accounts-db", default=str(DEFAULT_ACCOUNT_DATABASE))
@@ -456,8 +459,7 @@ def _account_command(args: argparse.Namespace) -> None:
         AuthorizedClients(Path(args.database)).revoke(device.client_fingerprint)
         store.set_device_status(device.id, "revoked", expected=("approved",))
         print(
-            "Device revoked for new sessions. Restart the VPN server to terminate "
-            "existing sessions (all clients); live reload is not implemented."
+            "Device revoked. A running server ends its existing sessions within about 30 seconds."
         )
 
 
@@ -516,13 +518,20 @@ def main(argv: list[str] | None = None) -> None:
         except (AccountError, ValueError, OSError) as exc:
             raise SystemExit(f"account error: {exc}") from None
         return
+    if args.command == "client" and args.action == "recover":
+        from vpn.network import KillSwitch
+        was_present = KillSwitch.present()
+        try:
+            KillSwitch.remove()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise SystemExit(f"kill switch not removed: {getattr(exc, 'stderr', '') or exc}") from None
+        print("kill switch removed; traffic is no longer blocked" if was_present else "no kill switch was active")
+        return
     if args.command == "client" and args.action == "revoke":
         if not AuthorizedClients(Path(args.database)).revoke(args.fingerprint):
             raise SystemExit("client fingerprint not found")
         print(
-            "Client revoked for new sessions. Existing active sessions continue until "
-            "disconnect/expiration/server restart. Restart the VPN server to terminate "
-            "existing sessions (all clients); live reload is not implemented."
+            "Client revoked. A running server ends its existing sessions within about 30 seconds."
         )
         return
 
@@ -558,7 +567,14 @@ def main(argv: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        service.disconnect()
+        # A session that ended itself is cleaning up on its own thread: wait for that (exiting first would kill it
+        # mid-restore) rather than disconnect again, which would lift a kill switch it left blocking.
+        if getattr(service, "state", "") in ("FAILED", "BLOCKED"):
+            service._cleanup_done.wait(timeout=12)
+        else:
+            service.disconnect()
+    if getattr(service, "state", "") == "BLOCKED":
+        raise SystemExit(f"{service.error}; kill switch is blocking all traffic, run `pqvpn client recover` to restore it")
     if getattr(service, "state", "") == "FAILED":
         raise SystemExit(service.error)
 

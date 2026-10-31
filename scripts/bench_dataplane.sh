@@ -14,23 +14,25 @@
 # reported) and M7 at 0,1000,10000/s with every legitimate connect succeeding at 10000/s.
 # Output goes to eval/results-summary/phase3-<date>.
 #
-# PHASE=4 gates Phase 4 (docs/phase4-design.md section 3), definitions unchanged from Phases 0-3:
+# PHASE=4 gates Phase 4 (docs/rust-core-migration-plan.md, Appendix A section 3), definitions unchanged from Phases 0-3:
 #   - M1 LAN cold, v2, n=30, per data-plane/handshake backend, plus the pqvpnd native row
 #     (gate: native cold median <= 30 ms, all 30 connected)
 #   - M2 in-process, both roles, n=50, python and rust handshake (gate: v3-kem rust total <= 0.2 ms)
 #   - M8 N=50, v2, cookies off, per backend (gate: <= 64 kB per session, all 50 connected)
 #   - no regression: M5 (rust >= 3000 Mbps TCP), M6 hitless rekey/rehandshake (0% ping loss),
 #     M7 at 0,1000,10000/s (every legitimate connect succeeds at 10000/s)
+# PHASE=5 is the final M1-M8 rerun with the Phase 4 definitions and gates (output phase5-<date>).
 # Backends are data_plane/handshake: python/python, rust/python, rust/rust. The pqvpnd binary is
 # built from core/ when that crate exists (slice d); NATIVE=<path> overrides it.
 #
 # DRY_RUN=1 (no sudo needed) prints the plan and the commands without running anything.
+# A dirty tree stops the run; ALLOW_DIRTY=1 runs it anyway into OUT-DIRTY with dirty.txt.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PHASE=${PHASE:-2}
 DRY_RUN=${DRY_RUN:-0}
-[[ $PHASE == 2 || $PHASE == 3 || $PHASE == 4 ]] || { echo "PHASE must be 2, 3 or 4" >&2; exit 1; }
+[[ $PHASE == 2 || $PHASE == 3 || $PHASE == 4 || $PHASE == 5 ]] || { echo "PHASE must be 2, 3, 4 or 5" >&2; exit 1; }
 UDP_RATES=${UDP_RATES:-100M,500M,1G,2G,3G,4G,5G,6G,8G}
 OUT=${1:-$ROOT/eval/results-summary/phase$PHASE-$(date +%F)}
 PY=$ROOT/.venv/bin/python
@@ -52,12 +54,21 @@ run() {
 if (( DRY_RUN )); then
   echo "DRY RUN: PHASE=$PHASE OUT=$OUT (nothing runs; needs sudo for real)"
   echo "  pins every CPU governor to performance, restores on exit"
-  echo "  builds pqvpn_core (maturin develop --release)$( (( PHASE == 4 )) && echo " and pqvpnd if core/pqvpnd exists" )"
-  echo "  writes $OUT/environment.txt (commit, kernel, governor, CPU, python, pqc_mode, rustc)"
+  echo "  builds pqvpn_core (maturin develop --release)$( (( PHASE >= 4 )) && echo " and pqvpnd if core/pqvpnd exists (a failed build stops the run)" )"
+  echo "  writes \$OUT/environment.txt (commit, kernel, governor, CPU, python, pqc_mode, rustc, pqvpnd sha256, jitter symbols)"
 fi
 (( DRY_RUN )) || [[ $EUID -eq 0 && -n ${SUDO_USER:-} ]] || { echo "run with sudo from your user account" >&2; exit 1; }
-as_user() { sudo -u "$SUDO_USER" -H env "PATH=$PATH" "$@"; }
+# Without SUDO_USER (DRY_RUN only) commands already run as the user.
+as_user() { if [[ -n ${SUDO_USER:-} ]]; then sudo -u "$SUDO_USER" -H env "PATH=$PATH" "$@"; else "$@"; fi; }
 [[ -x $PY ]] || { echo "missing $PY (create the venv first)" >&2; exit 1; }
+
+# --- A gate run must be one committed tree; ALLOW_DIRTY=1 runs anyway, labelled DIRTY everywhere ---
+DIRTY_PATHS=$(as_user git -C "$ROOT" status --porcelain)
+if [[ -n $DIRTY_PATHS ]]; then
+  [[ ${ALLOW_DIRTY:-0} == 1 ]] || { printf 'tree is dirty (ALLOW_DIRTY=1 to run anyway):\n%s\n' "$DIRTY_PATHS" >&2; exit 1; }
+  OUT+=-DIRTY
+fi
+(( DRY_RUN )) && echo "  OUT=$OUT$([[ -n $DIRTY_PATHS ]] && echo " (DIRTY: $(wc -l <<<"$DIRTY_PATHS") paths, listed in dirty.txt)")"
 if (( ! DRY_RUN )); then
 command -v iperf3 >/dev/null || { echo "iperf3 not found" >&2; exit 1; }
 
@@ -71,13 +82,17 @@ for g in "${!GOVERNOR[@]}"; do echo performance >"$g"; done
 # --- Release build of the Rust core into the venv (as the user: their rustup toolchain) ---
 as_user env VIRTUAL_ENV="$ROOT/.venv" maturin develop --release -m "$ROOT/core/pqvpn_core/Cargo.toml"
 "$PY" -c "import pqvpn_core; pqvpn_core.DataPlane"
+if (( PHASE >= 4 )) && [[ -z $NATIVE_GIVEN && -d $ROOT/core/pqvpnd ]]; then
+  as_user cargo build --release --manifest-path "$ROOT/core/Cargo.toml" -p pqvpnd || { echo "pqvpnd build failed" >&2; exit 1; }
+fi
 
-# --- Environment ---
+# --- Environment (after every build, so it describes the binaries that run) ---
 as_user mkdir -p "$OUT"
 COMMIT=$(as_user git -C "$ROOT" rev-parse HEAD)
-DIRTY=$(as_user git -C "$ROOT" status --porcelain | wc -l)
+[[ -z $DIRTY_PATHS ]] || as_user tee "$OUT/dirty.txt" <<<"$DIRTY_PATHS" >/dev/null
 {
-  echo "commit: $COMMIT ($([[ $DIRTY -eq 0 ]] && echo clean || echo "DIRTY: $DIRTY paths modified or untracked"))"
+  [[ -z $DIRTY_PATHS ]] || echo "DIRTY: $(wc -l <<<"$DIRTY_PATHS") paths modified or untracked (dirty.txt); not a gate run"
+  echo "commit: $COMMIT ($([[ -z $DIRTY_PATHS ]] && echo clean || echo DIRTY))"
   echo "date: $(date -Iseconds)"
   echo "kernel: $(uname -r)"
   echo "governor: performance (was $(printf '%s\n' "${GOVERNOR[@]}" | sort -u | paste -sd,))"
@@ -88,16 +103,15 @@ DIRTY=$(as_user git -C "$ROOT" status --porcelain | wc -l)
   "$PY" -c "from crypto.hybrid_crypto import get_crypto_status as s; print('pqc_mode', s()['pqc_mode'])"
   echo "rustc: $(cd "$ROOT/core" && as_user rustc --version)"
   echo "pqvpn_core: maturin develop --release"
-  if (( PHASE == 4 )); then
+  # aws-lc's CPU Jitter Entropy is linked in only when the no-jitter build setting was missed: expect 0.
+  jitter() { nm "$1" >/dev/null 2>&1 || { echo "unknown (nm failed)"; return; }; nm "$1" | grep -c jent_ || true; }
+  echo "pqvpn_core jitter symbols: $(jitter "$("$PY" -c 'import pqvpn_core.pqvpn_core as m; print(m.__file__)')")"
+  if (( PHASE >= 4 )); then
     "$PY" -c "import dataclasses; from vpn.config import ServerConfig
 print('handshake switch:', 'present' if 'handshake' in {f.name for f in dataclasses.fields(ServerConfig)} else 'MISSING (slice b)')"
-    echo "pqvpnd: $([[ -x $NATIVE ]] && echo "$NATIVE" || echo "MISSING (slice d)")"
+    echo "pqvpnd: $([[ -x $NATIVE ]] && echo "$NATIVE sha256=$(sha256sum <"$NATIVE" | cut -d' ' -f1) jitter symbols: $(jitter "$NATIVE")" || echo MISSING)"
   fi
 } | tee "$OUT/environment.txt"
-fi
-
-if (( PHASE == 4 )) && [[ -z $NATIVE_GIVEN && -d $ROOT/core/pqvpnd ]]; then
-  run "build pqvpnd" as_user cargo build --release --manifest-path "$ROOT/core/Cargo.toml" -p pqvpnd
 fi
 
 # --- M5 LAN: python vs rust, interleaved so drift hits both equally ---
@@ -118,7 +132,7 @@ run "m1 rust lan" env PYTHON="$PY" bash eval/run_pqvpn_net.sh lan --iterations 3
 M7_RATES=0,100,1000; [[ $PHASE == 3 ]] && M7_RATES=0,1000,10000
 run "m7 rust" "$PY" eval/flood_clienthello.py --rates "$M7_RATES" --data-plane rust --out "$OUT/m7-flood-rust.csv"
 else
-# --- Phase 4: M1, M8, M6 and M7 per backend; M2 per handshake; the native row on rust/rust ---
+# --- Phase 4 and 5: M1, M8, M6 and M7 per backend; M2 per handshake; the native row on rust/rust ---
 for backend in "${BACKENDS[@]}"; do
   read -r plane handshake <<<"$backend"
   tag=$plane-$handshake
@@ -210,7 +224,7 @@ if phase >= 3:
                   f"  delivered {m.get('flood_delivered_per_s', 0):.0f}/s"
                   f"  median {m.get('median_connect_time_ms', -1):.0f} ms"
                   f"  gate(all connects, offered >=9500/s): {'PASS' if ok else 'FAIL'}")
-if phase == 4:
+if phase >= 4:
     def rows(path):
         return list(csv.DictReader(open(path))) if os.path.exists(path) else []
     def med(values):

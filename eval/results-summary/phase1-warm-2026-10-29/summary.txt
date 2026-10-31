@@ -1,6 +1,0 @@
-System                Profile       Metric                        N      Median        CI Low        CI High     
---------------------  ------------  ----------------------------  -----  ------------  ------------  ------------
-pqvpn-net             lan           connect_time_ms               30     164.0000      164.0000      164.0000    
-pqvpn-net             metro         connect_time_ms               30     464.0000      463.0000      465.0000    
-pqvpn-net-warm        lan           connect_time_ms               30     52.0000       52.0000       52.0000     
-pqvpn-net-warm        metro         connect_time_ms               30     351.0000      351.0000      351.0000    

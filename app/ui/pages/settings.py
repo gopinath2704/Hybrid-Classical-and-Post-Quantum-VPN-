@@ -18,8 +18,10 @@ DEFAULT_PREFS: dict[str, object] = {
 }
 
 KILL_SWITCH_NOTE = (
-    "The kill switch is a service configuration flag. The current runtime records it but "
-    "does not install blocking firewall rules, so traffic is not blocked if the tunnel drops."
+    "When the service config enables it, the kill switch blocks all traffic outside the tunnel, "
+    "LAN included, and keeps blocking if the tunnel drops or the client crashes, until you "
+    "disconnect. It needs a full tunnel and a server IP address, and is not active before the "
+    "first connect after a reboot."
 )
 
 
@@ -104,10 +106,11 @@ class SettingsPage:
             widget.blockSignals(False)
 
     def render(self, status, connected: bool) -> None:
+        blocked = status.state == "BLOCKED"
         self.settings_kill_switch.set_status(
-            ("Flag on · not enforced" if status.kill_switch_active else "Off")
-            if connected else "Reported only while connected",
-            warning=connected and status.kill_switch_active,
+            "Blocking all traffic" if blocked else
+            ("Enforced" if status.kill_switch_active else "Off") if connected else "Reported only while connected",
+            warning=blocked,
         )
         if status.full_tunnel is True:
             tunnel = "Full tunnel"

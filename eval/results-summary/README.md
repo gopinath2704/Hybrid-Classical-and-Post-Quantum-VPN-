@@ -8,9 +8,9 @@ the paper-facing summary and figures live here instead.
 | File | What it is |
 |---|---|
 | [`EVALUATION.md`](EVALUATION.md) | The evaluation write-up: claim, headline findings, tables (median + 95 % CI), interpretation, threats to validity, reproducibility pointer. |
-| [`VALIDITY_REPORT.md`](VALIDITY_REPORT.md) | Per-cell validation of the campaign: what is trustworthy, missing, or suspect, with the concrete root cause for each. |
-| [`RERUN_COMMANDS.md`](RERUN_COMMANDS.md) | Exact commands + host prerequisites to produce the PENDING cells on a capable host; dry-run validation for the new baselines. |
-| [`REMAINING_STEPS.md`](REMAINING_STEPS.md) | What is still outstanding for the paper/artifact, in recommended order. |
+| [Validity report](../../docs/evaluation.md#validity-report) | Per-cell validation of the campaign: what is trustworthy, missing, or suspect, with the concrete root cause for each. |
+| [Re-run commands](../../docs/evaluation.md#re-run-commands) | Exact commands + host prerequisites to produce the PENDING cells on a capable host; dry-run validation for the new baselines. |
+| [Remaining steps](../../docs/evaluation.md#remaining-steps) | What is still outstanding for the paper/artifact, in recommended order. |
 | `figures/handshake_wire_sizes.svg` | **Final** — PQ-VPN handshake wire size by suite (deterministic). |
 | `figures/formal_verification.svg` | **Final** — 13/13 Tamarin lemmas verified. |
 
@@ -30,7 +30,7 @@ this preparation environment is not netem/WireGuard/liboqs-capable, so results
 could not be regenerated here. Rather than fabricate numbers, the trustworthy
 committed evidence is reported as final, the rest is marked PENDING, the harness
 gaps that would have corrupted a future run are fixed, and exact re-run commands
-are provided. See `VALIDITY_REPORT.md` for the full account.
+are provided. See the [validity report](../../docs/evaluation.md#validity-report) for the full account.
 
 ## Harness changes made in this pass (eval files only)
 
@@ -46,3 +46,25 @@ are provided. See `VALIDITY_REPORT.md` for the full account.
   non-zero on any failed unit; records CPU model/kernel/governor in `sanity.json`.
 
 No `handshake/`, `crypto/`, `vpn/`, or `formal/` files were changed.
+
+## Gate-run archives
+
+Each `scripts/bench_dataplane.sh` gate run is packed into one archive (raw CSVs, `environment.txt`,
+per-run logs). Open one with `tar -xzf <archive>`. Pack a new run the same way before committing:
+`tar --sort=name --owner=0 --group=0 -C eval/results-summary -cf - phaseN-<date> | gzip -9n > eval/results-summary/phaseN-<date>.tar.gz`.
+
+| Archive |
+|---|
+| `phase0-2026-10-28.tar.gz` |
+| `phase1-nodelay-2026-10-29.tar.gz` |
+| `phase1-warm-2026-10-29.tar.gz` |
+| `phase2-2026-10-29.tar.gz` |
+| `phase3-2026-10-29.tar.gz` |
+| `phase4-2026-10-30.tar.gz` |
+| `phase5-2026-10-31.tar.gz` (the v4.0.0 gate run on 5c4ff39; `reruns/README.md` inside covers the M8 outlier and the M6 fix) |
+
+### Phase 0 caveat
+
+The `pqvpn-net` M1 rows for metro, continent, lossy and mtu-1280 are resumed connects: `run_pqvpn_net.sh` never removed the resumption ticket, so runs 1-29 reused the ticket saved by run 0.
+True cold connect is run 0 in the raw CSVs (metro 462 ms, continent 1364 ms) or `full_connect_ms` in `resumption-*.csv`. LAN is unaffected (RTT ≈ 0).
+Fixed in Phase 1, which also changed the poll interval, so Phase 1 M1 numbers are not directly comparable with these rows.

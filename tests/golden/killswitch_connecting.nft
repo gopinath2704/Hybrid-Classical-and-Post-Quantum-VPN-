@@ -1,0 +1,7 @@
+destroy table inet pqvpn_killswitch
+add table inet pqvpn_killswitch
+add chain inet pqvpn_killswitch output { type filter hook output priority filter; policy drop; }
+add rule inet pqvpn_killswitch output oifname "lo" accept
+add rule inet pqvpn_killswitch output udp sport 68 udp dport 67 accept
+add rule inet pqvpn_killswitch output ip daddr 192.0.2.1 tcp dport 51820 accept
+add rule inet pqvpn_killswitch output counter

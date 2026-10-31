@@ -18,10 +18,13 @@ override_dh_installsystemd:
 execute_after_dh_python3:
 	sed -i '1s|^#! \?/usr/bin/python3$$|#!/usr/bin/python3 -s|' debian/pqvpn/usr/bin/pqvpn debian/pqvpn/usr/bin/pqvpn-gui debian/pqvpn/usr/bin/pqvpn-account-api
 
-# ponytail: cargo fetches crates at build time; vendor them for offline/sbuild builds later.
+# ponytail: cargo fetches crates at build time (pinned by Cargo.lock); vendor them for offline/sbuild builds later.
 execute_after_dh_auto_build:
 	# trixie maturin 1.8 predates setting this; without it pyo3 0.30 links libpython.
 	PYO3_BUILD_EXTENSION_MODULE=1 maturin build --release --locked --compatibility linux -m core/pqvpn_core/Cargo.toml -o debian/core-wheel
+	# pqvpnd builds pqvpn_core as a dependency, whose cdylib would link libpython without this too.
+	PYO3_BUILD_EXTENSION_MODULE=1 cargo build --release --locked --manifest-path core/Cargo.toml -p pqvpnd
 
 execute_after_dh_auto_install:
 	python3 -m zipfile -e debian/core-wheel/pqvpn_core-*.whl debian/pqvpn/usr/lib/python3/dist-packages/
+	install -Dm755 core/target/release/pqvpnd debian/pqvpn/usr/bin/pqvpnd

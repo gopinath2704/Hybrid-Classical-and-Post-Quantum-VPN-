@@ -425,6 +425,27 @@ class ReplayWindow:
             self.bitmap |= 1 << (self.highest - sequence)
 
 
+# pqvpn_core::session::{RECEIVE_GRACE, SEND_HOLD}, which say why; the hold is strictly shorter than the grace.
+RECEIVE_GRACE_SECONDS = 5.0
+SEND_HOLD_SECONDS = 2.0
+
+
+@dataclass
+class _KeptEpoch:
+    """One direction of the previous epoch's Python data channel after a switch: the receive grace (with that
+    epoch's own replay window) or the server's send hold (continuing that epoch's own counter)."""
+    epoch: int
+    cipher: AESGCM | None
+    nonce_base: bytearray
+    until: float
+    sequence: int = 0
+    replay: ReplayWindow | None = None
+
+    def wipe(self) -> None:
+        _secure_zero(self.nonce_base)
+        self.cipher = None
+
+
 class HandshakeState(enum.Enum):
     IDLE = "IDLE"
     CLIENT_HELLO_SENT = "CLIENT_HELLO_SENT"
@@ -596,6 +617,10 @@ class HandshakeSession:
     _epoch_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _closed: bool = field(default=False, repr=False)
     _data: object | None = field(default=None, repr=False)
+    # data_plane="python" only. Previous-epoch receive state, guarded by _data_receive_lock; the server's held
+    # previous-epoch send state, guarded by _data_send_lock (the receive side may only zero its `until`).
+    _data_previous: _KeptEpoch | None = field(default=None, repr=False)
+    _data_held: _KeptEpoch | None = field(default=None, repr=False)
     # A client's epoch change between its request and the confirmation: (kind, epoch, request, state).
     _pending: tuple | None = field(default=None, repr=False)
 
@@ -650,19 +675,39 @@ class HandshakeSession:
         with lock:
             if self._closed:
                 raise HandshakeError("session closed")
-            sequence = self._data_send_sequence if channel == Channel.DATA else self._control_send_sequence
+            held = self._live_held() if channel == Channel.DATA else None
+            if held is not None:
+                epoch, sequence, cipher, nonce_base = held.epoch, held.sequence, held.cipher, held.nonce_base
+            elif channel == Channel.DATA:
+                epoch, sequence, cipher, nonce_base = self.epoch, self._data_send_sequence, self._data_send_cipher, self._data_send_nonce_base
+            else:
+                epoch, sequence, cipher, nonce_base = self.epoch, self._control_send_sequence, self._control_send_cipher, self._control_send_nonce_base
             if sequence == MAX_SEQUENCE:
                 raise HandshakeError("sequence exhausted; rekey required")
             header = struct.pack(DATA_HEADER_FORMAT, DATA_MAGIC, self.protocol_version, int(channel), int(frame_type),
-                                 int(self.send_direction), self.session_id[:8], self.epoch, sequence)
-            cipher = self._data_send_cipher if channel == Channel.DATA else self._control_send_cipher
-            nonce_base = self._data_send_nonce_base if channel == Channel.DATA else self._control_send_nonce_base
+                                 int(self.send_direction), self.session_id[:8], epoch, sequence)
             result = header + cipher.encrypt(self._nonce(nonce_base, sequence), plaintext, header)
-            if channel == Channel.DATA:
+            if held is not None:
+                held.sequence += 1
+            elif channel == Channel.DATA:
                 self._data_send_sequence += 1
             else:
                 self._control_send_sequence += 1
             return result
+
+    def _live_held(self) -> _KeptEpoch | None:
+        """Under _data_send_lock: the server's held send state until promotion or SEND_HOLD, then wiped."""
+        held = self._data_held
+        if held is not None and time.monotonic() >= held.until:
+            held.wipe()
+            held = self._data_held = None
+        return held
+
+    def _wipe_kept(self) -> None:
+        for kept in (self._data_previous, self._data_held):
+            if kept is not None:
+                kept.wipe()
+        self._data_previous = self._data_held = None
 
     _CONTROL_TYPES = frozenset({
         FrameType.CONFIG, FrameType.REKEY_REQUEST, FrameType.REKEY_RESPONSE,
@@ -697,16 +742,29 @@ class HandshakeSession:
             raise HandshakeError("unexpected frame type")
         if channel == Channel.DATA:
             with self._data_receive_lock:
-                if session_id != self.session_id[:8] or epoch != self.epoch or direction != self.recv_direction:
+                previous = self._data_previous
+                if previous is not None and time.monotonic() >= previous.until:
+                    previous.wipe()
+                    previous = self._data_previous = None
+                current = epoch == self.epoch
+                if (session_id != self.session_id[:8] or direction != self.recv_direction
+                        or not (current or (previous is not None and epoch == previous.epoch))):
                     raise HandshakeError("wrong session, epoch, or direction")
                 if self._closed:
                     raise HandshakeError("session closed")
-                self._data_replay.check(sequence)
+                if current:
+                    cipher, nonce_base, replay = self._data_recv_cipher, self._data_recv_nonce_base, self._data_replay
+                else:
+                    cipher, nonce_base, replay = previous.cipher, previous.nonce_base, previous.replay
+                replay.check(sequence)
                 try:
-                    plaintext = self._data_recv_cipher.decrypt(self._nonce(self._data_recv_nonce_base, sequence), frame[DATA_HEADER_SIZE:], header)
+                    plaintext = cipher.decrypt(self._nonce(nonce_base, sequence), frame[DATA_HEADER_SIZE:], header)
                 except InvalidTag as exc:
                     raise HandshakeError("Frame decryption failed") from exc
-                self._data_replay.commit(sequence)
+                replay.commit(sequence)
+                held = self._data_held
+                if current and held is not None:
+                    held.until = 0.0  # the client sealed at this epoch, so it has switched: promote
                 return frame_type, plaintext
         with self._control_receive_lock:
             if session_id != self.session_id[:8] or epoch != self.epoch or direction != self.recv_direction:
@@ -783,6 +841,15 @@ class HandshakeSession:
             if epoch != self.epoch + 1:
                 raise HandshakeError("non-monotonic epoch")
             old = self.secrets
+            self._wipe_kept()
+            if self.data_plane == "python":
+                # Copies: the nonce bases alias `old`, wiped below. The ciphers, replay window and counter carry over.
+                now = time.monotonic()
+                self._data_previous = _KeptEpoch(self.epoch, self._data_recv_cipher, bytearray(self._data_recv_nonce_base),
+                                                 now + RECEIVE_GRACE_SECONDS, replay=self._data_replay)
+                if self.role == "server":  # always the responder: hold sending at the old epoch
+                    self._data_held = _KeptEpoch(self.epoch, self._data_send_cipher, bytearray(self._data_send_nonce_base),
+                                                 now + SEND_HOLD_SECONDS, sequence=self._data_send_sequence)
             self.secrets = secrets
             self.epoch = epoch
             self._data_send_sequence = 0
@@ -796,6 +863,7 @@ class HandshakeSession:
         with self._epoch_lock, self._data_send_lock, self._data_receive_lock, self._control_send_lock, self._control_receive_lock:
             self._closed = True
             self.secrets.wipe()
+            self._wipe_kept()
             if self._data is not None:
                 self._data.close()
             self._data_send_cipher = self._data_recv_cipher = None
