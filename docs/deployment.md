@@ -326,7 +326,7 @@ committed tree, with fixed mtimes so the checksum depends only on content:
 ```bash
 git archive --format=tar.gz --mtime=2026-09-14T00:00:00Z --prefix=pqvpn-3.0.0/ \
   --output=packaging/arch/pqvpn-3.0.0.tar.gz 'HEAD^{tree}' -- \
-  app benchmarks.py crypto handshake vpn pyproject.toml README.md \
+  app crypto handshake vpn pyproject.toml README.md \
   docs/design.md docs/deployment.md docs/accounts.md packaging/common \
   config/account-api.toml scripts core .cargo
 (cd packaging/arch && updpkgsums && makepkg -fC)

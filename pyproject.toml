@@ -38,14 +38,11 @@ pqvpn-account-api = "vpn.account_api:main"
 include = ["app*", "crypto*", "handshake*", "vpn*"]
 namespaces = true
 
-[tool.setuptools]
-py-modules = ["benchmarks"]
-
 [tool.setuptools.package-data]
 app = ["server-account-api.crt"]
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = [".", "eval"]
 markers = [
   "mock_pqc: uses the explicitly enabled insecure PQC test provider",
   "native_pqc: requires native liboqs ML-KEM-768",

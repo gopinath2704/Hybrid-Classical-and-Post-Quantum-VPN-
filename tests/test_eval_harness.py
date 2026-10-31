@@ -42,7 +42,7 @@ def test_cpu_split_all_suites():
 
 
 def test_benchmarks_cpu_split():
-    """benchmarks.py _run_handshake also measures CPU correctly."""
+    """eval/benchmarks.py _run_handshake also measures CPU correctly."""
     from benchmarks import HandshakeBenchmark
     hb = HandshakeBenchmark(iterations=1, warmup_runs=0)
     for suite in ("v2-ed25519", "v3-kem", "v3-mldsa"):

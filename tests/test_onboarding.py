@@ -474,7 +474,7 @@ def test_packaging_foundation_has_safe_launcher_and_managed_service():
 
 def _make_arch_source_archive(root: Path, archive: Path) -> None:
     included = (
-        "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
+        "app", "crypto", "handshake", "vpn", "pyproject.toml",
         "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
         "packaging/common", "config/account-api.toml", "scripts", "core", ".cargo",
     )
@@ -499,7 +499,7 @@ def _stable_archive_digest(root: Path, tmp: Path) -> str:
     and never matched in CI.
     """
     included = (
-        "app", "benchmarks.py", "crypto", "handshake", "vpn", "pyproject.toml",
+        "app", "crypto", "handshake", "vpn", "pyproject.toml",
         "README.md", "docs/design.md", "docs/deployment.md", "docs/accounts.md",
         "packaging/common", "config/account-api.toml", "scripts", "core", ".cargo",
     )
@@ -523,7 +523,7 @@ def test_arch_development_archive_is_checksum_verified_and_secret_free(tmp_path)
     # changes: python -m pytest -q tests/test_onboarding.py -k checksum  (the
     # failure message prints the new digest).
     digest = _stable_archive_digest(root, tmp_path)
-    assert digest == "f1a8a6c4a9a3dfc39720c915aa548e8cd4d9c5a9a811aae4fd0af979580eee63"
+    assert digest == "e1012ad4499f8794c862cf70069c8cf8e27e157e0e40da63f81483c3d7f5d67d"
 
     with tarfile.open(archive, "r:gz") as source:
         names = source.getnames()
