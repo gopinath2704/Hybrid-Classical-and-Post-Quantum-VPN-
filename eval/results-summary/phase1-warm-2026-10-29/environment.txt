@@ -1,3 +1,0 @@
-commit: 3ce2d22 (harness), date: 2026-10-29, host as phase0-2026-10-28/environment.txt
-cold = new process, no ticket; warm = IPC CONNECT to a running app.client --service, full handshake; poll 10 ms
-Governor was NOT pinned for this run (eval/run_pqvpn_net.sh only); compare with care.

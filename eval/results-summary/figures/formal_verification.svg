@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 500" font-family="system-ui,Segoe UI,Roboto,sans-serif">
 <rect width="760" height="500" fill="#ffffff"/>
 <text x="380.0" y="26" text-anchor="middle" font-size="16" font-weight="600" fill="#111827">Formal verification — 13/13 lemmas verified</text>
-<text x="380.0" y="46" text-anchor="middle" font-size="12" fill="#6B7280">Tamarin Prover 1.12.0 · Maude 3.5.1 · formal/results/verify-2026-10-02.txt</text>
+<text x="380.0" y="46" text-anchor="middle" font-size="12" fill="#6B7280">Tamarin Prover 1.12.0 · Maude 3.5.1 · formal/results/*-verify.txt</text>
 <text x="30" y="92" font-size="13" font-weight="600" fill="#111827">Handshake model — formal/pqvpn_v3.spthy (7 lemmas)</text>
 <rect x="24" y="92" width="712" height="26" fill="#F9FAFB"/>
 <text x="40" y="108" font-size="12" fill="#374151">protocol_completes</text>

@@ -37,7 +37,7 @@ authentication, KCI resistance on both sides, and PCS recovery of a fresh epoch
 after control-key-only and full-epoch passive compromise. The one exists-trace
 "attack" lemma documents the **stated limitation** (an active adversary holding
 full epoch state can complete a re-handshake). See
-`figures/formal_verification.svg` and `formal/results/verify-2026-10-02.txt`.
+`figures/formal_verification.svg` and `formal/results/handshake-verify.txt` and `formal/results/pcs-verify.txt`.
 
 **This is PQ-VPN's strongest, fully reproducible result and directly supports the
 "PQ + verified-handshake + PCS" half of the claim.** No baseline in this study
@@ -404,7 +404,7 @@ sudo env PATH="$PATH" python eval/measure_memory.py \
 | File | What it shows | Source |
 |---|---|---|
 | `figures/handshake_wire_sizes.svg` | PQ-VPN handshake wire size by suite (final) | deterministic; `run_pqvpn.py` |
-| `figures/formal_verification.svg` | 13/13 lemma verification status (final) | `formal/results/verify-2026-10-02.txt` |
+| `figures/formal_verification.svg` | 13/13 lemma verification status (final) | `formal/results/handshake-verify.txt`, `formal/results/pcs-verify.txt` |
 | `figures/connect_time_comparison.png` | M1 connect time, median + 95% CI | `generate_tables.py` |
 | `figures/latency_comparison.png` | per-system latency, median + 95% CI | `generate_tables.py` |
 

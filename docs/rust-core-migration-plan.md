@@ -117,7 +117,7 @@ All numbers right of "Today" are targets, not measurements. Phase 0 may move the
 
 ### Phase 2 ablation: Python vs Rust data plane
 
-Final run: commit 17d4667 (clean), governor pinned to performance, M5 LAN, median of 5 runs per cell, Python and Rust interleaved on the same commit (`scripts/bench_dataplane.sh`, raw data and `environment.txt` in `eval/results-summary/phase2-2026-10-29/`).
+Final run: commit 17d4667 (clean), governor pinned to performance, M5 LAN, median of 5 runs per cell, Python and Rust interleaved on the same commit (`scripts/bench_dataplane.sh`, raw data and `environment.txt` in `eval/results-summary/phase2-2026-10-29.tar.gz`).
 
 | Suite | Data plane | TCP (Mbps) | Tunnel RTT overhead (ms) |
 | --- | --- | --- | --- |
@@ -220,7 +220,7 @@ A later multi-worker phase would add one knob, `data_plane_workers` (an int or `
 
 ### Phase 3 results
 
-Gate run: commit 2e0a5e5 (clean), governor pinned to performance, median of 5 runs per cell (`sudo env PHASE=3 scripts/bench_dataplane.sh`, raw data and `environment.txt` in `eval/results-summary/phase3-2026-10-29/`). Shipped: slice (a) UDP GSO/GRO with a 4 MB `SO_RCVBUF`, and the control accept backlog fixed at 64 (`CONTROL_LISTEN_BACKLOG`). Slice (b) was skipped: a profile put it at about 1.1 to 1.25x, below its 1.3x bar. Raising TUN `txqueuelen` to 4000 removed the TUN drops but did not add throughput, and it adds about 7 ms of standing queue, so it was not shipped either.
+Gate run: commit 2e0a5e5 (clean), governor pinned to performance, median of 5 runs per cell (`sudo env PHASE=3 scripts/bench_dataplane.sh`, raw data and `environment.txt` in `eval/results-summary/phase3-2026-10-29.tar.gz`). Shipped: slice (a) UDP GSO/GRO with a 4 MB `SO_RCVBUF`, and the control accept backlog fixed at 64 (`CONTROL_LISTEN_BACKLOG`). Slice (b) was skipped: a profile put it at about 1.1 to 1.25x, below its 1.3x bar. Raising TUN `txqueuelen` to 4000 removed the TUN drops but did not add throughput, and it adds about 7 ms of standing queue, so it was not shipped either.
 
 | Suite | Data plane | TCP (Mbps) | Tunnel RTT overhead (ms) | UDP, highest rate with <1% loss |
 | --- | --- | --- | --- | --- |
@@ -247,7 +247,7 @@ All numbers are from veth on one host. EC2's ENA has no UDP segmentation offload
 
 ### Phase 4 results
 
-Gate run: commit 6822d09 (clean), governor pinned to performance, on AC power, one `sudo PHASE=4 bash scripts/bench_dataplane.sh` run. Raw data and `environment.txt` are in `eval/results-summary/phase4-2026-10-30/`. Each row is named by its server backends, data plane then handshake: `python-python`, `rust-python` or `rust-rust`. The native client is `pqvpnd connect`, a separate binary, not the Python CLI made faster.
+Gate run: commit 6822d09 (clean), governor pinned to performance, on AC power, one `sudo PHASE=4 bash scripts/bench_dataplane.sh` run. Raw data and `environment.txt` are in `eval/results-summary/phase4-2026-10-30.tar.gz`. Each row is named by its server backends, data plane then handshake: `python-python`, `rust-python` or `rust-rust`. The native client is `pqvpnd connect`, a separate binary, not the Python CLI made faster.
 
 | Metric | Python (published) | Phase 4 | Gate |
 | --- | --- | --- | --- |
@@ -416,7 +416,7 @@ Treat the Python and Rust backends as two configurations of one artifact, not as
 
 ## Next steps
 
-- [x] Phase 0: re-run M1 to M8 on current main with flame graphs, then tag `v3-paper-artifact` (needs root on your machine). Baseline b726b42 in `eval/results-summary/phase0-2026-10-28/`; the `v3-paper-artifact` tag already existed and is public, so it was not moved.
+- [x] Phase 0: re-run M1 to M8 on current main with flame graphs, then tag `v3-paper-artifact` (needs root on your machine). Baseline b726b42 in `eval/results-summary/phase0-2026-10-28.tar.gz`; the `v3-paper-artifact` tag already existed and is public, so it was not moved.
 - [x] Phase 1: open one PR per quick win, starting with warm connect through `ClientService` and pyroute2. Merged: #28 warm connect, #29 TCP_NODELAY.
 - [x] Phase 4: Rust handshake behind `handshake = "rust"`, `pqvpnd connect`, the server selector thread. Gate run 6822d09: transcripts, M8, M5 and M7 met; M1 cold (42 ms) and M2 (0.205 ms) missed and reported. The IPC daemon is deferred to Phase 5.
 - [ ] Phase 5: hardening and release. Done: both Phase 4 misses root-caused (aws-lc jitter seeding; built without it, 4425fa6), pqvpnd network parity, a real kill switch on both clients, the native backend of the client service with the GUI contract tested, ticket loader hardening, and new resume and ticket-file fuzz coverage. In progress: the 24 h fuzz run (since 2026-10-30 23:19 IST). Pending: the full pentest re-run, Arch and Debian package builds, the sudo M1 to M8 gate run, then tag `v4.0.0`.
@@ -1189,7 +1189,7 @@ The run needs root.
 | Phase 2 | 17d4667 | Rust | 131 | 9.0 |
 | Phase 3 | 2026-10-29 | Rust | 126 | 15 |
 
-- The Phase 0 caveat (`eval/results-summary/phase0-2026-10-28/README.md`): metro and other non-LAN cold rows were really resumed connects, because the ticket was not deleted. This was fixed in Phase 1. LAN is unaffected.
+- The Phase 0 caveat ("Phase 0 caveat" in `eval/results-summary/README.md`): metro and other non-LAN cold rows were really resumed connects, because the ticket was not deleted. This was fixed in Phase 1. LAN is unaffected.
 - **The cold definition for Phases 0-3:** a new client process, no ticket, full v2 handshake, from spawn to the first tunnel ping.
 - The ≤30 ms gate under this definition needs a **native one-shot client** (no Python interpreter or imports). `pqvpnd` alone would improve the warm row, not cold. Cold minus warm is about 110 ms, which is process start alone.
 
@@ -1226,7 +1226,7 @@ The run needs root.
 **What it includes:** one server `_client` thread per session (stack plus objects), `ServerSession`, `HandshakeSession`, the AESGCM objects, the IP pool and the ticket-key state.
 
 **Results:**
-- 186 kB published (`EVALUATION.md` Table G); 170.3 kB at Phase 0 (`phase0-2026-10-28/m8-memory.csv`).
+- 186 kB published (`EVALUATION.md` Table G); 170.3 kB at Phase 0 (`m8-memory.csv` in `phase0-2026-10-28.tar.gz`).
 - Not to be confused with `eval/run_pqvpn.py:181` `measure_memory_per_session`: that is an in-process psutil RSS delta over 100 session pairs, both roles, a different metric.
 
 ### 5. Regression tests the port must keep

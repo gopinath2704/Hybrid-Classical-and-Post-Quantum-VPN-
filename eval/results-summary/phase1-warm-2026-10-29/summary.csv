@@ -1,5 +1,0 @@
-system,profile,metric,n,median,ci_lo,ci_hi
-pqvpn-net,lan,connect_time_ms,30,164.0,164.0,164.0
-pqvpn-net,metro,connect_time_ms,30,464.0,463.0,465.0
-pqvpn-net-warm,lan,connect_time_ms,30,52.0,52.0,52.0
-pqvpn-net-warm,metro,connect_time_ms,30,351.0,351.0,351.0

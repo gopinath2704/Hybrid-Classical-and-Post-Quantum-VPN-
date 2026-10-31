@@ -8,10 +8,10 @@ harness output is committed; no number here is estimated or hand-edited.
 | Results | Commit / tag | Location |
 |---|---|---|
 | Paper campaign, Python stack (M1–M8, WireGuard baseline for M1) | tag `v3-paper-artifact` (e719c4c) | `eval/results-summary/EVALUATION.md`, `summary.csv`, `figures/` |
-| Phase 0 baseline before the Rust migration | tag `v3.1-baseline` | `eval/results-summary/phase0-2026-10-28/` |
-| Paper freeze with the Rust data plane, Phases 0–3 | tag `v3.1-paper-dataplane` | `phase1-nodelay-2026-10-29/`, `phase3-2026-10-29/` |
+| Phase 0 baseline before the Rust migration | tag `v3.1-baseline` | `eval/results-summary/phase0-2026-10-28.tar.gz` |
+| Paper freeze with the Rust data plane, Phases 0–3 | tag `v3.1-paper-dataplane` | `phase1-nodelay-2026-10-29.tar.gz`, `phase3-2026-10-29.tar.gz` |
 | Rust-core migration, Phases 0–4 gate runs | per-phase commit, recorded in each `environment.txt` | `eval/results-summary/phase*-<date>/` (`summary.txt` + raw CSVs) |
-| Phase 5 / v4.0.0 gate run | **not run yet** | will land in `eval/results-summary/phase5-<date>/` |
+| Phase 5 / v4.0.0 gate run | **not run yet** | will land in `eval/results-summary/phase5-<date>/`, packed into `phase5-<date>.tar.gz` before committing |
 | Formal verification (13/13 lemmas) | 2026-10-02 | `formal/results/` |
 
 The migration plan, [docs/rust-core-migration-plan.md](rust-core-migration-plan.md),

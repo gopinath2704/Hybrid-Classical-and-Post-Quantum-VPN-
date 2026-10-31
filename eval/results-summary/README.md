@@ -46,3 +46,24 @@ are provided. See the [validity report](../../docs/evaluation.md#validity-report
   non-zero on any failed unit; records CPU model/kernel/governor in `sanity.json`.
 
 No `handshake/`, `crypto/`, `vpn/`, or `formal/` files were changed.
+
+## Gate-run archives
+
+Each `scripts/bench_dataplane.sh` gate run is packed into one archive (raw CSVs, `environment.txt`,
+per-run logs). Open one with `tar -xzf <archive>`. Pack a new run the same way before committing:
+`tar --sort=name --owner=0 --group=0 -C eval/results-summary -cf - phaseN-<date> | gzip -9n > eval/results-summary/phaseN-<date>.tar.gz`.
+
+| Archive |
+|---|
+| `phase0-2026-10-28.tar.gz` |
+| `phase1-nodelay-2026-10-29.tar.gz` |
+| `phase1-warm-2026-10-29.tar.gz` |
+| `phase2-2026-10-29.tar.gz` |
+| `phase3-2026-10-29.tar.gz` |
+| `phase4-2026-10-30.tar.gz` |
+
+### Phase 0 caveat
+
+The `pqvpn-net` M1 rows for metro, continent, lossy and mtu-1280 are resumed connects: `run_pqvpn_net.sh` never removed the resumption ticket, so runs 1-29 reused the ticket saved by run 0.
+True cold connect is run 0 in the raw CSVs (metro 462 ms, continent 1364 ms) or `full_connect_ms` in `resumption-*.csv`. LAN is unaffected (RTT ≈ 0).
+Fixed in Phase 1, which also changed the poll interval, so Phase 1 M1 numbers are not directly comparable with these rows.
