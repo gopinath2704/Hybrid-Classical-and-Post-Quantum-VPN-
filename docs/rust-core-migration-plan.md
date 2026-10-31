@@ -273,7 +273,7 @@ Caveat: `environment.txt` says `pqvpnd: MISSING`, because the environment is cap
 
 ### Phase 5 results
 
-Branch `rust-core/phase-5-hardening` from main a16ae2a. Every number here is from an unprivileged probe unless it says gate run. The gate run needs sudo and has not happened yet.
+Branch `rust-core/phase-5-hardening` from main a16ae2a. Every number here is from an unprivileged probe unless it says gate run. The gate run is in [Gate run](#gate-run-5c4ff39) below.
 
 #### The Phase 4 misses: root cause
 
@@ -331,9 +331,10 @@ The M2 margin is thin. If the pinned gate run lands above 0.2 ms, it is reported
 #### Fuzzing
 
 - **New coverage (ad2aa52):** resume tickets that pass GCM with hostile hello fields (X25519 points, a malformed ML-KEM key, the wrong protocol version); control traffic on a resumed session; and the client ticket-file parser (JSON and base64), which must round-trip through the writer's format.
-- **The 24 h run started 2026-10-30 23:19 IST** from 6f991ef. All 5 targets run side by side, one worker each, with ASan.
-  - It counts for v4.0.0 only if these are unchanged at the tag: `pqvpn_core` tree `60df2ae`, `core/fuzz` tree `b624343`, `core/Cargo.lock` `537a016`. The governor was not pinned, which is fine because the gate is 0 artifacts, not a rate.
-  - The run started with `core/pqvpnd/src` dirty. That crate is not a fuzz dependency, and the run's validity rests on the three tree hashes, not on a clean checkout.
+- **The 24 h run has not completed.** Attempts on 2026-10-30 (about 2 h) and 2026-10-31 (32 min) were stopped early with 0 artifacts and do not count; hours are never summed.
+  - The epoch-switch fix (91d4928) changed `pqvpn_core` and the `open` target, so the earlier tree hashes no longer apply. The run counts for v4.0.0 only if these are unchanged at the tag: `pqvpn_core` tree `d34ac62`, `core/fuzz` tree `93e5d46`, `core/Cargo.lock` `537a016`.
+  - All 5 targets run side by side, one worker each, with ASan. The governor need not be pinned: the gate is 0 artifacts, not a rate.
+  - After the fix, each target ran a 60 s smoke test with 0 crashes.
 - **10-minute preflight at 45d3bfb, 0 artifacts:**
 
 | Target | exec/s | Coverage after cmin | Corpus after cmin (files) |
@@ -351,19 +352,52 @@ The M2 margin is thin. If the pinned gate run lands above 0.2 ms, it is reported
 - The Rust loader opens with `O_NONBLOCK`, so a FIFO planted at the path cannot hang it.
 - A ticket the server rejects is deleted (de1bea7).
 
+#### Epoch-switch packet loss (M6): root cause and fix
+
+- **Symptom.** The first gate run (3ebe643) lost one ping in an M6 rehandshake on python-python and rust-python. Re-runs that kept the ping logs showed real mid-run `icmp_seq` gaps on rust-rust too. In one rust-rust rekey run, the gaps (454 and 2729 = 6 × 455 pings) lined up with the 5 s rekey interval.
+- **Root cause: a hard one-sided cutover, in the protocol rather than in either port.**
+  - The server switched send and receive inside `respond_rekey` / `respond_rehandshake`, before its response left.
+  - The client switched only after the TCP response arrived.
+  - Each side accepted only its current epoch. So in that window, client frames at N reaching the server and server frames at N+1 that beat the TCP response were dropped.
+  - Both data planes behaved the same; Phase 4's Python-plane 0.04% / 0.01% was the same bug.
+  - No frame was ever accepted under the wrong key or replayed.
+- **Fix (91d4928, wire format unchanged), in `pqvpn_core/src/session.rs` and `handshake/kemtls.py`:**
+  - (a) After a switch, one previous-epoch receive state is kept for `RECEIVE_GRACE` = 5 s, with its own replay window.
+  - (b) The responder keeps sealing at the old epoch, continuing that epoch's counter, until an AEAD-verified frame at the new epoch arrives, or for `SEND_HOLD` = 2 s at most. A compile-time assert keeps the hold shorter than the grace.
+  - N-2 frames, and N-1 frames after the grace, are rejected.
+  - Python and Rust make the same decisions.
+  - 8 new tests, plus the old hard-cutover tests rewritten to the new rules.
+- **Cost:** the previous epoch's key lives up to 5 s after each switch, and is wiped on the next switch, on close or at expiry.
+- **Result:** 3 setups × 3 re-runs on 5c4ff39 had 0 missing `icmp_seq` in all 18 phases, and the gate run's M6 is 0.00% on every backend.
+
+#### Gate run (5c4ff39)
+
+One `sudo PHASE=5 bash scripts/bench_dataplane.sh` run on a clean tree, governor pinned, on AC power, `jent_` = 0 in `pqvpn_core` and `pqvpnd`. Raw data, `environment.txt` and `reruns/` are in `eval/results-summary/phase5-2026-10-31.tar.gz`.
+
+| Metric | python-python | rust-python | rust-rust | Gate |
+| --- | --- | --- | --- | --- |
+| M1 LAN cold, median of 30 (ms) | 126 | 126 | 126 (native `pqvpnd`: **18**) | native 30 or less: **met** |
+| M2 handshake CPU, v3-kem (ms) | 0.391 | n/a | **0.183** | 0.2 or less: **met** |
+| M5 LAN TCP, v2 / v3-kem, median of 5 (Mbps) | 659 / 663 | n/a | 6611 / 6619 | rust 3000 or more: **met** |
+| M6 ping loss, rekey / rehandshake | 0.00% / 0.00% | 0.00% / 0.00% | 0.00% / 0.00% | 0%: **met** |
+| M7 legitimate connects at 10,000 ClientHello/s | 5/5 | 5/5 | 5/5 | all: **met** |
+| M8 per session, N = 50 (kB) | 49.6 | 61.0 (see below) | 27.9 | 64 or less: **met** |
+
+The runner's summary says `PHASE 5 GATES: FAIL` because of one M8 rust-python reading of 67.6 kB. Three gate-path re-runs on the same commit gave 60.9, 61.0 and 61.2 kB; the pre-fix run gave 61.3 kB and the unprivileged probe 61.4 to 61.8 kB. The 67.6 kB was a single-snapshot outlier, and all four readings are kept in the archive. Tunnel RTT overhead is reported but not gated: 0.224 ms for rust, 0.45 ms for python.
+
 #### Phase 5 gates
 
 | Gate | Status | How it is verified |
 | --- | --- | --- |
-| 24 h of fuzzing, no crash | **In progress** (started 2026-10-30 23:19 IST) | 0 files in `artifacts/*/` after 86,400 s per target, and the three tree hashes above unchanged at the tag |
-| `cargo deny` and `cargo audit` clean | sentinel-10, S4 | Both run at the tag commit; output in the release notes |
-| unsafe review | sentinel-10, S4 | `pqvpn_fd` is the only crate with unsafe; `own()` stays a safe fn so the single-crate invariant holds |
-| Pentest suite re-run clean | **Partial** | The network-leak section (#33 to #40) re-ran with the kill-switch case: SECTION 4 OK, while #33, #37 and #39 stay PARTIAL in `report.md`. Pending: the full 70-attack re-run and the real-host (sudo) kill-switch check |
-| Arch and Debian packages build from `git archive HEAD` | **Pending** (pqvpnd is in the PKGBUILD and debian/rules since 186f744; neither build has run) | `makepkg -fC` and the `debian:trixie` build, after the final digest re-pin, which comes last |
-| Full M1 to M8 rerun | **Pending, needs sudo** | One `bench_dataplane.sh` run on a clean tree, governor pinned, `jent_` = 0 recorded; M1 native and M2 reported as separate labelled rows attributed to the jitter decision |
-| M1 LAN cold 30 ms or less (carried from Phase 4) | **Pending** (probe: native 6.5 ms on a shorter clock) | The gate run's native M1 row |
-| M2 0.2 ms or less (carried from Phase 4) | **Pending** (probe: 0.184 to 0.199 ms) | The gate run's M2 v3-kem row; reported as missed if above 0.2 |
-| Tag `v4.0.0` | Pending | After every row above is met or reported |
+| 24 h of fuzzing, no crash | **Pending** (scheduled 2026-11-01) | 0 files in `artifacts/*/` after 86,400 s per target, and the three tree hashes above unchanged at the tag |
+| `cargo deny` and `cargo audit` clean | **Met** 2026-10-31 (deny: advisories, bans, licenses, sources ok; audit: 0 vulnerabilities in 71 + 48 crates) | Re-run at the tag commit |
+| unsafe review | **Met** (sentinel-10, S4) | `pqvpn_fd` is the only crate with unsafe; `own()` stays a safe fn so the single-crate invariant holds |
+| Pentest suite re-run clean | **Met** with known partials (2026-10-31, 5f0d15b): all 33 harnesses pass; #33/#37/#39 stay PARTIAL as before. Pending: the real-host (sudo) kill-switch check | `pentesting/report.md` |
+| Arch and Debian packages build from `git archive HEAD` | **Met** 2026-10-31 (Arch makepkg + pacman -U; trixie docker build, rustc 1.85.1; `jent_` = 0, no libpython) | Rebuild after the final re-pin |
+| Full M1 to M8 rerun | **Met** on 5c4ff39 | [Gate run](#gate-run-5c4ff39) |
+| M1 LAN cold 30 ms or less (carried from Phase 4) | **Met**: native 18 ms, 30/30 | The gate run's native M1 row |
+| M2 0.2 ms or less (carried from Phase 4) | **Met**: 0.183 ms | The gate run's M2 v3-kem row |
+| Tag `v4.0.0` | Pending | After the fuzz run and the real-host kill-switch check |
 
 ## Security invariants and tests
 
@@ -419,7 +453,7 @@ Treat the Python and Rust backends as two configurations of one artifact, not as
 - [x] Phase 0: re-run M1 to M8 on current main with flame graphs, then tag `v3-paper-artifact` (needs root on your machine). Baseline b726b42 in `eval/results-summary/phase0-2026-10-28.tar.gz`; the `v3-paper-artifact` tag already existed and is public, so it was not moved.
 - [x] Phase 1: open one PR per quick win, starting with warm connect through `ClientService` and pyroute2. Merged: #28 warm connect, #29 TCP_NODELAY.
 - [x] Phase 4: Rust handshake behind `handshake = "rust"`, `pqvpnd connect`, the server selector thread. Gate run 6822d09: transcripts, M8, M5 and M7 met; M1 cold (42 ms) and M2 (0.205 ms) missed and reported. The IPC daemon is deferred to Phase 5.
-- [ ] Phase 5: hardening and release. Done: both Phase 4 misses root-caused (aws-lc jitter seeding; built without it, 4425fa6), pqvpnd network parity, a real kill switch on both clients, the native backend of the client service with the GUI contract tested, ticket loader hardening, and new resume and ticket-file fuzz coverage. In progress: the 24 h fuzz run (since 2026-10-30 23:19 IST). Pending: the full pentest re-run, Arch and Debian package builds, the sudo M1 to M8 gate run, then tag `v4.0.0`.
+- [ ] Phase 5: hardening and release. Done: both Phase 4 misses root-caused (aws-lc jitter seeding; built without it, 4425fa6), pqvpnd network parity, a real kill switch on both clients, the native backend of the client service with the GUI contract tested, ticket loader hardening, and new resume and ticket-file fuzz coverage. Also done: the full pentest re-run, Arch and Debian package builds, `cargo deny` / `cargo audit`, the epoch-switch loss fix (91d4928), and the sudo M1 to M8 gate run on 5c4ff39 with every gate met. Pending: the 24 h fuzz run, the real-host kill-switch check, then tag `v4.0.0`.
 - [x] Phase 2 spike: a `core/` skeleton with maturin, one known-answer test for frame encryption, and a `--backend` pytest option, to prove the build and packaging path before the real port.
 
 Open question: which venue and deadline is the paper aiming for? That decides whether to freeze after Phase 2, Phase 3 or Phase 4.

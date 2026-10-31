@@ -61,6 +61,7 @@ per-run logs). Open one with `tar -xzf <archive>`. Pack a new run the same way b
 | `phase2-2026-10-29.tar.gz` |
 | `phase3-2026-10-29.tar.gz` |
 | `phase4-2026-10-30.tar.gz` |
+| `phase5-2026-10-31.tar.gz` (the v4.0.0 gate run on 5c4ff39; `reruns/README.md` inside covers the M8 outlier and the M6 fix) |
 
 ### Phase 0 caveat
 

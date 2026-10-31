@@ -11,7 +11,7 @@ harness output is committed; no number here is estimated or hand-edited.
 | Phase 0 baseline before the Rust migration | tag `v3.1-baseline` | `eval/results-summary/phase0-2026-10-28.tar.gz` |
 | Paper freeze with the Rust data plane, Phases 0–3 | tag `v3.1-paper-dataplane` | `phase1-nodelay-2026-10-29.tar.gz`, `phase3-2026-10-29.tar.gz` |
 | Rust-core migration, Phases 0–4 gate runs | per-phase commit, recorded in each `environment.txt` | `eval/results-summary/phase*-<date>/` (`summary.txt` + raw CSVs) |
-| Phase 5 / v4.0.0 gate run | **not run yet** | will land in `eval/results-summary/phase5-<date>/`, packed into `phase5-<date>.tar.gz` before committing |
+| Phase 5 / v4.0.0 gate run | commit 5c4ff39 | `eval/results-summary/phase5-2026-10-31.tar.gz` |
 | Formal verification (13/13 lemmas) | 2026-10-02 | `formal/results/` |
 
 The migration plan, [docs/rust-core-migration-plan.md](rust-core-migration-plan.md),
@@ -20,9 +20,15 @@ M5 LAN rust 6665 / 6783 Mbps (v2 / v3-kem) against 680 / 677 Mbps for Python; M8
 24.5 kB per session for rust-rust; M7 5/5 connects at 10,000 ClientHello/s on every
 backend. Missed and reported: M2 v3-kem 0.205 ms (gate 0.2) and native `pqvpnd` cold
 connect 42 ms (gate 30). Phase 5 traced both misses to aws-lc's jitter-entropy seeding
-([deployment.md](deployment.md#components-and-tested-versions)). The no-jitter numbers
-so far are unprivileged probes (M2 0.184–0.199 ms, native connect 6.5 ms on a shorter
-clock), not gate results.
+([deployment.md](deployment.md#components-and-tested-versions)).
+
+Phase 5 gate run (5c4ff39, no-jitter build, `jent_` = 0, governor pinned): native `pqvpnd`
+cold connect 18 ms, M2 v3-kem 0.183 ms, M5 rust 6611 / 6619 Mbps, M6 0.00% loss on every
+backend, M7 5/5 at 10,000 ClientHello/s, M8 49.6 / 61 / 27.9 kB per session (python-python /
+rust-python / rust-rust). All gates are met. The runner's own summary says FAIL for one M8
+rust-python reading of 67.6 kB; three gate-path re-runs gave 60.9–61.2 kB, recorded in the
+archive's `reruns/`. M6 is met only since fix 91d4928: the protocol used to drop 0–1 packets
+per epoch switch (see the migration plan's Phase 5 results).
 
 ## Setup
 
@@ -172,10 +178,9 @@ What still holds for any claim:
 ## Remaining steps
 
 1. **24 h fuzz run** of the 5 `core/fuzz` targets with 0 crashes. Earlier attempts were
-   stopped early and do not count. It is valid for v4.0.0 only if `core/pqvpn_core`,
-   `core/fuzz` and `core/Cargo.lock` are unchanged at the tag.
-2. **Phase 5 gate run** (`PHASE=5`) on a clean tree with `jent_` = 0. M1 native ≤ 30 ms
-   and M2 ≤ 0.2 ms are decided here, and misses are reported.
+   stopped early and do not count. It is valid for v4.0.0 only if `core/pqvpn_core` (tree
+   `d34ac62`), `core/fuzz` (`93e5d46`) and `core/Cargo.lock` (`537a016`) are unchanged at the tag.
+2. ~~Phase 5 gate run~~: done on 5c4ff39, all gates met (above).
 3. **Real-host kill-switch check:** with `kill_switch` on, `sudo kill -9` the client;
    curl and dig must fail, and GUI Disconnect must restore traffic (so far verified in a
    network namespace only).
